@@ -121,6 +121,39 @@ class SessionOriginTest(unittest.TestCase):
     def codex(self, **fields):
         return collector.codex_row({'id': 'child-session', **fields}, '.codex', None, 'Fixture', set(), [])
 
+    def test_claude_kind_is_not_proof_of_direct_start_and_saved_entrypoint_is_used(self):
+        sid = '12345678-abcd-1234-abcd-123456789abc'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (sid + '.jsonl')
+            for entrypoint, category in (('sdk-cli', 'agent'), ('cli', 'general'), (None, 'agent')):
+                path.write_text(json.dumps({'type': 'user', 'sessionId': sid, 'entrypoint': entrypoint,
+                                            'message': {'content': '합성 요청'}}) + '\n')
+                for kind in ('interactive', 'background'):
+                    with self.subTest(entrypoint=entrypoint, kind=kind):
+                        row = collector.claude_row({'id': sid[:8], 'sessionId': sid, 'kind': kind}, {sid: path}, [])
+                        self.assertEqual(collector.session_category(row), category)
+                        self.assertEqual(row.get('entrypoint'), entrypoint)
+
+    def test_claude_launch_metadata_has_the_same_bounded_identity_checks_on_both_platforms(self):
+        import windows_collector
+        sid = '12345678-abcd-1234-abcd-123456789abc'
+        first = {'type': 'user', 'sessionId': sid, 'entrypoint': 'sdk-cli'}
+        later = {**first, 'entrypoint': 'cli'}
+        cases = [([first, later], 'sdk-cli'),
+                 ([{**later, 'isMeta': True}, {**later, 'isSidechain': True},
+                   {**later, 'sessionId': 'other-session'}, first], 'sdk-cli'),
+                 ([{**first, 'entrypoint': None}, later], None),
+                 ([{**first, 'entrypoint': ['cli']}], None),
+                 ([{**first, 'entrypoint': 'x' * 257}], None),
+                 ([{'type': 'queue-operation', 'content': 'x' * 65536}, later], None)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (sid + '.jsonl')
+            for entries, expected in cases:
+                path.write_text('\n'.join(json.dumps(entry) for entry in entries) + '\n')
+                with self.subTest(entries=expected):
+                    self.assertEqual(collector.claude_entrypoint(path, sid), expected)
+                    self.assertEqual(windows_collector._claude_entrypoint(path, sid), expected)
+
     def test_client_and_execution_modes_never_determine_initiator(self):
         for source in ('cli', 'vscode', 'exec', 'appServer', 'mcp', 'background', 'future-client', None):
             with self.subTest(source=source):

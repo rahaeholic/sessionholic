@@ -1560,12 +1560,13 @@ function botFolderOf(s) {
 }
 // Who opened a session, from what the board sees of it: "bot" (a bot request's, or a bot's own),
 // "agent" (a subagent, or a program's run such as codex exec), "human" (opened by hand in a
-// terminal: Codex's terminal UI or a board launch, Claude's interactive or background session)
+// terminal: Codex's terminal UI or a board launch, Claude's recorded cli entrypoint)
 // or "unknown". 일반 세션 lists only "human"; 에이전트 세션 the agents', programs' and unknown.
 function originOf(s) {
   if (!s) return "unknown";
   if (botNameOf(s)) return "bot";
   if (s.initiator === "agent" || s.parentSessionId || s.agentRole) return "agent";
+  if (s.agent === "claude" && (s.entrypoint === "sdk-cli" || s.executionMode === "one-shot")) return "agent";
   if (s.initiator === "human") return "human";
   if (s.agent === "codex") {
     // How Codex recorded the run decides: its terminal UI or an app's or IDE's connection is
@@ -1576,7 +1577,7 @@ function originOf(s) {
     if (s.originator) return DIRECT_ORIGINATORS.has(s.originator) ? "human" : "agent";
     return "unknown";
   }
-  if (s.agent === "claude" && ["interactive", "background"].includes(s.kind)) return "human";
+  if (s.agent === "claude" && s.entrypoint === "cli") return "human";
   return "unknown";
 }
 // 시작 주체's own values (a bot is picked by its name instead).

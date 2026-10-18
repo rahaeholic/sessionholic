@@ -9994,8 +9994,12 @@ test('the origin of a session follows how it was opened: by hand in a terminal, 
     [{ agent: 'codex', originator: 'codex-tui' }, 'human', 'general'],
     [{ agent: 'codex', originator: 'session-board' }, 'human', 'general'],
     [{ agent: 'codex', source: 'cli' }, 'human', 'general'],
-    [{ agent: 'claude', kind: 'interactive' }, 'human', 'general'],
-    [{ agent: 'claude', kind: 'background' }, 'human', 'general'],
+    [{ agent: 'claude', kind: 'interactive', entrypoint: 'cli' }, 'human', 'general'],
+    [{ agent: 'claude', kind: 'background', entrypoint: 'cli' }, 'human', 'general'],
+    [{ agent: 'claude', kind: 'interactive', entrypoint: 'sdk-cli' }, 'agent', 'agent'],
+    [{ agent: 'claude', kind: 'interactive' }, 'unknown', 'agent'],
+    [{ agent: 'claude', kind: 'background' }, 'unknown', 'agent'],
+    [{ agent: 'claude', entrypoint: 'cli', executionMode: 'one-shot' }, 'agent', 'agent'],
     [{ agent: 'codex', originator: 'codex_exec' }, 'agent', 'agent'],
     // Read by the board's own reader (its name as originator): still the app session it was.
     [{ agent: 'codex', originator: 'sessionholic_windows_reader', source: 'vscode' }, 'human', 'general'],
@@ -10055,18 +10059,21 @@ test('Windows 저장 기록의 실행 미확인은 기기 연결·과거 live ph
 test('일반 세션은 직접 시작한 세션만, 에이전트 세션은 하위 에이전트·프로그램 실행·출처 미확인을 중복 없이 나눈다', () => {
   const c = client(undefined, noChatTimers);
   const rows = [recentSession('human', { initiator: 'human' }), recentSession('tui'),
-    recentSession('claude-bg', { agent: 'claude', kind: 'background', originator: undefined }),
+    recentSession('claude-bg', { agent: 'claude', kind: 'background', entrypoint: 'cli', originator: undefined }),
+    recentSession('opus-review', { agent: 'claude', kind: 'interactive', entrypoint: 'sdk-cli', originator: undefined,
+      runtimeKnown: false, initiator: 'unknown' }),
+    recentSession('claude-unknown', { agent: 'claude', kind: 'interactive', originator: undefined }),
     recentSession('agent', { initiator: 'agent' }), recentSession('exec', { originator: 'codex_exec' }),
     recentSession('unknown', { originator: undefined })];
   setRecentSnapshot(c, rows);
   const general = rows.filter(s => c.matches(s, 1100));
   assert.deepEqual(general.map(s => s.id), ['human', 'tui', 'claude-bg']);
   c.state.sessionCategory = 'agent';
-  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['agent', 'exec', 'unknown']);
+  const agents = rows.filter(s => c.matches(s, 1100)); assert.deepEqual(agents.map(s => s.id), ['opus-review', 'claude-unknown', 'agent', 'exec', 'unknown']);
   assert.equal(new Set([...general, ...agents].map(s => s.key)).size, rows.length);
   c.renderSessionCategories(rows, 1100);
   assert.equal(c.get('session-category-general-count').textContent, '3');
-  assert.equal(c.get('session-category-agent-count').textContent, '3');
+  assert.equal(c.get('session-category-agent-count').textContent, '5');
   assert.equal(c.get('session-category-agent').attributes['aria-selected'], 'true');
   assert.equal(c.get('groups').attributes['aria-labelledby'], 'session-category-agent');
   // The agent tab says it holds programs' and unknown runs too.

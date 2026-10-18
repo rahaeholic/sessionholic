@@ -667,6 +667,8 @@ def session_category(row, bot=False):
         return "bot"
     if row.get("initiator") == "agent" or row.get("parentSessionId") or row.get("agentRole"):
         return "agent"
+    if row.get("agent") == "claude" and (row.get("entrypoint") == "sdk-cli" or row.get("executionMode") == "one-shot"):
+        return "agent"
     if row.get("initiator") == "human":
         return "general"
     if row.get("agent") == "codex":
@@ -675,9 +677,28 @@ def session_category(row, bot=False):
         if row.get("source") == "exec":
             return "agent"
         return "general" if row.get("originator") in ("codex-tui", "session-board") else "agent"
-    if row.get("agent") == "claude" and row.get("kind") in ("interactive", "background"):
+    if row.get("agent") == "claude" and row.get("entrypoint") == "cli":
         return "general"
     return "agent"
+
+
+def claude_entrypoint(path, session_id):
+    """Original main-thread launch mode, never a later resume or the prompt's text.
+
+    As windows_collector._claude_entrypoint; that collector runs standalone on the PC.
+    Missing/oversized initial metadata stays unknown rather than implying a direct start.
+    """
+    with path.open("rb") as stream:
+        raw = stream.read(65536)
+    for line in raw.splitlines()[:30]:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(entry, dict) and entry.get("type") == "user" and entry.get("sessionId") == session_id
+                and not any(entry.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary"))):
+            return _metadata_text(entry.get("entrypoint"))
+    return None
 
 
 def claude_row(row, transcripts, projects):
@@ -686,11 +707,13 @@ def claude_row(row, transcripts, projects):
     session_id = str(row.get("sessionId") or "")
     path = transcripts.get(session_id) if SESSION_ID.match(session_id) else None
     snippet, updated = "", to_epoch(row.get("startedAt"))
+    entrypoint = _metadata_text(row.get("entrypoint")) if not path else None
     if path:
         try:
             info = path.stat()
             updated = int(info.st_mtime)
             snippet = claude_snippet(path, info.st_size)
+            entrypoint = claude_entrypoint(path, session_id)
         except OSError:
             # Removed or unreadable transcripts keep the session row without a preview.
             pass
@@ -698,7 +721,7 @@ def claude_row(row, transcripts, projects):
         "agent": "claude", "id": str(row.get("id") or ""), "sessionId": session_id,
         "title": row.get("name") or "(이름 없음)", "cwd": row.get("cwd") or "",
         "project": project_for(row.get("cwd"), projects), "account": "",
-        "kind": row.get("kind"), "state": row.get("state"), "status": row.get("status"),
+        "kind": row.get("kind"), "entrypoint": entrypoint, "state": row.get("state"), "status": row.get("status"),
         "waitingFor": row.get("waitingFor"), "phase": claude_phase(row.get("state"), row.get("status")),
         "startedAt": to_epoch(row.get("startedAt")), "updatedAt": updated,
         "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
