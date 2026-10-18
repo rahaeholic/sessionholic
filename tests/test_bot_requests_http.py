@@ -90,6 +90,12 @@ class BotRequestsHTTPTest(unittest.TestCase):
                 self.assertIn(response.status, (400, 409), result)
                 self.assertIn('봇', result['error'])
 
+    def test_slack_origin_keeps_direct_controls_blocked_when_the_ledger_has_no_request(self):
+        self.response['requests'] = []
+        self.board.state[self.host['name']]['data']['codex'][0].update(
+            source='exec', botOrigin='slack', botOriginEvidence='request_envelope')
+        self.test_known_bot_cannot_inherit_direct_send_terminal_or_termination()
+
     def test_other_native_identity_is_not_inferred_to_be_a_bot(self):
         self.assertIsNone(self.httpd.workflow.bot_request({**self.ref, 'id': 'different'}))
         self.assertIsNone(self.httpd.workflow.bot_request({**self.ref, 'home': '.codex-other'}))

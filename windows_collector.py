@@ -118,6 +118,18 @@ def _json(path, root, limit=65536):
     return json.loads(raw.decode('utf-8-sig'))
 
 
+def _slack_bot_origin(row, source):
+    """As collector.slack_bot_origin; this DB's title is also an original-prompt fallback."""
+    if source != 'exec':
+        return {}
+    initial = next((row[key] for key in ('first_user_message', 'preview', 'title')
+                    if isinstance(row.get(key), str) and row[key]), '')
+    text = _codex_user_text(initial[:65536])
+    if text and _bot_request_text(text) != text:
+        return {'botOrigin': 'slack', 'botOriginEvidence': 'request_envelope'}
+    return {}
+
+
 def _origin(row):
     source = row.get('source') or row.get('thread_source')
     if isinstance(source, str) and len(source) <= 4096 and source.lstrip().startswith(('{', '"')):
@@ -144,7 +156,8 @@ def _origin(row):
             'initiatorName': _metadata(row.get('initiatorName')) or _metadata(row.get('initiator_name')) or _metadata(detail.get('name')),
             'parentSessionId': parent or _metadata(spawn.get('parent_thread_id')),
             'agentName': _metadata(row.get('agentName')) or _metadata(row.get('agentNickname')) or _metadata(row.get('agent_nickname')) or _metadata(spawn.get('agent_nickname')),
-            'agentRole': _metadata(row.get('agentRole')) or _metadata(row.get('agent_role')) or _metadata(spawn.get('agent_role')) or _metadata(spawn.get('agent_type'))}
+            'agentRole': _metadata(row.get('agentRole')) or _metadata(row.get('agent_role')) or _metadata(spawn.get('agent_role')) or _metadata(spawn.get('agent_type')),
+            **_slack_bot_origin(row, source)}
 
 
 def _phase(status, known=True):

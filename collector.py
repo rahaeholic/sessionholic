@@ -624,6 +624,22 @@ def session_source(value):
     return None
 
 
+def slack_bot_origin(row, source):
+    """A native exec's original Slack request, before list previews are clipped.
+
+    The full envelope (requester, job number and policy), never a display title or
+    a quoted label, is evidence. As windows_collector._slack_bot_origin.
+    """
+    if source != "exec":
+        return {}
+    initial = next((row[key] for key in ("first_user_message", "preview")
+                    if isinstance(row.get(key), str) and row[key]), "")
+    text = codex_user_text(initial[:65536])
+    if text and bot_request_text(text) != text:
+        return {"botOrigin": "slack", "botOriginEvidence": "request_envelope"}
+    return {}
+
+
 def session_origin(row):
     """Explicit initiator evidence, independent of client mode or current executor.
 
@@ -657,12 +673,12 @@ def session_origin(row):
     return {"initiator": kind or ("agent" if is_subagent else "unknown"),
             "initiatorName": name, "initiatorEvidence": evidence, "parentSessionId": parent,
             "agentName": agent_name, "agentRole": role, "source": source,
-            "originator": _metadata_text(row.get("originator"))}
+            "originator": _metadata_text(row.get("originator")), **slack_bot_origin(row, source)}
 
 
 def session_category(row, bot=False):
     """The board's general/agent/bot policy, also used by notification delivery."""
-    if (bot or row.get("originator") == "hermes" or
+    if (bot or row.get("botOrigin") == "slack" or row.get("originator") == "hermes" or
             re.search(r"[\\/]workspaces[\\/]slack(?:[\\/]|$)|[\\/]\.hermes(?:[\\/]|$)", str(row.get("cwd") or ""), re.I)):
         return "bot"
     if row.get("initiator") == "agent" or row.get("parentSessionId") or row.get("agentRole"):
@@ -984,6 +1000,7 @@ def codex_db_threads(path):
                          if key not in ("name", "preview", "first_user_message")},
                      "id": row[0], "cwd": row[1], "name": extra.get("name") or None,
                      "preview": extra.get("preview") or extra.get("first_user_message") or row[2],
+                     "first_user_message": extra.get("first_user_message") or row[2],
                      "createdAt": row[3], "updatedAt": row[4], "source": session_source(row[5]),
                      "status": {"type": "notLoaded"}})
     return {"data": data}, set(), None

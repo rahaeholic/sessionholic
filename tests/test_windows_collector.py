@@ -459,6 +459,20 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(), before)
         self.assertEqual(self.calls, [])
 
+    def test_saved_slack_exec_in_a_normal_project_is_a_bot_even_after_renaming(self):
+        import collector
+        envelope = '[슬랙 요청]\n- 요청자: 예제\n- 작업 번호: 12\n[처리 원칙] 봇 정책\n[요청]\n합성 요청'
+        with sqlite3.connect(self.db) as connection:
+            connection.execute('ALTER TABLE threads ADD COLUMN first_user_message TEXT')
+            connection.execute('UPDATE threads SET source=?,title=?,name=?,first_user_message=?',
+                               ('exec', envelope, '표시 이름 수정', envelope))
+        before = self.db.read_bytes()
+        row = self.reader.snapshot()['codex'][0]
+        self.assertEqual(row.get('botOrigin'), 'slack')
+        self.assertEqual(collector.session_category(row), 'bot')
+        self.assertEqual(row['title'], '표시 이름 수정')
+        self.assertEqual(self.db.read_bytes(), before)
+
     def test_explicit_subagent_metadata_survives_db(self):
         row = self.reader.snapshot()['codex'][0]
         self.assertEqual(row['initiator'], 'agent')

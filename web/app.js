@@ -1600,7 +1600,7 @@ function botNameOf(s) {
     const source = (state.botRequests.sources || []).find((item) => item.id === request.sourceId);
     return String(source?.label || request.botName || "").split(" · ")[0].trim() || null;
   }
-  return ORIGINATOR_BOTS[s?.originator] || botFolderOf(s) || null;
+  return ORIGINATOR_BOTS[s?.originator] || (s?.botOrigin === "slack" ? "Slack" : null) || botFolderOf(s) || null;
 }
 function botFilter() {
   const value = state.filters?.initiator || "";
