@@ -121,6 +121,33 @@ class SessionOriginTest(unittest.TestCase):
     def codex(self, **fields):
         return collector.codex_row({'id': 'child-session', **fields}, '.codex', None, 'Fixture', set(), [])
 
+    def test_slack_exec_keeps_bot_origin_without_a_ledger_or_special_workspace(self):
+        import windows_collector
+        envelope = '[슬랙 요청]\n- 요청자: 예제\n- 작업 번호: 12\n[처리 원칙] 봇 정책\n[요청]\n합성 요청'
+        for text in (envelope, '# AGENTS.md instructions for /fixture\n<INSTRUCTIONS>규칙</INSTRUCTIONS>\n' + envelope):
+            for origin in (collector.session_origin, windows_collector._origin):
+                with self.subTest(origin=origin.__module__, harness=text != envelope):
+                    metadata = origin({'source': 'exec', 'first_user_message': text, 'preview': '짧은 미리보기'})
+                    self.assertEqual(metadata.get('botOrigin'), 'slack')
+                    self.assertEqual(metadata.get('botOriginEvidence'), 'request_envelope')
+        row = self.codex(source='exec', preview=envelope, name='사용자가 바꾼 이름', cwd='/fixture/project')
+        self.assertEqual(collector.session_category(row), 'bot')
+        self.assertEqual(row['title'], '사용자가 바꾼 이름')
+
+    def test_slack_label_and_quoted_text_do_not_make_an_ordinary_session_a_bot(self):
+        import windows_collector
+        envelope = '[슬랙 요청]\n- 요청자: 예제\n- 작업 번호: 12\n[처리 원칙] 봇 정책\n[요청]\n합성 요청'
+        cases = [{'source': 'cli', 'preview': envelope},
+                 {'source': 'exec', 'preview': '[슬랙 요청] 문구를 검토해 주세요'},
+                 {'source': 'exec', 'preview': '인용:\n' + envelope},
+                 {'source': 'exec', 'preview': envelope.replace('[처리 원칙]', '[일반 설명]')},
+                 {'source': 'exec', 'first_user_message': '직접 요청', 'preview': envelope},
+                 {'source': 'exec', 'preview': 'x' * 65536 + envelope}]
+        for fields in cases:
+            for origin in (collector.session_origin, windows_collector._origin):
+                with self.subTest(origin=origin.__module__, source=fields['source']):
+                    self.assertIsNone(origin(fields).get('botOrigin'))
+
     def test_claude_kind_is_not_proof_of_direct_start_and_saved_entrypoint_is_used(self):
         sid = '12345678-abcd-1234-abcd-123456789abc'
         with tempfile.TemporaryDirectory() as directory:

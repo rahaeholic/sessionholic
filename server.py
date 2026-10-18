@@ -2226,8 +2226,12 @@ class Workflow:
         return None
 
     def ensure_direct_session(self, source):
+        try:
+            listed = self.board.source(source)
+        except ValueError:
+            listed = {}
         owns = getattr(getattr(self, "bot_requests", None), "owns", None)
-        if self.bot_request(source) or (owns is not None and owns(source)):
+        if listed.get("botOrigin") == "slack" or self.bot_request(source) or (owns is not None and owns(source)):
             raise ValueError("봇을 통해 받은 요청입니다. 요청자의 권한과 사용 범위를 유지하도록 원래 봇에서 이어가 주세요.")
 
     def ensure_direct_terminal(self, terminal_id):

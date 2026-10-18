@@ -11947,17 +11947,22 @@ test('docked, the conversation beside follows the terminal on docking and for a 
 
 test('봇 요청 탭은 봇이 연 세션도 보여 주고, 누르면 그 대화를 보기 전용으로 따라간다', () => {
   const c = client(undefined, noChatTimers);
-  const slack = recentSession('slack-run', { originator: 'codex_exec', cwd: '/srv/bot/workspaces/slack', title: 'Slack 요청 작업' });
+  const slack = recentSession('slack-run', { originator: 'codex_exec', source: 'exec', cwd: '/fixture/project',
+    botOrigin: 'slack', botOriginEvidence: 'request_envelope', title: '사용자가 바꾼 이름' });
+  const quoted = recentSession('quoted', { originator: 'codex_exec', source: 'exec', title: '[슬랙 요청] 문구 검토' });
   const mine = recentSession('mine', { title: '직접 연 작업' });
-  setRecentSnapshot(c, [slack, mine]);
+  setRecentSnapshot(c, [slack, mine, quoted]);
   c.state.botRequests = { requests: [], sources: [], loaded: true, busy: false, error: '', readAt: 0, fetchedAt: null, promise: null };
   c.render();
   // Not in 일반 세션; counted in 봇 요청.
   assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['직접 연 작업']);
   assert.equal(c.get('session-category-bot-count').textContent, '1');
+  assert.equal(c.get('session-category-agent-count').textContent, '1', '문구만 같은 실행은 에이전트 탭에 남는다');
+  c.setSessionCategory('agent');
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['[슬랙 요청] 문구 검토']);
   c.setSessionCategory('bot');
   assert.match(textOf(c.get('groups')), /봇이 연 세션/);
-  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['Slack 요청 작업']);
+  assert.deepEqual(byClass(c.get('groups'), 'card').map((card) => byClass(card, 'card-title')[0].textContent), ['사용자가 바꾼 이름']);
   // Opened: its conversation, watched (no composer), in this tab.
   c.select(slack.key);
   assert.equal(c.state.selected, slack.key);

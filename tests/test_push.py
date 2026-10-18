@@ -568,6 +568,7 @@ class RouteTest(unittest.TestCase):
                  ({'source': 'cli', 'parentSessionId': 'parent'}, 'agent'),
                  ({'source': 'cli', 'agentRole': 'worker'}, 'agent'),
                  ({'cwd': '/work/workspaces/slack/project'}, 'bot'),
+                 ({'source': 'exec', 'botOrigin': 'slack'}, 'bot'),
                  ({'agent': 'claude', 'kind': 'background', 'entrypoint': 'cli'}, 'general'),
                  ({'agent': 'claude', 'kind': 'interactive', 'entrypoint': 'sdk-cli'}, 'agent'),
                  ({'agent': 'claude', 'kind': 'interactive'}, 'agent'),
