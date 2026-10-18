@@ -3,7 +3,7 @@
 The board injects this module, windows_collector and windows_attachments over SSH stdin.
 It starts no server and accepts no arbitrary shell command, PID, binary or filesystem path.
 Besides uploads kept in the session's own work folder (windows_attachments), only metadata
-receipts and a local proof key are persisted; input is not logged.
+receipts, unresolved resume permissions and a local proof key are persisted; input is not logged.
 """
 from __future__ import annotations
 
@@ -37,6 +37,9 @@ CONTROL_REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 PROOF_TTL = 45
 ARCHIVE_EFFECT = '선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다.'
 STORE_RELATIVE = '.local/state/sessionholic-windows'
+RESUME_PENDING_REASON = 'PC 세션의 재개 권한 확인이 끝나지 않았습니다. 원본 PC 터미널에서 확인한 뒤 해당 세션을 닫거나 프로젝트 서버를 다시 시작해 주세요.'
+TERMINAL_SECONDS = 15
+RESUME_MIN_SECONDS = 6
 
 
 def _digest(value):
@@ -96,7 +99,8 @@ def _codex_resume_settings(row):
             if mode == 'read-only' and value:
                 # The native legacy read-only preset cannot restore enabled networking.
                 raise ValueError(message)
-            config['sandbox_' + mode.replace('-', '_') + '.' + key] = value
+            if mode == 'workspace-write':
+                config['sandbox_workspace_write.' + key] = value
     elif kind == 'managed' and set(policy) == {'type', 'file_system', 'network'}:
         fs = policy['file_system']
         if (not isinstance(fs, dict) or set(fs) != {'type', 'entries'} or fs['type'] != 'restricted'
@@ -236,15 +240,18 @@ class Store:
         try:
             if os.fstat(fd).st_nlink != 1:
                 raise ValueError('PC 작업 잠금 파일이 안전하지 않습니다.')
-            if os.name == 'nt':
-                import msvcrt
-                if os.fstat(fd).st_size == 0:
-                    os.write(fd, b'0')
-                os.lseek(fd, 0, 0)
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b'0')
+                    os.lseek(fd, 0, 0)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                raise ValueError('PC에서 다른 작업을 처리하고 있습니다. 잠시 뒤 다시 시도해 주세요.') from None
             yield
         finally:
             os.close(fd)
@@ -365,6 +372,38 @@ class WindowsRuntime:
         self.store = Store(self.home)
         self.terminate_process = terminate_process
 
+    def _resume_record_name(self, identity):
+        # Host aliases must not provide another route around an unresolved resume.
+        return 'resume-' + _digest([identity['agent'], identity['home'], identity['id']]) + '.json'
+
+    def _resume_pending(self, observed):
+        if not self.store.root.exists():
+            return False
+        name = self._resume_record_name(observed['source'])
+        pending = self.store.read(name)
+        if pending is None:
+            if self.store.path(name).exists():
+                raise ValueError(RESUME_PENDING_REASON)
+            return False
+        server = pending.get('server') if isinstance(pending, dict) else None
+        if (not isinstance(pending, dict) or set(pending) != {'version', 'threadId', 'path', 'cwd', 'server', 'settings'}
+                or pending.get('version') != 1 or pending.get('threadId') != observed['source']['id']
+                or not all(isinstance(pending.get(k), str) and pending[k] for k in ('path', 'cwd'))
+                or not isinstance(server, dict) or set(server) != {'pid', 'start', 'exe'}
+                or type(server.get('pid')) is not int or server['pid'] <= 0
+                or not all(isinstance(server.get(k), str) and server[k] for k in ('start', 'exe'))
+                or not isinstance(pending.get('settings'), dict)
+                or pending['settings'].get('sandbox') not in ('danger-full-access', 'workspace-write', 'read-only')
+                or pending['settings'].get('approvalPolicy') not in ('never', 'on-request')):
+            raise ValueError(RESUME_PENDING_REASON)
+        # A different verified process cannot contain the previous process's loaded thread.
+        # Do not clear anything on read/preview; the next explicit cold resume replaces it.
+        return server == observed['server']
+
+    def _require_resume_verified(self, observed):
+        if self._resume_pending(observed):
+            raise ValueError(RESUME_PENDING_REASON)
+
     def _thread(self, client, identity, cwd):
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
@@ -428,7 +467,8 @@ class WindowsRuntime:
                      and not (self.reader.home / 'Projects' / name).exists()]
         return self.reader.endpoint(named[0]) if len(named) == 1 else None
 
-    def _codex_resume(self, source, prepare=False):
+    def _codex_resume(self, source, prepare=False, deadline=None):
+        deadline = time.monotonic() + TERMINAL_SECONDS if deadline is None else deadline
         identity = _identity(source)
         rows = self.reader.database_rows(identity['id'])
         if len(rows) != 1 or rows[0].get('archived') or source.get('cwd') and wc._norm(source['cwd']) != wc._norm(rows[0]['cwd']):
@@ -444,27 +484,49 @@ class WindowsRuntime:
             # An SSH session is elevated: without its project's own (non-elevated) server, Codex
             # would run an embedded runtime in that session instead.
             raise ValueError('이 기록의 프로젝트 Codex 서버가 PC에서 꺼져 있습니다. 새 세션으로 그 프로젝트를 열어 서버를 켠 뒤 이어갈 수 있습니다.')
+        settings = _codex_resume_settings(rows[0])
         argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(endpoint).as_posix(), '--cd', cwd]
         if prepare:
-            settings = _codex_resume_settings(rows[0])
             # A preview never loads a thread. The explicit terminal action preloads it
             # with its saved permissions; the native remote TUI accepts no overrides.
-            with self.proxy_factory(self.reader.binary, endpoint, time.monotonic() + 12) as client:
+            with self.store.lock(), self.proxy_factory(self.reader.binary, endpoint, deadline) as client:
+                current = self.reader.database_rows(identity['id'])
+                keys = ('id', 'cwd', 'archived', 'sandbox_policy', 'approval_mode')
+                if len(current) != 1 or any(current[0].get(k) != rows[0].get(k) for k in keys):
+                    raise ValueError('PC 세션의 실행 권한이 변경되었습니다. 다시 연결해 주세요.')
+                state = wc._json(Path(endpoint).parent / 'server-state.json', self.reader.codex_home)
+                process = self.reader.process_reader(state.get('server_pid'))
+                if not process:
+                    raise ValueError('PC 원본 서버 프로세스를 확인하지 못했습니다.')
+                observed = {'source': identity, 'path': str(endpoint), 'cwd': cwd,
+                            'server': {'pid': process['pid'], 'start': process['start'], 'exe': wc._norm(process['exe'])}}
+                self._verify_endpoint(observed)
                 loaded, complete = _loaded(client)
                 if not complete:
                     raise ValueError('PC 서버의 실행 목록을 다시 확인해 주세요.')
                 if identity['id'] not in loaded:
-                    current = self.reader.database_rows(identity['id'])
-                    keys = ('id', 'cwd', 'archived', 'sandbox_policy', 'approval_mode')
-                    if len(current) != 1 or any(current[0].get(k) != rows[0].get(k) for k in keys):
-                        raise ValueError('PC 세션의 실행 권한이 변경되었습니다. 다시 연결해 주세요.')
+                    if deadline - time.monotonic() < RESUME_MIN_SECONDS:
+                        raise TimeoutError('PC 세션 재개 전에 확인 시간이 부족해 중단했습니다. 다시 연결해 주세요.')
+                    name = self._resume_record_name(identity)
+                    # Persist BEFORE sending: a lost response or terminated SSH process must
+                    # block subsequent warm attaches and chat sends in another RPC process.
+                    self.store.save(name, {'version': 1, 'threadId': identity['id'], 'path': str(endpoint),
+                                          'cwd': cwd, 'server': observed['server'], 'settings': settings})
+                    if deadline - time.monotonic() < RESUME_MIN_SECONDS:
+                        # Nothing has been sent yet; a slow local write is not an
+                        # ambiguous native result. The operation lock still owns this record.
+                        self.store.path(name).unlink()
+                        raise TimeoutError('PC 세션 재개 전에 확인 시간이 부족해 중단했습니다.')
                     result = client.call('thread/resume', {'threadId': identity['id'], 'cwd': cwd, **settings})
                     thread = result.get('thread') if isinstance(result, dict) else None
                     if (not isinstance(thread, dict) or thread.get('id') != identity['id']
                             or wc._norm(thread.get('cwd')) != wc._norm(cwd)
                             or not _same_resume_permissions(result, settings)):
                         raise ValueError('PC 세션의 재개와 기존 실행 권한을 확인하지 못했습니다.')
+                    self._verify_endpoint(observed)
+                    self.store.path(name).unlink()
                 else:
+                    self._require_resume_verified(observed)
                     self._thread(client, identity, cwd)
         return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach', 'resumed': True}
@@ -585,6 +647,10 @@ class WindowsRuntime:
                 receipt = {**receipt, 'attachments': saved['attachments']}
             receipts.append(receipt)
         capabilities = {**_capabilities(thread), 'canLaunch': True}
+        try:
+            self._require_resume_verified(observed)
+        except (OSError, ValueError) as exc:
+            capabilities.update(canSend=False, canLaunch=False, reason=str(exc))
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
         result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
                   'modelSettings': wc._model_settings(thread),
@@ -652,6 +718,7 @@ class WindowsRuntime:
                 return prior['result']
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
                 self._verify_endpoint(observed)
+                self._require_resume_verified(observed)
                 thread = self._thread(client, identity, observed['cwd'])
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
@@ -802,14 +869,21 @@ class WindowsRuntime:
                     **({'effect': ARCHIVE_EFFECT, 'scope': 'session-and-descendants', 'scopeReadback': 'selected-session',
                         'descendantsConfirmed': False} if action == 'terminate' else {})}
 
-    def terminal_plan(self, source, prepare=True):
+    def terminal_plan(self, source, prepare=False):
         identity = _identity(source)
         if identity['agent'] == 'codex':
+            deadline = time.monotonic() + TERMINAL_SECONDS
             try:
-                observed = self._codex(source, time.monotonic() + 12)
+                observed = self._codex(source, deadline - RESUME_MIN_SECONDS)
             except NotLoaded:
-                return self._codex_resume(source, prepare=prepare)
-            self._verify_endpoint(observed)
+                return self._codex_resume(source, prepare=prepare, deadline=deadline)
+            if prepare:
+                with self.store.lock():
+                    self._verify_endpoint(observed)
+                    self._require_resume_verified(observed)
+            else:
+                self._verify_endpoint(observed)
+                self._require_resume_verified(observed)
             argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(observed['path']).as_posix(), '--cd', observed['cwd']]
             cwd = observed['cwd']
         else:
@@ -839,10 +913,7 @@ class WindowsRuntime:
             if identity['agent'] != 'codex':
                 self._claude_resume(source)
             else:
-                try:
-                    self._codex(source, time.monotonic() + 12)
-                except NotLoaded:
-                    self._codex_resume(source)
+                self.terminal_plan(source)
             return {'source': identity, 'allowed': True, 'blockedByBoard': False, 'reason': None}
         except (OSError, ValueError, TimeoutError) as exc:
             return {'source': identity, 'allowed': False, 'blockedByBoard': False,

@@ -46,6 +46,7 @@ class FakeReader:
         self.fail_after = False
         self.send_calls = 0
         self.mutate_hook = None
+        self.resume_hook = None
 
     def endpoints(self):
         return self.paths
@@ -108,8 +109,9 @@ class FakeReader:
                                                      ('exclude_slash_tmp', 'excludeSlashTmp', False),
                                                      ('exclude_tmpdir_env_var', 'excludeTmpdirEnvVar', False)]:
                             sandbox[native] = config.get('sandbox_workspace_write.' + key, default)
-                    return {'thread': copy.deepcopy(owner.thread), 'approvalPolicy': params['approvalPolicy'],
-                            'sandbox': sandbox}
+                    result = {'thread': copy.deepcopy(owner.thread), 'approvalPolicy': params['approvalPolicy'],
+                              'sandbox': sandbox}
+                    return owner.resume_hook(result) if owner.resume_hook else result
                 if method == 'turn/start':
                     owner.send_calls += 1
                     if owner.fail_send:
@@ -463,17 +465,19 @@ class WindowsRuntimeTest(unittest.TestCase):
                 self.reader.row.update(sandbox_policy=json.dumps(policy), approval_mode='on-request')
                 # Neither these browser fields nor default launch configuration are authority.
                 plan = self.runtime.terminal_plan({**self.source, 'sandbox_policy': '{"type":"disabled"}',
-                                                   'approval_mode': 'never'})
+                                                   'approval_mode': 'never'}, prepare=True)
                 self.assertNotIn('--sandbox', plan['argv'])
                 params = [p for method, p in self.reader.calls if method == 'thread/resume'][-1]
                 self.assertEqual(params['sandbox'], policy['type'])
                 self.assertEqual(params['approvalPolicy'], 'on-request')
-                config = params['config']
-                prefix = 'sandbox_' + policy['type'].replace('-', '_') + '.'
-                self.assertEqual(config[prefix + 'network_access'], policy['network_access'])
                 if policy['type'] == 'workspace-write':
+                    config = params['config']
+                    prefix = 'sandbox_workspace_write.'
+                    self.assertEqual(config[prefix + 'network_access'], policy['network_access'])
                     self.assertEqual(config[prefix + 'writable_roots'], policy['writable_roots'])
                     self.assertIs(config[prefix + 'exclude_slash_tmp'], True)
+                else:
+                    self.assertNotIn('config', params)
         self.assertEqual(self.reader.send_calls, 0)
 
     def test_native_managed_workspace_policy_is_preserved_without_expanding_paths(self):
@@ -488,7 +492,7 @@ class WindowsRuntimeTest(unittest.TestCase):
                   'network': 'restricted'}
         self.reader.row['sandbox_policy'] = json.dumps(policy)
         self.reader.loaded = []
-        self.runtime.terminal_plan(self.source)
+        self.runtime.terminal_plan(self.source, prepare=True)
         params = [p for method, p in self.reader.calls if method == 'thread/resume'][-1]
         self.assertEqual(params['sandbox'], 'workspace-write')
         self.assertIs(params['config']['sandbox_workspace_write.network_access'], False)
@@ -513,6 +517,8 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.reader.loaded = []
             with self.subTest(policy=policy, approval=approval), self.assertRaisesRegex(ValueError, '기존 실행 권한'):
                 self.runtime.terminal_plan(self.source)
+            self.assertFalse(self.runtime.resume_preview(self.source)['allowed'])
+        self.assertFalse(any(method == 'thread/resume' for method, params in self.reader.calls))
         self.assertEqual(self.reader.send_calls, 0)
 
     def test_terminal_previews_never_load_or_change_the_stored_thread(self):
@@ -530,6 +536,161 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.assertFalse(wr._same_resume_permissions(result, settings))
         self.assertTrue(wr._same_resume_permissions({'approvalPolicy': 'never',
                                                     'sandbox': {'type': 'dangerFullAccess'}}, settings))
+
+    def test_failed_resume_persists_and_blocks_later_attach_preview_and_send(self):
+        for failure in ('sandbox', 'approval', 'id', 'cwd', 'timeout', 'error'):
+            with self.subTest(failure=failure):
+                self.reader.loaded = []
+                self.reader.calls = []
+                def fail(result):
+                    if failure == 'timeout':
+                        raise TimeoutError('synthetic lost response after load')
+                    if failure == 'error':
+                        raise OSError('synthetic disconnected proxy after load')
+                    if failure == 'sandbox':
+                        result['sandbox'] = {'type': 'readOnly', 'networkAccess': False}
+                    elif failure == 'approval':
+                        result['approvalPolicy'] = 'on-request'
+                    elif failure == 'id':
+                        result['thread']['id'] = str(uuid.uuid4())
+                    elif failure == 'cwd':
+                        result['thread']['cwd'] = str(self.home / 'other')
+                    return result
+                self.reader.resume_hook = fail
+                with self.assertRaises((ValueError, TimeoutError, OSError)):
+                    self.runtime.terminal_plan(self.source, prepare=True)
+                self.assertEqual(self.reader.loaded, [self.reader.sid])
+                # Every SSH RPC constructs a new runtime, possibly with a host alias.
+                self.runtime = wr.WindowsRuntime(reader=self.reader, proxy_factory=self.reader.proxy)
+                alias = {**self.source, 'host': 'another-alias'}
+                for prepare in (False, True):
+                    with self.assertRaisesRegex(ValueError, '재개 권한 확인'):
+                        self.runtime.terminal_plan(alias, prepare=prepare)
+                self.assertFalse(self.runtime.resume_preview(alias)['allowed'])
+                caps = self.runtime.chat({'action': 'capabilities', 'source': alias})['capabilities']
+                self.assertFalse(caps['canSend'])
+                self.assertFalse(caps['canLaunch'])
+                with self.assertRaisesRegex(ValueError, '재개 권한 확인'):
+                    self.send()
+                self.assertEqual(self.reader.send_calls, 0)
+                self.assertEqual(sum(method == 'thread/resume' for method, params in self.reader.calls), 1)
+
+    def failed_resume(self):
+        self.reader.loaded = []
+        self.reader.resume_hook = lambda result: None
+        with self.assertRaises(ValueError):
+            self.runtime.terminal_plan(self.source, prepare=True)
+        self.reader.resume_hook = None
+
+    def test_failed_resume_recovers_only_after_unload_or_verified_process_change(self):
+        self.failed_resume()
+        # The loaded path cannot evade the marker if another client wins the cold-load race.
+        with patch.object(self.runtime, '_codex', side_effect=wr.NotLoaded()):
+            with self.assertRaisesRegex(ValueError, '재개 권한 확인'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+        self.reader.loaded = []
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertIsNone(self.runtime.store.read(self.runtime._resume_record_name(wr._identity(self.source))))
+        self.assertTrue(self.runtime.resume_preview(self.source)['allowed'])
+        self.failed_resume()
+        name = self.runtime._resume_record_name(wr._identity(self.source))
+        before = self.runtime.store.read(name)
+        self.reader.processes[12]['start'] = '134362358929099999'
+        self.assertTrue(self.runtime.resume_preview(self.source)['allowed'])
+        self.assertEqual(self.runtime.store.read(name), before)  # previews never clear records
+        self.assertTrue(self.runtime.terminal_plan(self.source, prepare=True))
+        self.assertTrue(self.send()['confirmed'])
+
+    def test_resume_marker_write_failure_stops_before_native_mutation(self):
+        self.reader.loaded = []
+        with patch.object(self.runtime.store, 'save', side_effect=OSError('synthetic disk failure')):
+            with self.assertRaises(OSError):
+                self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertEqual(self.reader.loaded, [])
+        self.assertFalse(any(method == 'thread/resume' for method, params in self.reader.calls))
+
+    def test_corrupt_resume_record_blocks_warm_attach_and_send(self):
+        self.runtime.store.prepare()
+        name = self.runtime._resume_record_name(wr._identity(self.source))
+        for record in (None, {}, {'version': 999}, {'server': None}):
+            self.runtime.store.save(name, record)
+            with self.assertRaisesRegex(ValueError, '재개 권한 확인'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+            with self.assertRaisesRegex(ValueError, '재개 권한 확인'):
+                self.send()
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_successful_resume_clears_marker_only_after_verifying_server_identity(self):
+        self.reader.loaded = []
+        def restart(result):
+            self.reader.processes[12]['start'] = '134362358929099999'
+            return result
+        self.reader.resume_hook = restart
+        with self.assertRaisesRegex(ValueError, '서버가 변경'):
+            self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertIsNotNone(self.runtime.store.read(self.runtime._resume_record_name(wr._identity(self.source))))
+
+    def test_resume_shares_observation_deadline_and_refuses_a_late_mutation(self):
+        clock, deadlines = [100.0], []
+        def cold(source, deadline):
+            deadlines.append(deadline)
+            clock[0] = 111.0
+            raise wr.NotLoaded()
+        def proxy(binary, path, deadline):
+            deadlines.append(deadline)
+            return self.reader.proxy(binary, path, deadline)
+        self.reader.loaded = []
+        self.runtime.proxy_factory = proxy
+        with patch.object(wr.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.runtime, '_codex', side_effect=cold):
+            with self.assertRaisesRegex(TimeoutError, '시간이 부족'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertEqual(deadlines, [109.0, 115.0])
+        self.assertFalse(any(method == 'thread/resume' for method, params in self.reader.calls))
+
+    def test_slow_marker_write_leaves_no_pending_state_if_nothing_was_sent(self):
+        clock = [100.0]
+        self.reader.loaded = []
+        save = self.runtime.store.save
+        def slow(name, value):
+            save(name, value)
+            clock[0] = 110.0
+        with patch.object(wr.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.runtime.store, 'save', side_effect=slow):
+            with self.assertRaisesRegex(TimeoutError, '시간이 부족'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertIsNone(self.runtime.store.read(self.runtime._resume_record_name(wr._identity(self.source))))
+        self.assertEqual(self.reader.loaded, [])
+        self.assertFalse(any(method == 'thread/resume' for method, params in self.reader.calls))
+        # A later PC-side load must not be blocked by an unsent request.
+        self.reader.loaded = [self.reader.sid]
+        self.assertTrue(self.runtime.resume_preview(self.source)['allowed'])
+
+    def test_database_change_before_resume_refuses_without_loading(self):
+        self.reader.loaded = []
+        original = self.reader.database_rows
+        calls = []
+        def changed(sid):
+            calls.append(sid)
+            if len(calls) == 3:  # discovery, initial policy, final recheck
+                self.reader.row['approval_mode'] = 'on-request'
+            return original(sid)
+        with patch.object(self.reader, 'database_rows', side_effect=changed):
+            with self.assertRaisesRegex(ValueError, '실행 권한이 변경'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertEqual(self.reader.loaded, [])
+
+    def test_resume_and_send_use_the_same_nonblocking_operation_lock(self):
+        self.reader.loaded = []
+        with self.runtime.store.lock():
+            with self.assertRaisesRegex(ValueError, '다른 작업을 처리'):
+                self.runtime.terminal_plan(self.source, prepare=True)
+            self.reader.loaded = [self.reader.sid]
+            with self.assertRaisesRegex(ValueError, '다른 작업을 처리'):
+                self.send()
+            self.reader.loaded = []
+        self.assertEqual(self.reader.loaded, [])
+        self.assertEqual(self.reader.send_calls, 0)
 
     def test_claude_external_interactive_process_can_terminate(self):
         source, row, path = self.claude()
@@ -629,7 +790,7 @@ class WindowsRuntimeTest(unittest.TestCase):
 
     def test_a_stored_codex_session_resumes_into_its_projects_running_server_only(self):
         self.reader.loaded = []
-        plan = self.runtime.terminal_plan(self.source)
+        plan = self.runtime.terminal_plan(self.source, prepare=True)
         self.assertEqual(plan['argv'], [str(self.reader.binary), 'resume', self.reader.sid, '--remote',
                                         'unix://' + self.reader.path.as_posix(), '--cd', str(self.reader.cwd)])
         resumes = [params for method, params in self.reader.calls if method == 'thread/resume']
