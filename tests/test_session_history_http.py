@@ -1,4 +1,5 @@
 import http.client
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -10,6 +11,8 @@ from unittest.mock import patch
 
 import server
 import session_history
+from history_native import DeleteRefused
+from transfer import WorkerError
 
 
 class HistoryHTTPTest(unittest.TestCase):
@@ -62,17 +65,64 @@ class HistoryHTTPTest(unittest.TestCase):
         self.row['phase'] = 'closed'
         self.board.state['fixture']['ok'] = False
         self.assertFalse(server.history_candidates(self.httpd, refresh=False)[0])
-        with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+        with patch.object(self.board, 'poll', return_value=False), patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
             with self.assertRaises(ValueError): server.history_rpc(self.httpd, {'host': 'fixture'}, {'action': 'delete'})
             rpc.assert_not_called()
 
     def test_original_pin_is_checked_again_before_delete(self):
         source = {'host': 'fixture', 'agent': 'codex', **self.row}
         self.httpd.session_pinned.mark(source, int(time.time()))
-        with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+        with patch.object(self.board, 'poll', return_value=True), patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
             with self.assertRaises(ValueError):
                 server.history_rpc(self.httpd, source, {'action': 'delete', 'family': [self.row['id']]})
             rpc.assert_not_called()
+
+    def test_persisted_pin_protects_missing_root_and_child_rows(self):
+        source = {'host': 'fixture', 'agent': 'codex', **self.row}
+        child = {**source, 'id': '22222222-2222-4222-8222-222222222222'}
+        export = {'family': [source['id'], child['id']], 'fingerprint': 'a' * 64, 'canDelete': True,
+                  'exportVersion': session_history.history_native.EXPORT_VERSION,
+                  'lastActivityAt': 1, 'messages': [{'role': 'user', 'text': 'request'}, {'role': 'assistant', 'text': 'answer'}]}
+        now = [100 * session_history.DAY]
+        self.httpd.session_history.clock = lambda: now[0]
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=copy.deepcopy(export)):
+            self.httpd.session_history.sweep([source], set())
+        now[0] += 8 * session_history.DAY
+        self.board.state['fixture']['data']['codex'] = []
+        for pinned in [source, child]:
+            with self.subTest(pinned=pinned['id']):
+                self.httpd.session_pinned.mark(pinned, int(time.time()))
+                candidates, protected = server.history_candidates(self.httpd, refresh=False)
+                self.assertIn(('fixture', 'codex', '.codex', pinned['id']), protected)
+                with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+                    self.httpd.session_history.sweep(candidates, protected)
+                    rpc.assert_not_called()
+                    with patch.object(self.board, 'poll', return_value=True):
+                        with self.assertRaises(DeleteRefused):
+                            server.history_rpc(self.httpd, source, {'action': 'delete', 'family': export['family']})
+                    rpc.assert_not_called()
+                self.httpd.session_pinned.unmark(pinned)
+
+    def test_delete_refreshes_owner_and_maps_only_proven_worker_refusal(self):
+        source = {'host': 'fixture', 'agent': 'codex', **self.row}
+        args = {'action': 'delete', 'family': [source['id']]}
+        for stage, expected in [(DeleteRefused.transfer_stage, DeleteRefused), (None, WorkerError)]:
+            with self.subTest(stage=stage), patch.object(self.board, 'poll', return_value=True) as poll:
+                with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=WorkerError('fixture', stage)):
+                    with self.assertRaises(expected): server.history_rpc(self.httpd, source, args)
+                poll.assert_called_once_with(self.host)
+        with patch.object(self.board, 'poll', return_value=False):
+            with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+                with self.assertRaises(DeleteRefused): server.history_rpc(self.httpd, source, args)
+                rpc.assert_not_called()
+
+    def test_pin_store_failure_blocks_candidate_collection_and_delete(self):
+        source = {'host': 'fixture', 'agent': 'codex', **self.row}
+        with patch.object(self.httpd.session_pinned, 'sources', side_effect=server.GoalError('fixture')):
+            with self.assertRaises(ValueError): server.history_candidates(self.httpd, refresh=False)
+            with patch.object(self.board, 'poll', return_value=True):
+                with self.assertRaises(DeleteRefused):
+                    server.history_rpc(self.httpd, source, {'action': 'delete', 'family': [source['id']]})
 
 
 if __name__ == '__main__': unittest.main()

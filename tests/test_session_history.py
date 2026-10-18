@@ -1,9 +1,12 @@
 import copy
+from contextlib import redirect_stdout
 import gzip
+import io
 import json
 import sqlite3
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +25,7 @@ class RetentionTest(unittest.TestCase):
                                     {'role': 'assistant', 'text': '검수 결과입니다.', 'ts': 2}],
                        'family': [self.source['id']], 'fingerprint': 'a' * 64,
                        'lastActivityAt': self.now - 20 * history.DAY, 'canDelete': True, 'sourceBytes': 90000}
+        self.export['exportVersion'] = native.EXPORT_VERSION
         self.calls = []
         self.fail_delete = False
         def rpc(source, args):
@@ -153,6 +157,102 @@ class RetentionTest(unittest.TestCase):
         self.store.root.symlink_to(self.root / 'outside')
         with self.assertRaises(ValueError): self.store.status()
 
+    def test_preserved_and_uncertain_rows_do_not_take_the_eight_slots(self):
+        original = self.store.rpc
+        def rpc(source, args):
+            return {**original(source, args), 'family': [source['id']]}
+        self.store.rpc = rpc
+        skipped = []
+        for i in range(8):
+            source = {**self.source, 'id': 'preserved-' + str(i)}
+            self.store.sweep([source], set())
+            self.store.preserve(history.key(source), True)
+            skipped.append(source)
+            self.now += 1
+        self.sweep()
+        self.now += 8 * history.DAY
+        self.store.sweep(skipped + [self.source], set())
+        target = next(r for r in self.store.status()['records'] if r['key'] == self.key)
+        self.assertEqual(target['state'], 'deleted')
+        self.assertEqual([c['action'] for c in self.calls].count('delete'), 1)
+        with self.store.storage():
+            data = self.store._load()
+            for source in skipped:
+                data['records'][history.key(source)].update(state='uncertain', preserved=False)
+            self.store._write(data)
+        before = len(self.calls)
+        fresh = {**self.source, 'id': 'fresh'}
+        self.store.sweep(skipped + [fresh], set())
+        self.assertEqual(len(self.calls), before + 1)
+
+    def test_policy_changed_during_export_controls_new_grace_and_eligibility(self):
+        original_rpc = self.store.rpc
+        for policy, expected in [({'enabled': True, 'idleDays': 14, 'graceDays': 30}, 'pending'),
+                                 ({'enabled': True, 'idleDays': 365, 'graceDays': 7}, 'waiting'),
+                                 ({'enabled': False, 'idleDays': 14, 'graceDays': 7}, None)]:
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as directory:
+                def rpc(source, args):
+                    if args['action'] == 'export':
+                        store.policy(policy)
+                    return original_rpc(source, args)
+                store = history.Histories(Path(directory).resolve(), rpc, clock=lambda: self.now)
+                store.sweep([self.source], set())
+                rows = store.status()['records']
+                self.assertEqual(rows[0]['state'] if rows else None, expected)
+                if expected == 'pending':
+                    self.assertEqual(rows[0]['deleteAfter'], self.now + 30 * history.DAY)
+                    self.now += 8 * history.DAY
+                    store.sweep([self.source], set())
+                    self.assertEqual(store.status()['records'][0]['state'], 'pending')
+
+    def test_extractor_upgrade_rearchives_then_restarts_grace(self):
+        self.sweep()
+        with self.store.storage():
+            data = self.store._load(); data['records'][self.key].pop('exportVersion')
+            self.store._write(data)
+        self.now += 8 * history.DAY
+        self.export['messages'].append({'role': 'assistant', 'text': '이전에 빠졌던 리뷰 결과'})
+        self.sweep()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.assertEqual(self.row()['deleteAfter'], self.now + 7 * history.DAY)
+        self.assertEqual(self.store.conversation(self.key)['messages'][-1]['text'], '이전에 빠졌던 리뷰 결과')
+        self.assertNotIn('delete', [c['action'] for c in self.calls])
+        self.export.pop('exportVersion')
+        self.now += 8 * history.DAY; self.sweep()
+        self.assertEqual(self.row()['state'], 'blocked')
+        self.assertNotIn('delete', [c['action'] for c in self.calls])
+
+    def test_proven_pre_delete_refusal_retries_only_after_a_new_full_grace(self):
+        self.sweep(); self.now += 8 * history.DAY
+        original = self.store.rpc
+        def refused(source, args):
+            if args['action'] == 'delete':
+                raise native.DeleteRefused('fixture pre-dispatch refusal')
+            return original(source, args)
+        self.store.rpc = refused; self.sweep()
+        self.assertEqual(self.row()['state'], 'waiting')
+        self.assertIsNone(self.row()['deleteAfter'])
+        self.store.rpc = original; self.sweep()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.assertEqual(self.row()['deleteAfter'], self.now + 7 * history.DAY)
+        self.now += 8 * history.DAY; self.sweep()
+        self.assertEqual(self.row()['state'], 'deleted')
+
+    def test_preserve_release_never_claims_an_unverified_archive(self):
+        self.export['messages'] = []
+        self.sweep(); self.assertEqual(self.row()['state'], 'blocked')
+        self.store.preserve(self.key, True); self.store.preserve(self.key, False)
+        self.assertEqual(self.row()['state'], 'blocked')
+        self.assertIsNone(self.row()['archiveBytes'])
+        self.export['messages'] = [{'role': 'user', 'text': 'request'}, {'role': 'assistant', 'text': 'answer'}]
+        self.sweep()
+        (self.store.root / (self.key + '.json.gz')).write_bytes(b'broken')
+        self.store.preserve(self.key, True); self.store.preserve(self.key, False)
+        self.assertEqual(self.row()['state'], 'blocked')
+        self.sweep()
+        self.assertEqual(self.row()['state'], 'pending')
+        self.assertEqual(len(self.store.conversation(self.key)['messages']), 2)
+
 
 class NativeHistoryTest(unittest.TestCase):
     def codex_client(self):
@@ -166,12 +266,15 @@ class NativeHistoryTest(unittest.TestCase):
             goal = None
             children = []
             pinned = []
+            parent = None
+            extra_items = []
             def __enter__(self): return self
             def __exit__(self, *args): return False
             def call(self, method, params):
                 self.calls.append((method, copy.deepcopy(params)))
                 if method == 'thread/read':
                     return {'thread': {'id': params['threadId'], 'status': {'type': self.status}, 'updatedAt': 1,
+                                       'parentThreadId': self.parent,
                                        'isPinned': any(row['id'] == params['threadId'] for row in self.pinned)}}
                 if method == 'thread/list':
                     if params.get('isPinned'): return {'data': self.pinned}
@@ -180,7 +283,7 @@ class NativeHistoryTest(unittest.TestCase):
                     return {'data': [{'status': 'completed', 'startedAt': 1, 'completedAt': 2, 'itemsView': 'full',
                       'items': [{'id': 'user', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '요청'},
                           {'type': 'image', 'url': 'data:image/png;base64,SECRET_IMAGE'}]},
-                                {'id': 'answer', 'type': 'agentMessage', 'text': self.answer}]}]}
+                                {'id': 'answer', 'type': 'agentMessage', 'text': self.answer}] + self.extra_items}]}
                 if method == 'thread/queue/list': return {'data': self.queued}
                 if method == 'thread/goal/get': return {'goal': self.goal}
                 if method == 'thread/loaded/list': return {'data': [] if self.status == 'notLoaded' else [sid]}
@@ -231,6 +334,89 @@ class NativeHistoryTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
         self.assertNotIn('thread/delete', [m for m, p in client.calls])
+
+    def test_reviews_questions_and_user_answers_are_kept_but_unknown_items_refuse_export(self):
+        source, client = self.codex_client()
+        client.extra_items = [
+            {'type': 'enteredReviewMode', 'id': 'r1', 'review': '리뷰 요청'},
+            {'type': 'exitedReviewMode', 'id': 'r2', 'review': '전체 리뷰 결과'},
+            {'type': 'agentMessage', 'id': 'q1', 'text': '질문입니다.',
+             'questions': [{'title': '어떤 방식?', 'options': ['첫째', '둘째']}]},
+            {'type': 'functionCallOutput', 'id': 'a1', 'name': 'request_user_input', 'output': '둘째로 해줘'},
+            {'type': 'functionCallOutput', 'id': 'tool', 'name': 'exec', 'output': 'omit tool output'},
+            {'type': 'reasoning', 'id': 'hidden', 'content': ['omit reasoning']},
+        ]
+        with patch.object(native.native, '_client', return_value=client):
+            result = native.handle({'action': 'export', 'source': source})
+            dialogue = '\n'.join(m['text'] for m in result['messages'])
+            for text in ['리뷰 요청', '전체 리뷰 결과', '어떤 방식?', '첫째', '둘째로 해줘']:
+                self.assertIn(text, dialogue)
+            self.assertTrue(result['canDelete'])
+            self.assertNotIn('omit', dialogue)
+            client.extra_items.append({'type': 'futureVisibleMessage', 'text': 'must not lose'})
+            with self.assertRaises(ValueError): native.handle({'action': 'export', 'source': source})
+            with self.assertRaises(native.DeleteRefused):
+                native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
+        self.assertNotIn('thread/delete', [m for m, p in client.calls])
+
+    def test_parent_or_descendant_family_is_export_only_until_cascade_is_verified(self):
+        source, client = self.codex_client()
+        with patch.object(native.native, '_client', return_value=client):
+            for parent, children in [('parent', []), (None, [{'id': 'child', 'parentThreadId': source['id']}])]:
+                client.parent, client.children = parent, children
+                result = native.handle({'action': 'export', 'source': source})
+                self.assertFalse(result['canDelete'])
+                self.assertTrue(result['messages'])
+                with self.assertRaises(native.DeleteRefused):
+                    native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
+
+    def test_native_refusal_proof_stops_at_the_destructive_rpc_boundary(self):
+        source, client = self.codex_client()
+        with patch.object(native.native, '_client', return_value=client):
+            result = native.handle({'action': 'export', 'source': source})
+            original = client.call
+            for failure_method, exception in [('thread/read', native.collector.RpcError('read failed')),
+                                              ('thread/delete', OSError('response lost after dispatch'))]:
+                def call(method, params):
+                    if method == failure_method: raise exception
+                    return original(method, params)
+                client.call = call
+                expected = native.DeleteRefused if failure_method == 'thread/read' else OSError
+                with self.assertRaises(expected) as raised:
+                    native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
+                if failure_method == 'thread/delete':
+                    self.assertNotIsInstance(raised.exception, native.DeleteRefused)
+
+    def test_helper_serializes_pre_dispatch_refusal_proof(self):
+        import transfer_worker
+        output = io.StringIO()
+        with patch.object(transfer_worker, 'rpc', side_effect=native.DeleteRefused('fixture')):
+            with patch('sys.argv', ['fixture.pyz']), patch('sys.stdin', SimpleNamespace(buffer=io.BytesIO(b'{}'))):
+                with redirect_stdout(output): transfer_worker._main()
+        reply = json.loads(output.getvalue())
+        self.assertFalse(reply['ok'])
+        self.assertEqual(reply['stage'], native.DeleteRefused.transfer_stage)
+
+    def test_codex_all_turn_pages_are_exported_in_order_and_short_items_are_refused(self):
+        source, client = self.codex_client()
+        original = client.call
+        def call(method, params):
+            response = original(method, params)
+            if method == 'thread/turns/list':
+                page = int(params.get('cursor', '0'))
+                response['data'][0]['items'] = [{'id': str(page), 'type': 'agentMessage', 'text': 'page-' + str(page)}]
+                response['nextCursor'] = str(page + 1) if page < 2 else None
+            return response
+        client.call = call
+        with patch.object(native.native, '_client', return_value=client):
+            result = native.handle({'action': 'export', 'source': source})
+            self.assertEqual([m['text'] for m in result['messages']], ['page-0', 'page-1', 'page-2'])
+            def short(method, params):
+                response = call(method, params)
+                if method == 'thread/turns/list': response['data'][0]['itemsView'] = 'notLoaded'
+                return response
+            client.call = short
+            with self.assertRaises(ValueError): native.handle({'action': 'export', 'source': source})
 
     def test_archived_native_stores_must_confirm_no_queue_or_unfinished_goal(self):
         source, _ = self.codex_client()

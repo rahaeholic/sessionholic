@@ -339,6 +339,12 @@ class SessionPinned(SessionSeen):
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-pinned', 'pinnedAt', 'sessionPinned', 'session_pinned'
     WHAT = '상단 고정 기록'
 
+    def sources(self):
+        """Fresh persisted pins, including sessions absent from the native picker."""
+        with self._storage():
+            data = self._read()
+            return [copy.deepcopy(row['source']) for row in (data or {}).get('seen', {}).values()]
+
 
 class BoardPreferences(_KeptRead, Goals):
     """Small shared UI preferences; never credentials, drafts or native settings."""
