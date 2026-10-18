@@ -2599,7 +2599,7 @@ class Workflow:
         # The owning helper resolves binaries and explicit environment settings.
         # No configuration values or credentials cross back into an SSH command.
         if host.get("platform") == "windows":
-            spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "prepare": True}, timeout=12)
+            spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "prepare": True}, timeout=20)
             import collector
             return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
                     "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",

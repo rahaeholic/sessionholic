@@ -373,7 +373,7 @@ class WindowsRoutingTest(unittest.TestCase):
         with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
                 patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
             self.flow.remote_attach(HOST, ROW)
-        rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True}, timeout=12)
+        rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True}, timeout=20)
 
     def test_a_pc_conversation_resumed_in_a_board_terminal_is_reopened_not_resumed_again(self):
         import hashlib
