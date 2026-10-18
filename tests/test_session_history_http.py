@@ -106,12 +106,18 @@ class HistoryHTTPTest(unittest.TestCase):
     def test_delete_refreshes_owner_and_maps_only_proven_worker_refusal(self):
         source = {'host': 'fixture', 'agent': 'codex', **self.row}
         args = {'action': 'delete', 'family': [source['id']]}
-        for stage, expected in [(DeleteRefused.transfer_stage, DeleteRefused), (None, WorkerError)]:
-            with self.subTest(stage=stage), patch.object(self.board, 'poll', return_value=True) as poll:
-                with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=WorkerError('fixture', stage)):
+        for error, expected in [(WorkerError('fixture', DeleteRefused.transfer_stage), DeleteRefused),
+                                (WorkerError('fixture'), WorkerError), (OSError('response lost'), OSError),
+                                (AttributeError('invalid helper response'), AttributeError)]:
+            with self.subTest(error=type(error).__name__), patch.object(self.board, 'poll', return_value=True) as poll:
+                with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=error):
                     with self.assertRaises(expected): server.history_rpc(self.httpd, source, args)
                 poll.assert_called_once_with(self.host)
         with patch.object(self.board, 'poll', return_value=False):
+            with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+                with self.assertRaises(DeleteRefused): server.history_rpc(self.httpd, source, args)
+                rpc.assert_not_called()
+        with patch.object(self.board, 'poll', return_value=True), patch.object(self.board, 'snapshot', side_effect=AttributeError('fixture')):
             with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
                 with self.assertRaises(DeleteRefused): server.history_rpc(self.httpd, source, args)
                 rpc.assert_not_called()
@@ -120,9 +126,32 @@ class HistoryHTTPTest(unittest.TestCase):
         source = {'host': 'fixture', 'agent': 'codex', **self.row}
         with patch.object(self.httpd.session_pinned, 'sources', side_effect=server.GoalError('fixture')):
             with self.assertRaises(ValueError): server.history_candidates(self.httpd, refresh=False)
-            with patch.object(self.board, 'poll', return_value=True):
+            with patch.object(self.board, 'poll', return_value=True), patch.object(self.httpd.session_pinned, 'protection', side_effect=server.GoalError('fixture')):
                 with self.assertRaises(DeleteRefused):
                     server.history_rpc(self.httpd, source, {'action': 'delete', 'family': [source['id']]})
+
+    def test_successful_pin_write_is_ordered_after_an_in_progress_delete(self):
+        source = {'host': 'fixture', 'agent': 'codex', **self.row}
+        entered, written = threading.Event(), threading.Event()
+        errors, threads = [], []
+        # Another store instance uses the same file lock, as another board process would.
+        other = server.SessionPinned(Path(self.temp.name).resolve())
+        def pin():
+            entered.set()
+            try: other.mark(source, int(time.time()))
+            except Exception as error: errors.append(error)
+            finally: written.set()
+        def rpc(*args, **kwargs):
+            thread = threading.Thread(target=pin); threads.append(thread); thread.start()
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(written.wait(.05), 'pin must not report success while native deletion is still in flight')
+            return {'confirmed': True}
+        with patch.object(self.board, 'poll', return_value=True), patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc):
+            self.assertTrue(server.history_rpc(self.httpd, source, {'action': 'delete', 'family': [source['id']]})['confirmed'])
+        for thread in threads: thread.join(2)
+        self.assertTrue(written.is_set())
+        self.assertFalse(errors)
+        self.assertEqual(other.sources()[0]['id'], source['id'])
 
 
 if __name__ == '__main__': unittest.main()

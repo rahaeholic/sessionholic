@@ -2728,45 +2728,44 @@ def history_candidates(server, refresh=True):
 
 
 def history_rpc(server, source, args):
-    from history_native import DeleteRefused
+    from contextlib import ExitStack
+    from history_native import DeleteRefused, _deletion_guard
     from transfer import WorkerError
     deleting = args['action'] == 'delete'
-    host = next((h for h in server.board.hosts if h['name'] == source['host']), None)
-    if deleting:
-        try:
+    # The board knows whether its own helper was invoked. Never turn failures after
+    # that boundary into a retry, except for the helper's explicit pre-delete proof.
+    with _deletion_guard(deleting) as attempt, ExitStack() as held:
+        host = next((h for h in server.board.hosts if h['name'] == source['host']), None)
+        if deleting:
             if host is None or host.get('monitorOnly') or host.get('platform') == 'windows':
                 raise ValueError('지원하는 원본 기기가 아닙니다.')
             if not server.board.poll(host):
                 raise ValueError('원본 기기를 다시 확인하지 못했습니다.')
-        except (OSError, ValueError, RuntimeError):
-            raise DeleteRefused('원본 기기를 다시 확인하지 못해 삭제 요청을 보내지 않았습니다.') from None
-    owner = server.board.state.get(source['host']) or {}
-    if (host is None or host.get('monitorOnly') or host.get('platform') == 'windows'
-            or not owner.get('ok') or time.time() - (owner.get('fetchedAt') or 0) > (30 if deleting else 300)):
-        raise (DeleteRefused if deleting else ValueError)('기기의 현재 상태를 확인하지 못했습니다.')
-    if deleting:
+        owner = server.board.state.get(source['host']) or {}
+        if (host is None or host.get('monitorOnly') or host.get('platform') == 'windows'
+                or not owner.get('ok') or time.time() - (owner.get('fetchedAt') or 0) > (30 if deleting else 300)):
+            raise ValueError('기기의 현재 상태를 확인하지 못했습니다.')
+        if deleting:
+            pins = held.enter_context(server.session_pinned.protection())
+            if any(s['host'] == source['host'] and s['agent'] == source['agent'] and s.get('home') == source.get('home')
+                   and s['id'] in (args.get('family') or []) for s in pins):
+                raise ValueError('고정한 원본이므로 삭제 요청을 보내지 않았습니다.')
+            snapshot = server.board.snapshot()
+            for owner in snapshot['hosts']:
+                if owner['name'] != source['host']:
+                    continue
+                for row in (owner.get('data') or {}).get(source['agent'], []):
+                    if ((row.get('id') or row.get('sessionId')) in (args.get('family') or [])
+                            and row.get('home') == source.get('home')
+                            and row.get('phase') not in ('closed', 'done')):
+                        raise ValueError('사용 중인 세션입니다.')
         try:
-            pins = server.session_pinned.sources()
-        except GoalError:
-            raise DeleteRefused('고정 상태를 확인하지 못해 삭제 요청을 보내지 않았습니다.') from None
-        if any(s['host'] == source['host'] and s['agent'] == source['agent'] and s.get('home') == source.get('home')
-               and s['id'] in (args.get('family') or []) for s in pins):
-            raise DeleteRefused('고정한 원본이므로 삭제 요청을 보내지 않았습니다.')
-        snapshot = server.board.snapshot()
-        for owner in snapshot['hosts']:
-            if owner['name'] != source['host']:
-                continue
-            for row in (owner.get('data') or {}).get(source['agent'], []):
-                if ((row.get('id') or row.get('sessionId')) in (args.get('family') or [])
-                        and row.get('home') == source.get('home')
-                        and (row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'))):
-                    raise DeleteRefused('보존하거나 사용 중인 세션입니다.')
-    try:
-        return server.workflow.transfers.rpc(host, 'session_history', args, timeout=50)
-    except WorkerError as exc:
-        if deleting and exc.stage == DeleteRefused.transfer_stage:
-            raise DeleteRefused('원본 기기가 삭제 요청 전 상태 변경을 확인했습니다.') from None
-        raise
+            attempt['dispatched'] = True
+            return server.workflow.transfers.rpc(host, 'session_history', args, timeout=50)
+        except WorkerError as exc:
+            if deleting and exc.stage == DeleteRefused.transfer_stage:
+                raise DeleteRefused('원본 기기가 삭제 요청 전 상태 변경을 확인했습니다.') from None
+            raise
 
 
 # A snapshot field each display store adds; a body is kept only when every one read.

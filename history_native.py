@@ -36,7 +36,7 @@ def _deletion_guard(deleting):
     attempt = {'dispatched': False}
     try:
         yield attempt
-    except (OSError, ValueError, RuntimeError, KeyError, TypeError, collector.RpcError):
+    except Exception:
         if deleting and not attempt['dispatched']:
             raise DeleteRefused('원본 상태를 다시 확인해야 하므로 삭제 요청을 보내지 않았습니다.') from None
         raise
@@ -139,13 +139,13 @@ def _claude(source, home):
                      'reason': 'Claude는 전체 대화를 보존합니다. 단일 세션 기록 삭제 범위가 검증되기 전까지 원본을 유지합니다.'})
 
 
-def _all_threads(client, root):
+def _all_threads(client, root, state_db_only=True):
     rows = []
     for archived in (False, True):
         cursor = None
         for _ in range(100):
             params = {'ancestorThreadId': root, 'archived': archived, 'limit': 100,
-                      'sourceKinds': SOURCE_KINDS, 'useStateDbOnly': True}
+                      'sourceKinds': SOURCE_KINDS, 'useStateDbOnly': state_db_only}
             if cursor:
                 params['cursor'] = cursor
             page = client.call('thread/list', params)
@@ -186,7 +186,11 @@ def _turns(client, sid):
         thread = client.call('thread/read', {'threadId': sid, 'includeTurns': True}).get('thread')
         if not isinstance(thread, dict) or thread.get('id') != sid or not isinstance(thread.get('turns'), list):
             raise ValueError('전체 대화를 확인하지 못했습니다.')
-        return thread['turns']
+        turns = thread['turns']
+        if any(not isinstance(t, dict) or not isinstance(t.get('items'), list)
+               or t.get('itemsView', 'full') != 'full' for t in turns):
+            raise ValueError('대화 본문이 생략되어 원본 기록을 유지합니다.')
+        return turns
 
 
 def _archived_clear(identity, home, sid):
@@ -216,10 +220,13 @@ def _archived_clear(identity, home, sid):
 def _codex(source, home, deadline, delete_fingerprint=None):
     identity = native._identity(source)
     with _deletion_guard(delete_fingerprint is not None) as attempt, native._client(identity, home, deadline) as client:
+        scanned = _all_threads(client, identity['id'], state_db_only=False) if delete_fingerprint is not None else None
         root = client.call('thread/read', {'threadId': identity['id'], 'includeTurns': False}).get('thread')
         if not isinstance(root, dict) or root.get('id') != identity['id']:
             raise ValueError('원본 세션을 확인하지 못했습니다.')
         descendants = _all_threads(client, identity['id'])
+        if scanned is not None and {r['id'] for r in scanned} != {r['id'] for r in descendants}:
+            raise ValueError('하위 대화 목록이 달라 원본 기록을 유지합니다.')
         family = {identity['id']: root}
         for row in descendants:
             if not isinstance(row, dict) or not isinstance(row.get('id'), str):
@@ -350,17 +357,18 @@ def _codex(source, home, deadline, delete_fingerprint=None):
 
 
 def handle(args, home=None, timeout=40):
-    source = args.get('source')
-    identity = native._identity(source)
-    if args.get('action') not in ('export', 'delete'):
-        raise ValueError('대화 보존 요청이 올바르지 않습니다.')
-    deleting = args['action'] == 'delete'
-    fingerprint = args.get('fingerprint')
-    if deleting and (not isinstance(fingerprint, str) or not re.fullmatch('[0-9a-f]{64}', fingerprint)):
-        raise ValueError('원본 대화 확인 정보가 올바르지 않습니다.')
-    if identity['agent'] == 'claude':
-        if deleting:
+    deleting = isinstance(args, dict) and args.get('action') == 'delete'
+    with _deletion_guard(deleting):
+        source = args.get('source')
+        identity = native._identity(source)
+        if args.get('action') not in ('export', 'delete'):
+            raise ValueError('대화 보존 요청이 올바르지 않습니다.')
+        fingerprint = args.get('fingerprint')
+        if deleting and (not isinstance(fingerprint, str) or not re.fullmatch('[0-9a-f]{64}', fingerprint)):
+            raise ValueError('원본 대화 확인 정보가 올바르지 않습니다.')
+        if identity['agent'] == 'claude' and deleting:
             raise ValueError('Claude 원본 기록의 자동 삭제는 아직 지원하지 않습니다.')
+    if identity['agent'] == 'claude':
         return {**_claude(source, home), 'ownerTime': time.time()}
     result = _codex(source, home, time.monotonic() + timeout, fingerprint if deleting else None)
     return result if deleting else {**result, 'ownerTime': time.time()}

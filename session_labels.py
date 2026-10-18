@@ -1,5 +1,6 @@
 """Private board display names and read marks. Native titles and session identities never change."""
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -341,9 +342,23 @@ class SessionPinned(SessionSeen):
 
     def sources(self):
         """Fresh persisted pins, including sessions absent from the native picker."""
+        with self.protection() as sources:
+            return sources
+
+    @contextmanager
+    def protection(self):
+        """Order successful pin writes before or after a protected native operation."""
+        failure = None
         with self._storage():
             data = self._read()
-            return [copy.deepcopy(row['source']) for row in (data or {}).get('seen', {}).values()]
+            try:
+                yield [copy.deepcopy(row['source']) for row in (data or {}).get('seen', {}).values()]
+            except BaseException as exc:
+                # _storage translates ValueError/OSError into a store failure. A native
+                # result must keep its dispatch proof (or uncertainty) after unlocking.
+                failure = exc
+        if failure is not None:
+            raise failure
 
 
 class BoardPreferences(_KeptRead, Goals):

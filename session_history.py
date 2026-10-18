@@ -93,6 +93,7 @@ class Histories:
         self.rpc, self.clock = rpc, clock
         self.lock, self.sweeping, self.stop = threading.RLock(), threading.Lock(), threading.Event()
         self.worker_enabled = False
+        self.error = None
 
     @contextmanager
     def storage(self):
@@ -153,7 +154,7 @@ class Histories:
             data = self._load()
             rows = [self._public(k, r) for k, r in data['records'].items()]
             return {'policy': data['policy'], 'records': sorted(rows, key=lambda r: r.get('createdAt') or 0, reverse=True),
-                    'running': self.sweeping.locked(), 'workerEnabled': self.worker_enabled}
+                    'running': self.sweeping.locked(), 'workerEnabled': self.worker_enabled, 'error': self.error}
 
     def policy(self, value):
         value = self._policy(value)
@@ -244,7 +245,7 @@ class Histories:
                     break
                 try:
                     self._one(source, protected)
-                except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                except Exception:
                     # Never write raw exceptions: native error text can include a private dialogue.
                     with self.storage():
                         data = self._load()
@@ -319,9 +320,11 @@ class Histories:
                 if (sibling.get('preserved') and peer['host'] == source['host']
                         and peer['agent'] == source['agent'] and peer.get('home') == source.get('home')
                         and (peer['id'] in family or any(sid in family for sid in sibling.get('family') or []))):
-                    if row:
-                        row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='하위 대화를 보존하도록 지정했습니다.')
-                        self._write(data)
+                    if row is None:
+                        row = {'source': source, 'title': source.get('title'), 'state': 'waiting'}
+                        data['records'][k] = row
+                    row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='하위 대화를 보존하도록 지정했습니다.')
+                    self._write(data)
                     return
             export_version = export['exportVersion']
             if (not row or row.get('fingerprint') != export['fingerprint']
@@ -380,6 +383,8 @@ class Histories:
                 try:
                     candidates, protected = collect()
                     self.sweep(candidates, protected)
-                except (OSError, ValueError, RuntimeError):
-                    pass
+                    self.error = None
+                except Exception:
+                    # Neither private exception details nor a silently dead worker.
+                    self.error = '자동 보존 상태 확인에 실패했습니다. 다음 점검에서 다시 확인합니다.'
         threading.Thread(target=run, name='session-history', daemon=True).start()

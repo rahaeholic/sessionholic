@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import session_history as history
 import history_native as native
@@ -185,6 +185,17 @@ class RetentionTest(unittest.TestCase):
         self.store.sweep(skipped + [fresh], set())
         self.assertEqual(len(self.calls), before + 1)
 
+    def test_preserved_family_blocks_a_new_child_without_starving_other_records(self):
+        child = {**self.source, 'id': 'child'}
+        self.export['family'].append('child')
+        self.sweep(); self.store.preserve(self.key, True)
+        self.store.sweep([child], set())
+        row = next(r for r in self.store.status()['records'] if r['key'] == history.key(child))
+        self.assertEqual(row['state'], 'waiting')
+        self.assertEqual(row['createdAt'], None)
+        with self.store.storage():
+            self.assertEqual(self.store._load()['records'][history.key(child)]['attemptedAt'], self.now)
+
     def test_policy_changed_during_export_controls_new_grace_and_eligibility(self):
         original_rpc = self.store.rpc
         for policy, expected in [({'enabled': True, 'idleDays': 14, 'graceDays': 30}, 'pending'),
@@ -252,6 +263,20 @@ class RetentionTest(unittest.TestCase):
         self.sweep()
         self.assertEqual(self.row()['state'], 'pending')
         self.assertEqual(len(self.store.conversation(self.key)['messages']), 2)
+
+    def test_unexpected_collection_error_does_not_kill_future_sweeps(self):
+        attempts = []
+        self.store.stop = SimpleNamespace(wait=Mock(side_effect=[False, False, True]))
+        def collect():
+            attempts.append(1)
+            if len(attempts) == 1: raise AttributeError('private fixture detail must not be exposed')
+            self.assertNotIn('private fixture', self.store.error)
+            return [], set()
+        with patch.object(history.threading, 'Thread') as thread:
+            self.store.start(collect)
+            thread.call_args.kwargs['target']()
+        self.assertEqual(len(attempts), 2)
+        self.assertIsNone(self.store.error)
 
 
 class NativeHistoryTest(unittest.TestCase):
@@ -376,16 +401,32 @@ class NativeHistoryTest(unittest.TestCase):
             result = native.handle({'action': 'export', 'source': source})
             original = client.call
             for failure_method, exception in [('thread/read', native.collector.RpcError('read failed')),
+                                              ('thread/loaded/list', AttributeError('new native shape')),
                                               ('thread/delete', OSError('response lost after dispatch'))]:
                 def call(method, params):
                     if method == failure_method: raise exception
                     return original(method, params)
                 client.call = call
-                expected = native.DeleteRefused if failure_method == 'thread/read' else OSError
+                expected = OSError if failure_method == 'thread/delete' else native.DeleteRefused
                 with self.assertRaises(expected) as raised:
                     native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
                 if failure_method == 'thread/delete':
                     self.assertNotIsInstance(raised.exception, native.DeleteRefused)
+
+    def test_scan_disagreement_blocks_delete_and_invalid_selector_is_proven_refusal(self):
+        source, client = self.codex_client()
+        original = client.call
+        with patch.object(native.native, '_client', return_value=client):
+            result = native.handle({'action': 'export', 'source': source})
+            def call(method, params):
+                if method == 'thread/list' and params.get('useStateDbOnly') is False and not params['archived']:
+                    return {'data': [{'id': 'hidden-child', 'parentThreadId': source['id']}]}
+                return original(method, params)
+            client.call = call
+            with self.assertRaises(native.DeleteRefused):
+                native.handle({'action': 'delete', 'source': source, 'fingerprint': result['fingerprint']})
+        self.assertNotIn('thread/delete', [m for m, p in client.calls])
+        with self.assertRaises(native.DeleteRefused): native.handle({'action': 'delete', 'source': None})
 
     def test_helper_serializes_pre_dispatch_refusal_proof(self):
         import transfer_worker
@@ -416,6 +457,19 @@ class NativeHistoryTest(unittest.TestCase):
                 if method == 'thread/turns/list': response['data'][0]['itemsView'] = 'notLoaded'
                 return response
             client.call = short
+            with self.assertRaises(ValueError): native.handle({'action': 'export', 'source': source})
+
+    def test_legacy_fallback_also_refuses_turns_without_full_items(self):
+        source, client = self.codex_client()
+        original = client.call
+        def call(method, params):
+            if method == 'thread/turns/list': raise native.collector.RpcError('fixture legacy')
+            result = original(method, params)
+            if method == 'thread/read' and params.get('includeTurns'):
+                result['thread']['turns'] = [{'id': 'partial', 'itemsView': 'notLoaded', 'items': []}]
+            return result
+        client.call = call
+        with patch.object(native.native, '_client', return_value=client), patch.object(native.collector, 'paging_unsupported', return_value=True):
             with self.assertRaises(ValueError): native.handle({'action': 'export', 'source': source})
 
     def test_archived_native_stores_must_confirm_no_queue_or_unfinished_goal(self):
