@@ -568,7 +568,12 @@ class RouteTest(unittest.TestCase):
                  ({'source': 'cli', 'parentSessionId': 'parent'}, 'agent'),
                  ({'source': 'cli', 'agentRole': 'worker'}, 'agent'),
                  ({'cwd': '/work/workspaces/slack/project'}, 'bot'),
-                 ({'agent': 'claude', 'kind': 'background'}, 'general'), ({'agent': 'claude'}, 'agent')]
+                 ({'agent': 'claude', 'kind': 'background', 'entrypoint': 'cli'}, 'general'),
+                 ({'agent': 'claude', 'kind': 'interactive', 'entrypoint': 'sdk-cli'}, 'agent'),
+                 ({'agent': 'claude', 'kind': 'interactive'}, 'agent'),
+                 ({'agent': 'claude', 'kind': 'background'}, 'agent'),
+                 ({'agent': 'claude', 'entrypoint': 'cli', 'executionMode': 'one-shot'}, 'agent'),
+                 ({'agent': 'claude'}, 'agent')]
         for fields, expected in cases:
             with self.subTest(fields=fields):
                 self.assertEqual(self.httpd.push.classify({'name': 'local'}, {**base, **fields}), expected)

@@ -973,6 +973,12 @@ class WindowsCollector:
                 except (OSError, ValueError, TypeError):
                     pass
             cwd = row.get('cwd') or ''
+            entrypoint = _metadata(row.get('entrypoint')) if not path else None
+            if path:
+                try:
+                    entrypoint = _claude_entrypoint(path, sid)
+                except (OSError, ValueError):
+                    pass
             if not cwd and path:
                 for entry in _head(path):
                     if isinstance(entry.get('cwd'), str):
@@ -988,7 +994,8 @@ class WindowsCollector:
                     title = title or named
                 except (OSError, ValueError):
                     pass  # A transcript that cannot be read keeps the row without its label.
-            output.append({'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude', 'kind': 'background' if row.get('kind') == 'bg' else 'interactive',
+            output.append({'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude',
+                'kind': 'background' if row.get('kind') == 'bg' else row.get('kind'), 'entrypoint': entrypoint,
                 'title': title or '(Claude 대화)', 'cwd': cwd, 'project': project,
                 'phase': phase, 'state': phase, 'status': status if exact else None, 'runtimeKnown': exact and phase != 'unknown',
                 'startedAt': _epoch(row.get('startedAt')), 'updatedAt': int(path.stat().st_mtime) if path else None,
@@ -1106,6 +1113,15 @@ def _head(path):
     with path.open('rb') as stream:
         raw = stream.read(65536)
     return _entries(raw.splitlines()[:30])
+
+
+def _claude_entrypoint(path, session_id):
+    """As collector.claude_entrypoint: only the original main-thread request counts."""
+    for entry in _head(path):
+        if (entry.get('type') == 'user' and entry.get('sessionId') == session_id
+                and not any(entry.get(flag) for flag in ('isMeta', 'isSidechain', 'isCompactSummary'))):
+            return _metadata(entry.get('entrypoint'))
+    return None
 
 
 def _tail(path, limit):

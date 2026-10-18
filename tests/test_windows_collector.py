@@ -132,12 +132,13 @@ class ClaudeProcessOriginTest(unittest.TestCase):
         """A `claude --bg` session runs under Claude's own `--bg-pty-host`, started by Claude's daemon.
 
         The original caller is not in that lineage, so the host is no agent evidence and the
-        session keeps the background policy (general). The daemon above the host is not used.
+        session's recorded cli entrypoint keeps it general. The daemon above the host is not used.
         """
         self.parents = {300: 150, 150: 120}
         self.processes[150] = {'pid': 150, 'start': str(self.stamp - 50), 'exe': str(self.child)}
         self.processes[120] = {'pid': 120, 'start': str(self.stamp - 80), 'exe': str(self.child)}  # daemon
         self.row['kind'] = 'bg'
+        self.row['entrypoint'] = 'cli'
         self.registry.write_text(json.dumps(self.row), encoding='utf-8')
         host = ['claude.exe', '--bg-pty-host', r'\\.\pipe\cc-daemon-pty', '44', '8', '--', 'claude.exe', '--session-id', self.sid]
         self.reader.flags_reader = lambda expected, deadline: (
@@ -703,6 +704,34 @@ class WindowsCollectorTest(unittest.TestCase):
         result = self.reader.read('claude', sid)
         self.assertEqual([row['text'] for row in result['messages']], ['합성 Claude 요청', '합성 Claude 결과'])
         self.assertFalse(result['runtimeKnown'])
+
+    def test_saved_claude_origin_survives_the_review_process_exiting(self):
+        import collector
+        sid, path = self.claude_transcript()
+        for entrypoint, expected in (('sdk-cli', 'agent'), ('cli', 'general'), (None, 'agent')):
+            entries = [{'type': 'queue-operation', 'sessionId': sid},
+                       {'type': 'user', 'sessionId': sid, 'entrypoint': entrypoint,
+                        'cwd': self.cwd, 'message': {'content': '합성 요청'}}]
+            self.claude_transcript(sid, entries)
+            with self.subTest(entrypoint=entrypoint):
+                row = self.reader.snapshot()['claude'][0]
+                self.assertEqual(collector.session_category(row), expected)
+                self.assertEqual(row.get('entrypoint'), entrypoint)
+                self.assertFalse(row['runtimeKnown'])
+                self.assertNotEqual(row['kind'], 'interactive', '저장 기록에 실행 형식을 만들어 붙이지 않는다')
+
+    def test_saved_claude_origin_uses_the_original_main_thread_request(self):
+        import collector
+        sid, path = self.claude_transcript()
+        entries = [{'type': 'user', 'sessionId': sid, 'entrypoint': 'cli', 'isMeta': True},
+                   {'type': 'user', 'sessionId': sid, 'entrypoint': 'cli', 'isSidechain': True},
+                   {'type': 'user', 'sessionId': str(uuid.uuid4()), 'entrypoint': 'cli'},
+                   {'type': 'user', 'sessionId': sid, 'entrypoint': 'sdk-cli', 'message': {'content': '리뷰'}},
+                   {'type': 'user', 'sessionId': sid, 'entrypoint': 'cli', 'message': {'content': '나중에 재개'}}]
+        self.claude_transcript(sid, entries)
+        row = self.reader.snapshot()['claude'][0]
+        self.assertEqual(row.get('entrypoint'), 'sdk-cli')
+        self.assertEqual(collector.session_category(row), 'agent')
 
     def test_claude_list_row_titles_from_transcript_end_or_first_request(self):
         # Unnamed rows used to all read '(Claude 대화)' with no preview.
