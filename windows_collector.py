@@ -622,6 +622,9 @@ class WindowsCollector:
                 raise ValueError('PC 세션 DB 형식이 예상과 다릅니다.')
             optional = [key for key in ('name', 'preview', 'first_user_message', 'originator', 'agent_nickname',
                 'agent_role', 'thread_source', 'parent_thread_id', 'parent_session_id', 'initiator', 'initiator_name', 'rollout_path') if key in columns]
+            # Exact terminal attaches need the saved policy, never browser-supplied settings.
+            if sid:
+                optional += [key for key in ('sandbox_policy', 'approval_mode') if key in columns]
             select = 'SELECT ' + ','.join(sorted(required) + optional) + ' FROM threads WHERE '
             if sid:
                 rows = connection.execute(select + 'id=? LIMIT 2', (sid,)).fetchall()

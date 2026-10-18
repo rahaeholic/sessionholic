@@ -365,7 +365,15 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertTrue(result['allowed'])
         self.assertEqual(result['mode'], 'attach')
         self.assertEqual(rpc.call_args.args[1], 'terminal_plan')
+        self.assertNotIn('prepare', rpc.call_args.args[2])
         self.terms.reserve.assert_not_called()
+
+    def test_only_explicit_terminal_attach_prepares_the_stored_pc_session(self):
+        spec = {'argv': ['fixture'], 'cwd': ROW['cwd'], 'connectionMode': 'attach'}
+        with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
+                patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
+            self.flow.remote_attach(HOST, ROW)
+        rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True}, timeout=12)
 
     def test_a_pc_conversation_resumed_in_a_board_terminal_is_reopened_not_resumed_again(self):
         import hashlib

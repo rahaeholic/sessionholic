@@ -35,7 +35,8 @@ class FakeReader:
         self.binary.touch()
         (self.path.parent / 'server-state.json').write_text(json.dumps({'server_pid': 12}))
         self.processes = {12: {'pid': 12, 'start': '134362358929022995', 'exe': str(self.binary)}}
-        self.row = {'id': self.sid, 'cwd': str(self.cwd), 'archived': 0}
+        self.row = {'id': self.sid, 'cwd': str(self.cwd), 'archived': 0,
+                    'sandbox_policy': json.dumps({'type': 'disabled'}), 'approval_mode': 'never'}
         self.paths = [self.path]
         self.calls = []
         self.loaded = [self.sid]
@@ -93,6 +94,22 @@ class FakeReader:
                     return {'data': list(owner.loaded)}
                 if method == 'thread/read':
                     return {'thread': copy.deepcopy(owner.thread)}
+                if method == 'thread/resume':
+                    owner.loaded.append(params['threadId'])
+                    modes = {'danger-full-access': 'dangerFullAccess', 'workspace-write': 'workspaceWrite',
+                             'read-only': 'readOnly'}
+                    sandbox = {'type': modes[params['sandbox']]}
+                    if params['sandbox'] == 'read-only':
+                        sandbox['networkAccess'] = False
+                    elif params['sandbox'] == 'workspace-write':
+                        config = params.get('config', {})
+                        for key, native, default in [('network_access', 'networkAccess', False),
+                                                     ('writable_roots', 'writableRoots', []),
+                                                     ('exclude_slash_tmp', 'excludeSlashTmp', False),
+                                                     ('exclude_tmpdir_env_var', 'excludeTmpdirEnvVar', False)]:
+                            sandbox[native] = config.get('sandbox_workspace_write.' + key, default)
+                    return {'thread': copy.deepcopy(owner.thread), 'approvalPolicy': params['approvalPolicy'],
+                            'sandbox': sandbox}
                 if method == 'turn/start':
                     owner.send_calls += 1
                     if owner.fail_send:
@@ -433,6 +450,87 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(plan['nativeSource']['id'], self.source['id'])
         self.assertEqual(self.reader.send_calls, 0)
 
+    def test_terminal_attach_preserves_readonly_and_workspace_permissions(self):
+        policies = [
+            {'type': 'read-only', 'network_access': False},
+            {'type': 'workspace-write', 'network_access': True,
+             'writable_roots': [str(self.home / 'extra folder')],
+             'exclude_slash_tmp': True, 'exclude_tmpdir_env_var': True},
+        ]
+        for policy in policies:
+            with self.subTest(policy=policy):
+                self.reader.loaded = []
+                self.reader.row.update(sandbox_policy=json.dumps(policy), approval_mode='on-request')
+                # Neither these browser fields nor default launch configuration are authority.
+                plan = self.runtime.terminal_plan({**self.source, 'sandbox_policy': '{"type":"disabled"}',
+                                                   'approval_mode': 'never'})
+                self.assertNotIn('--sandbox', plan['argv'])
+                params = [p for method, p in self.reader.calls if method == 'thread/resume'][-1]
+                self.assertEqual(params['sandbox'], policy['type'])
+                self.assertEqual(params['approvalPolicy'], 'on-request')
+                config = params['config']
+                prefix = 'sandbox_' + policy['type'].replace('-', '_') + '.'
+                self.assertEqual(config[prefix + 'network_access'], policy['network_access'])
+                if policy['type'] == 'workspace-write':
+                    self.assertEqual(config[prefix + 'writable_roots'], policy['writable_roots'])
+                    self.assertIs(config[prefix + 'exclude_slash_tmp'], True)
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_native_managed_workspace_policy_is_preserved_without_expanding_paths(self):
+        entries = [{'path': {'type': 'special', 'value': {'kind': 'root'}}, 'access': 'read'},
+                   {'path': {'type': 'path', 'path': str(self.reader.cwd)}, 'access': 'write'}]
+        entries += [{'path': {'type': 'special', 'value': {'kind': kind}}, 'access': 'write'}
+                    for kind in ('slash_tmp', 'tmpdir')]
+        entries += [{'path': {'type': 'path', 'path': str(self.reader.cwd / name)},
+                     'access': 'read', 'missing_path_behavior': 'skip'}
+                    for name in ('.git', '.agents', '.codex', '.aws')]
+        policy = {'type': 'managed', 'file_system': {'type': 'restricted', 'entries': entries},
+                  'network': 'restricted'}
+        self.reader.row['sandbox_policy'] = json.dumps(policy)
+        self.reader.loaded = []
+        self.runtime.terminal_plan(self.source)
+        params = [p for method, p in self.reader.calls if method == 'thread/resume'][-1]
+        self.assertEqual(params['sandbox'], 'workspace-write')
+        self.assertIs(params['config']['sandbox_workspace_write.network_access'], False)
+        self.assertEqual(params['config']['sandbox_workspace_write.writable_roots'], [])
+        # A custom deny or additional rule must never be flattened into a broader preset.
+        for changed in [entries + [{'path': {'type': 'path', 'path': str(self.home / 'private')}, 'access': 'deny'}],
+                        entries[:-1], entries + [entries[0]]]:
+            policy['file_system']['entries'] = changed
+            self.reader.row['sandbox_policy'] = json.dumps(policy)
+            self.reader.loaded = []
+            with self.assertRaisesRegex(ValueError, '기존 실행 권한'):
+                self.runtime.terminal_plan(self.source)
+
+    def test_unknown_or_missing_native_permissions_never_fall_back_to_defaults(self):
+        for policy, approval in [(None, 'never'), ('not-json', 'never'), ('[]', 'never'),
+                                 ('{"type":"future-policy"}', 'never'),
+                                 ('{"type":"disabled","deny":"extra"}', 'never'),
+                                 ('{"type":"disabled"}', None), ('{"type":"disabled"}', 'unsupported'),
+                                 ('{"type":"read-only","network_access":true}', 'never'),
+                                 ('{"type":"read-only","network_access":"false"}', 'never')]:
+            self.reader.row.update(sandbox_policy=policy, approval_mode=approval)
+            self.reader.loaded = []
+            with self.subTest(policy=policy, approval=approval), self.assertRaisesRegex(ValueError, '기존 실행 권한'):
+                self.runtime.terminal_plan(self.source)
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_terminal_previews_never_load_or_change_the_stored_thread(self):
+        self.reader.loaded = []
+        self.runtime.terminal_plan(self.source, prepare=False)
+        self.runtime.resume_preview(self.source)
+        self.assertEqual(self.reader.loaded, [])
+        self.assertFalse(any(method == 'thread/resume' for method, params in self.reader.calls))
+
+    def test_resume_permissions_require_an_exact_native_readback(self):
+        settings = {'sandbox': 'danger-full-access', 'approvalPolicy': 'never'}
+        for result in [{'approvalPolicy': 'on-request', 'sandbox': {'type': 'dangerFullAccess'}},
+                       {'approvalPolicy': 'never', 'sandbox': {'type': 'workspaceWrite'}},
+                       {'approvalPolicy': 'never'}, None]:
+            self.assertFalse(wr._same_resume_permissions(result, settings))
+        self.assertTrue(wr._same_resume_permissions({'approvalPolicy': 'never',
+                                                    'sandbox': {'type': 'dangerFullAccess'}}, settings))
+
     def test_claude_external_interactive_process_can_terminate(self):
         source, row, path = self.claude()
         preview = self.runtime.preview(source)
@@ -534,8 +632,13 @@ class WindowsRuntimeTest(unittest.TestCase):
         plan = self.runtime.terminal_plan(self.source)
         self.assertEqual(plan['argv'], [str(self.reader.binary), 'resume', self.reader.sid, '--remote',
                                         'unix://' + self.reader.path.as_posix(), '--cd', str(self.reader.cwd)])
+        resumes = [params for method, params in self.reader.calls if method == 'thread/resume']
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(resumes[0]['sandbox'], 'danger-full-access')
+        self.assertEqual(resumes[0]['approvalPolicy'], 'never')
         self.assertEqual((plan['resumed'], plan['connectionMode']), (True, 'attach'))
         self.assertEqual(plan['env'], {'CODEX_HOME': str(self.reader.codex_home)})
+        self.reader.loaded = []  # Each topology below starts with a stored thread again.
         # The folder's own server, in any case; while it exists, never another one.
         other = self.reader.codex_home / 'agents-servers/fixture-us/app.sock'
         other.parent.mkdir(parents=True)
@@ -547,10 +650,12 @@ class WindowsRuntimeTest(unittest.TestCase):
         upper = self.reader.codex_home / 'agents-servers/FIXTURE/app.sock'
         self.reader.paths = [upper, other]
         self.assertIn('unix://' + upper.as_posix(), self.runtime.terminal_plan(self.source)['argv'])
+        self.reader.loaded = []
         # With none of its name, the only <folder>-… server is the folder's (a project named apart)...
         upper.parent.rename(upper.parent.with_name('retired'))
         self.reader.paths = [other]
         self.assertIn('unix://' + other.as_posix(), self.runtime.terminal_plan(self.source)['argv'])
+        self.reader.loaded = []
         # ...unless a project folder of that name owns it, or another such server exists.
         (self.home / 'Projects/fixture-us').mkdir()
         with self.assertRaisesRegex(ValueError, '꺼져'):
@@ -622,6 +727,7 @@ class WindowsRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '기록'):
             self.runtime.terminal_plan(source)
 
+    @unittest.skipIf(sys.platform == 'win32', 'non-Windows guard')
     def test_windows_process_termination_never_executes_on_non_windows(self):
         with self.assertRaises(ValueError):
             wr._terminate_windows({'pid': 123, 'start': 'x', 'exe': 'fixture'})

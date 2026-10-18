@@ -58,6 +58,113 @@ def _identity(source):
     return {'host': host, 'agent': agent, 'id': sid, 'home': '.codex' if agent == 'codex' else '.claude'}
 
 
+def _codex_resume_settings(row):
+    """Restore the stored policy before a remote TUI attaches to a closed thread.
+
+    Only faithfully representable native policies are accepted. Custom filesystem
+    rules must not be weakened or silently replaced by a built-in sandbox.
+    """
+    message = 'PC 세션의 기존 실행 권한을 그대로 연결할 수 없습니다. 원본 PC 터미널에서 권한 설정을 확인해 주세요.'
+    approval = row.get('approval_mode')
+    if approval not in ('never', 'on-request'):
+        raise ValueError(message)
+    try:
+        policy = json.loads(row['sandbox_policy'])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError(message) from None
+    if not isinstance(policy, dict):
+        raise ValueError(message)
+    kind = policy.get('type')
+    config = {}
+    if policy == {'type': 'disabled'} or policy == {'type': 'danger-full-access'}:
+        mode = 'danger-full-access'
+    elif kind in ('read-only', 'workspace-write'):
+        mode = kind
+        fields = {'type', 'network_access'}
+        if mode == 'workspace-write':
+            fields |= {'writable_roots', 'exclude_slash_tmp', 'exclude_tmpdir_env_var'}
+        if set(policy) - fields:
+            raise ValueError(message)
+        for key in fields - {'type'}:
+            value = policy.get(key, [] if key == 'writable_roots' else False)
+            if key == 'writable_roots':
+                if not isinstance(value, list) or any(not isinstance(p, str) or not wc._windows_path(p).startswith(('/',))
+                    and not re.match(r'^[A-Za-z]:/', wc._windows_path(p)) for p in value):
+                    raise ValueError(message)
+            elif type(value) is not bool:
+                raise ValueError(message)
+            if mode == 'read-only' and value:
+                # The native legacy read-only preset cannot restore enabled networking.
+                raise ValueError(message)
+            config['sandbox_' + mode.replace('-', '_') + '.' + key] = value
+    elif kind == 'managed' and set(policy) == {'type', 'file_system', 'network'}:
+        fs = policy['file_system']
+        if (not isinstance(fs, dict) or set(fs) != {'type', 'entries'} or fs['type'] != 'restricted'
+                or not isinstance(fs['entries'], list) or policy['network'] not in ('restricted', 'enabled')):
+            raise ValueError(message)
+        # These are the exact built-in workspace entries emitted by native Codex.
+        cwd = wc._norm(row.get('cwd'))
+        expected = {
+            ('special', 'root', 'read', None),
+            ('path', cwd, 'write', None),
+            ('special', 'slash_tmp', 'write', None),
+            ('special', 'tmpdir', 'write', None),
+            *(('path', wc._norm(str(row['cwd']) + '/' + name), 'read', 'skip')
+              for name in ('.git', '.agents', '.codex', '.aws')),
+        }
+        entries = set()
+        for entry in fs['entries']:
+            if not isinstance(entry, dict) or set(entry) - {'path', 'access', 'missing_path_behavior'}:
+                raise ValueError(message)
+            path = entry.get('path')
+            if not isinstance(path, dict):
+                raise ValueError(message)
+            if path.get('type') == 'path' and set(path) == {'type', 'path'} and isinstance(path['path'], str):
+                target = ('path', wc._norm(path['path']))
+            elif (path.get('type') == 'special' and set(path) == {'type', 'value'}
+                  and isinstance(path['value'], dict) and set(path['value']) == {'kind'}
+                  and isinstance(path['value']['kind'], str)):
+                target = ('special', path['value']['kind'])
+            else:
+                raise ValueError(message)
+            access, missing = entry.get('access'), entry.get('missing_path_behavior')
+            if not isinstance(access, str) or missing is not None and not isinstance(missing, str):
+                raise ValueError(message)
+            entries.add((*target, access, missing))
+        readonly = {('special', 'root', 'read', None)}
+        if entries == readonly and len(fs['entries']) == 1 and policy['network'] == 'restricted':
+            return {'sandbox': 'read-only', 'approvalPolicy': approval}
+        if entries != expected or len(entries) != len(fs['entries']):
+            raise ValueError(message)
+        mode = 'workspace-write'
+        config['sandbox_workspace_write.network_access'] = policy['network'] == 'enabled'
+        config['sandbox_workspace_write.writable_roots'] = []
+        config['sandbox_workspace_write.exclude_slash_tmp'] = False
+        config['sandbox_workspace_write.exclude_tmpdir_env_var'] = False
+    else:
+        raise ValueError(message)
+    return {'sandbox': mode, 'approvalPolicy': approval, **({'config': config} if config else {})}
+
+
+def _same_resume_permissions(result, settings):
+    if not isinstance(result, dict) or result.get('approvalPolicy') != settings['approvalPolicy']:
+        return False
+    actual = result.get('sandbox')
+    mode = settings['sandbox']
+    expected = {'type': {'danger-full-access': 'dangerFullAccess', 'read-only': 'readOnly',
+                         'workspace-write': 'workspaceWrite'}[mode]}
+    config = settings.get('config', {})
+    if mode == 'read-only':
+        expected['networkAccess'] = False
+    elif mode == 'workspace-write':
+        for key, native, default in [('network_access', 'networkAccess', False),
+                                     ('writable_roots', 'writableRoots', []),
+                                     ('exclude_slash_tmp', 'excludeSlashTmp', False),
+                                     ('exclude_tmpdir_env_var', 'excludeTmpdirEnvVar', False)]:
+            expected[native] = config.get('sandbox_workspace_write.' + key, default)
+    return actual == expected
+
+
 def _private_acl(path):
     if os.name != 'nt':
         path.chmod(0o700)
@@ -153,7 +260,7 @@ class Store:
 
 
 class NativeProxy(wc.Proxy):
-    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive'}
+    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume'}
 
 
 def _loaded(client):
@@ -321,7 +428,7 @@ class WindowsRuntime:
                      and not (self.reader.home / 'Projects' / name).exists()]
         return self.reader.endpoint(named[0]) if len(named) == 1 else None
 
-    def _codex_resume(self, source):
+    def _codex_resume(self, source, prepare=False):
         identity = _identity(source)
         rows = self.reader.database_rows(identity['id'])
         if len(rows) != 1 or rows[0].get('archived') or source.get('cwd') and wc._norm(source['cwd']) != wc._norm(rows[0]['cwd']):
@@ -338,6 +445,27 @@ class WindowsRuntime:
             # would run an embedded runtime in that session instead.
             raise ValueError('이 기록의 프로젝트 Codex 서버가 PC에서 꺼져 있습니다. 새 세션으로 그 프로젝트를 열어 서버를 켠 뒤 이어갈 수 있습니다.')
         argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(endpoint).as_posix(), '--cd', cwd]
+        if prepare:
+            settings = _codex_resume_settings(rows[0])
+            # A preview never loads a thread. The explicit terminal action preloads it
+            # with its saved permissions; the native remote TUI accepts no overrides.
+            with self.proxy_factory(self.reader.binary, endpoint, time.monotonic() + 12) as client:
+                loaded, complete = _loaded(client)
+                if not complete:
+                    raise ValueError('PC 서버의 실행 목록을 다시 확인해 주세요.')
+                if identity['id'] not in loaded:
+                    current = self.reader.database_rows(identity['id'])
+                    keys = ('id', 'cwd', 'archived', 'sandbox_policy', 'approval_mode')
+                    if len(current) != 1 or any(current[0].get(k) != rows[0].get(k) for k in keys):
+                        raise ValueError('PC 세션의 실행 권한이 변경되었습니다. 다시 연결해 주세요.')
+                    result = client.call('thread/resume', {'threadId': identity['id'], 'cwd': cwd, **settings})
+                    thread = result.get('thread') if isinstance(result, dict) else None
+                    if (not isinstance(thread, dict) or thread.get('id') != identity['id']
+                            or wc._norm(thread.get('cwd')) != wc._norm(cwd)
+                            or not _same_resume_permissions(result, settings)):
+                        raise ValueError('PC 세션의 재개와 기존 실행 권한을 확인하지 못했습니다.')
+                else:
+                    self._thread(client, identity, cwd)
         return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach', 'resumed': True}
 
@@ -674,13 +802,13 @@ class WindowsRuntime:
                     **({'effect': ARCHIVE_EFFECT, 'scope': 'session-and-descendants', 'scopeReadback': 'selected-session',
                         'descendantsConfirmed': False} if action == 'terminate' else {})}
 
-    def terminal_plan(self, source):
+    def terminal_plan(self, source, prepare=True):
         identity = _identity(source)
         if identity['agent'] == 'codex':
             try:
                 observed = self._codex(source, time.monotonic() + 12)
             except NotLoaded:
-                return self._codex_resume(source)
+                return self._codex_resume(source, prepare=prepare)
             self._verify_endpoint(observed)
             argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(observed['path']).as_posix(), '--cd', observed['cwd']]
             cwd = observed['cwd']
@@ -738,7 +866,7 @@ def handle(request, data=None):
     if op == 'control_execute':
         return runtime.execute(args)
     if op == 'terminal_plan':
-        return runtime.terminal_plan(args.get('source'))
+        return runtime.terminal_plan(args.get('source'), prepare=args.get('prepare') is True)
     if op == 'resume_preview':
         return runtime.resume_preview(args.get('source'))
     raise ValueError('지원하지 않는 PC 작업 요청입니다.')

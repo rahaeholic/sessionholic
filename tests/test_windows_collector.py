@@ -404,6 +404,22 @@ class WindowsCollectorTest(unittest.TestCase):
         connection.commit()
         connection.close()
 
+    def test_exact_database_row_reads_native_permissions_without_exporting_them_in_lists(self):
+        policy = json.dumps({'type': 'disabled'})
+        with contextlib.closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute('ALTER TABLE threads ADD COLUMN sandbox_policy TEXT')
+            connection.execute('ALTER TABLE threads ADD COLUMN approval_mode TEXT')
+            connection.execute('UPDATE threads SET sandbox_policy=?,approval_mode=? WHERE id=?',
+                               (policy, 'never', self.sid))
+        before = self.db.read_bytes()
+        exact = self.reader.database_rows(self.sid)
+        self.assertEqual((exact[0]['sandbox_policy'], exact[0]['approval_mode']), (policy, 'never'))
+        listed = self.reader.database_rows()
+        self.assertNotIn('sandbox_policy', listed[0])
+        self.assertNotIn('approval_mode', listed[0])
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertFalse(self.calls)
+
     def endpoint(self, folder_name='fixture-server', **changes):
         folder = self.reader.codex_home / 'agents-servers' / folder_name
         folder.mkdir(parents=True, exist_ok=True)
