@@ -93,6 +93,7 @@ class Histories:
         self.rpc, self.clock = rpc, clock
         self.lock, self.sweeping, self.stop = threading.RLock(), threading.Lock(), threading.Event()
         self.worker_enabled = False
+        self.error = None
 
     @contextmanager
     def storage(self):
@@ -153,7 +154,7 @@ class Histories:
             data = self._load()
             rows = [self._public(k, r) for k, r in data['records'].items()]
             return {'policy': data['policy'], 'records': sorted(rows, key=lambda r: r.get('createdAt') or 0, reverse=True),
-                    'running': self.sweeping.locked(), 'workerEnabled': self.worker_enabled}
+                    'running': self.sweeping.locked(), 'workerEnabled': self.worker_enabled, 'error': self.error}
 
     def policy(self, value):
         value = self._policy(value)
@@ -179,8 +180,19 @@ class Histories:
                 raise ValueError('보존할 대화를 찾지 못했습니다.')
             row['preserved'] = value
             if row.get('state') not in ('deleted', 'uncertain'):
-                row['state'] = 'preserved' if value else ('pending' if row.get('canDelete') else 'archived')
-                row['deleteAfter'] = self.clock() + data['policy']['graceDays'] * DAY if not value and row.get('canDelete') else None
+                if value:
+                    row.update(state='preserved', deleteAfter=None)
+                else:
+                    try:
+                        if not row.get('archiveHash'):
+                            raise ValueError('보존 대화가 아직 없습니다.')
+                        self._archive(archive_key, row['archiveHash'])
+                    except (OSError, ValueError):
+                        row.update(state='blocked', deleteAfter=None, canDelete=False,
+                                   reason='검증된 보존 대화가 없습니다. 원본을 유지하고 다시 보존합니다.')
+                    else:
+                        row['state'] = 'pending' if row.get('canDelete') else 'archived'
+                        row['deleteAfter'] = self.clock() + data['policy']['graceDays'] * DAY if row.get('canDelete') else None
             self._write(data)
         return self.status()
 
@@ -224,19 +236,27 @@ class Histories:
                 if not data['policy']['enabled']:
                     return
                 attempted = {k: r.get('attemptedAt', 0) for k, r in data['records'].items()}
-            candidates = sorted(candidates, key=lambda s: attempted.get(key(s), 0))[:8]
+                excluded = {k for k, r in data['records'].items()
+                            if r.get('preserved') or r.get('state') in ('deleted', 'uncertain')}
+            eligible = {key(s): s for s in candidates if key(s) not in excluded}
+            candidates = sorted(eligible.values(), key=lambda s: attempted.get(key(s), 0))[:8]
             for source in candidates:
                 if self.stop.is_set():
                     break
                 try:
                     self._one(source, protected)
-                except (OSError, ValueError, RuntimeError, KeyError, TypeError):
+                except Exception:
                     # Never write raw exceptions: native error text can include a private dialogue.
                     with self.storage():
                         data = self._load()
                         k = key(source)
                         row = data['records'].setdefault(k, {'source': source, 'title': source.get('title'), 'state': 'blocked'})
-                        row.update(attemptedAt=self.clock(), reason='대화 또는 원본 상태를 확인하지 못해 정리를 미뤘습니다.')
+                        row['attemptedAt'] = self.clock()
+                        if row['state'] == 'uncertain':
+                            row['reason'] = '삭제 요청의 결과를 확인하지 못했습니다. 자동 재시도하지 않습니다.'
+                        elif not row.get('preserved') and row['state'] != 'deleted':
+                            row.update(state='blocked', deleteAfter=None,
+                                       reason='대화 또는 원본 상태를 확인하지 못해 정리를 미뤘습니다.')
                         self._write(data)
         finally:
             self.sweeping.release()
@@ -245,7 +265,7 @@ class Histories:
         k, now = key(source), self.clock()
         with self.storage():
             data = self._load()
-            policy, row = data['policy'], data['records'].get(k)
+            row = data['records'].get(k)
             if len(data['records']) >= MAX_RECORDS and row is None:
                 return
             if row and (row.get('state') in ('deleted', 'uncertain') or row.get('preserved')):
@@ -257,6 +277,8 @@ class Histories:
                     self._write(data)
                 return
         export = self.rpc(source, {'action': 'export', 'source': source})
+        if export.get('exportVersion') != history_native.EXPORT_VERSION:
+            raise ValueError('현재 추출기로 전체 대화를 확인하지 못했습니다.')
         family = export['family']
         if any((source['host'], source['agent'], source.get('home'), sid) in protected for sid in family):
             with self.storage():
@@ -267,18 +289,6 @@ class Histories:
                     data['records'][k] = row
                 row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='하위 대화를 사용 중이거나 고정했습니다.')
                 self._write(data)
-            return
-        if export['lastActivityAt'] <= 0 or export.get('ownerTime', now) - export['lastActivityAt'] < policy['idleDays'] * DAY:
-            # Reuse after the previous snapshot cancels its pending deletion.
-            with self.storage():
-                data = self._load()
-                row = data['records'].get(k)
-                if row is None:
-                    row = {'source': source, 'title': source.get('title'), 'state': 'waiting'}
-                    data['records'][k] = row
-                if row.get('state') not in ('deleted', 'uncertain'):
-                    row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='최근에 사용한 대화입니다.')
-                    self._write(data)
             return
         messages = export['messages']
         if not messages or any(not isinstance(m, dict) or m.get('role') not in ('user', 'assistant')
@@ -292,19 +302,33 @@ class Histories:
         summary['messageCount'] = len(messages)
         with self.storage():
             data = self._load()
+            now, policy = self.clock(), data['policy']
             row = data['records'].get(k)
-            if not data['policy']['enabled'] or (row and (row.get('preserved') or row.get('state') in ('deleted', 'uncertain'))):
+            if not policy['enabled'] or (row and (row.get('preserved') or row.get('state') in ('deleted', 'uncertain'))):
+                return
+            # Policy may have changed while the owner exported a large conversation.
+            # Eligibility and the new grace period use this same, freshly locked policy.
+            if export['lastActivityAt'] <= 0 or export.get('ownerTime', now) - export['lastActivityAt'] < policy['idleDays'] * DAY:
+                if row is None:
+                    row = {'source': source, 'title': source.get('title'), 'state': 'waiting'}
+                    data['records'][k] = row
+                row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='최근에 사용한 대화입니다.')
+                self._write(data)
                 return
             for sibling in data['records'].values():
                 peer = sibling['source']
                 if (sibling.get('preserved') and peer['host'] == source['host']
                         and peer['agent'] == source['agent'] and peer.get('home') == source.get('home')
                         and (peer['id'] in family or any(sid in family for sid in sibling.get('family') or []))):
-                    if row:
-                        row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='하위 대화를 보존하도록 지정했습니다.')
-                        self._write(data)
+                    if row is None:
+                        row = {'source': source, 'title': source.get('title'), 'state': 'waiting'}
+                        data['records'][k] = row
+                    row.update(state='waiting', deleteAfter=None, attemptedAt=now, reason='하위 대화를 보존하도록 지정했습니다.')
+                    self._write(data)
                     return
-            if not row or row.get('fingerprint') != export['fingerprint'] or row.get('state') == 'waiting':
+            export_version = export['exportVersion']
+            if (not row or row.get('fingerprint') != export['fingerprint']
+                    or row.get('exportVersion') != export_version or row.get('state') in ('waiting', 'blocked')):
                 artifact = {'version': 1, 'key': k, 'source': identity(source), 'title': history_native.text(source.get('title')),
                             'messages': messages, 'summary': summary, 'createdAt': now}
                 raw = encode(artifact)
@@ -318,6 +342,7 @@ class Histories:
                 row = {'source': source, 'title': artifact['title'], 'state': 'pending', 'createdAt': now,
                        'deleteAfter': now + policy['graceDays'] * DAY, 'preserved': False,
                        'fingerprint': export['fingerprint'], 'archiveHash': archive_hash,
+                       'exportVersion': export_version,
                        'messageCount': len(messages), 'archiveBytes': len(packed), 'sourceBytes': export.get('sourceBytes'),
                        'summary': summary, 'family': family}
                 data['records'][k] = row
@@ -335,8 +360,15 @@ class Histories:
             # Journal intent before dispatch: a lost response must never cause a replay.
             row.update(state='uncertain', reason='원본 기록 정리 결과를 확인 중입니다.')
             self._write(data)
-            result = self.rpc(source, {'action': 'delete', 'source': source,
-                                       'fingerprint': row['fingerprint'], 'family': family})
+            try:
+                result = self.rpc(source, {'action': 'delete', 'source': source,
+                                           'fingerprint': row['fingerprint'], 'family': family})
+            except history_native.DeleteRefused:
+                # This typed result proves no native delete was sent. Genuine transport
+                # uncertainty keeps the durable intent above and is never replayed.
+                row.update(state='waiting', deleteAfter=None, reason='삭제 요청을 보내기 전에 상태가 바뀌었습니다. 다시 보존 후 유예합니다.')
+                self._write(data)
+                return
             if result.get('confirmed') is not True or set(result.get('family') or []) != set(family):
                 row.update(state='uncertain', reason='원본 기록 정리 결과를 확인하지 못했습니다. 자동 재시도하지 않습니다.')
             else:
@@ -351,6 +383,8 @@ class Histories:
                 try:
                     candidates, protected = collect()
                     self.sweep(candidates, protected)
-                except (OSError, ValueError, RuntimeError):
-                    pass
+                    self.error = None
+                except Exception:
+                    # Neither private exception details nor a silently dead worker.
+                    self.error = '자동 보존 상태 확인에 실패했습니다. 다음 점검에서 다시 확인합니다.'
         threading.Thread(target=run, name='session-history', daemon=True).start()

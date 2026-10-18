@@ -102,8 +102,8 @@
     try {
       const data = await api('/api/session-history');
       if (epoch !== generation) return;
-      render(data); $('history-status').textContent = data.workerEnabled === false ? '이 실행에서는 자동 정리가 꺼져 있습니다.'
-        : data.running ? '대화를 보존하고 있습니다.' : '자동 정리는 매시간 확인합니다.';
+      render(data); $('history-status').textContent = data.error || (data.workerEnabled === false ? '이 실행에서는 자동 정리가 꺼져 있습니다.'
+        : data.running ? '대화를 보존하고 있습니다.' : '자동 정리는 매시간 확인합니다.');
     } catch (error) { if (epoch === generation) $('history-status').textContent = error.message || '대화 보존 상태를 읽지 못했습니다.'; }
   }
   function init(options) {

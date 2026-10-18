@@ -2684,10 +2684,12 @@ def history_candidates(server, refresh=True):
             state = server.board.state.get(host['name']) or {}
             if now - (state.get('fetchedAt') or 0) > 300:
                 server.board.poll(host)
-    snapshot = server.session_pinned.decorate(server.board.snapshot())
-    if not (snapshot.get('sessionPinned') or {}).get('ok'):
-        raise ValueError('보존할 고정 세션 정보를 읽지 못했습니다.')
-    candidates, protected, seen = [], set(), set()
+    snapshot = server.board.snapshot()
+    try:
+        protected = {(s['host'], s['agent'], s.get('home'), s['id']) for s in server.session_pinned.sources()}
+    except GoalError:
+        raise ValueError('고정 세션 정보를 확인하지 못해 정리를 미뤘습니다.') from None
+    candidates, seen = [], set()
     for owner in snapshot['hosts']:
         if not owner.get('ok') or now - (owner.get('fetchedAt') or 0) > 300:
             continue
@@ -2701,12 +2703,13 @@ def history_candidates(server, refresh=True):
                     continue
                 source = {field: row.get(field) for field in ('home', 'cwd', 'kind', 'sessionId', 'title')}
                 source.update(host=owner['name'], agent=agent, id=sid)
-                if row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'):
+                pinned = (owner['name'], agent, row.get('home'), sid) in protected
+                if pinned or row.get('phase') not in ('closed', 'done'):
                     protected.add((owner['name'], agent, row.get('home'), sid))
                     if any(r['key'] == key(source) and r['state'] not in ('deleted', 'uncertain') for r in status['records']):
                         seen.add(key(source))
                         candidates.append(source)
-                if row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'):
+                if pinned or row.get('phase') not in ('closed', 'done'):
                     continue
                 changed = row.get('updatedAt')
                 if not isinstance(changed, (int, float)) or now - changed < status['policy']['idleDays'] * DAY:
@@ -2725,24 +2728,44 @@ def history_candidates(server, refresh=True):
 
 
 def history_rpc(server, source, args):
-    host = next((h for h in server.board.hosts if h['name'] == source['host']), None)
-    owner = server.board.state.get(source['host']) or {}
-    if (host is None or host.get('monitorOnly') or host.get('platform') == 'windows'
-            or not owner.get('ok') or time.time() - (owner.get('fetchedAt') or 0) > 300):
-        raise ValueError('기기의 현재 상태를 확인하지 못했습니다.')
-    if args['action'] == 'delete':
-        snapshot = server.session_pinned.decorate(server.board.snapshot())
-        if not (snapshot.get('sessionPinned') or {}).get('ok'):
-            raise ValueError('고정 상태를 확인하지 못했습니다.')
-        for owner in snapshot['hosts']:
-            if owner['name'] != source['host']:
-                continue
-            for row in (owner.get('data') or {}).get(source['agent'], []):
-                if ((row.get('id') or row.get('sessionId')) in (args.get('family') or [])
-                        and row.get('home') == source.get('home')
-                        and (row.get('pinnedAt') or row.get('phase') not in ('closed', 'done'))):
-                    raise ValueError('보존하거나 사용 중인 세션입니다.')
-    return server.workflow.transfers.rpc(host, 'session_history', args, timeout=50)
+    from contextlib import ExitStack
+    from history_native import DeleteRefused, _deletion_guard
+    from transfer import WorkerError
+    deleting = args['action'] == 'delete'
+    # The board knows whether its own helper was invoked. Never turn failures after
+    # that boundary into a retry, except for the helper's explicit pre-delete proof.
+    with _deletion_guard(deleting) as attempt, ExitStack() as held:
+        host = next((h for h in server.board.hosts if h['name'] == source['host']), None)
+        if deleting:
+            if host is None or host.get('monitorOnly') or host.get('platform') == 'windows':
+                raise ValueError('지원하는 원본 기기가 아닙니다.')
+            if not server.board.poll(host):
+                raise ValueError('원본 기기를 다시 확인하지 못했습니다.')
+        owner = server.board.state.get(source['host']) or {}
+        if (host is None or host.get('monitorOnly') or host.get('platform') == 'windows'
+                or not owner.get('ok') or time.time() - (owner.get('fetchedAt') or 0) > (30 if deleting else 300)):
+            raise ValueError('기기의 현재 상태를 확인하지 못했습니다.')
+        if deleting:
+            pins = held.enter_context(server.session_pinned.protection())
+            if any(s['host'] == source['host'] and s['agent'] == source['agent'] and s.get('home') == source.get('home')
+                   and s['id'] in (args.get('family') or []) for s in pins):
+                raise ValueError('고정한 원본이므로 삭제 요청을 보내지 않았습니다.')
+            snapshot = server.board.snapshot()
+            for owner in snapshot['hosts']:
+                if owner['name'] != source['host']:
+                    continue
+                for row in (owner.get('data') or {}).get(source['agent'], []):
+                    if ((row.get('id') or row.get('sessionId')) in (args.get('family') or [])
+                            and row.get('home') == source.get('home')
+                            and row.get('phase') not in ('closed', 'done')):
+                        raise ValueError('사용 중인 세션입니다.')
+        try:
+            attempt['dispatched'] = True
+            return server.workflow.transfers.rpc(host, 'session_history', args, timeout=50)
+        except WorkerError as exc:
+            if deleting and exc.stage == DeleteRefused.transfer_stage:
+                raise DeleteRefused('원본 기기가 삭제 요청 전 상태 변경을 확인했습니다.') from None
+            raise
 
 
 # A snapshot field each display store adds; a body is kept only when every one read.

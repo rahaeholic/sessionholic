@@ -1,4 +1,5 @@
 """Whole, text-only history on the owning host. Never copy or delete workspace files."""
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -15,10 +16,30 @@ import transfer_native as native
 
 MAX_TEXT_BYTES = 16 * 1024 * 1024
 MAX_FAMILY = 100
+EXPORT_VERSION = 2
 DELETE_VERSIONS = {'0.163.0'}
 SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
                 'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown']
 DATA_URL = re.compile(r'data:[^\s,;]+(?:;[^\s,;]+)*;base64,[A-Za-z0-9+/=]+', re.I)
+OMITTED_ITEMS = {'hookPrompt', 'reasoning', 'commandExecution', 'fileChange', 'mcpToolCall',
+                 'dynamicToolCall', 'collabAgentToolCall', 'subAgentActivity', 'webSearch',
+                 'imageView', 'sleep', 'contextCompaction'}
+
+
+class DeleteRefused(ValueError):
+    """Proof that no destructive native call was dispatched (also sent by the helper)."""
+    transfer_stage = 'history-pre-delete'
+
+
+@contextmanager
+def _deletion_guard(deleting):
+    attempt = {'dispatched': False}
+    try:
+        yield attempt
+    except Exception:
+        if deleting and not attempt['dispatched']:
+            raise DeleteRefused('원본 상태를 다시 확인해야 하므로 삭제 요청을 보내지 않았습니다.') from None
+        raise
 
 
 def text(value):
@@ -38,6 +59,8 @@ def blocks(content):
     """Keep complete visible text and attachment references; never serialize unknown blocks."""
     if isinstance(content, str):
         return text(content)
+    if not isinstance(content, list):
+        raise ValueError('대화 본문 형식을 확인하지 못했습니다.')
     result = []
     for block in content if isinstance(content, list) else []:
         if not isinstance(block, dict):
@@ -110,18 +133,19 @@ def _claude(source, home):
             if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
                 raise ValueError('대화 기록이 변경되어 보존을 미룹니다.')
         signatures.append([str(file.relative_to(launch._home(home))), checksum.hexdigest()])
-    return _bounded({'messages': messages, 'family': family, 'fingerprint': digest(signatures),
+    return _bounded({'messages': messages, 'family': family, 'fingerprint': digest([EXPORT_VERSION, signatures]),
+                     'exportVersion': EXPORT_VERSION,
                      'lastActivityAt': latest, 'sourceBytes': total, 'canDelete': False,
                      'reason': 'Claude는 전체 대화를 보존합니다. 단일 세션 기록 삭제 범위가 검증되기 전까지 원본을 유지합니다.'})
 
 
-def _all_threads(client, root):
+def _all_threads(client, root, state_db_only=True):
     rows = []
     for archived in (False, True):
         cursor = None
         for _ in range(100):
             params = {'ancestorThreadId': root, 'archived': archived, 'limit': 100,
-                      'sourceKinds': SOURCE_KINDS, 'useStateDbOnly': True}
+                      'sourceKinds': SOURCE_KINDS, 'useStateDbOnly': state_db_only}
             if cursor:
                 params['cursor'] = cursor
             page = client.call('thread/list', params)
@@ -162,7 +186,11 @@ def _turns(client, sid):
         thread = client.call('thread/read', {'threadId': sid, 'includeTurns': True}).get('thread')
         if not isinstance(thread, dict) or thread.get('id') != sid or not isinstance(thread.get('turns'), list):
             raise ValueError('전체 대화를 확인하지 못했습니다.')
-        return thread['turns']
+        turns = thread['turns']
+        if any(not isinstance(t, dict) or not isinstance(t.get('items'), list)
+               or t.get('itemsView', 'full') != 'full' for t in turns):
+            raise ValueError('대화 본문이 생략되어 원본 기록을 유지합니다.')
+        return turns
 
 
 def _archived_clear(identity, home, sid):
@@ -191,11 +219,14 @@ def _archived_clear(identity, home, sid):
 
 def _codex(source, home, deadline, delete_fingerprint=None):
     identity = native._identity(source)
-    with native._client(identity, home, deadline) as client:
+    with _deletion_guard(delete_fingerprint is not None) as attempt, native._client(identity, home, deadline) as client:
+        scanned = _all_threads(client, identity['id'], state_db_only=False) if delete_fingerprint is not None else None
         root = client.call('thread/read', {'threadId': identity['id'], 'includeTurns': False}).get('thread')
         if not isinstance(root, dict) or root.get('id') != identity['id']:
             raise ValueError('원본 세션을 확인하지 못했습니다.')
         descendants = _all_threads(client, identity['id'])
+        if scanned is not None and {r['id'] for r in scanned} != {r['id'] for r in descendants}:
+            raise ValueError('하위 대화 목록이 달라 원본 기록을 유지합니다.')
         family = {identity['id']: root}
         for row in descendants:
             if not isinstance(row, dict) or not isinstance(row.get('id'), str):
@@ -217,7 +248,10 @@ def _codex(source, home, deadline, delete_fingerprint=None):
         agent = initialized.get('userAgent', '') if isinstance(initialized, dict) else ''
         match = re.search(r'\b(\d+\.\d+\.\d+)\b', agent) if isinstance(agent, str) else None
         version = match.group(1) if match else None
-        can_delete = version in DELETE_VERSIONS
+        # Single-thread deletion is verified. Never infer native cascade semantics or
+        # remove a child independently of its parent's protection.
+        family_read_only = bool(root.get('parentThreadId')) or len(family) != 1
+        can_delete = version in DELETE_VERSIONS and not family_read_only
         for sid in [identity['id']] + sorted(s for s in family if s != identity['id']):
             thread = client.call('thread/read', {'threadId': sid, 'includeTurns': False}).get('thread')
             if not isinstance(thread, dict) or thread.get('id') != sid:
@@ -250,11 +284,36 @@ def _codex(source, home, deadline, delete_fingerprint=None):
                     if kind == 'userMessage':
                         body, role = blocks(item.get('content')), 'user'
                     elif kind in ('agentMessage', 'plan'):
+                        if not isinstance(item.get('text'), str):
+                            raise ValueError('답변 본문 형식을 확인하지 못했습니다.')
                         body, role = text(item.get('text')), 'assistant'
+                        if kind == 'agentMessage' and item.get('questions') is not None:
+                            questions = item['questions']
+                            if not isinstance(questions, list):
+                                raise ValueError('질문 본문 형식을 확인하지 못했습니다.')
+                            for question in questions:
+                                if (not isinstance(question, dict) or set(question) - {'title', 'options'}
+                                        or not isinstance(question.get('title'), str)
+                                        or (question.get('options') is not None and (
+                                            not isinstance(question['options'], list)
+                                            or any(not isinstance(option, str) for option in question['options'])))):
+                                    raise ValueError('질문 본문 형식을 확인하지 못했습니다.')
+                                body += '\n' + text(question['title'])
+                                body += ''.join('\n- ' + text(option) for option in question.get('options') or [])
+                    elif kind in ('enteredReviewMode', 'exitedReviewMode'):
+                        if not isinstance(item.get('review'), str):
+                            raise ValueError('리뷰 본문을 확인하지 못했습니다.')
+                        body, role = text(item['review']), 'assistant'
+                    elif kind == 'functionCallOutput':
+                        if item.get('name') not in ('request_user_input', 'request_user_input_async'):
+                            continue  # Other tool output is outside the user/assistant dialogue.
+                        body, role = blocks(item.get('output')), 'user'
                     elif kind == 'imageGeneration':
                         body, role = '[이미지 생성%s]' % (' · ' + text(item['savedPath']) if item.get('savedPath') else ''), 'assistant'
-                    else:
+                    elif kind in OMITTED_ITEMS:
                         continue
+                    else:
+                        raise ValueError('지원하지 않는 대화 항목입니다. 원본 기록을 유지합니다.')
                     if body:
                         text_bytes += len(body.encode())
                         if text_bytes > MAX_TEXT_BYTES:
@@ -263,10 +322,12 @@ def _codex(source, home, deadline, delete_fingerprint=None):
                                          'ts': collector.to_epoch(turn.get('startedAt') if role == 'user'
                                                                   else turn.get('completedAt')), 'threadId': sid})
         result = _bounded({'messages': messages, 'family': sorted(family), 'lastActivityAt': latest,
-                           'fingerprint': digest(evidence), 'sourceBytes': None, 'canDelete': can_delete,
+                           'fingerprint': digest([EXPORT_VERSION, evidence]), 'exportVersion': EXPORT_VERSION,
+                           'sourceBytes': None, 'canDelete': can_delete,
                            'nativeVersion': version,
                            'reason': None if can_delete else (
                                '이 Codex 앱 서버 버전은 대화만 보존하고 원본 기록을 유지합니다.' if version not in DELETE_VERSIONS
+                               else '부모·하위 대화가 있는 세션은 대화만 보존하고 원본 기록을 유지합니다.' if family_read_only
                                else '실행·연결·고정·목표 상태가 남아 있어 원본 기록을 유지합니다.')})
         if delete_fingerprint is not None:
             if not can_delete or result['fingerprint'] != delete_fingerprint:
@@ -289,23 +350,25 @@ def _codex(source, home, deadline, delete_fingerprint=None):
             else:
                 raise ValueError('원본 연결 상태를 끝까지 확인하지 못했습니다.')
             # The official API owns metadata cleanup. Never stop a shared daemon or remove a worktree.
+            attempt['dispatched'] = True
             client.call('thread/delete', {'threadId': identity['id']})
             return {'confirmed': True, 'family': sorted(family), 'reclaimedBytes': None}
         return result
 
 
 def handle(args, home=None, timeout=40):
-    source = args.get('source')
-    identity = native._identity(source)
-    if args.get('action') not in ('export', 'delete'):
-        raise ValueError('대화 보존 요청이 올바르지 않습니다.')
-    deleting = args['action'] == 'delete'
-    fingerprint = args.get('fingerprint')
-    if deleting and (not isinstance(fingerprint, str) or not re.fullmatch('[0-9a-f]{64}', fingerprint)):
-        raise ValueError('원본 대화 확인 정보가 올바르지 않습니다.')
-    if identity['agent'] == 'claude':
-        if deleting:
+    deleting = isinstance(args, dict) and args.get('action') == 'delete'
+    with _deletion_guard(deleting):
+        source = args.get('source')
+        identity = native._identity(source)
+        if args.get('action') not in ('export', 'delete'):
+            raise ValueError('대화 보존 요청이 올바르지 않습니다.')
+        fingerprint = args.get('fingerprint')
+        if deleting and (not isinstance(fingerprint, str) or not re.fullmatch('[0-9a-f]{64}', fingerprint)):
+            raise ValueError('원본 대화 확인 정보가 올바르지 않습니다.')
+        if identity['agent'] == 'claude' and deleting:
             raise ValueError('Claude 원본 기록의 자동 삭제는 아직 지원하지 않습니다.')
+    if identity['agent'] == 'claude':
         return {**_claude(source, home), 'ownerTime': time.time()}
     result = _codex(source, home, time.monotonic() + timeout, fingerprint if deleting else None)
     return result if deleting else {**result, 'ownerTime': time.time()}
