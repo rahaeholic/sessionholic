@@ -84,7 +84,7 @@ INSTANCE_META = re.compile(r'(<meta\b[^>]*?\bname="sessionholic-instance"[^>]*?\
 # Page text named by the instance: (brand key, element pattern with the text in group 2, attribute?).
 # A value equal to the public default leaves the page as is; a changed value whose element is
 # missing stops rendering rather than serving public names.
-_WORDMARK = '<div class="wordmark"><span class="brand-icon" aria-hidden="true">↗</span> '
+_WORDMARK = '<div class="wordmark"><img class="brand-icon" src="/icon.svg" alt="" /> '
 PAGE_TEXT = (
     ("shortName", re.compile(r'(<meta name="apple-mobile-web-app-title" content=")([^"]*)(")'), True),
     ("title", re.compile(r"(<title>)([^<]*)(</title>)"), False),

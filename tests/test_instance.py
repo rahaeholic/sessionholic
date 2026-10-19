@@ -362,7 +362,7 @@ class RenderTest(unittest.TestCase):
         rendered = server.render_page(self.page, self.demo)
         self.assertIn("<title>데모 &lt;보드&gt;</title>", rendered)
         self.assertIn('<meta name="apple-mobile-web-app-title" content="데모 &amp; 보드" />', rendered)
-        self.assertIn('↗</span> 데모 &amp; 보드</div>', rendered)
+        self.assertIn('<img class="brand-icon" src="/icon.svg" alt="" /> 데모 &amp; 보드</div>', rendered)
         self.assertIn('<span class="home-label">데모 &amp; 보드</span>', rendered)
         self.assertIn("<h1>들어오세요 &lt;지금&gt;</h1>", rendered)
         self.assertIn("<p>합성 안내 &amp; 문구</p>", rendered)
