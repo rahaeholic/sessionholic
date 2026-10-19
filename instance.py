@@ -133,7 +133,8 @@ _SCHEMA = {
         "serverVersion": _pattern("serverVersion"), "threadPrefix": _pattern("threadPrefix"),
         "codexClientName": _pattern("codexClientName"),
         # Optional: a private folder whose icon.svg, icon-192.png, icon-512.png and
-        # icon-maskable-512.png stand in for the shipped ones (server.StaticAssets).
+        # icon-maskable-512.png stand in for the shipped ones (server.StaticAssets); the page's
+        # brand tiles show the same icon.svg.
         "iconDir": _absolute,
     },
     "web": {key: _pattern(key) for key in ("storagePrefix", "historyKey", "cachePrefix", "manifestId")},

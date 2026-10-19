@@ -48,8 +48,6 @@
   --on-accent-fill: rgba(255, 255, 255, 0.14);
   --focus-ring: rgba(0, 113, 227, 0.6);
   --focus-ring-soft: rgba(0, 113, 227, 0.3);
-  --brand-a: #3a93ff;
-  --brand-b: #0a6ee6;
   --brand-glow: rgba(10, 110, 230, 0.25);
   --red: #d70015;
   --red-fill: #ff3b30;
@@ -570,17 +568,11 @@ select:disabled {
   letter-spacing: -0.01em;
 }
 .brand-icon {
-  display: grid;
-  place-items: center;
+  display: block;
   flex: none;
   width: 26px;
   height: 26px;
   border-radius: 7px;
-  background: linear-gradient(var(--brand-a), var(--brand-b));
-  color: var(--on-accent);
-  font-size: 16px;
-  font-weight: 600;
-  line-height: 1;
 }
 
 /* 4. Login --------------------------------------------------------------- */
@@ -612,7 +604,6 @@ select:disabled {
   width: 64px;
   height: 64px;
   border-radius: 15px;
-  font-size: 34px;
   box-shadow: 0 4px 14px var(--brand-glow);
 }
 .login-card h1 {
@@ -1839,15 +1830,11 @@ button.host:focus-visible {
   text-align: center;
 }
 .welcome-mark {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 60px;
   height: 60px;
   margin: 0 auto 16px;
   border-radius: 16px;
-  background: var(--fill-soft);
-  color: var(--label-3);
-  font-size: 28px;
 }
 .welcome h2 {
   margin-bottom: 6px;
@@ -3492,7 +3479,6 @@ li[data-task] {
     width: 44px;
     height: 44px;
     border-radius: 11px;
-    font-size: 24px;
   }
   .login-card h1 {
     font-size: 21px;
