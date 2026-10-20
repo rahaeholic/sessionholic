@@ -358,3 +358,21 @@ Windows native 0.163.0의 격리된 빈 CODEX_HOME에서도 저장 세션 재개
 닫고 별도 proxy에서 loaded 상태와 전체 접근·승인 정책을 다시 확인했다. 실제 모델
 turn은 0개다. Windows TUI 전체 연결은 확인하지 않았으며, macOS에서는 별도의
 격리 native 검증에서 proxy 종료 후 TUI 연결과 권한 유지를 확인했다.
+
+## 2026-10-20 보드로 연 PC Codex 대화의 권한 유지
+
+보드 터미널의 Codex 화면(`codex resume --remote`)은 권한 값을 보내지 않는다. PC
+프로젝트 서버(0.162.1)는 구독자가 없는 로드된 대화에 값이 다른 resume이 오면 대화를
+기록에서 다시 만들며 승인 정책만 되살리고 샌드박스를 서버 기본값으로 내린다. 이때
+바뀐 권한이 turn 없이도 바로 상태 DB에 저장되어 다음 열기에서 그대로 복원됐다.
+터미널을 연 뒤 45초 동안 보드가 그 대화를 구독하고, 화면이 먼저 붙어 권한이 바뀌었으면
+`thread/settings/update`로 다시 적용한 뒤 알림이나 다시 읽기로 확인한다.
+
+Python 전체 1,379개, 프런트엔드 563개를 통과했고 공개 파일 검사에서 발견 사항은
+없었다. 실제 Windows에서는 runtime 76개 중 75개 통과·비Windows 검사 1개를 제외했다.
+실제 PC(beaulink-agent-config 서버, 6일간 쉰 대화 하나)에서 보드와 같은 계획·SSH
+TUI·settle 순서로 두 경우를 확인했다. TUI가 먼저 붙으면 실제 권한이 `never` +
+`workspaceWrite`(네트워크 차단)로 바뀌고 DB도 managed workspace 정책으로 저장되는
+사고가 재현됐고, settle 뒤 실제 권한과 DB가 `never` + 전체 접근으로 돌아왔다.
+settle이 먼저 구독하면 TUI가 붙어도 권한과 DB가 바뀌지 않았다. 실제 모델 turn은 0개,
+남은 TUI 프로세스는 0개다. 그 대화의 갱신 시각은 시험 시각으로 바뀌었다.
