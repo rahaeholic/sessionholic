@@ -4873,6 +4873,11 @@ body.terminal-docked .terminal-screen {
   padding-left: 0;
   border-left: 1px solid var(--t-sep);
 }
+/* In the conversation's place (app.js applyDock "switch"): the board keeps its width and the
+   terminal covers everything right of the list, the conversation waiting (inert) beneath. */
+body.terminal-switch .app {
+  margin-right: 0;
+}
 body.dock-solo .layout {
   grid-template-columns: minmax(0, 1fr);
 }

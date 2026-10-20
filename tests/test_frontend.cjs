@@ -5143,6 +5143,55 @@ test('menus the web cannot drive stay readable with disabled options, and a wait
   assert.equal(c.get('chat-prompt').hidden, true);
 });
 
+test('a question the board can neither read nor load says where to answer it instead of hiding', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: null, id: 'claude-external' });
+  c.drawDetail(s);
+  const external = '이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. 그 터미널에서 입력해 주세요.';
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: false,
+    capability: { supported: false, reason: external } };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(card.hidden, false);
+  assert.match(textOf(card), /답이 필요한 상태입니다/);
+  assert.ok(textOf(card).includes(external), 'the reason the session takes no web input');
+  assert.ok(findClass(card, 'chat-prompt-terminal').length === 1, 'the terminal button stays beside it');
+  // A Codex session: a board terminal's screen gives its question here.
+  const codex = selectChat(c, { id: 'codex-waiting' });
+  c.drawDetail(codex.s);
+  codex.entry.data = { ...codex.entry.data, phase: 'needs_input', prompt: null, promptOpenable: false };
+  c.renderPrompt(codex.s, codex.entry.data);
+  assert.match(textOf(c.get('chat-prompt')), /터미널을 열면 그 화면의 질문을 여기서 고를 수 있습니다/);
+  // A read-only session (a bot's, a one-shot run) is answered where it was asked.
+  codex.entry.data = { ...codex.entry.data, readOnly: true };
+  c.renderPrompt(codex.s, codex.entry.data);
+  assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('choosing "Type something." asks for the terminal instead of sending a choice the board cannot finish', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: null, id: 'claude-question' });
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'd'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: '어느 방식으로 할까요?', options: [{ number: 1, label: '빠르게', detail: '' },
+      { number: 2, label: '꼼꼼하게', detail: '' }, { number: 3, label: 'Type something.', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  findClass(c.get('chat-prompt'), 'chat-prompt-option')[2].events.click();
+  const card = c.get('chat-prompt');
+  assert.match(textOf(card), /직접 써야 해서 여기서 보낼 수 없습니다/);
+  const action = findClass(card, 'primary')[0];
+  assert.equal(action.textContent, '터미널에서 입력');
+  // A choice the board can send still sends.
+  findClass(card, 'chat-prompt-option')[1].events.click();
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /2번 보내기/);
+  assert.ok(!requests.includes('/api/chat/prompt'), 'nothing was sent by choosing');
+});
+
 test('a 답 필요 session opened from its card or notification loads its question once, without another tap', async () => {
   const requests = [];
   const c = client(async (url, opts) => {
@@ -11201,8 +11250,8 @@ test('what was heard is joined in order; only Android\'s cumulative results repl
   assert.equal(c.dictationText(results('오늘', '오늘 날씨')), '오늘 오늘 날씨');
 });
 
-// --- Terminal beside the conversation (wide screens) --------------------------
-function dockClient(width, fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) })) {
+// --- Terminal beside the conversation or in its place (wide screens) ----------
+function dockClient(width, fetchImpl = async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), place = "beside") {
   const c = client(fetchImpl, noChatTimers);
   const classes = new Set();
   c.context.document.body.classList = {
@@ -11211,6 +11260,7 @@ function dockClient(width, fetchImpl = async () => ({ ok: true, status: 200, jso
   const vars = {};
   c.context.document.documentElement.style.setProperty = (name, value) => { vars[name] = value; };
   c.context.window.innerWidth = width;
+  c.state.terminalPlace = place;
   return { c, classes, vars };
 }
 
@@ -11229,7 +11279,7 @@ test("a wide screen shows the terminal beside the conversation; an upright iPad 
   assert.equal(c.chatVisible(), true);
   assert.equal(c.get("terminal-return").hidden, true);
   assert.equal(c.get("terminal-dock").hidden, false);
-  assert.equal(c.get("terminal-dock").textContent, "크게");
+  assert.equal(c.get("terminal-dock").textContent, "대화 자리");
   assert.equal(c.get("terminal-back").textContent, "숨기기");
   assert.equal(c.get("terminal-back").attributes["aria-label"], "터미널 칸 숨기기");
   assert.equal(c.get("terminal-screen").attributes.role, "region");
@@ -11271,35 +11321,107 @@ test("a wide screen shows the terminal beside the conversation; an upright iPad 
   assert.equal(c.get("app").hidden, true);
 });
 
-test("크게 covers the board and 나란히 brings it back, remembered on this device", async () => {
-  const { c } = dockClient(1180);
+test("대화 자리 and 나란히 swap the terminal's place, remembered on this device; the board reads on in both", async () => {
+  const { c, classes } = dockClient(1180);
   const saved = new Map();
   c.context.localStorage.setItem = (key, value) => saved.set(key, value);
-  const stored = () => [...saved].find(([key]) => key.endsWith("ui:terminalDock"))?.[1];
+  const stored = () => [...saved].find(([key]) => key.endsWith("ui:terminalPlace"))?.[1];
   c.state.authenticated = true;
   await c.openTerminal({ id: "toggle", mode: "attach" });
   c.schedule();
   assert.notEqual(c.state.pollTimer, null);
   c.toggleDock();
-  assert.equal(c.state.docked, false);
-  assert.equal(c.boardCovered(), true);
-  assert.equal(c.get("app").hidden, true);
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.terminalSwitch, true);
+  assert.equal(c.boardCovered(), false);
+  assert.equal(c.get("app").hidden, false);
+  assert.equal(classes.has("terminal-switch"), true);
+  assert.equal(classes.has("dock-solo"), false, "the list stays beside the terminal in the conversation's place");
+  assert.equal(c.get("terminal-dock").textContent, "나란히");
+  assert.equal(c.get("terminal-back").textContent, "대화");
+  assert.equal(JSON.parse(stored()), "switch");
+  assert.notEqual(c.state.pollTimer, null);
+  // The next terminal takes the conversation's place too, until 나란히 is chosen.
+  c.returnToBoard({ selectLaunchedSource: false, animate: false });
+  assert.equal(classes.has("terminal-switch"), false);
+  await c.openTerminal({ id: "toggle", mode: "attach" });
+  assert.equal(c.state.terminalSwitch, true);
+  c.toggleDock();
+  assert.equal(c.state.terminalSwitch, false);
+  assert.equal(c.state.docked, true);
+  assert.equal(c.get("terminal-dock").textContent, "대화 자리");
+  assert.equal(JSON.parse(stored()), "beside");
+});
+
+test("in the conversation's place the list stays, the conversation waits with its draft, and 대화 or Ctrl+` switches back and forth", async () => {
+  const { c, classes, vars } = dockClient(1180, undefined, "switch");
+  const { s, entry } = selectChat(c);
+  entry.text = "아직 보내지 않은 초안";
+  const own = { id: "own", mode: "attach", alive: true, nativeSource: c.sourceOf(s) };
+  c.state.terminals = [own];
+  await c.openTerminal(own);
+  assert.equal(c.state.docked, true);
+  assert.equal(c.state.terminalSwitch, true);
+  assert.equal(classes.has("terminal-switch"), true);
+  assert.equal(classes.has("dock-solo"), false, "the list stays");
+  assert.equal(c.get("app").hidden, false);
+  assert.equal(c.get("detail").inert, true, "the conversation beneath is out of reach");
+  assert.equal(vars["--dock-w"], `${1180 - 340}px`, "everything right of the list");
+  assert.equal(c.state.selected, s.key);
+  assert.equal(c.get("terminal-back").textContent, "대화");
   assert.equal(c.get("terminal-dock").hidden, false);
   assert.equal(c.get("terminal-dock").textContent, "나란히");
-  assert.equal(stored(), "false");
-  // Covered, the board rests as before.
-  assert.equal(c.state.pollTimer, null);
-  c.schedule();
-  assert.equal(c.state.pollTimer, null);
-  // The next terminal covers the board too, until 나란히 is chosen.
-  c.returnToBoard({ selectLaunchedSource: false, animate: false });
-  await c.openTerminal({ id: "toggle", mode: "attach" });
-  assert.equal(c.state.docked, false);
-  c.toggleDock();
-  assert.equal(c.state.docked, true);
-  assert.equal(c.get("app").hidden, false);
-  assert.equal(stored(), "true");
-  assert.notEqual(c.state.pollTimer, null);
+  // Ctrl+` on the terminal brings the conversation back, its input focused and its draft kept;
+  // the CLI gets nothing for it.
+  const input = c.get("chat-input");
+  const focused = input.focusCount || 0;
+  let prevented = false;
+  assert.equal(c.xtermKeyEvent({ type: "keydown", key: "`", code: "Backquote", ctrlKey: true,
+    preventDefault() { prevented = true; } }), false);
+  assert.equal(prevented, true);
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.get("detail").inert, false);
+  assert.equal(classes.has("terminal-switch"), false);
+  assert.equal(entry.text, "아직 보내지 않은 초안");
+  assert.equal(input.focusCount, focused + 1);
+  // From the conversation, Ctrl+` (even while typing) opens its terminal again in its place.
+  const body = c.context.document.body;
+  c.context.document.activeElement = body;
+  c.documentKeydown({ key: "`", code: "Backquote", ctrlKey: true, preventDefault() {}, target: input });
+  assert.equal(c.state.terminalVisible, true);
+  assert.equal(c.state.terminalSwitch, true);
+  // 대화 (the terminal's back) is the same switch.
+  c.backFromTerminal();
+  assert.equal(c.state.terminalVisible, false);
+  assert.equal(entry.text, "아직 보내지 않은 초안");
+});
+
+test("t in a conversation opens its terminal (a Korean layout's ㅅ too), never while typing", async () => {
+  const { c } = dockClient(1180, undefined, "switch");
+  const { s } = selectChat(c);
+  const own = { id: "own", mode: "attach", alive: true, nativeSource: c.sourceOf(s) };
+  c.state.terminals = [own];
+  const body = c.context.document.body;
+  c.context.document.activeElement = body;
+  const typing = c.get("chat-input");
+  typing.closest = (selector) => (selector.includes("textarea") ? typing : null);
+  let taken = false;
+  c.documentKeydown({ key: "t", code: "KeyT", preventDefault() { taken = true; }, target: typing });
+  assert.equal(taken, false, "a t typed into the input stays a letter");
+  assert.equal(c.state.terminalVisible, false);
+  c.documentKeydown({ key: "ㅅ", code: "KeyT", preventDefault() { taken = true; }, target: body });
+  assert.equal(taken, true);
+  assert.equal(c.state.terminalVisible, true);
+  assert.equal(c.state.terminal.id, "own");
+});
+
+test("beside falls back to the conversation's place where 나란히 does not fit, and a narrow window covers", () => {
+  const { c } = dockClient(1000);
+  // 1000px: beside would leave the conversation 420px with fewer than 64 columns; the place fits.
+  assert.equal(c.dockWidth("beside"), 1000 - 340);
+  c.context.window.innerWidth = 834;  // the list is 300px under 900px: 534px is under 64 columns
+  assert.equal(c.dockWidth("switch"), 0);
+  assert.equal(c.dockWidth("beside"), 0);
 });
 
 test("docked, a key typed with nothing focused goes to the side last touched", async () => {
@@ -11324,12 +11446,12 @@ test("docked, a key typed with nothing focused goes to the side last touched", a
   assert.equal(kept.prevented, undefined);
   c.noteDockSide("terminal");
   assert.equal(c.boardKeysBlocked(), true);
-  // Covering the board gives the terminal every key again.
+  // Covering the board (a window too narrow for either place) gives the terminal every key again.
   c.noteDockSide("board");
-  c.toggleDock();
+  c.context.window.innerWidth = 834;
+  c.updateViewport();
   assert.equal(c.state.docked, false);
   c.noteDockSide("board");
-  assert.equal(c.state.dockSide, "terminal");
   assert.equal(c.boardKeysBlocked(), true);
   assert.equal(c.terminalDocumentKey(key()), true);
 });
@@ -11423,7 +11545,8 @@ test("docked, the board's focus is let go, a phone held sideways never docks, an
   // A phone held sideways (short) covers the board even when wide.
   c.context.window.innerWidth = 932;
   c.context.window.matchMedia = (query) => ({ matches: query === "(max-height: 520px)" });
-  assert.equal(c.dockWidth({ preferred: true }), 0);
+  assert.equal(c.dockWidth("beside"), 0);
+  assert.equal(c.dockWidth("switch"), 0);
 });
 
 test("docked, closing the terminal keeps the conversation, and another session gives the terminal's history entry way", async () => {
@@ -11936,15 +12059,17 @@ test('docked, the conversation beside follows the terminal on docking and for a 
   const other = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'other-session',
     key: ['workstation', 'codex', '.codex-example', 'other-session'].join('|') };
   c.state.snapshot.hosts[0].data.codex.push(other);
-  // 크게: a terminal of s covers the board; back on the board, another conversation is picked.
-  c.state.terminalDock = false;
+  // Too narrow for either place: a terminal of s covers the board; back on the board, another
+  // conversation is picked.
+  c.context.window.innerWidth = 834;
   await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
   assert.equal(c.state.docked, false);
   c.returnToBoard({ selectLaunchedSource: false, animate: false });
   c.select(other.key);
   await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
-  // 나란히: the terminal's own conversation comes beside it, not the one picked before.
-  c.toggleDock();
+  // Wide again (나란히): the terminal's own conversation comes beside it, not the one picked before.
+  c.context.window.innerWidth = 1180;
+  c.updateViewport();
   assert.equal(c.state.docked, true);
   assert.equal(c.state.selected, s.key);
   // Pressing the conversation shown beside it does not hide the terminal.
