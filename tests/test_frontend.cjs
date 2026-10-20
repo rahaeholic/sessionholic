@@ -5143,6 +5143,55 @@ test('menus the web cannot drive stay readable with disabled options, and a wait
   assert.equal(c.get('chat-prompt').hidden, true);
 });
 
+test('a question the board can neither read nor load says where to answer it instead of hiding', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: null, id: 'claude-external' });
+  c.drawDetail(s);
+  const external = '이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. 그 터미널에서 입력해 주세요.';
+  entry.data = { ...entry.data, phase: 'needs_input', prompt: null, promptOpenable: false,
+    capability: { supported: false, reason: external } };
+  c.renderPrompt(s, entry.data);
+  const card = c.get('chat-prompt');
+  assert.equal(card.hidden, false);
+  assert.match(textOf(card), /답이 필요한 상태입니다/);
+  assert.ok(textOf(card).includes(external), 'the reason the session takes no web input');
+  assert.ok(findClass(card, 'chat-prompt-terminal').length === 1, 'the terminal button stays beside it');
+  // A Codex session: a board terminal's screen gives its question here.
+  const codex = selectChat(c, { id: 'codex-waiting' });
+  c.drawDetail(codex.s);
+  codex.entry.data = { ...codex.entry.data, phase: 'needs_input', prompt: null, promptOpenable: false };
+  c.renderPrompt(codex.s, codex.entry.data);
+  assert.match(textOf(c.get('chat-prompt')), /터미널을 열면 그 화면의 질문을 여기서 고를 수 있습니다/);
+  // A read-only session (a bot's, a one-shot run) is answered where it was asked.
+  codex.entry.data = { ...codex.entry.data, readOnly: true };
+  c.renderPrompt(codex.s, codex.entry.data);
+  assert.equal(c.get('chat-prompt').hidden, true);
+});
+
+test('choosing "Type something." asks for the terminal instead of sending a choice the board cannot finish', async () => {
+  const requests = [];
+  const c = client(async (url, opts) => {
+    requests.push(url);
+    return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: null, id: 'claude-question' });
+  c.drawDetail(s);
+  const prompt = { agent: 'claude', fingerprint: 'd'.repeat(64), current: 1, multi: false, terminalId: 'a'.repeat(32),
+    question: '어느 방식으로 할까요?', options: [{ number: 1, label: '빠르게', detail: '' },
+      { number: 2, label: '꼼꼼하게', detail: '' }, { number: 3, label: 'Type something.', detail: '' }] };
+  entry.data = { ...entry.data, prompt, phase: 'needs_input' };
+  c.renderPrompt(s, entry.data);
+  findClass(c.get('chat-prompt'), 'chat-prompt-option')[2].events.click();
+  const card = c.get('chat-prompt');
+  assert.match(textOf(card), /직접 써야 해서 여기서 보낼 수 없습니다/);
+  const action = findClass(card, 'primary')[0];
+  assert.equal(action.textContent, '터미널에서 입력');
+  // A choice the board can send still sends.
+  findClass(card, 'chat-prompt-option')[1].events.click();
+  assert.match(findClass(c.get('chat-prompt'), 'primary')[0].textContent, /2번 보내기/);
+  assert.ok(!requests.includes('/api/chat/prompt'), 'nothing was sent by choosing');
+});
+
 test('a 답 필요 session opened from its card or notification loads its question once, without another tap', async () => {
   const requests = [];
   const c = client(async (url, opts) => {
