@@ -9416,6 +9416,13 @@ function terminalCloseCopy(terminal) {
 function terminalHeld(terminal) {
   return !!terminalInfo(terminal).holdName;
 }
+// A PC Codex terminal's permissions, as the board found them once its TUI joined.
+function renderTerminalPermission(terminal) {
+  const notice = terminalInfo(terminal).permissionNotice;
+  const line = $("terminal-permission");
+  line.textContent = typeof notice === "string" ? notice : "";
+  line.hidden = !line.textContent;
+}
 function terminalContextCopy(terminal, copy = terminalCloseCopy(terminal)) {
   const mode = terminal?.mode || terminal?.metadata?.mode;
   const host = capsHost(terminalInfo(terminal).host);
@@ -9931,6 +9938,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   $("terminal-close").className = `terminal-button terminal-close${copy.danger ? " danger-quiet" : ""}`;
   $("terminal-close").disabled = !state.terminalAlive;
   $("terminal-context").textContent = terminalContextCopy(terminal, copy);
+  renderTerminalPermission(terminal);
   restoreTerminalDraft(terminal);
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
   state.composing = false;
@@ -10775,6 +10783,7 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
       state.terminal = { ...state.terminal, ...current };
       // Linked to its session now (a new session's): its title, and beside it its conversation.
       renameTerminals();
+      renderTerminalPermission(state.terminal);
       if (state.docked && !state.dockBeside) syncBeside();
       if (current.closed || current.alive === false) {
         saveDraft();

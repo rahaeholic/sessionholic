@@ -16,6 +16,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import stat
@@ -40,6 +41,16 @@ STORE_RELATIVE = '.local/state/sessionholic-windows'
 RESUME_PENDING_REASON = 'PC 세션의 재개 권한 확인이 끝나지 않았습니다. 원본 PC 터미널에서 확인한 뒤 해당 세션을 닫거나 프로젝트 서버를 다시 시작해 주세요.'
 TERMINAL_SECONDS = 15
 RESUME_MIN_SECONDS = 6
+# A board terminal's `codex resume --remote` TUI sends no permissions. Resuming a loaded thread
+# nobody is subscribed to, the server rebuilds it from its record with the project server's
+# default sandbox (only the approval policy is restored). Subscribed while the TUI joins, the
+# server keeps the loaded thread and its permissions: settle stays subscribed this long.
+SETTLE_HOLD_SECONDS = 45
+SETTLE_CONFIRM_SECONDS = 8
+# The plan's record of what the terminal must keep is used once, shortly after the plan.
+SETTLE_RECORD_SECONDS = 120
+SETTLE_FAILED = ('PC 대화의 실행 권한이 터미널 연결 뒤에도 그대로인지 확인하지 못했습니다. '
+                 'Codex 화면의 /permissions에서 확인해 주세요.')
 
 
 def _digest(value):
@@ -169,6 +180,25 @@ def _same_resume_permissions(result, settings):
     return actual == expected
 
 
+def _live_permissions(value):
+    """The approval policy and sandbox a loaded thread reports: a thread/resume result, or a
+    thread/settings/updated notification's threadSettings. None when either is missing."""
+    if not isinstance(value, dict):
+        return None
+    approval = value.get('approvalPolicy')
+    sandbox = value['sandbox'] if 'sandbox' in value else value.get('sandboxPolicy')
+    if (not isinstance(approval, (str, dict)) or not isinstance(sandbox, dict)
+            or not isinstance(sandbox.get('type'), str)):
+        return None
+    return {'approvalPolicy': approval, 'sandbox': sandbox}
+
+
+def _restricted(permissions):
+    """Never asking for approval inside a sandbox: what needs approval (a connector's
+    write, for one) is refused rather than asked."""
+    return permissions['approvalPolicy'] == 'never' and permissions['sandbox']['type'] != 'dangerFullAccess'
+
+
 def _private_acl(path):
     if os.name != 'nt':
         path.chmod(0o700)
@@ -267,7 +297,26 @@ class Store:
 
 
 class NativeProxy(wc.Proxy):
-    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume'}
+    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume',
+                                  'thread/settings/update'}
+
+    def notification(self, until):
+        """The next server notification before `until` (monotonic), else None. Waiting stops
+        only between messages, so no frame is left half read; a message that has begun
+        arriving is read whole within the connection's own deadline."""
+        while True:
+            if not self.pending:
+                try:
+                    chunk = self.frames.get(timeout=max(0, until - time.monotonic()))
+                except queue.Empty:
+                    return None
+                if not chunk:
+                    raise ValueError('PC 서버 읽기 연결이 끝났습니다.')
+                self.pending.extend(chunk)
+            message = self._message()
+            # A server request (it has an id) is the TUI's to answer; it is left unanswered.
+            if isinstance(message.get('method'), str) and 'id' not in message:
+                return message
 
 
 def _loaded(client):
@@ -488,7 +537,7 @@ class WindowsRuntime:
         argv = [str(self.reader.binary), 'resume', identity['id'], '--remote', 'unix://' + Path(endpoint).as_posix(), '--cd', cwd]
         if prepare:
             # A preview never loads a thread. The explicit terminal action preloads it
-            # with its saved permissions; the native remote TUI accepts no overrides.
+            # with its saved permissions; the native remote TUI sends none (terminal_settle).
             with self.store.lock(), self.proxy_factory(self.reader.binary, endpoint, deadline) as client:
                 current = self.reader.database_rows(identity['id'])
                 keys = ('id', 'cwd', 'archived', 'sandbox_policy', 'approval_mode')
@@ -525,11 +574,118 @@ class WindowsRuntime:
                         raise ValueError('PC 세션의 재개와 기존 실행 권한을 확인하지 못했습니다.')
                     self._verify_endpoint(observed)
                     self.store.path(name).unlink()
+                    live = _live_permissions(result)
                 else:
                     self._require_resume_verified(observed)
                     self._thread(client, identity, cwd)
+                    live = self._join(client, identity, settings)
+                # The TUI that attaches next sends no permissions: terminal_settle keeps these.
+                self._save_settle(identity, observed, live, settings)
+                return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)},
+                        'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach',
+                        'resumed': True, 'settle': True, 'restricted': _restricted(live)}
         return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach', 'resumed': True}
+
+    def _join(self, client, identity, settings):
+        """Subscribe this connection to the thread and read its live permissions.
+
+        The stored permissions go along, never the cwd: a loaded thread with the same ones, or
+        one another client is subscribed to, is joined as it is; one unloaded meanwhile is
+        loaded with them rather than with the server's defaults."""
+        params = {'threadId': identity['id'], 'approvalPolicy': settings['approvalPolicy'], 'sandbox': settings['sandbox'],
+                  **({'config': settings['config']} if settings.get('config') else {})}
+        try:
+            result = client.call('thread/resume', {**params, 'excludeTurns': True})
+        except ValueError:
+            # A server that does not take excludeTurns: the same join, with the history.
+            result = client.call('thread/resume', params)
+        thread = result.get('thread') if isinstance(result, dict) else None
+        live = _live_permissions(result)
+        if not isinstance(thread, dict) or thread.get('id') != identity['id'] or live is None:
+            raise ValueError('PC 세션의 현재 실행 권한을 확인하지 못했습니다.')
+        return live
+
+    def _settle_record_name(self, identity):
+        return 'settle-' + _digest([identity['agent'], identity['home'], identity['id']]) + '.json'
+
+    def _save_settle(self, identity, observed, live, settings):
+        if live is None:
+            raise ValueError('PC 세션의 현재 실행 권한을 확인하지 못했습니다.')
+        self.store.save(self._settle_record_name(identity), {
+            'version': 1, 'threadId': identity['id'], 'path': observed['path'], 'server': observed['server'],
+            'expected': live, 'settings': settings, 'createdAt': int(time.time())})
+
+    @staticmethod
+    def _settings_notified(client, identity, until):
+        """The thread's permissions from its next thread/settings/updated before `until`."""
+        while True:
+            message = client.notification(until)
+            if message is None:
+                return None
+            params = message.get('params')
+            if (message.get('method') == 'thread/settings/updated' and isinstance(params, dict)
+                    and params.get('threadId') == identity['id']):
+                live = _live_permissions(params.get('threadSettings'))
+                if live is not None:
+                    return live
+
+    def terminal_settle(self, source):
+        """After the board started a terminal's TUI on a thread its plan loaded: keep the
+        permissions the plan recorded.
+
+        Subscribed for SETTLE_HOLD_SECONDS, so a TUI that joins meanwhile joins the loaded
+        thread as it is. A TUI that came first may have rebuilt it with the server's default
+        sandbox: then the recorded permissions are applied again and read back. A change
+        notified while subscribed (a /permissions choice in that TUI) is the user's and stays."""
+        identity = _identity(source)
+        result = {'source': identity, 'settled': None, 'restored': False, 'changed': False,
+                  'restricted': False, 'reason': None}
+        if identity['agent'] != 'codex':
+            return result
+        name = self._settle_record_name(identity)
+        with self.store.lock():
+            record = self.store.read(name)
+            if record is None:
+                return result
+            # Used once: a later terminal starts from its own plan.
+            self.store.path(name).unlink()
+        failed = {**result, 'settled': False, 'reason': SETTLE_FAILED}
+        expected = _live_permissions(record.get('expected')) if isinstance(record, dict) else None
+        if (expected is None or record.get('version') != 1 or record.get('threadId') != identity['id']
+                or not isinstance(record.get('path'), str) or not isinstance(record.get('server'), dict)
+                or not isinstance(record.get('settings'), dict)
+                or record['settings'].get('sandbox') not in ('danger-full-access', 'workspace-write', 'read-only')
+                or record['settings'].get('approvalPolicy') not in ('never', 'on-request')
+                or type(record.get('createdAt')) is not int
+                or not 0 <= time.time() - record['createdAt'] <= SETTLE_RECORD_SECONDS):
+            return failed
+        failed['restricted'] = _restricted(expected)
+        hold = time.monotonic() + SETTLE_HOLD_SECONDS
+        restored = False
+        try:
+            self._verify_endpoint({'path': record['path'], 'server': record['server']})
+            with self.proxy_factory(self.reader.binary, record['path'], hold + SETTLE_CONFIRM_SECONDS + 5) as client:
+                live = self._join(client, identity, record['settings'])
+                if live != expected:
+                    client.call('thread/settings/update', {'threadId': identity['id'],
+                                                           'approvalPolicy': expected['approvalPolicy'],
+                                                           'sandboxPolicy': expected['sandbox']})
+                    restored = True
+                    # Notified only when the settings changed; read back once more otherwise.
+                    live = (self._settings_notified(client, identity, time.monotonic() + SETTLE_CONFIRM_SECONDS)
+                            or self._join(client, identity, record['settings']))
+                    if live != expected:
+                        return {**failed, 'restored': True}
+                while True:
+                    later = self._settings_notified(client, identity, hold)
+                    if later is None:
+                        break
+                    live = later
+        except (OSError, ValueError, TimeoutError):
+            return {**failed, 'restored': restored}
+        return {**result, 'settled': True, 'restored': restored, 'changed': live != expected,
+                'restricted': _restricted(live)}
 
     def _claude_running(self, sid):
         """Whether a live Claude process on this PC owns the session (its registry record).
@@ -869,8 +1025,24 @@ class WindowsRuntime:
                     **({'effect': ARCHIVE_EFFECT, 'scope': 'session-and-descendants', 'scopeReadback': 'selected-session',
                         'descendantsConfirmed': False} if action == 'terminate' else {})}
 
+    def _warm_settle(self, identity, observed, deadline):
+        """A loaded thread a board TUI attaches to: its live permissions, recorded for
+        terminal_settle. None when its stored policy is not one the board can restore."""
+        rows = self.reader.database_rows(identity['id'])
+        try:
+            settings = _codex_resume_settings(rows[0]) if len(rows) == 1 else None
+        except ValueError:
+            settings = None
+        if settings is None:
+            return None
+        with self.proxy_factory(self.reader.binary, observed['path'], deadline) as client:
+            live = self._join(client, identity, settings)
+        self._save_settle(identity, observed, live, settings)
+        return live
+
     def terminal_plan(self, source, prepare=False):
         identity = _identity(source)
+        settle = None
         if identity['agent'] == 'codex':
             deadline = time.monotonic() + TERMINAL_SECONDS
             try:
@@ -881,6 +1053,7 @@ class WindowsRuntime:
                 with self.store.lock():
                     self._verify_endpoint(observed)
                     self._require_resume_verified(observed)
+                    settle = self._warm_settle(identity, observed, deadline)
             else:
                 self._verify_endpoint(observed)
                 self._require_resume_verified(observed)
@@ -905,7 +1078,8 @@ class WindowsRuntime:
         if not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_dir():
             raise ValueError('PC 원본 작업 폴더를 확인하지 못했습니다.')
         return {'argv': argv, 'cwd': cwd, 'env': {'CODEX_HOME': str(self.reader.codex_home)} if identity['agent'] == 'codex' else {},
-                'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach'}
+                'nativeSource': {**identity, 'cwd': cwd, 'kind': source.get('kind')}, 'connectionMode': 'attach',
+                **({'settle': True, 'restricted': _restricted(settle)} if settle is not None else {})}
 
     def resume_preview(self, source):
         identity = _identity(source)
@@ -938,6 +1112,8 @@ def handle(request, data=None):
         return runtime.execute(args)
     if op == 'terminal_plan':
         return runtime.terminal_plan(args.get('source'), prepare=args.get('prepare') is True)
+    if op == 'terminal_settle':
+        return runtime.terminal_settle(args.get('source'))
     if op == 'resume_preview':
         return runtime.resume_preview(args.get('source'))
     raise ValueError('지원하지 않는 PC 작업 요청입니다.')

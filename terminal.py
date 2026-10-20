@@ -1013,6 +1013,25 @@ class TerminalManager:
             self._changed()
         return True
 
+    def note_permissions(self, terminal_id, notice):
+        """What the board found of the permissions a terminal's run keeps (a PC Codex thread's,
+        after its TUI joined): a sentence for its screen, or None when there is nothing to say."""
+        if notice is not None and (not isinstance(notice, str) or not notice or len(notice) > 500):
+            raise ValueError("권한 안내 문구가 올바르지 않습니다.")
+        with self.lock:
+            terminal = self._get(terminal_id)
+            previous = terminal.record["metadata"]
+            if previous.get("permissionNotice") == notice:
+                return False
+            terminal.record["metadata"] = _metadata({**previous, "permissionNotice": notice})
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+        self._changed()
+        return True
+
     def _typed(self, terminal):
         """A 새 세션 terminal someone typed into (a menu choice included) is never taken for an
         untouched menu (idle_launchers); the caller holds self.lock. Saving is best effort."""

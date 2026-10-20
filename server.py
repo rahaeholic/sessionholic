@@ -47,6 +47,11 @@ COLLECTOR = HERE / "collector.py"
 WINDOWS_COLLECTOR = HERE / "windows_collector.py"
 HARDWARE = HERE / "hardware.py"
 WINDOWS_READ_ONLY = "이 Windows 작업은 아직 지원하지 않습니다. 기존 세션의 대화·터미널·종료 기능을 사용해 주세요."
+# A PC Codex terminal's permissions, as its screen states them (windows_runtime terminal_settle).
+PERMISSIONS_RESTRICTED = ("이 대화는 '승인 없이 · 제한된 샌드박스'라 커넥터 쓰기처럼 승인이 필요한 작업이 거절됩니다. "
+                          "필요하면 Codex 화면의 /permissions에서 바꿔 주세요.")
+PERMISSIONS_UNCONFIRMED = ("PC 대화의 실행 권한이 터미널 연결 뒤에도 그대로인지 확인하지 못했습니다. "
+                           "Codex 화면의 /permissions에서 확인해 주세요.")
 # Installation names (instance.json); without one these are the public names.
 NAMES = instance.current()
 BRAND = NAMES["brand"]
@@ -2517,6 +2522,8 @@ class Workflow:
                     metadata["holdName"] = spec["holdName"]
                 if spec.get("transferId"):
                     metadata.update(transferId=spec["transferId"], destinationCwd=spec["destinationCwd"], sourceHost=source["host"])
+                if spec.get("windowsRestricted"):
+                    metadata["permissionNotice"] = PERMISSIONS_RESTRICTED
                 try:
                     terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
                     if spec.get("nativeReceiptPath"):
@@ -2540,6 +2547,8 @@ class Workflow:
                     failure = LaunchFailure(recovery)
                     self._finish(request_id, plan_id, failure)
                     raise failure from exc
+                if spec.get("windowsSettle"):
+                    self.settle_windows_terminal(host, source, terminal["id"])
                 result = self._link_handoff_goals({"terminal": terminal, "mode": plan["mode"]})
                 self._finish(request_id, plan_id, result)
                 return result
@@ -2595,6 +2604,28 @@ class Workflow:
                 "nativeSource": native,
                 "connectionMode": "attach" if prepared.get("connectionMode") == "attach" else None}
 
+    def settle_windows_terminal(self, host, source, terminal_id):
+        """In the background: the PC keeps the permissions its plan recorded while the terminal's
+        TUI joins (windows_runtime terminal_settle); the terminal's screen says what it found."""
+        def settle():
+            from transfer import WINDOWS_SETTLE_SECONDS
+            try:
+                result = self.transfers.rpc(host, "terminal_settle", {"source": source},
+                                            timeout=WINDOWS_SETTLE_SECONDS)
+            except (OSError, RuntimeError, ValueError):
+                result = {"settled": False}
+            if not isinstance(result, dict) or result.get("settled") is None:
+                return
+            if result.get("settled") is not True:
+                notice = PERMISSIONS_UNCONFIRMED
+            else:
+                notice = PERMISSIONS_RESTRICTED if result.get("restricted") is True else None
+            try:
+                self.terminals.note_permissions(terminal_id, notice)
+            except (OSError, RuntimeError, ValueError):
+                pass
+        threading.Thread(target=settle, name="windows-settle", daemon=True).start()
+
     def remote_attach(self, host, source):
         # The owning helper resolves binaries and explicit environment settings.
         # No configuration values or credentials cross back into an SSH command.
@@ -2603,7 +2634,8 @@ class Workflow:
             import collector
             return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
                     "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",
-                    "nativeSource": self.native_of(source)}
+                    "nativeSource": self.native_of(source),
+                    "windowsSettle": spec.get("settle") is True, "windowsRestricted": spec.get("restricted") is True}
         profiles = self.transfers.profiles(host, refresh=True)
         identity = "claude:default" if source["agent"] == "claude" else "codex:" + source["home"]
         profile = next((p for p in profiles if p.get("id") == identity and p.get("available")), None)
