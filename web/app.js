@@ -235,9 +235,12 @@ const state = {
   resizeTimer: null,
   lastSize: "",
   fontSize: prefs.get("fontSize", 14),
-  // A wide screen shows the terminal beside the conversation ("나란히"); "크게" covers the board.
-  terminalDock: prefs.get("terminalDock", true) !== false,
+  // A wide screen shows a session's terminal in its conversation's place ("switch", the
+  // default: the list stays and the conversation waits beneath) or beside it ("beside", 나란히);
+  // with room for neither the terminal covers the board.
+  terminalPlace: prefs.get("terminalPlace", "switch") === "beside" ? "beside" : "switch",
   docked: false,
+  terminalSwitch: false,
   dockSolo: false,
   dockWidth: 0,
   // Edge swipes (bindEdgeSwipe): on in an iOS home-screen app; this stored switch turns them
@@ -5610,6 +5613,11 @@ function documentKeydown(event) {
   // Native details keeps Enter/Space/Tab; a device overview never routes keys to an
   // underlying conversation's approval choices or the terminal beside it.
   if ($("board-status")?.open) { noteHardwareKey(event); return; }
+  if (switchKey(event) && switchConversationTerminal()) {
+    event.preventDefault();
+    noteHardwareKey(event);
+    return;
+  }
   if (terminalDocumentKey(event)) {
     noteHardwareKey(event);
     return;
@@ -5707,6 +5715,7 @@ function listNavigationKeydown(event) {
       if (input && !input.disabled) return take(() => input.focus({ preventScroll: true }));
     }
     const s = selectedSession();
+    if (s && letter("t") && !sessionOneShot(s) && !state.launchBusy) return take(() => openSessionTerminal(s));
     if (s && endSessionKey(event, key)) return take(() => confirmEndSession(s, target));
   }
   // Nothing focused on the list: ↑↓ start at the open session's card, or the first.
@@ -5718,6 +5727,29 @@ function listNavigationKeydown(event) {
   const back = (key === "Escape" && plain && !editing) || (event.metaKey && key === "[");
   if (!back || !state.selected || !$("session-layout") || $("session-layout").hidden) return false;
   return take(() => keyboardBack());
+}
+// Ctrl+` turns between a session's conversation and its terminal, as VS Code's terminal key
+// does. Esc stays the CLI's (it stops Claude's reply), and the CLI gets nothing for this key.
+function switchKey(event) {
+  return !!event && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && !event.isComposing &&
+    event.keyCode !== 229 && (event.code === "Backquote" || event.key === "`");
+}
+// From a shown terminal back (in the conversation's place, to that conversation's input);
+// from an open conversation to its terminal, as t opens it.
+function switchConversationTerminal() {
+  if (document.querySelector?.("dialog[open]")) return false;
+  if (state.terminalVisible) {
+    const switching = state.terminalSwitch;
+    backFromTerminal();
+    const input = $("chat-input");
+    if (switching && input && !input.disabled) input.focus?.({ preventScroll: true });
+    return true;
+  }
+  const s = selectedSession();
+  const open = !!s && !!$("session-layout") && !$("session-layout").hidden && (!phoneLayout() || state.detailShown);
+  if (!open || sessionOneShot(s) || state.launchBusy) return false;
+  openSessionTerminal(s);
+  return true;
 }
 // PgUp/PgDn in the list move this many cards.
 const LIST_PAGE = 5;
@@ -9670,14 +9702,34 @@ function terminalCellWidth() {
   }
   return size * 0.62;
 }
-// The width a terminal takes beside the conversation on this screen; 0 covers the board.
-function dockWidth({ preferred = state.terminalDock } = {}) {
+// The list's column (style.css .layout and its narrower screens), measured while it shows.
+function listColumnWidth() {
+  const shown = $("task-list-pane")?.getBoundingClientRect?.().width;
+  if (shown > 0) return shown;
   const width = window.innerWidth || 0;
-  if (!preferred || width <= 0 || phoneLayout() || shortLayout()) return 0;
+  if (touchDevice() && width >= 701 && width <= 1023 && (window.innerHeight || 0) >= 521)
+    return Math.min(300, Math.max(256, width * 0.33));
+  return width <= 900 ? 300 : 340;
+}
+// Where a terminal shows on this screen: in its conversation's place ("switch": everything
+// right of the list), beside it ("beside": the conversation keeps 420px) or, with room for
+// neither, over the board (width 0). The chosen place first; beside falls back to switch.
+function dockPlacement(place = state.terminalPlace) {
+  const width = window.innerWidth || 0;
+  if (width <= 0 || phoneLayout() || shortLayout()) return { place: null, width: 0 };
   const cell = terminalCellWidth();
-  const wanted = Math.max(Math.ceil(cell * DOCK.cols) + DOCK.chrome, Math.round(width * DOCK.share));
-  const docked = Math.min(wanted, width - DOCK.minChat);
-  return docked >= cell * DOCK.minCols + DOCK.chrome ? Math.floor(docked) : 0;
+  const fits = (value) => (value >= cell * DOCK.minCols + DOCK.chrome ? Math.floor(value) : 0);
+  if (place === "beside") {
+    const wanted = Math.max(Math.ceil(cell * DOCK.cols) + DOCK.chrome, Math.round(width * DOCK.share));
+    const beside = fits(Math.min(wanted, width - DOCK.minChat));
+    if (beside) return { place: "beside", width: beside };
+  }
+  const switched = fits(width - listColumnWidth());
+  return switched ? { place: "switch", width: switched } : { place: null, width: 0 };
+}
+// The width a terminal takes on this screen; 0 covers the board.
+function dockWidth(place = state.terminalPlace) {
+  return dockPlacement(place).width;
 }
 function boardCovered() {
   return state.terminalVisible && !state.docked;
@@ -9738,21 +9790,27 @@ function boardKeysBlocked() {
 function noteDockSide(side) {
   if (state.docked) state.dockSide = side;
 }
-// Beside the conversation or over the board: decided on open, resize and font change.
+// In the conversation's place, beside it or over the board: decided on open, resize and font change.
 function applyDock() {
-  const width = state.terminalVisible ? dockWidth() : 0;
+  const placement = state.terminalVisible ? dockPlacement() : { place: null, width: 0 };
+  const width = placement.width;
   const docked = width > 0;
-  const changed = docked !== state.docked;
+  const switching = placement.place === "switch";
+  const changed = docked !== state.docked || switching !== state.terminalSwitch;
   // Newly beside the conversation, the terminal has the keys (as when it opens).
   if (changed && docked) state.dockSide = "terminal";
   state.docked = docked;
+  state.terminalSwitch = switching;
   state.dockWidth = width;
   document.documentElement.style?.setProperty?.("--dock-w", `${width}px`);
-  state.dockSolo = docked && (window.innerWidth || 0) - width < DOCK.withList;
+  state.dockSolo = docked && !switching && (window.innerWidth || 0) - width < DOCK.withList;
   const classes = document.body?.classList;
   classes?.[docked ? "add" : "remove"]("terminal-docked");
+  classes?.[switching ? "add" : "remove"]("terminal-switch");
   classes?.[state.dockSolo ? "add" : "remove"]("dock-solo");
   $("app").hidden = state.terminalVisible && !docked;
+  // In its place the conversation stays (its draft, scroll and reading) but out of reach.
+  if ($("detail")) $("detail").inert = switching;
   // Beside the conversation (the page's main) the terminal is one region of it.
   $("terminal-screen").setAttribute("role", docked ? "region" : "main");
   renderDockToggle();
@@ -9793,25 +9851,28 @@ function redock() {
 function renderDockToggle() {
   const toggle = $("terminal-dock");
   if (toggle) {
-    toggle.hidden = !state.terminalVisible || !(dockWidth({ preferred: true }) > 0);
-    toggle.textContent = state.docked ? "크게" : "나란히";
-    toggle.setAttribute("aria-label", state.docked ? "터미널을 화면 가득 보기" : "터미널을 대화 옆에 보기");
+    // Placed, the other place is offered when it fits; covering the board, neither fits.
+    const other = state.terminalSwitch ? "beside" : "switch";
+    toggle.hidden = !state.terminalVisible || !state.docked || dockPlacement(other).place !== other;
+    toggle.textContent = state.terminalSwitch ? "나란히" : "대화 자리";
+    toggle.setAttribute("aria-label", state.terminalSwitch ? "터미널을 대화 옆에 보기" : "터미널을 대화 자리에 보기");
   }
   const back = $("terminal-back");
   // A phone names the screen back returns to, as iOS does: the conversation the terminal
-  // was opened from, or the session list. Wider screens return to the whole board.
+  // was opened from, or the session list. Wider screens return to the whole board; in the
+  // conversation's place, to that conversation.
   const entry = window.history.state;
   const fromChat = !!(entry?.[INSTANCE.historyKey] && entry.view === "terminal" && entry.parentDetailId);
   const phone = !state.docked && phoneLayout();
-  back.textContent = state.docked ? "숨기기" : phone ? (fromChat ? "대화" : "세션") : "보드";
-  const label = state.docked ? "터미널 칸 숨기기"
+  back.textContent = state.terminalSwitch ? "대화" : state.docked ? "숨기기" : phone ? (fromChat ? "대화" : "세션") : "보드";
+  const label = state.terminalSwitch ? "대화로 돌아가기 (Ctrl+`)" : state.docked ? "터미널 칸 숨기기"
     : phone ? (fromChat ? "대화로 돌아가기" : "세션 목록으로 돌아가기") : back.dataset?.boardLabel;
   if (label) back.setAttribute("aria-label", label);
 }
-// "크게"/"나란히" is remembered for every terminal on this device.
+// "대화 자리"/"나란히" is remembered for every terminal on this device.
 function toggleDock() {
-  state.terminalDock = !state.docked;
-  prefs.set("terminalDock", state.terminalDock);
+  state.terminalPlace = state.terminalSwitch ? "beside" : "switch";
+  prefs.set("terminalPlace", state.terminalPlace);
   // Pressed in the terminal's header: its keys stay with it either way.
   state.dockSide = "terminal";
   redock();
@@ -10650,6 +10711,13 @@ function terminalDocumentKey(event) {
 function xtermKeyEvent(event) {
   if (event.type !== "keydown") return !state.terminalKeyHandled;
   state.terminalKeyHandled = false;
+  // Ctrl+` is the board's (switchConversationTerminal); xterm would send the CLI a NUL.
+  if (switchKey(event)) {
+    event.preventDefault?.();
+    state.terminalKeyHandled = true;
+    switchConversationTerminal();
+    return false;
+  }
   const ours = anyTerminalMod() || event.metaKey || (event.altKey && ["ArrowLeft", "ArrowRight", "Backspace"].includes(event.key));
   if (!ours) return true;
   const bytes = terminalKeyFromEvent(event, { focusless: true });
