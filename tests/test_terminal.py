@@ -905,6 +905,21 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertTrue(changes)
         self.assertIsNotNone(recent)
 
+    def test_a_terminal_states_its_permissions_and_announces_only_a_change(self):
+        attached = self.connection("attached", "attach", idle=False)
+        changes = []
+        self.manager.add_listener(lambda: changes.append(1))
+        self.assertTrue(self.manager.note_permissions(attached["id"], "권한을 확인해 주세요."))
+        self.assertFalse(self.manager.note_permissions(attached["id"], "권한을 확인해 주세요."))
+        self.assertEqual(len(changes), 1)
+        row = next(item for item in self.manager.list() if item["key"] == "attached")
+        self.assertEqual(row["permissionNotice"], "권한을 확인해 주세요.")
+        self.assertTrue(self.manager.note_permissions(attached["id"], None))
+        self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "attached")["permissionNotice"])
+        for bad in ("", "x" * 501, 3):
+            with self.assertRaises(ValueError):
+                self.manager.note_permissions(attached["id"], bad)
+
     def test_a_new_session_terminal_records_what_it_runs_and_announces_only_a_change(self):
         self.manager.max_terminals = 4
         launched = self.connection("launched", "new-session", idle=False)

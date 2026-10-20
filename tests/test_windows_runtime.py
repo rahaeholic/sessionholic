@@ -987,5 +987,265 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.assertEqual(calls[-1], ('close', 99))
 
 
+FULL = {'approvalPolicy': 'never', 'sandbox': {'type': 'dangerFullAccess'}}
+# The project server's default sandbox (scripts/windows/codex-agents-server.py: workspace-write).
+DEFAULT_SANDBOX = {'type': 'workspaceWrite', 'writableRoots': [], 'networkAccess': False,
+                   'excludeTmpdirEnvVar': False, 'excludeSlashTmp': False}
+
+
+class SettleServer:
+    """One PC project server's resume rules for one thread (Codex app-server
+    resume_running_thread): a loaded thread nobody is subscribed to is rebuilt from its record
+    by a resume whose values differ from it, keeping only the approval policy and taking the
+    server's default sandbox when the request carries none. Otherwise a resume joins the loaded
+    thread as it is. A board terminal's `codex resume --remote` TUI sends no permissions."""
+
+    def __init__(self, reader):
+        self.reader, self.loaded, self.live, self.subscribers = reader, False, None, 0
+        self.notes, self.calls, self.fail_update, self.reject_exclude, self.on_wait = [], [], False, False, None
+
+    @staticmethod
+    def requested(params):
+        modes = {'danger-full-access': 'dangerFullAccess', 'workspace-write': 'workspaceWrite', 'read-only': 'readOnly'}
+        sandbox = {'type': modes[params['sandbox']]}
+        if params['sandbox'] == 'workspace-write':
+            config = params.get('config', {})
+            sandbox.update(writableRoots=config.get('sandbox_workspace_write.writable_roots', []),
+                           networkAccess=config.get('sandbox_workspace_write.network_access', False),
+                           excludeTmpdirEnvVar=config.get('sandbox_workspace_write.exclude_tmpdir_env_var', False),
+                           excludeSlashTmp=config.get('sandbox_workspace_write.exclude_slash_tmp', False))
+        elif params['sandbox'] == 'read-only':
+            sandbox['networkAccess'] = False
+        return {'approvalPolicy': params['approvalPolicy'], 'sandbox': sandbox}
+
+    def tui_attach(self):
+        """The TUI's resume: no permissions, and a cwd spelled differently from the live one."""
+        if not self.loaded or self.subscribers == 0:
+            approval = self.live['approvalPolicy'] if self.live else self.reader.row['approval_mode']
+            self.live = {'approvalPolicy': approval, 'sandbox': dict(DEFAULT_SANDBOX)}
+        self.loaded = True
+        self.subscribers += 1
+
+    def proxy(self, binary, path, deadline):
+        server = self
+
+        class Client:
+            subscribed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                if self.subscribed:
+                    server.subscribers -= 1
+
+            def call(self, method, params):
+                server.calls.append((method, copy.deepcopy(params)))
+                if method == 'thread/loaded/list':
+                    return {'data': [server.reader.sid] if server.loaded else []}
+                if method == 'thread/read':
+                    return {'thread': copy.deepcopy(server.reader.thread)}
+                if method == 'thread/resume':
+                    if server.reject_exclude and 'excludeTurns' in params:
+                        raise ValueError('PC 서버가 읽기 요청을 거부했습니다.')
+                    wanted = server.requested(params)
+                    if not server.loaded or wanted != server.live and server.subscribers == 0:
+                        server.live = wanted
+                    server.loaded = True
+                    if not self.subscribed:
+                        self.subscribed = True
+                        server.subscribers += 1
+                    return {'thread': copy.deepcopy(server.reader.thread), **copy.deepcopy(server.live)}
+                if method == 'thread/settings/update':
+                    if server.fail_update:
+                        raise ValueError('PC 서버가 읽기 요청을 거부했습니다.')
+                    new = {'approvalPolicy': params['approvalPolicy'], 'sandbox': params['sandboxPolicy']}
+                    if new != server.live:
+                        server.live = copy.deepcopy(new)
+                        server.notes.append({'method': 'thread/settings/updated', 'params': {
+                            'threadId': params['threadId'],
+                            'threadSettings': {'approvalPolicy': new['approvalPolicy'], 'sandboxPolicy': new['sandbox'],
+                                               'model': 'fixture-model'}}})
+                    return {}
+                raise AssertionError('unexpected native operation: ' + method)
+
+            def notification(self, until):
+                if server.on_wait:
+                    hook, server.on_wait = server.on_wait, None
+                    hook()
+                return server.notes.pop(0) if server.notes else None
+        return Client()
+
+
+class TerminalSettleTest(unittest.TestCase):
+    """A board terminal on a PC Codex thread keeps the thread's permissions after its TUI joins."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.reader = FakeReader(Path(self.temp.name).resolve())
+        self.server = SettleServer(self.reader)
+        self.runtime = wr.WindowsRuntime(reader=self.reader, proxy_factory=self.server.proxy)
+        self.source = {'host': 'fixture-pc', 'agent': 'codex', 'id': self.reader.sid, 'home': '.codex',
+                       'cwd': str(self.reader.cwd)}
+
+    def methods(self, name):
+        return [params for method, params in self.server.calls if method == name]
+
+    def test_a_tui_that_joins_before_settle_is_brought_back_to_the_stored_permissions(self):
+        # 2026-10-20: never + full access became never + workspace-write once the TUI attached.
+        plan = self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertTrue(plan['settle'])
+        self.assertFalse(plan['restricted'])
+        self.assertEqual(self.server.subscribers, 0)  # the plan's connection is gone
+        self.server.tui_attach()
+        self.assertEqual(self.server.live['sandbox'], DEFAULT_SANDBOX)
+        result = self.runtime.terminal_settle(self.source)
+        self.assertEqual((result['settled'], result['restored'], result['changed']), (True, True, False))
+        self.assertEqual(self.server.live, FULL)
+        self.assertEqual(self.methods('thread/settings/update'), [
+            {'threadId': self.reader.sid, 'approvalPolicy': 'never', 'sandboxPolicy': {'type': 'dangerFullAccess'}}])
+        # The join carries the stored permissions and never the cwd (a cwd mismatch would rebuild).
+        join = self.methods('thread/resume')[-1]
+        self.assertNotIn('cwd', join)
+        self.assertEqual((join['sandbox'], join['approvalPolicy'], join['excludeTurns']), ('danger-full-access', 'never', True))
+
+    def test_settle_subscribed_first_lets_the_tui_join_without_changing_anything(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.server.on_wait = self.server.tui_attach  # the TUI joins while settle holds
+        result = self.runtime.terminal_settle(self.source)
+        self.assertEqual((result['settled'], result['restored']), (True, False))
+        self.assertEqual(self.server.live, FULL)
+        self.assertEqual(self.methods('thread/settings/update'), [])
+        self.assertEqual(self.server.subscribers, 1)  # the TUI stays; settle let go
+
+    def test_a_thread_unloaded_before_settle_is_loaded_with_the_stored_permissions(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.server.loaded, self.server.live = False, None
+        result = self.runtime.terminal_settle(self.source)
+        self.assertTrue(result['settled'])
+        self.assertEqual(self.server.live, FULL)
+        self.assertEqual(self.methods('thread/settings/update'), [])
+
+    def test_an_update_the_server_refuses_is_reported_not_retried(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.server.tui_attach()
+        self.server.fail_update = True
+        result = self.runtime.terminal_settle(self.source)
+        self.assertFalse(result['settled'])
+        self.assertEqual(result['reason'], wr.SETTLE_FAILED)
+        self.assertEqual(len(self.methods('thread/settings/update')), 1)
+
+    def test_an_update_without_a_notification_is_read_back_by_another_join(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.server.tui_attach()
+        update = SettleServer.proxy
+        def quiet(binary, path, deadline):
+            client = update(self.server, binary, path, deadline)
+            client.notification = lambda until: self.server.notes.clear()
+            return client
+        self.runtime.proxy_factory = quiet
+        result = self.runtime.terminal_settle(self.source)
+        self.assertTrue(result['settled'])
+        self.assertEqual(len(self.methods('thread/resume')), 3)  # the plan's load, the join, the readback
+
+    def test_a_permissions_choice_made_while_subscribed_stays(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        chosen = {'type': 'readOnly', 'networkAccess': False}
+        def choose():
+            self.server.tui_attach()
+            self.server.live = {'approvalPolicy': 'on-request', 'sandbox': chosen}
+            self.server.notes.append({'method': 'thread/settings/updated', 'params': {
+                'threadId': self.reader.sid, 'threadSettings': {'approvalPolicy': 'on-request', 'sandboxPolicy': chosen}}})
+        self.server.on_wait = choose
+        result = self.runtime.terminal_settle(self.source)
+        self.assertEqual((result['settled'], result['changed'], result['restored']), (True, True, False))
+        self.assertEqual(self.server.live['sandbox'], chosen)
+        self.assertEqual(self.methods('thread/settings/update'), [])
+
+    def test_a_record_is_used_once_and_only_shortly_after_its_plan(self):
+        self.assertIsNone(self.runtime.terminal_settle(self.source)['settled'])  # no plan: nothing to keep
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertTrue(self.runtime.terminal_settle(self.source)['settled'])
+        self.assertIsNone(self.runtime.terminal_settle(self.source)['settled'])
+        self.server.loaded, self.server.live = False, None
+        self.runtime.terminal_plan(self.source, prepare=True)
+        with patch.object(wr.time, 'time', return_value=time.time() + wr.SETTLE_RECORD_SECONDS + 5):
+            result = self.runtime.terminal_settle(self.source)
+        self.assertFalse(result['settled'])
+        self.assertEqual(self.methods('thread/settings/update'), [])
+
+    def test_a_restarted_project_server_is_not_settled(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.reader.processes[12]['start'] = '134362358929099999'
+        resumes = len(self.methods('thread/resume'))
+        self.assertFalse(self.runtime.terminal_settle(self.source)['settled'])
+        self.assertEqual(len(self.methods('thread/resume')), resumes)
+
+    def test_never_asking_inside_a_sandbox_is_kept_and_flagged(self):
+        # No automatic widening: the stored combination returns, and the board says what it means.
+        self.reader.row['sandbox_policy'] = json.dumps({'type': 'workspace-write'})
+        plan = self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertTrue(plan['restricted'])
+        self.server.tui_attach()
+        result = self.runtime.terminal_settle(self.source)
+        self.assertTrue(result['settled'])
+        self.assertTrue(result['restricted'])
+        self.assertEqual(self.server.live['sandbox']['type'], 'workspaceWrite')
+
+    def test_a_loaded_thread_is_recorded_as_it_runs(self):
+        self.server.loaded, self.server.subscribers = True, 1  # a PC TUI holds it
+        chosen = {'type': 'readOnly', 'networkAccess': False}
+        self.server.live = {'approvalPolicy': 'on-request', 'sandbox': chosen}
+        plan = self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertTrue(plan['settle'])
+        self.assertEqual(self.server.live['sandbox'], chosen)  # its live choice, not the stored one
+        self.server.tui_attach()
+        result = self.runtime.terminal_settle(self.source)
+        self.assertEqual((result['settled'], result['restored']), (True, False))
+        self.assertEqual(self.server.live['sandbox'], chosen)
+
+    def test_a_loaded_thread_with_a_policy_the_board_cannot_restore_is_not_settled(self):
+        self.server.loaded, self.server.live = True, FULL
+        self.reader.row['sandbox_policy'] = json.dumps({'type': 'future-policy'})
+        plan = self.runtime.terminal_plan(self.source, prepare=True)
+        self.assertNotIn('settle', plan)
+        self.assertEqual(self.methods('thread/resume'), [])
+        self.assertIsNone(self.runtime.terminal_settle(self.source)['settled'])
+
+    def test_a_server_without_exclude_turns_is_joined_with_the_history(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        self.server.tui_attach()
+        self.server.reject_exclude = True
+        self.assertTrue(self.runtime.terminal_settle(self.source)['settled'])
+        self.assertNotIn('excludeTurns', self.methods('thread/resume')[-1])
+
+    def test_settle_is_an_rpc_and_holds_no_operation_lock(self):
+        self.runtime.terminal_plan(self.source, prepare=True)
+        def other_operation():
+            with self.runtime.store.lock():  # a chat send meanwhile is not refused
+                pass
+        self.server.on_wait = other_operation
+        with patch.object(wr, 'WindowsRuntime', return_value=self.runtime):
+            self.assertTrue(wr.handle({'op': 'terminal_settle', 'args': {'source': self.source}})['settled'])
+
+    def test_the_native_proxy_reads_notifications_whole_and_waits_only_between_messages(self):
+        proxy = object.__new__(wr.NativeProxy)
+        proxy.deadline, proxy.pending, proxy.frames = time.monotonic() + 5, bytearray(), __import__('queue').Queue()
+        def frame(value):
+            raw = json.dumps(value).encode()
+            return bytes([0x81, len(raw)]) + raw
+        note = {'method': 'thread/settings/updated', 'params': {'threadId': 'x'}}
+        request = {'id': 7, 'method': 'item/commandExecution/requestApproval', 'params': {}}
+        both = frame(request) + frame(note)
+        proxy.frames.put(both[:5])
+        proxy.frames.put(both[5:])
+        self.assertEqual(proxy.notification(time.monotonic() + 1), note)  # the request is skipped
+        self.assertIsNone(proxy.notification(time.monotonic() + 0.05))
+        proxy.frames.put(b'')
+        with self.assertRaises(ValueError):
+            proxy.notification(time.monotonic() + 1)
+
+
 if __name__ == '__main__':
     unittest.main()

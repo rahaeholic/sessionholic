@@ -375,6 +375,48 @@ class WindowsRoutingTest(unittest.TestCase):
             self.flow.remote_attach(HOST, ROW)
         rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True}, timeout=20)
 
+    def test_a_pc_codex_terminal_carries_what_its_plan_says_of_permissions(self):
+        spec = {'argv': ['fixture'], 'cwd': ROW['cwd'], 'connectionMode': 'attach', 'settle': True, 'restricted': True}
+        with patch.object(self.flow.transfers, 'rpc', return_value=spec), \
+                patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
+            attached = self.flow.remote_attach(HOST, ROW)
+            self.assertEqual((attached['windowsSettle'], attached['windowsRestricted']), (True, True))
+            with patch.object(self.flow.transfers, 'rpc', return_value={'argv': ['fixture'], 'cwd': ROW['cwd']}):
+                plain = self.flow.remote_attach(HOST, ROW)
+        self.assertEqual((plain['windowsSettle'], plain['windowsRestricted']), (False, False))
+
+    def test_the_settled_permissions_of_a_pc_terminal_reach_its_screen(self):
+        from transfer import WINDOWS_SETTLE_SECONDS
+        notes = []
+        self.terms.note_permissions = lambda tid, notice: notes.append((tid, notice))
+        class Inline:  # the background thread, run here
+            def __init__(self, target, name, daemon):
+                self.target = target
+            def start(self):
+                self.target()
+        cases = [({'settled': True, 'restricted': False}, [('t' * 32, None)]),
+                 ({'settled': True, 'restricted': True}, [('t' * 32, server.PERMISSIONS_RESTRICTED)]),
+                 ({'settled': False, 'reason': '확인 실패'}, [('t' * 32, server.PERMISSIONS_UNCONFIRMED)]),
+                 ({'settled': None}, []),  # nothing recorded on the PC: nothing to say
+                 (RuntimeError('PC 응답을 확인하지 못했습니다.'), [('t' * 32, server.PERMISSIONS_UNCONFIRMED)])]
+        for answer, expected in cases:
+            notes.clear()
+            rpc = Mock(side_effect=answer) if isinstance(answer, Exception) else Mock(return_value=answer)
+            with self.subTest(answer=answer), patch.object(self.flow.transfers, 'rpc', rpc), \
+                    patch.object(server.threading, 'Thread', Inline):
+                self.flow.settle_windows_terminal(HOST, ROW, 't' * 32)
+                rpc.assert_called_once_with(HOST, 'terminal_settle', {'source': ROW}, timeout=WINDOWS_SETTLE_SECONDS)
+                self.assertEqual(notes, expected)
+
+    def test_terminal_settle_reaches_the_pc_with_its_longer_time(self):
+        from transfer import WINDOWS_SETTLE_SECONDS
+        envelope = json.dumps({'ok': True, 'result': {'settled': True}}).encode()
+        with patch('transfer.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=envelope)) as run:
+            self.flow.transfers.rpc(HOST, 'terminal_settle', {'source': ROW}, timeout=WINDOWS_SETTLE_SECONDS)
+            self.assertEqual(run.call_args.kwargs['timeout'], WINDOWS_SETTLE_SECONDS)
+            self.flow.transfers.rpc(HOST, 'chat', {'action': 'read', 'source': ROW}, timeout=WINDOWS_SETTLE_SECONDS)
+            self.assertEqual(run.call_args.kwargs['timeout'], 30)
+
     def test_a_pc_conversation_resumed_in_a_board_terminal_is_reopened_not_resumed_again(self):
         import hashlib
         target = {'host': HOST['name'], 'agent': 'claude', 'account': 'claude:default'}

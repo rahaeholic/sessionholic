@@ -31,9 +31,13 @@ WINDOWS_COMMAND_LIMIT = 8000
 # What a PC takes over windows_rpc. An upload (`attachment`) stays one program on stdin: its
 # base64 goes in literal lines of this length (Python 3.9's tokenizer grows its buffer a little
 # per read of one long line), and its wait is the caller's (Chat.upload), as on a Mac.
-WINDOWS_OPS = ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'resume_preview', 'attachment')
+WINDOWS_OPS = ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'terminal_settle', 'resume_preview',
+               'attachment')
 WINDOWS_DATA_LINE = 4096
 WINDOWS_UPLOAD_SECONDS = 120
+# terminal_settle stays subscribed while a board terminal's TUI joins (windows_runtime
+# SETTLE_HOLD_SECONDS and SETTLE_CONFIRM_SECONDS), then answers.
+WINDOWS_SETTLE_SECONDS = 75
 BASE64 = re.compile(r'[A-Za-z0-9+/]*={0,2}\Z')
 PROFILE_FAILURE_TTL = 120
 RUNTIME_MODULES = ('collector.py', 'launch.py', 'transfer_native.py', 'transfer_workspace.py', 'transfer_worker.py',
@@ -407,7 +411,8 @@ class Transfers:
         try:
             done = subprocess.run(collector_command(host, [], self.base_dir), input=program.encode(),
                                   capture_output=True,
-                                  timeout=min(timeout, WINDOWS_UPLOAD_SECONDS if data is not None else 30))
+                                  timeout=min(timeout, WINDOWS_UPLOAD_SECONDS if data is not None
+                                              else WINDOWS_SETTLE_SECONDS if op == 'terminal_settle' else 30))
         except subprocess.TimeoutExpired:
             raise RuntimeError('PC 응답을 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.') from None
         if done.returncode:

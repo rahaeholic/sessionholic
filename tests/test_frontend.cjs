@@ -936,6 +936,24 @@ test("failed terminal listing keeps previous rows and exposes retry; a closed ro
   assert.match(c.get("terminal-status").textContent, /실행 기기의 최근 작업/);
 });
 
+test("a PC Codex terminal states its permissions once the board has checked them, and drops a cleared notice", async () => {
+  let notice = null;
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [
+    { id: "term", mode: "attach", alive: true, host: "example-pc", agent: "codex", permissionNotice: notice }] }) }));
+  c.state.terminal = { id: "term", mode: "attach", alive: true, host: "example-pc", agent: "codex" };
+  c.state.terminals = [c.state.terminal];
+  await c.refreshTerminals();
+  assert.equal(c.get("terminal-permission").hidden, true);
+  notice = "PC 대화의 실행 권한을 확인해 주세요.";
+  await c.refreshTerminals();
+  assert.equal(c.get("terminal-permission").hidden, false, "the check answers after the terminal opened");
+  assert.equal(c.get("terminal-permission").textContent, notice);
+  notice = null;
+  await c.refreshTerminals();
+  assert.equal(c.get("terminal-permission").hidden, true);
+  assert.equal(c.get("terminal-permission").textContent, "");
+});
+
 function tidyFixture(fetchImpl) {
   const c = client(fetchImpl, noChatTimers);
   const session = (id, phase) => ({ host: 'workstation', agent: 'codex', home: '.codex', id, phase, title: `세션 ${id}`,

@@ -2766,6 +2766,19 @@ li[data-task] {
 .terminal-status-row:has(+ .terminal-context:not(:empty):not([hidden])) {
   border-bottom-color: transparent;
 }
+/* What the board found of a PC Codex terminal's permissions: needs a look, not an error. */
+.terminal-permission {
+  flex: none;
+  margin: 0;
+  padding: 0 16px 7px 30px;
+  border-bottom: 1px solid var(--t-sep);
+  color: var(--t-orange);
+  font-size: var(--fs-cap);
+  line-height: 1.4;
+}
+.terminal-context:has(+ .terminal-permission:not([hidden])) {
+  border-bottom-color: transparent;
+}
 .terminal-error {
   flex: none;
   max-height: 30%;
