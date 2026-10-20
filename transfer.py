@@ -32,7 +32,7 @@ WINDOWS_COMMAND_LIMIT = 8000
 # base64 goes in literal lines of this length (Python 3.9's tokenizer grows its buffer a little
 # per read of one long line), and its wait is the caller's (Chat.upload), as on a Mac.
 WINDOWS_OPS = ('chat', 'control_preview', 'control_execute', 'terminal_plan', 'terminal_settle', 'resume_preview',
-               'attachment')
+               'recover_session', 'attachment')
 WINDOWS_DATA_LINE = 4096
 WINDOWS_UPLOAD_SECONDS = 120
 # terminal_settle stays subscribed while a board terminal's TUI joins (windows_runtime

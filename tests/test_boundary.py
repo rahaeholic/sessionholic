@@ -442,7 +442,7 @@ class ToggleTest(BoundaryFixture):
 
     def test_tmux_user_options_become_title_and_task(self):
         calls = []
-        def run(args, timeout=20):
+        def run(args, timeout=20, **kwargs):
             calls.append(args[-1])
             fields = args[-1].split('\t')
             row = ['work', '1', '100', 'zsh'] + (['Custom title', 'Task'] if len(fields) == 7 else []) + ['pane']

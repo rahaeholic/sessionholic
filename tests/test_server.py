@@ -254,7 +254,7 @@ class ServerTest(unittest.TestCase):
                       "sessionTidied": body["sessionTidied"], "sessionRemoved": body["sessionRemoved"],
                       "sessionOpened": body["sessionOpened"], "sessionPinned": body["sessionPinned"], "bootId": self.httpd.boot_id,
                       "quickReplyPreferences": {"ok": True, "revision": 0, "quickReplies": None},
-                      "savedPrompts": {"ok": True, "revision": 0}}
+                      "savedPrompts": {"ok": True, "revision": 0}, "recoverySessions": []}
             self.assertEqual(body, served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})
@@ -1147,13 +1147,15 @@ class FakeWatcher:
                     self.owner.say({"type": "bye", "reason": "stdin-closed"})
                     self.owner.exit(0)
 
-    def __init__(self, leave_on_eof=True):
+    def __init__(self, leave_on_eof=True, hello=True):
         read, write = os.pipe()
         self.stdout, self.out = os.fdopen(read, "rb"), os.fdopen(write, "wb", buffering=0)
         self.stdin = self.Input(self)
         self.leave_on_eof = leave_on_eof
         self.lines, self.signals = [], []
         self.exited, self.returncode = threading.Event(), None
+        if hello:
+            self.say({'type': 'hello', 'proto': 1})
 
     def say(self, message):
         try:
@@ -1472,6 +1474,22 @@ class BoardLiveTest(unittest.TestCase):
         self.assertEqual(watcher.signals, [])
         self.assertEqual((len(watchers), self.calls, self.live(board)), (1, [], False))
 
+    def test_incompatible_or_missing_hello_ends_only_live_and_keeps_one_shot_fallback(self):
+        for hello in ({'type': 'hello', 'proto': 2}, {'type': 'hello', 'proto': True},
+                      {'type': 'hello', 'proto': '1'}, {'type': 'heartbeat'}):
+            with self.subTest(hello=hello):
+                self.calls = []
+                board, watchers = self.live_board(hello=False)
+                board.viewer_joined()
+                wait_for(lambda: len(watchers) == 1)
+                watchers[0].say(hello)
+                watchers[0].say({'type': 'snapshot', 'data': live_data('호환되지 않는 목록')})
+                wait_for(lambda: self.calls == [('remote', ['snapshot'])])
+                self.assertTrue(board.state['remote']['ok'])
+                self.assertFalse(board.state['remote']['live'])
+                self.assertNotEqual(board.state['remote']['data']['claude'][0].get('title'), '호환되지 않는 목록')
+                board.close_live()
+
     def test_a_failed_watcher_falls_back_once_and_restarts_after_its_own_backoff(self):
         board, watchers = self.live_board()
         board.STREAM_BACKOFF, board.STREAM_TRIP = (60, 60, 60, 60), 60
@@ -1690,7 +1708,7 @@ class BoardLiveTest(unittest.TestCase):
         preface = server.remote_program()
         self.assertTrue(preface.startswith(b"from __future__ import annotations\n"))
         data = board.state["remote"]["data"]
-        self.assertEqual(set(data), {"host", "collectedAt", "claude", "codex", "tmux", "errors"})
+        self.assertEqual(set(data), {"host", "collectedAt", "claude", "codex", "tmux", "errors", 'sourceStatus'})
         self.assertEqual(data["codex"], [])
         board.viewer_left()
         wait_for(lambda: board.live_manager is None and not board.streams, timeout=10)

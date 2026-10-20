@@ -277,6 +277,26 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=rpc
         self.chat=chat.Chat(self.board,self.flow,self.root)
     def tearDown(self): self.temp.cleanup()
+    def test_runtime_metadata_is_explicit_and_independent_of_readonly(self):
+        for readonly, known in ((False, True), (True, False)):
+            with self.subTest(readonly=readonly), patch.object(self.chat, 'rpc', return_value={
+                    'phase': 'working' if known else 'unknown', 'messages': [],
+                    'readOnly': readonly, 'runtimeKnown': known, 'runtimeReason': '합성 관측 이유'}):
+                self.chat.cache.clear()
+                result = self.chat.state({'source': REF})
+            self.assertIs(result['runtimeKnown'], known)
+            self.assertEqual(result['runtimeReason'], '합성 관측 이유')
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'idle', 'messages': []}):
+            self.chat.cache.clear()
+            self.assertNotIn('runtimeKnown', self.chat.state({'source': REF}))
+
+    def test_stale_read_does_not_carry_confirmed_runtime(self):
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'working', 'messages': [], 'runtimeKnown': True}):
+            self.chat.state({'source': REF})
+        self.board.state['local']['ok'] = False
+        result = self.chat.state({'source': REF})
+        self.assertTrue(result['stale'])
+        self.assertFalse(result['runtimeKnown'])
     def test_upload_bytes_exact_and_bound_to_session(self):
         raw=b'\x00\xfffile\r\n'
         result=self.chat.upload(REF,'한글 파일.bin',raw)['attachment']
@@ -1024,7 +1044,8 @@ class ChatClaudeTest(unittest.TestCase):
                 raise AssertionError('Claude input must never use the host send RPC')
             if args['action'] == 'capabilities':
                 return {'phase': self.phase, 'kind': self.row['kind'], 'cwd': str(self.project)}
-            return {'phase': self.phase, 'cwd': str(self.project), 'messages': list(self.messages),
+            return {'phase': self.phase, 'runtimeKnown': self.phase in ('idle', 'working', 'needs_input', 'done', 'closed'),
+                    'cwd': str(self.project), 'messages': list(self.messages),
                     'requiresNativeTerminal': True, **({'modelSettings': dict(self.model_settings)} if self.model_settings else {}),
                     'capabilities': {'canSend': False, 'reason': 'Claude 입력은 보드가 연결한 터미널로 전달합니다.'}}
         self.flow.transfers.rpc = rpc
@@ -1037,7 +1058,7 @@ class ChatClaudeTest(unittest.TestCase):
     def terminal(self, **native):
         row = {'id': TERMINAL_ID, 'alive': True, 'closed': False,
                'nativeSource': {'host': 'local', 'agent': 'claude', 'id': CLAUDE_REF['id'], 'home': '.claude',
-                                'cwd': str(self.project), **native}}
+                                'cwd': str(self.project), 'sessionId': CLAUDE_SID, **native}}
         self.terms.rows.append(row)
         return row
 
@@ -1242,7 +1263,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertNotIn('action', state['capability'])
         for key in ('queuedMessages', 'queueState'):
             self.assertNotIn(key, state)
-        for native in ({'host': 'other'}, {'id': 'other12345'}, {'agent': 'codex'}):
+        for native in ({'host': 'other'}, {'id': 'other12345', 'sessionId': 'other12345'}, {'agent': 'codex'}):
             with self.subTest(native=native):
                 self.terms.rows = []
                 self.terminal(**native)
@@ -1869,14 +1890,47 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.terms.log, log)
         with self.assertRaises(ValueError) as caught:
             self.answer(3)
-        self.assertNotIsInstance(caught.exception, chat.PromptRejected)
+        self.assertEqual(caught.exception.code, 'prompt_request_conflict')
         self.assertEqual(len(self.terms.keys), 1)
-        # Bounded in memory: the oldest saved answer is dropped first.
-        with patch.object(chat, 'PROMPT_RESULTS', 2), patch.object(chat.time, 'sleep'):
+        # Durable receipts remain after later questions; no memory eviction re-enables input.
+        with patch.object(chat.time, 'sleep'):
             for rid in ('answer-0002', 'answer-0003'):
                 self.terms.screens = [CLAUDE_PERMISSION, '> ']
                 self.answer(1, rid=rid)
-        self.assertEqual(len(self.chat.prompt_results), 2)
+        self.assertEqual(self.chat.prompt({'source': CLAUDE_REF, 'action': 'status',
+                                         'requestId': 'answer-0001'})['status'], 'answered')
+
+    def test_answer_receipt_survives_chat_restart_and_terminal_disappearance(self):
+        self.terminal()
+        self.terms.screens = [CLAUDE_PERMISSION, '> ']
+        with patch.object(chat.time, 'sleep'):
+            self.assertEqual(self.answer(2)['status'], 'answered')
+        self.chat = chat.Chat(self.board, self.flow, self.root)
+        self.terms.rows = []
+        self.assertEqual(self.answer(2)['status'], 'answered')
+        self.assertEqual(self.chat.prompt({'source': CLAUDE_REF, 'action': 'status',
+                                          'requestId': 'answer-0001'})['status'], 'answered')
+        self.assertEqual(len(self.terms.keys), 1)
+
+    def test_prompt_status_is_readonly_even_offline_and_never_attaches(self):
+        self.board.state['local']['ok'] = False
+        with patch.object(self.chat, '_prompt_terminal', side_effect=AssertionError('terminal lookup')), \
+             patch.object(self.flow, 'launch', side_effect=AssertionError('launch')):
+            receipt = self.chat.prompt({'source': CLAUDE_REF, 'action': 'status', 'requestId': 'answer-0001'})
+        self.assertEqual(receipt['status'], 'not_found')
+        self.assertEqual(self.terms.keys, [])
+
+    def test_finish_failure_keeps_durable_reservation_and_never_retries(self):
+        from prompt_receipts import PromptReceiptError
+        self.terminal()
+        self.terms.screens = [CLAUDE_PERMISSION, '> ']
+        with patch.object(chat.time, 'sleep'), \
+             patch.object(self.chat.prompt_receipts, 'finish', side_effect=PromptReceiptError()):
+            result = self.answer(2)
+        self.assertEqual((result['status'], result['reasonCode']), ('unconfirmed', 'receipt_write_failed'))
+        self.chat = chat.Chat(self.board, self.flow, self.root)
+        self.assertEqual(self.answer(2)['status'], 'unconfirmed')
+        self.assertEqual(len(self.terms.keys), 1)
 
     def test_changed_or_unanswerable_menus_never_press_keys(self):
         self.terminal()
@@ -1926,7 +1980,8 @@ class ChatClaudeTest(unittest.TestCase):
         self.terms.keys_error = terminal.InputNotSent('터미널에 키를 보내지 못했습니다.')
         exc = self.refused(2)
         self.assertEqual((str(exc), exc.code), ('터미널에 키를 보내지 못했습니다.', 'terminal_unavailable'))
-        self.assertEqual(self.chat.prompt_results, {})
+        self.assertEqual(self.chat.prompt({'source': CLAUDE_REF, 'action': 'status',
+                                         'requestId': 'answer-0001'})['status'], 'not_found')
         self.terms.keys_error = RuntimeError('fixture tmux timeout')
         with patch.object(chat.time, 'sleep') as sleep:
             result = self.answer(2)

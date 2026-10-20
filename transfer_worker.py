@@ -421,6 +421,9 @@ def _rpc(request):
     if op == 'resume_preview':
         from launch import resume_preview
         return resume_preview(args['source'])
+    if op == 'recover_session':
+        from launch import recover_saved_session
+        return recover_saved_session(args.get('source'))
     if op == 'launcher_programs':
         from launcher_programs import launcher_programs
         return launcher_programs(args)

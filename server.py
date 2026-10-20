@@ -848,6 +848,8 @@ class HostStream:
 
     def run(self):
         reason = "eof"
+        hello = False
+        from collector import WATCH_PROTO
         try:
             process, preface = self.board.streamer(self.host)
             with self.write_lock:
@@ -876,6 +878,15 @@ class HostStream:
                 if not isinstance(message, dict):
                     continue
                 self.last_line = time.monotonic()
+                if message.get('type') == 'hello':
+                    if type(message.get('proto')) is not int or message['proto'] != WATCH_PROTO:
+                        reason = 'protocol'
+                        break
+                    hello = True
+                    continue
+                if not hello:
+                    reason = 'protocol'
+                    break
                 if message.get("type") == "snapshot" and isinstance(message.get("data"), dict):
                     self.board.apply_live(self, message["data"])
                 elif message.get("type") == "busy":
@@ -975,6 +986,8 @@ class Board:
     def __init__(self, hosts, interval, runner=None, state_dir=None, streamer=None, live=True):
         self.hosts, self.interval = hosts, max(interval, 60)
         self.clock = time.time
+        from runtime_observation import RuntimeObservations
+        self.runtime_observations = RuntimeObservations(clock=lambda: self.clock())
         self.lock = threading.RLock()
         # Lock order: a host lock, then save_lock, then self.lock, then a change
         # listener's own lock; never the reverse.
@@ -1065,6 +1078,7 @@ class Board:
         # Only one collection per host; other hosts are collected concurrently.
         with self.host_locks[name]:
             started = self.clock()
+            observation_request = self.runtime_observations.begin()
             update = {"ok": False, "paused": True, "error": "수집 결과를 처리하지 못했습니다."}
             detail = ""
             try:
@@ -1090,6 +1104,26 @@ class Board:
                         update = {"ok": True, "durationMs": update["durationMs"], "refreshing": False}
                         self.state[name].update(durationMs=update["durationMs"], refreshing=False)
                     else:
+                        if update.get('ok'):
+                            update['data'] = self.merge_sources(name, update['data'])
+                            if host.get('platform') == 'windows':
+                                for agent in ('claude', 'codex'):
+                                    if ((update['data'].get('sourceStatus') or {}).get(agent) or {}).get('ok') is False:
+                                        self.runtime_observations.reject_scope(name, agent, observation_request)
+                                        for row in update['data'].get(agent, []):
+                                            source = {**row, 'host': name, 'agent': agent}
+                                            annotation = self.runtime_observations.accept(source, {}, observation_request, 0)
+                                            row.update(annotation)
+                                            accepted = annotation['runtimeObservation']
+                                            row.update(phase=accepted['phase'], runtimeKnown=accepted['known'])
+                                        continue
+                                    for row in update['data'].get(agent, []):
+                                        source = {**row, 'host': name, 'agent': agent}
+                                        annotation = self.runtime_observations.accept(source, row, observation_request,
+                                                                                     max(120, 2 * self.interval + 15))
+                                        row.update(annotation)
+                                        accepted = annotation['runtimeObservation']
+                                        row.update(phase=accepted['phase'], runtimeKnown=accepted['known'])
                         self.state[name].update(update)
                         self.log_collection(name, update, detail)
                         if update["ok"]:
@@ -1101,6 +1135,29 @@ class Board:
                     self.changed()
             self.persist("snapshot.json", self.snapshot)
             return update["ok"]
+
+    def merge_sources(self, name, data):
+        """Preserve one failed adapter's last rows; a successful empty list clears them.
+
+        This does not renew any runtime observation on the preserved rows.
+        """
+        result = copy.deepcopy(data)
+        previous = self.state[name].get('data') or {}
+        for agent in ('claude', 'codex', 'tmux'):
+            if ((result.get('sourceStatus') or {}).get(agent) or {}).get('ok') is not False:
+                continue
+            if agent in previous:
+                result[agent] = copy.deepcopy(previous[agent])
+            if agent == 'tmux':
+                continue
+            for row in result[agent]:
+                row.update(runtimeKnown=False, phase='unknown', runtimeReason='수집에 실패해 마지막 목록을 보여 줍니다.')
+                prior = row.get('runtimeObservation')
+                if isinstance(prior, dict):
+                    row['lastKnown'] = prior if prior.get('known') else row.get('lastKnown')
+                    row['runtimeObservation'] = {**prior, 'known': False, 'phase': 'unknown',
+                                                 'reasonCode': 'source_read_failed', 'evidence': 'unsupported'}
+        return result
 
     def log_collection(self, name, update, detail=""):
         """One line when a host's collection starts failing, fails differently or recovers;
@@ -1341,6 +1398,7 @@ class Board:
                 return False
             stream.delivered = True
             row = self.state[stream.name]
+            data = self.merge_sources(stream.name, data)
             now = self.clock()
             self.live_at[stream.name] = now
             same = (isinstance(row["data"], dict) and {k: v for k, v in row["data"].items() if k != "collectedAt"}
@@ -1566,6 +1624,8 @@ class Workflow:
         self.board, self.terminals, self.state_dir = board, terminals, Path(state_dir)
         self.goals = Goals(state_dir)
         self.plans, self.requests = {}, {}
+        from session_recovery import RecoverySessions
+        self.recoveries = RecoverySessions(state_dir)
         # self.lock guards these dictionaries only; remote work runs outside it. A request id
         # in flight (inflight: id -> (signature, Event)) is run once and waited for by repeats,
         # and one route's launch at a time (route_locks) keeps its terminal reused, not doubled.
@@ -1613,6 +1673,76 @@ class Workflow:
             running = self.inflight.pop(request_id, None)
         if running is not None:
             running[1].set()
+        if isinstance(result, dict) and isinstance(result.get("terminal"), dict):
+            self.remember_recovery({**result["terminal"], 'openedAt': int(time.time())})
+
+    def remember_recovery(self, terminal):
+        """Keep only server-written exact identities; this never changes launch success."""
+        info = {**(terminal.get("metadata") or {}), **terminal}
+        native = info.get("nativeSource")
+        if not isinstance(native, dict) or info.get("linkConfidence") == "estimated":
+            return
+        source = {**native, **{key: info[key] for key in ("title", "account", "hostLabel", "updatedAt", "openedAt")
+                             if key in info}}
+        reason = info.get("closedReason")
+        if reason == "user" and info.get("closeEffect") == "view":
+            reason = "view_closed"
+        try:
+            self.recoveries.remember(source, terminal_id=info.get("id"), closed_reason=reason)
+        except (ValueError, RuntimeError, OSError):
+            pass
+
+    def capture_recoveries(self, records=None):
+        try:
+            for terminal in records if records is not None else self.terminals.list():
+                self.remember_recovery(terminal)
+        except (ValueError, RuntimeError, OSError):
+            pass
+
+    def resolve_source(self, ref, verify=False):
+        """Resolve a listed source, or recheck an exact identity this board kept before.
+
+        A browser cannot promote an arbitrary ID/cwd into a runnable source. The saved
+        reference supplies the selector, and its owning host verifies it before a plan.
+        """
+        try:
+            source = self.board.source(ref)
+            if isinstance(ref, dict) and ref.get("sessionId") and source.get("sessionId") != ref["sessionId"]:
+                raise ValueError("원래 대화의 식별자가 변경되었습니다.")
+            return source
+        except ValueError as original:
+            if not isinstance(ref, dict):
+                raise
+            record = self.recoveries.get(ref)
+            if record is None:
+                raise original
+        source = dict(record["source"])
+        if record.get("provenance", {}).get("closure") in ("explicit_termination", "legacy_user_close"):
+            raise ValueError("이 작업의 종료 의도를 확인하지 못했습니다. 원래 기록에서 명시적으로 선택해 주세요.")
+        host = next((h for h in self.board.hosts if h["name"] == source["host"]), None)
+        if host is None:
+            raise ValueError("등록되지 않은 기기입니다.")
+        online = self.board.state.get(host["name"], {}).get("ok") is True
+        if verify:
+            if not online:
+                raise RuntimeError("기기가 다시 연결되면 원래 작업을 확인할 수 있습니다.")
+            result = self.transfers.rpc(host, "recover_session", {"source": source}, timeout=20)
+            fresh = result.get("source") if isinstance(result, dict) else None
+            if not isinstance(fresh, dict) or any(fresh.get(k) != source.get(k) for k in ("agent", "id")):
+                raise ValueError("원래 세션의 신원을 확인하지 못했습니다.")
+            def home(row):
+                return (row.get("home") or ".claude") if row.get("agent") == "claude" else row.get("home")
+            if home(fresh) != home(source) or fresh.get("cwd") != source.get("cwd"):
+                raise ValueError("원래 세션의 계정이나 작업 폴더가 변경되었습니다.")
+            if source.get("sessionId") and fresh.get("sessionId") != source["sessionId"]:
+                raise ValueError("원래 대화의 식별자가 변경되었습니다.")
+            source.update({k: fresh[k] for k in ("phase", "runtimeKnown", "runtimeReason", "kind", "sessionId", "readOnly", "canRead")
+                           if k in fresh})
+        source.update({k: record[k] for k in ("title", "account", "updatedAt", "openedAt") if k in record})
+        return {**source, "hostLabel": host.get("label", host["name"]), "online": online,
+                "fetchedAt": self.board.state.get(host["name"], {}).get("fetchedAt"),
+                "phase": source.get("phase", "unknown"), "runtimeKnown": source.get("runtimeKnown", False),
+                "recoverySource": True}
 
     @contextmanager
     def _route(self, key):
@@ -1992,10 +2122,10 @@ class Workflow:
         return closed
 
     def close_idle_codex_attaches(self):
-        """End Codex connections left unused (terminals.idle_codex_attaches) whose session is idle
-        or done, or no longer listed (archived): read from the board's last list of its host,
-        never a fresh call, and never while that host's list is not current. Only the board's TUI
-        client ends; the thread stays on its project's server. Returns their IDs."""
+        """Release unused Mac connections only with a fresh listed resting phase.
+
+        Missing rows prove nothing. Windows has no detached-run guarantee and is skipped.
+        """
         idle = getattr(self.terminals, "idle_codex_attaches", None)
         if idle is None:
             return []
@@ -2011,7 +2141,10 @@ class Workflow:
             try:
                 phase = self.board.source(native).get("phase")
             except ValueError:
-                phase = "done"  # No longer listed: archived or gone.
+                continue  # A bounded list does not prove that the native run ended.
+            owner = next((h for h in self.board.hosts if h["name"] == native.get("host")), {})
+            if owner.get("platform") == "windows":
+                continue  # Its SSH TUI has no detached-run lifetime guarantee.
             if phase not in ("idle", "done", "closed"):
                 continue
             try:
@@ -2020,6 +2153,7 @@ class Workflow:
                 continue
             if ended is None:
                 continue
+            self.remember_recovery(ended)
             self.end_hold(ended)
             sys.stderr.write("쓰지 않는 Codex 연결을 정리했습니다: %s %s\n" % (ended.get("host"), str(native.get("id"))[:8]))
             closed.append(row["id"])
@@ -2033,6 +2167,9 @@ class Workflow:
             return []
         closed = []
         for row in spare():
+            name = row.get('host') or (row.get('nativeSource') or {}).get('host')
+            if any(h['name'] == name and h.get('platform') == 'windows' for h in self.board.hosts):
+                continue
             try:
                 ended = self.terminals.release_spare_attach(row["id"])
             except (RuntimeError, OSError, ValueError, KeyError):
@@ -2058,6 +2195,9 @@ class Workflow:
         now, closed, resting = time.monotonic(), [], set()
         for row in idle():
             native = row.get("nativeSource")
+            name = row.get('host') or (native or {}).get('host')
+            if any(h['name'] == name and h.get('platform') == 'windows' for h in self.board.hosts):
+                continue
             if isinstance(native, dict):
                 host = self.board.state.get(native.get("host")) or {}
                 fetched = host.get("fetchedAt")
@@ -2067,7 +2207,10 @@ class Workflow:
                 try:
                     phase = self.board.source(native).get("phase")
                 except ValueError:
-                    phase = "done"  # No longer listed: archived or gone.
+                    continue
+                owner = next((h for h in self.board.hosts if h["name"] == native.get("host")), {})
+                if owner.get("platform") == "windows":
+                    continue
                 if phase not in ("idle", "done", "closed"):
                     continue
             try:
@@ -2208,6 +2351,26 @@ class Workflow:
         return {k: row.get(k) for k in ("host", "agent", "id", "home")}
 
     @classmethod
+    def route_identity(cls, row):
+        ref = cls.identity(row)
+        if row.get('cwd'):
+            ref['cwd'] = row['cwd']
+        if row.get('agent') == 'claude' and row.get('sessionId'):
+            ref['sessionId'] = row['sessionId']
+        return ref
+
+    @classmethod
+    def same_native(cls, left, right):
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return False
+        a, b = cls.identity(left), cls.identity(right)
+        if a.get('agent') == b.get('agent') == 'claude':
+            a['home'], b['home'] = a.get('home') or '.claude', b.get('home') or '.claude'
+            if (left.get('sessionId') or right.get('sessionId')) and left.get('sessionId') != right.get('sessionId'):
+                return False
+        return a == b and left.get('cwd') == right.get('cwd')
+
+    @classmethod
     def native_of(cls, source):
         """A terminal's nativeSource; a Claude row also names its conversation (sessionId), so
         the board can match the listed row exactly (a worker id can be reused)."""
@@ -2258,7 +2421,8 @@ class Workflow:
         for terminal in self.terminals.list():
             native = terminal.get("nativeSource") or (terminal.get("metadata") or {}).get("nativeSource")
             if (terminal.get("closedReason") == "user" and terminal.get("linkConfidence") != "estimated"
-                    and isinstance(native, dict) and self.identity(native) == self.identity(source)):
+                    and (terminal.get("closeEffect") or (terminal.get("metadata") or {}).get("closeEffect")) != "view"
+                    and self.same_native(native, source)):
                 return {"allowed": False, "blockedByBoard": True,
                         "reason": "웹보드에서 직접 닫은 세션입니다. 자동으로 다시 시작하지 않습니다."}
         selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
@@ -2268,7 +2432,7 @@ class Workflow:
         return result
 
     def plan(self, payload):
-        source = self.board.source(payload.get("source"))
+        source = self.resolve_source(payload.get("source"), verify=True)
         self.ensure_direct_session(source)
         target = payload.get("target")
         if not isinstance(target, dict) or target.get("agent") not in ("claude", "codex"):
@@ -2281,12 +2445,14 @@ class Workflow:
             raise ValueError("등록되지 않은 기기입니다.")
         current = "claude:default" if source["agent"] == "claude" else "codex:" + source["home"]
         same = source["host"] == target["host"] and source["agent"] == target["agent"] and current == target.get("account")
+        if source.get("recoverySource") and not same:
+            raise ValueError("먼저 원래 기기와 계정에서 같은 세션으로 돌아가 주세요.")
         cross_host = source["host"] != target["host"]
         source_host = next(h for h in self.board.hosts if h["name"] == source["host"])
         windows = source_host.get("platform") == "windows"
         if (windows or host.get("platform") == "windows") and not same:
             raise ValueError(WINDOWS_READ_ONLY)
-        resume = payload.get("resume") is True
+        resume = payload.get("resume") is True or bool(source.get("recoverySource") and same and source["agent"] == "codex" and source_host.get("platform") != "windows")
         if resume and (not same or source["agent"] != "codex"):
             raise ValueError("같은 기기·계정의 Codex 세션만 다시 열 수 있습니다.")
         resume = resume or (same and source["agent"] == "codex" and source.get("phase") in ("closed", "notLoaded"))
@@ -2326,7 +2492,7 @@ class Workflow:
         if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows:
             allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
         windows_resumed = False
-        route_key = hashlib.sha256(json.dumps([self.identity(source), target], sort_keys=True).encode()).hexdigest()
+        route_key = hashlib.sha256(json.dumps([self.route_identity(source), target], sort_keys=True).encode()).hexdigest()
         existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
         if existing is None and same:
             # The session already runs in another board terminal linked to it exactly (a handoff's
@@ -2335,7 +2501,7 @@ class Workflow:
             existing = next((item for item in self.terminals.list()
                              if item.get("alive") and not item.get("closed") and item.get("linkConfidence") != "estimated"
                              and isinstance(item.get("nativeSource"), dict)
-                             and self.identity(item["nativeSource"]) == self.identity(source)), None)
+                             and self.same_native(item["nativeSource"], source)), None)
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
@@ -2383,7 +2549,7 @@ class Workflow:
             warnings.append("최근 대화와 파일 변경 상태를 넘겨 새 실행을 준비합니다. 기존 프로세스·승인 상태는 이어지지 않습니다.")
         plan = {"id": secrets.token_hex(16), "mode": mode, "allowed": allowed,
                 "reason": reason, "summary": summary,
-                "warnings": warnings, "source": self.identity(source), "target": target,
+                "warnings": warnings, "source": self.route_identity(source), "target": target,
                 "expiresAt": int(time.time()) + 180}
         if mode == "reconnect" and existing is not None and existing.get("id"):
             plan["reconnectId"] = existing["id"]
@@ -2457,7 +2623,8 @@ class Workflow:
             if live is None and plan["mode"] == "reconnect" and plan.get("reconnectId"):
                 # The session's own terminal on another route (plan): that one, while it lives.
                 live = next((item for item in rows if item.get("id") == plan["reconnectId"]
-                             and item.get("alive") and not item.get("closed")), None)
+                             and item.get("alive") and not item.get("closed")
+                             and self.same_native(item.get('nativeSource'), source)), None)
             if live:
                 # Settled once linked: a waiting repeat never changes it while it is answered.
                 result = self._link_handoff_goals({"terminal": live, "mode": plan["mode"], "reused": True})
@@ -2472,7 +2639,10 @@ class Workflow:
                 host = next(h for h in self.board.hosts if h["name"] == source["host"])
                 if not self.board.poll(host):
                     raise RuntimeError("원본 기기에 연결할 수 없어 실행하지 않았어요.")
-                fresh = self.board.source(plan["source"])
+                fresh = self.resolve_source(plan["source"], verify=True)
+                if (fresh.get("cwd") != source.get("cwd") or (source.get("agent") == "claude"
+                        and source.get("sessionId") and fresh.get("sessionId") != source["sessionId"])):
+                    raise ValueError("원래 작업 폴더나 대화가 변경되었습니다. 다시 확인해 주세요.")
                 if plan["mode"] == "handoff" and fresh.get("phase") in ("working", "needs_input"):
                     raise ValueError("원래 작업이 실행 중이거나 승인을 기다리고 있어요. 마무리한 뒤 다시 전환해 주세요.")
                 source = fresh
@@ -2835,7 +3005,9 @@ class SnapshotResponses:
             settings.safe_path(server.session_labels.directory, directory=True, private=True, allow_missing=True)
         except ValueError:
             return None
-        return (server.board.version, server.boot_id) + tuple(store.state_key() for store in display_stores(server))
+        recovery = getattr(getattr(server, "workflow", None), "recoveries", None)
+        recovery_key = recovery.state_key() if recovery is not None else None
+        return (server.board.version, server.boot_id, recovery_key) + tuple(store.state_key() for store in display_stores(server))
 
     def body(self, handler, gzip_ok):
         """(JSON body, its gzip when the client takes it, else None): the bytes
@@ -3106,6 +3278,10 @@ class Handler(BaseHTTPRequestHandler):
             if data.get("action") == "terminate":
                 # The listed row the board resolved (a Claude row carries its sessionId).
                 self.tidy_after_close(source)
+                try:
+                    self.server.workflow.recoveries.remember({**source, "explicitTermination": True})
+                except (ValueError, RuntimeError, OSError):
+                    pass
             self.server.board.request_refresh(host["name"], force=False)
         return result
 
@@ -3113,8 +3289,8 @@ class Handler(BaseHTTPRequestHandler):
         """A listed session was looked at as of its update time: every device then shows it read."""
         if not isinstance(data, dict) or set(data) != {'source', 'updatedAt'} or type(data['updatedAt']) is not int:
             raise ValueError('읽은 세션과 시점을 확인해 주세요.')
-        source = self.listed_source(data['source'])
-        # Never ahead of what the board lists: a later change stays unread.
+        source = self.readable_source(data['source'])
+        # Never ahead of the exact source: a later change stays unread.
         at = min(data['updatedAt'], int(source.get('updatedAt') or 0))
         result, changed = self.server.session_seen.mark(source, at)
         if changed:
@@ -3156,8 +3332,15 @@ class Handler(BaseHTTPRequestHandler):
         next snapshot, rather than every device reading one again for each opening."""
         if not isinstance(data, dict) or set(data) != {'source'}:
             raise ValueError('연 세션을 확인해 주세요.')
-        source = self.listed_source(data['source'])
-        result, _changed = self.server.session_opened.mark(source, int(time.time()))
+        source = self.readable_source(data['source'])
+        at = int(time.time())
+        result, _changed = self.server.session_opened.mark(source, at)
+        try:
+            store = self.server.workflow.recoveries
+            if store.get(source) is not None:
+                store.remember({**source, 'openedAt': at})
+        except (ValueError, RuntimeError, OSError):
+            pass  # Optional recovery metadata cannot undo a successful display mark.
         return {'openedAt': result['seenAt']}
 
     def session_pin(self, data):
@@ -3174,17 +3357,12 @@ class Handler(BaseHTTPRequestHandler):
         return {'pinnedAt': result['seenAt'], 'version': self.server.board.version}
 
     def tidy_after_close(self, native, ended=True):
-        """A session the board just ended (or whose terminal its user closed) leaves 최근 끝남.
-        `ended` False is a view closed while its run goes on: a running or waiting session is
-        then left as it is, so its finish still shows. Best effort: the close itself already
-        succeeded, and an unlisted session has no card."""
-        if not isinstance(native, dict):
+        """Only confirmed execution termination tidies a card; closing a view does not."""
+        if not ended or not isinstance(native, dict):
             return
         try:
             source = self.listed_source({key: native.get(key) for key in ('host', 'agent', 'id', 'home', 'kind', 'sessionId')
                                          if native.get(key) is not None})
-            if not ended and source.get('phase') in ('working', 'needs_input'):
-                return
             _result, changed = self.server.session_tidied.mark(source, int(time.time()))
         except (GoalError, ValueError, KeyError, RuntimeError, OSError):
             return
@@ -3225,6 +3403,16 @@ class Handler(BaseHTTPRequestHandler):
             if ref['agent'] == 'claude' and (data['source'].get('sessionId') or None) != (source.get('sessionId') or None):
                 raise ValueError('Claude 세션의 대화 식별자가 바뀌었습니다. 목록에서 다시 선택해 주세요.')
         return source
+
+    def readable_source(self, given):
+        """Display marks may name a trusted recent source outside the bounded list.
+
+        Execution, removal and control still use their stricter native/listed checks.
+        """
+        try:
+            return self.listed_source(given)
+        except ValueError:
+            return self.server.workflow.resolve_source(given)
 
     def do_HEAD(self):
         self.do_GET()
@@ -3314,6 +3502,9 @@ class Handler(BaseHTTPRequestHandler):
                     if query.get("refresh") == "1":
                         self.server.board.request_refresh()
                     return self.send_snapshot()
+                if url.path == "/api/session/recover":
+                    source = self.server.workflow.resolve_source(query, verify=True)
+                    return self.send_json(200, {"session": scrub_payload(source)})
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))
                     self.observe_work(query, result)
@@ -3335,6 +3526,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.workflow.describe_launchers()
                     version = self.server.events.terminals_version
                     records = self.server.terminals.list()
+                    self.server.workflow.capture_recoveries(records)
                     result = {"terminals": records, "version": version}
                     # Rows the terminal list forgot (old closes) still may have receipts.
                     take = getattr(self.server.terminals, "take_forgotten", None)
@@ -3536,7 +3728,43 @@ class Handler(BaseHTTPRequestHandler):
         except GoalError as exc:
             prompts = {"ok": False, **exc.payload}
         return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences,
-                "savedPrompts": prompts}
+                "savedPrompts": prompts, "recoverySessions": self.recovery_sessions()}
+
+    def recovery_sessions(self):
+        """A bounded list of locators; this never reads a remote CLI or starts a run."""
+        try:
+            records = self.server.workflow.recoveries.snapshot()["sessions"]
+            hosts = {h["name"]: {"name": h["name"], "data": {"claude": [], "codex": []}}
+                     for h in self.server.board.hosts}
+            for record in records:
+                origin = record.get("provenance", {})
+                if origin.get("closure") in ("explicit_termination", "legacy_user_close"):
+                    continue
+                source = record["source"]
+                if source["host"] not in hosts:
+                    continue
+                try:
+                    listed = self.server.board.source(source)
+                except ValueError:
+                    listed = {**source, "phase": "unknown", "runtimeKnown": False}
+                row = {**listed, **{key: record[key] for key in ("title", "account", "openedAt", "updatedAt")
+                                   if key in record}, "terminalId": origin.get("terminalId"),
+                       "closedReason": origin.get("closedReason"), "lastSeenAt": record.get("openedAt")}
+                hosts[source["host"]]["data"][source["agent"]].append(row)
+            decorated = {"hosts": list(hosts.values())}
+            for store in display_stores(self.server)[:-2]:
+                decorated = store.decorate(decorated, in_place=True)
+            # An unreadable removal/tidy store cannot authorize resurfacing a record.
+            if any(isinstance(value, dict) and value.get('ok') is False
+                   for key, value in decorated.items() if key in ('sessionRemoved', 'sessionTidied')):
+                return []
+            labels = {h["name"]: h.get("label", h["name"]) for h in self.server.board.hosts}
+            out = [{**row, "host": host["name"], "hostLabel": labels[host["name"]]}
+                   for host in decorated["hosts"] for agent in ("codex", "claude")
+                   for row in host["data"][agent] if not row.get("removedAt") and not row.get("tidiedAt")]
+            return sorted(out, key=lambda row: row.get("openedAt") or row.get("lastSeenAt") or 0, reverse=True)[:20]
+        except (ValueError, RuntimeError, OSError):
+            return []
 
     def send_snapshot(self):
         """send_json(200, self.snapshot()), served by SnapshotResponses while nothing in it changed."""
@@ -3556,7 +3784,8 @@ class Handler(BaseHTTPRequestHandler):
             # its watcher backs off until the host is reachable again. The watcher follows
             # the server's identity of the listed source, never the query's spelling.
             try:
-                ref = self.server.chat.identity(self.server.chat.resolve(ref))
+                resolved = self.server.chat.resolve(ref)
+                ref = self.server.chat.watch_identity(resolved)
             except ValueError as exc:
                 return self.send_json(400, {"error": str(exc)})
             except (RuntimeError, OSError):
@@ -3603,7 +3832,7 @@ class Handler(BaseHTTPRequestHandler):
         """After a successful send or menu answer, its conversation watcher reads quickly again."""
         try:
             # The watcher follows the server's identity of the source, as in stream_events.
-            self.server.events.boost(self.server.chat.identity(self.server.chat.resolve(data.get("source"))))
+            self.server.events.boost(self.server.chat.watch_identity(self.server.chat.resolve(data.get("source"))))
         except (ValueError, RuntimeError, OSError):
             # No longer listed: there is no watcher to speed up.
             pass
@@ -3801,6 +4030,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "close":
                     row = next((t for t in self.server.terminals.list() if t.get("id") == tid), None)
                     self.server.terminals.close_terminal(tid)
+                    if row is not None:
+                        info = {**(row.get("metadata") or {}), **row}
+                        self.server.workflow.remember_recovery({**info, "closedReason": "user",
+                            "closeEffect": "view" if info.get("mode") == "attach" else "run"})
                     hold_pending = bool(row) and self.server.workflow.end_hold(row)
                     # Only a terminal still running when closed: one that already ended (a host
                     # that went to sleep) was not ended from the board.
@@ -3939,6 +4172,10 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # Names this server process (and so its CSRF token): a client that sees another
     # bootId reads /api/capabilities again instead of sending a token from before a restart.
     server.boot_id = secrets.token_urlsafe(12)
+    with board.runtime_observations.lock:
+        board.runtime_observations.boot_id = server.boot_id
+        board.runtime_observations.records.clear()
+        board.runtime_observations.failures.clear()
     server.upload_gate = threading.BoundedSemaphore(2)
     server.history_gate = threading.BoundedSemaphore(2)
     # 질문 목록 reads (one per conversation opened) never wait behind 전체 보기 or a search.
@@ -3953,6 +4190,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         server.server_close()
         raise
     server.workflow = workflow if workflow is not None else Workflow(board, server.terminals, state_dir)
+    server.workflow.capture_recoveries()
     server.workflow.goals = server.goals
     from session_history import Histories
     server.session_history = Histories(state_dir, lambda source, args: history_rpc(server, source, args))

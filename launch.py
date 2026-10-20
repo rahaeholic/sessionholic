@@ -99,6 +99,69 @@ def saved_codex_thread(source, home=None):
     return {"id": sid, "home": key, "cwd": rows[0][1], "archived": bool(rows[0][2])}
 
 
+def recover_saved_session(source, home=None):
+    """Resolve one trusted saved reference without starting or subscribing to a CLI.
+
+    The coordinator supplies a server-held reference, never a browser command. A
+    Claude worker id remains its board identity; only its explicit sessionId may
+    name a different transcript. Ambiguous or changed records fail closed.
+    """
+    if not isinstance(source, dict) or source.get("agent") not in ("codex", "claude"):
+        raise ValueError("저장된 세션 정보가 올바르지 않습니다.")
+    host = source.get("host")
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", host):
+        raise ValueError("저장된 세션의 기기를 확인해 주세요.")
+    if source["agent"] == "codex":
+        record = saved_codex_thread(source, home)
+        if record["archived"]:
+            raise ValueError("보관된 원본 세션은 복귀 대상으로 열지 않습니다.")
+        row = {"host": host, "agent": "codex", **{key: record[key] for key in ("id", "home", "cwd")}}
+    else:
+        key = source.get("home")
+        if key not in (None, "", ".claude"):
+            raise ValueError("원본 Claude 계정 경로가 올바르지 않습니다.")
+        identifier, sid = source.get("id"), source.get("sessionId") or source.get("id")
+        if (not isinstance(identifier, str) or not CLAUDE_ID.fullmatch(identifier)
+                or not isinstance(sid, str) or not re.fullmatch(r"[0-9A-Za-z-]{8,64}", sid)):
+            raise ValueError("저장된 Claude 대화 식별자가 올바르지 않습니다.")
+        root = _home(home) / ".claude/projects"
+        matches = list(root.glob("*/" + sid + ".jsonl"))
+        if len(matches) != 1:
+            raise ValueError("정확한 Claude 저장 대화를 확인하지 못했습니다.")
+        path = matches[0]
+        # Do not follow account/project links into another account or transcript.
+        for part in (root.parent, root, path.parent, path):
+            info = part.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("Claude 저장 대화의 경로와 소유자를 확인해 주세요.")
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise ValueError("Claude 저장 대화의 파일을 확인해 주세요.")
+            header = []
+            for raw in stream.read(65536).splitlines()[:30]:
+                try:
+                    entry = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(entry, dict):
+                    header.append(entry)
+        ids = {entry["sessionId"] for entry in header if isinstance(entry.get("sessionId"), str) and entry["sessionId"]}
+        cwds = {entry["cwd"] for entry in header if isinstance(entry.get("cwd"), str) and entry["cwd"]}
+        cwd = source.get("cwd")
+        if (ids != {sid} or not isinstance(cwd, str) or not Path(cwd).is_absolute() or not cwds
+                or any(not Path(value).is_absolute() or Path(value).resolve() != Path(cwd).resolve() for value in cwds)):
+            raise ValueError("Claude 저장 대화의 식별자 또는 작업 폴더가 바뀌었습니다.")
+        row = {"host": host, "agent": "claude", "id": identifier, "home": key, "cwd": cwd}
+        if source.get("sessionId"):
+            row["sessionId"] = sid
+        if source.get("kind") in ("interactive", "background", "bg"):
+            row["kind"] = source["kind"]
+    return {"source": {**row, "phase": "unknown", "runtimeKnown": False, "readOnly": True,
+                       "canRead": True, "runtimeReason": "저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다."}}
+
+
 def resume_preview(source, home=None):
     """Validate an explicit same-session recovery without starting a native process."""
     from session_control import SessionControl

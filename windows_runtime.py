@@ -342,11 +342,12 @@ def _state(thread):
         raise ValueError('PC 세션 응답 형식이 올바르지 않습니다.')
     known = all(isinstance(t, dict) and t.get('status') in ('inProgress', 'completed', 'interrupted', 'failed') for t in turns)
     active = [t for t in turns if isinstance(t, dict) and t.get('status') == 'inProgress']
-    phase = wc._phase(thread.get('status')) if known else 'unknown'
+    runtime = wc._codex_runtime(thread.get('status')) if known else wc._unknown_runtime('turn_status_unsupported', 'unsupported')
+    phase = runtime['phase']
     if phase == 'idle' and active:
-        phase = 'unknown'
-    return {'phase': phase, 'activeTurnId': active[0].get('id') if len(active) == 1 else None,
-            'activeFlags': wc._flags(thread.get('status')), 'runtimeKnown': phase != 'unknown',
+        runtime = wc._unknown_runtime('status_inconsistent', 'unsupported')
+    return {**runtime, 'activeTurnId': active[0].get('id') if len(active) == 1 else None,
+            'activeFlags': wc._flags(thread.get('status')),
             'turns': [{'id': t.get('id'), 'status': t.get('status')} for t in turns[-80:] if isinstance(t, dict)],
             'updatedAt': wc._epoch(thread.get('updatedAt'))}
 
@@ -420,6 +421,47 @@ class WindowsRuntime:
         self.home, self.proxy_factory = self.reader.home, proxy_factory
         self.store = Store(self.home)
         self.terminate_process = terminate_process
+
+    def recover_session(self, source):
+        """Read exact saved metadata only; no endpoint, process launch or native write."""
+        identity = _identity(source)
+        if identity['agent'] == 'codex':
+            rows = self.reader.database_rows(identity['id'])
+            cwd = source.get('cwd')
+            if (len(rows) != 1 or rows[0].get('id') != identity['id'] or rows[0].get('archived') != 0
+                    or not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_absolute()
+                    or not isinstance(rows[0].get('cwd'), str)
+                    or wc._norm(cwd) != wc._norm(rows[0]['cwd'])):
+                raise ValueError('PC 원본 세션과 저장된 작업 폴더를 확인하지 못했습니다.')
+            row = self.reader._row(rows[0])
+            row = {**row, **identity, 'cwd': rows[0]['cwd']}
+        else:
+            if source.get('home') not in (None, '', '.claude'):
+                raise ValueError('원본 PC Claude 계정 경로를 확인해 주세요.')
+            sid = source.get('sessionId') or identity['id']
+            if not isinstance(sid, str) or not wc.SID.fullmatch(sid):
+                raise ValueError('PC Claude 대화 식별자가 올바르지 않습니다.')
+            root = self.reader.claude_home / 'projects'
+            matches = list(root.glob('*/' + sid + '.jsonl'))
+            if len(matches) != 1:
+                raise ValueError('정확한 PC Claude 저장 대화를 확인하지 못했습니다.')
+            path = wc._safe(matches[0], root)
+            if path.stem != sid or not path.is_file():
+                raise ValueError('PC Claude 저장 대화의 식별자가 바뀌었습니다.')
+            header = wc._head(path)
+            ids = {entry['sessionId'] for entry in header if isinstance(entry.get('sessionId'), str) and entry['sessionId']}
+            cwds = {entry['cwd'] for entry in header if isinstance(entry.get('cwd'), str) and entry['cwd']}
+            cwd = source.get('cwd')
+            if (ids != {sid} or not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_absolute()
+                    or not cwds or any(wc._norm(value) != wc._norm(cwd) for value in cwds)):
+                raise ValueError('PC Claude 저장 대화의 식별자 또는 작업 폴더가 바뀌었습니다.')
+            row = {**identity, 'home': source.get('home'), 'cwd': cwd}
+            if source.get('sessionId'):
+                row['sessionId'] = sid
+            if source.get('kind') in ('interactive', 'background', 'bg'):
+                row['kind'] = source['kind']
+        return {'source': {**row, 'phase': 'unknown', 'runtimeKnown': False, 'readOnly': True, 'canRead': True,
+                           'runtimeReason': '저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다.'}}
 
     def _resume_record_name(self, identity):
         # Host aliases must not provide another route around an unresolved resume.
@@ -1116,4 +1158,6 @@ def handle(request, data=None):
         return runtime.terminal_settle(args.get('source'))
     if op == 'resume_preview':
         return runtime.resume_preview(args.get('source'))
+    if op == 'recover_session':
+        return runtime.recover_session(args.get('source'))
     raise ValueError('지원하지 않는 PC 작업 요청입니다.')

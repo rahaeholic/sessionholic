@@ -236,6 +236,21 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.reader.thread = saved
         self.assertEqual(self.reader.send_calls, 0)
 
+    def test_live_read_explains_unsupported_and_conflicting_status_without_allowing_input(self):
+        for change, code in (({'turns': [{'id': 'future', 'status': 'new-status'}]}, 'turn_status_unsupported'),
+                             ({'turns': [{'id': 'active', 'status': 'inProgress'}]}, 'status_inconsistent'),
+                             ({'status': {'type': 'future-status'}}, 'status_unsupported')):
+            before = copy.deepcopy(self.reader.thread)
+            self.reader.thread.update(change)
+            result = self.runtime.chat({'action': 'read', 'source': self.source})
+            self.assertEqual((result['phase'], result['runtimeKnown'], result['runtimeReasonCode']), ('unknown', False, code))
+            self.assertTrue(result['runtimeReason'])
+            self.assertFalse(result['capabilities']['canSend'])
+            self.reader.thread = before
+        known = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((known['runtimeKnown'], known['runtimeReason'], known['runtimeEvidence']), (True, None, 'project_app_server'))
+        self.assertEqual(self.reader.send_calls, 0)
+
     def test_send_exact_once_receipt_and_no_message_in_ledger(self):
         first = self.send(text='sensitive-fixture-body')
         replay = self.send(text='sensitive-fixture-body')

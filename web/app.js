@@ -189,6 +189,10 @@ const state = {
   detailRun: 0,
   route: null,
   plan: null,
+  planInline: null,
+  runtimeObservations: new Map(),
+  runtimeExpiryTimer: null,
+  runtimeClock: null,
   planRun: 0,
   launchBusy: false,
   pollTimer: null,
@@ -237,6 +241,7 @@ const state = {
   fontSize: prefs.get("fontSize", 14),
   // A wide screen shows the terminal beside the conversation ("나란히"); "크게" covers the board.
   terminalDock: prefs.get("terminalDock", true) !== false,
+  inlineTerminal: null,
   docked: false,
   dockSolo: false,
   dockWidth: 0,
@@ -286,6 +291,9 @@ const state = {
   // Reading state stays in this tab. Recoverable drafts are stored separately on this device.
   conversationViews: new Map(),
   nativeSessions: new Map(),
+  recoveryRun: 0,
+  recoveryBusy: null,
+  recoveryError: "",
   // Session key -> { phase, base }: the phase an open conversation's own read
   // found, shown while the list still has the phase `base` it had then.
   livePhases: new Map(),
@@ -484,6 +492,7 @@ function navTransition(direction, update) {
 // Phone screens: the list or one conversation. State changes at once (chat
 // reads depend on it); only the visible switch may wait for the transition.
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
+  if (!shown && state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (!shown) rememberConversationView();
   const changed = state.detailShown !== shown;
   state.detailShown = shown;
@@ -884,6 +893,11 @@ function assertAuthEpoch(epoch) {
 }
 function beginAuthEpoch() {
   state.authEpoch++;
+  clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
+  state.runtimeObservations.clear(); state.runtimeClock = null;
+  state.recoveryRun++;
+  state.recoveryBusy = null;
+  state.recoveryError = "";
   state.pollBusy = false;
   state.pollRun = null;
   state.manualRun = null;
@@ -1021,6 +1035,103 @@ function labeledSession(session) {
   return { ...value, originalTitle: typeof value.originalTitle === "string" ? value.originalTitle : value.title,
     title: typeof value.displayTitle === "string" && value.displayTitle ? value.displayTitle : value.title };
 }
+function normalizedRuntimeReason(value) {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+function runtimeNow() {
+  if (state.runtimeClock?.snapshot !== state.snapshot) state.runtimeClock = {
+    snapshot: state.snapshot, local: Date.now(),
+    server: Number.isFinite(state.snapshot?.serverTime) ? state.snapshot.serverTime : Date.now() / 1000,
+  };
+  return state.runtimeClock.server + (Date.now() - state.runtimeClock.local) / 1000;
+}
+function validRuntimeObservation(value) {
+  const boot = state.serverBoot || state.snapshot?.bootId;
+  return !!value && value.version === 1 && typeof value.known === "boolean" &&
+    typeof value.bootId === "string" && !!value.bootId && (!boot || value.bootId === boot) &&
+    Number.isSafeInteger(value.requestSeq) && value.requestSeq > 0 &&
+    Number.isSafeInteger(value.acceptedSeq) && value.acceptedSeq > 0 &&
+    Number.isFinite(value.observedAt) && Number.isFinite(value.expiresAt) && value.observedAt <= runtimeNow() + 30 &&
+    (value.known ? ["working", "needs_input", "idle", "done", "closed"].includes(value.phase) && value.expiresAt > value.observedAt : value.phase === "unknown");
+}
+function rememberRuntimeObservation(s, data, authEpoch = state.authEpoch) {
+  if (authEpoch !== state.authEpoch || data?.stale === true || !validRuntimeObservation(data?.runtimeObservation)) return false;
+  const observation = data.runtimeObservation, identity = conversationIdentity(s);
+  const previous = state.runtimeObservations.get(identity);
+  if (previous && (previous.observation.bootId !== observation.bootId ||
+      previous.observation.acceptedSeq >= observation.acceptedSeq || previous.observation.requestSeq > observation.requestSeq)) return false;
+  const lastKnown = validRuntimeObservation(data.lastKnown) && data.lastKnown.known &&
+    data.lastKnown.bootId === observation.bootId && data.lastKnown.acceptedSeq <= observation.acceptedSeq ? { ...data.lastKnown } : null;
+  const reason = Object.hasOwn(data, "runtimeReason") ? normalizedRuntimeReason(data.runtimeReason)
+    : previous?.observation.reasonCode === observation.reasonCode ? previous.reason : null;
+  const lastKnownReason = lastKnown && previous?.observation.acceptedSeq === lastKnown.acceptedSeq
+    ? previous.reason : lastKnown && previous?.lastKnown?.acceptedSeq === lastKnown.acceptedSeq ? previous.lastKnownReason : null;
+  state.runtimeObservations.set(identity, { observation: { ...observation }, lastKnown, reason, lastKnownReason, authEpoch });
+  if (state.runtimeObservations.size > 2048) state.runtimeObservations.delete(state.runtimeObservations.keys().next().value);
+  scheduleRuntimeExpiry();
+  return true;
+}
+function scheduleRuntimeExpiry() {
+  clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
+  if (!state.authenticated) return;
+  const now = runtimeNow(), future = [...state.runtimeObservations.values()]
+    .filter((value) => value.authEpoch === state.authEpoch)
+    .flatMap((value) => [value.observation, value.lastKnown])
+    .filter((value) => value?.known && value.expiresAt > now).map((value) => value.expiresAt);
+  if (!future.length) return;
+  state.runtimeExpiryTimer = setTimeout(() => {
+    state.runtimeExpiryTimer = null;
+    runtimeMetadataChanged({ refreshMessages: true }); scheduleRuntimeExpiry();
+  }, Math.max(1, Math.min(...future) * 1000 - now * 1000 + 10));
+}
+function runtimeMetadataChanged({ refreshMessages = false } = {}) {
+  const shown = selectedSession();
+  if (shown && state.detailFor === shown.key) {
+    state.detailRevision = detailRevision(shown); patchDetailMetadata(shown);
+    const entry = state.chats.get(chatKey(sourceOf(shown)));
+    if (refreshMessages && chatVisible() && entry?.conversation?.identity === conversationIdentity(shown) &&
+        entry.conversation.authEpoch === state.authEpoch) renderMessages(shown, entry.conversation.messages);
+  }
+  render();
+}
+function observedSessionRuntime(s) {
+  const hasAnnotation = Object.hasOwn(s, "runtimeObservation");
+  if (hasAnnotation) rememberRuntimeObservation(s, s);
+  const record = state.runtimeObservations.get(conversationIdentity(s));
+  if (!hasAnnotation && !record) return null;
+  const observation = record?.authEpoch === state.authEpoch && validRuntimeObservation(record.observation) ? record.observation : null;
+  const confirmed = !!observation?.known && observation.expiresAt > runtimeNow() && !s.stale;
+  const lastKnown = !confirmed ? observation?.known ? observation : record?.lastKnown : null;
+  const held = !confirmed && !!observation && !!lastKnown && validRuntimeObservation(lastKnown) && lastKnown.expiresAt > runtimeNow();
+  const display = confirmed ? observation : held ? lastKnown : null;
+  return { phase: display?.phase || "unknown", runtimeKnown: !!display,
+    runtimeReason: !observation ? "실행 상태를 다시 확인해야 합니다." : confirmed ? record.reason : held ? record.lastKnownReason || "최근 확인한 실행 상태를 잠시 유지합니다."
+      : observation.known ? "마지막 실행 상태의 확인 시간이 지났습니다." : record.reason,
+    runtimeReadReason: held ? record.reason || "이번 조회에서는 현재 실행 상태를 확인하지 못했습니다." : null,
+    runtimeObservation: observation, runtimeLastKnown: lastKnown, runtimeHeld: held, runtimeDisplayObservation: display,
+    listedPhase: s.phase, listedRuntimeKnown: s.runtimeKnown, listedRuntimeReason: s.runtimeReason };
+}
+function sessionRuntime(s, key, fetchedAt, following) {
+  const observed = observedSessionRuntime(s);
+  if (observed) return observed;
+  let live = state.livePhases.get(key);
+  const identity = conversationIdentity(s);
+  if (live && (live.base !== s.phase || live.authEpoch !== undefined && live.authEpoch !== state.authEpoch ||
+      live.identity !== undefined && live.identity !== identity ||
+      Object.hasOwn(live, "baseRuntimeKnown") && live.baseRuntimeKnown !== s.runtimeKnown ||
+      Object.hasOwn(live, "baseRuntimeReason") && live.baseRuntimeReason !== normalizedRuntimeReason(s.runtimeReason) ||
+      key !== following && (fetchedAt ?? 0) > (live.fetchedAt ?? 0))) {
+    state.livePhases.delete(key);
+    live = null;
+  }
+  // A phase remembered by an old client does not prove a saved Windows record is live.
+  if (s.runtimeKnown === false && live?.runtimeKnown !== true && live?.runtimeKnown !== false) live = null;
+  const runtimeKnown = live && Object.hasOwn(live, "runtimeKnown") ? live.runtimeKnown : s.runtimeKnown;
+  return { phase: runtimeKnown === false ? "unknown" : live ? live.phase : s.phase,
+    runtimeKnown, runtimeReason: live && Object.hasOwn(live, "runtimeReason") ? live.runtimeReason : s.runtimeReason,
+    runtimeReadReason: live?.runtimeReadReason || null,
+    listedPhase: s.phase, listedRuntimeKnown: s.runtimeKnown, listedRuntimeReason: s.runtimeReason };
+}
 function allSessions() {
   const out = [];
   // The open conversation is read again every few seconds; its own read stands until then.
@@ -1036,15 +1147,9 @@ function allSessions() {
       // The list's own phase stands again once it changed since the conversation was read,
       // or, for a conversation no longer open, once the host was read again after it (a quick
       // turn may end where it began).
-      let live = state.livePhases.get(key);
-      if (live && (live.base !== s.phase || (key !== following && (host.fetchedAt ?? 0) > (live.fetchedAt ?? 0)))) {
-        state.livePhases.delete(key);
-        live = null;
-      }
       out.push(labeledSession({
         ...s,
-        phase: s.runtimeKnown === false ? "unknown" : live && live.base === s.phase ? live.phase : s.phase,
-        listedPhase: s.phase,
+        ...sessionRuntime({ ...s, host: host.name, stale: !host.ok }, key, host.fetchedAt, following),
         host: host.name,
         account: sessionAccountLabel({ ...s, host: host.name }),
         hostLabel: host.label,
@@ -1055,31 +1160,74 @@ function allSessions() {
     }
   }
   for (const session of state.nativeSessions.values()) {
-    if (!out.some((s) => s.key === session.key)) out.push(labeledSession({ ...session, account: sessionAccountLabel(session) }));
+    if (out.some((s) => s.key === session.key)) continue;
+    const aliases = out.map((value, index) => ({ value, index })).filter(({ value }) =>
+      sameRecoverySource(session, value) && sameRecoverySource(value, session) &&
+      (session.cwd || null) === (value.cwd || null) &&
+      (session.agent !== "claude" || (session.sessionId || null) === (value.sessionId || null)));
+    if (aliases.length === 1) {
+      const { value, index } = aliases[0];
+      // The same listed conversation keeps its recovery identity after navigating
+      // away, so reopening it returns to the same draft and saved reading position.
+      const merged = { ...session, ...value, ...sourceOf(session), home: session.home,
+        key: session.key, cwd: session.cwd, sessionId: session.sessionId,
+        nativeSource: session.nativeSource, recoverySource: session.recoverySource,
+        phase: value.listedPhase, runtimeKnown: value.listedRuntimeKnown, runtimeReason: value.listedRuntimeReason };
+      out[index] = labeledSession({ ...merged, ...sessionRuntime(merged, session.key, value.fetchedAt, following) });
+      continue;
+    }
+    out.push(labeledSession({ ...session,
+      ...sessionRuntime(session, session.key, session.fetchedAt, following), account: sessionAccountLabel(session) }));
   }
   return out;
 }
 // The open conversation's own read says what its session does now; the list
 // may say so only a minute later (a host without a resident collector). Its
 // card, header and counts follow the read until the list's phase changes.
-function noteLivePhase(s, data, selected = null) {
+function noteLivePhase(s, data, selected = null, authEpoch = state.authEpoch) {
   // The selected session's row, when the caller just found it, is this one.
   const listed = selected && selected.key === s?.key ? selected : allSessions().find((value) => value.key === s?.key);
-  if (!listed || listed.runtimeKnown === false || listed.listedPhase === undefined && listed.nativeSource || !BADGES[data?.phase] ||
+  if (!listed || authEpoch !== state.authEpoch || state.selected !== listed.key || listed.nativeSource && !listed.recoverySource ||
+      data?.stale === true || !BADGES[data?.phase] || conversationIdentity(s) !== conversationIdentity(listed) ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
-  if (data.phase === listed.listedPhase) state.livePhases.delete(listed.key);
-  else state.livePhases.set(listed.key, { phase: data.phase, base: listed.listedPhase, fetchedAt: listed.fetchedAt });
+  if (listed.agent === "claude" && listed.sessionId && data.route?.sessionId && data.route.sessionId !== listed.sessionId) return;
+  if (Object.hasOwn(data, "runtimeObservation")) {
+    if (listed.agent === "claude" && listed.sessionId && data.route?.sessionId !== listed.sessionId) return false;
+    if (!rememberRuntimeObservation(listed, data, authEpoch)) return false;
+    state.livePhases.delete(listed.key); runtimeMetadataChanged({ refreshMessages: true }); return true;
+  }
+  if (Object.hasOwn(listed, "runtimeObservation")) return false;
+  const knownPhase = (phase) => ["working", "needs_input", "idle", "done", "closed"].includes(phase);
+  if (data.runtimeKnown === true && !knownPhase(data.phase)) return;
+  const unverified = data.runtimeKnown === false || data.readOnly === true && data.runtimeKnown !== true;
+  if (listed.runtimeKnown === false && data.runtimeKnown !== true && !unverified) return;
+  let phase = data.phase, runtimeKnown = data.runtimeKnown ?? listed.runtimeKnown,
+    runtimeReason = Object.hasOwn(data, "runtimeReason") || data.runtimeKnown !== undefined
+      ? normalizedRuntimeReason(data.runtimeReason) : normalizedRuntimeReason(listed.runtimeReason), runtimeReadReason = null;
+  if (unverified && listed.runtimeKnown !== false && knownPhase(listed.phase)) {
+    phase = listed.phase; runtimeKnown = listed.runtimeKnown; runtimeReason = normalizedRuntimeReason(listed.runtimeReason);
+    runtimeReadReason = normalizedRuntimeReason(data.runtimeReason) || "현재 실행 상태를 확인하지 못했습니다.";
+  } else if (unverified) {
+    phase = "unknown"; runtimeKnown = false;
+    runtimeReason ||= normalizedRuntimeReason(listed.runtimeReason);
+  }
+  const base = listed.listedPhase, baseRuntimeKnown = listed.listedRuntimeKnown,
+    baseRuntimeReason = normalizedRuntimeReason(listed.listedRuntimeReason);
+  if (phase === base && runtimeKnown === baseRuntimeKnown && runtimeReason === baseRuntimeReason && !runtimeReadReason)
+    state.livePhases.delete(listed.key);
+  else state.livePhases.set(listed.key, { phase, runtimeKnown, runtimeReason, runtimeReadReason,
+    base, baseRuntimeKnown, baseRuntimeReason, fetchedAt: listed.fetchedAt, identity: conversationIdentity(listed), authEpoch });
   // Redrawn only where it shows (a detail not drawn yet takes it when drawn).
   // This read is the news: the header shows it without reading the
   // conversation again, and the list follows.
-  if (listed.phase !== data.phase && state.detailFor === listed.key) {
-    const shown = allSessions().find((value) => value.key === listed.key);
+  const shown = allSessions().find((value) => value.key === listed.key);
+  const changed = shown && detailRevision(listed) !== detailRevision(shown);
+  if (changed && state.detailFor === listed.key) {
     state.detailRevision = detailRevision(shown);
     patchDetailMetadata(shown);
     render();
-    return true;
   }
-  return false;
+  return !!changed;
 }
 function sourceOf(s) {
   const source = {
@@ -1088,6 +1236,7 @@ function sourceOf(s) {
     id: s.id,
   };
   if (s.home) source.home = s.home;
+  if (s.agent === "claude" && s.sessionId) source.sessionId = s.sessionId;
   return source;
 }
 function accountOf(s) {
@@ -1098,12 +1247,99 @@ function accountOf(s) {
 function selectedSession() {
   return allSessions().find((s) => s.key === state.selected);
 }
+// Recovery references are navigation hints from the server, never launch instructions.
+// Claude's sole default account historically omitted home; Codex always names its account.
+function recoveryIdentity(source) {
+  if (!source || !["codex", "claude"].includes(source.agent) || typeof source.host !== "string" || !source.host || typeof source.id !== "string" || !source.id ||
+      source.agent === "codex" && !source.home || source.agent === "claude" && source.home && source.home !== ".claude") return null;
+  return JSON.stringify([source.host, source.agent, source.home || ".claude", source.id]);
+}
+function sameRecoverySource(a, b) {
+  const key = recoveryIdentity(a);
+  return !!key && key === recoveryIdentity(b) && (a.agent !== "claude" || !a.sessionId || a.sessionId === b.sessionId);
+}
+function recentRecoveries() {
+  const sessions = allSessions(), seen = new Set();
+  return (Array.isArray(state.snapshot?.recoverySessions) ? state.snapshot.recoverySessions : []).filter((ref) => {
+    const key = recoveryIdentity(ref);
+    if (!key || seen.has(key) || ref.closedReason === "user" || ref.removedAt || ref.terminatedAt || ref.closedByBoard) return false;
+    seen.add(key);
+    const listed = sessions.find((s) => sameRecoverySource(ref, s));
+    return !listed || !sessionRemoved(listed);
+  }).slice(0, 20);
+}
+function renderRecoveries() {
+  const section = $("session-recoveries"), list = $("session-recovery-list");
+  if (!section || !list) return;
+  const refs = recentRecoveries(), sessions = allSessions();
+  section.hidden = !state.authenticated || state.sessionCategory === "bot" || !refs.length;
+  $("session-recovery-count").textContent = String(refs.length);
+  const status = $("session-recovery-status");
+  status.textContent = state.recoveryError || (state.recoveryBusy ? "원래 대화를 확인하고 있습니다…" : "");
+  status.hidden = !status.textContent;
+  list.recoveryRows ||= new Map();
+  const rows = refs.map((ref) => {
+    const key = recoveryIdentity(ref);
+    let row = list.recoveryRows.get(key);
+    if (!row) {
+      row = button("", "session-recovery", () => openRecovery(row.recovery));
+      row.recoveryTitle = el("strong", "session-recovery-title");
+      row.recoveryMeta = el("span", "session-recovery-meta");
+      row.append(row.recoveryTitle, row.recoveryMeta);
+      list.recoveryRows.set(key, row);
+    }
+    row.recovery = ref;
+    const listed = sessions.find((s) => sameRecoverySource(ref, s));
+    row.recoveryTitle.textContent = listed?.title || ref.title || "이전에 연결한 대화";
+    row.recoveryMeta.textContent = [ref.hostLabel || ref.host, AGENTS[ref.agent],
+      ref.account || (ref.agent === "codex" ? ref.home : ""), ref.lastSeenAt ? `${ago(ref.lastSeenAt)} 연결 확인` : "이전 연결",
+      ref.closedReason === "released" ? "보기 연결 정리됨" : ref.closedReason ? "연결 종료됨" : "최근 열어 본 작업"].filter(Boolean).join(" · ");
+    row.disabled = !!state.recoveryBusy || state.launchBusy;
+    row.setAttribute("aria-label", `${row.recoveryTitle.textContent}. ${row.recoveryMeta.textContent}. 원래 대화 열기`);
+    return row;
+  });
+  for (const key of list.recoveryRows.keys()) if (!refs.some((ref) => recoveryIdentity(ref) === key)) list.recoveryRows.delete(key);
+  placeChildren(list, rows);
+}
+async function openRecovery(ref) {
+  if (!state.authenticated || state.launchBusy || !recentRecoveries().some((row) => sameRecoverySource(ref, row))) return;
+  const listed = allSessions().filter((s) => sameRecoverySource(ref, s));
+  if (listed.length === 1) { state.recoveryError = ""; select(listed[0].key); return; }
+  if (listed.length > 1) { state.recoveryError = "같은 식별자의 대화가 여러 개입니다. 목록을 새로고침한 뒤 다시 확인해 주세요."; renderRecoveries(); return; }
+  if (networkOffline()) { state.recoveryError = "오프라인입니다. 연결 후 원래 대화를 다시 확인해 주세요."; renderRecoveries(); return; }
+  const run = ++state.recoveryRun, authEpoch = state.authEpoch, selected = state.selected,
+    selectedBot = state.selectedBotRequest, identity = conversationIdentity(selectedSession());
+  const current = () => run === state.recoveryRun && authEpoch === state.authEpoch && state.authenticated &&
+    state.selected === selected && state.selectedBotRequest === selectedBot && conversationIdentity(selectedSession()) === identity &&
+    recentRecoveries().some((row) => sameRecoverySource(ref, row));
+  state.recoveryBusy = recoveryIdentity(ref); state.recoveryError = ""; renderRecoveries();
+  try {
+    const params = new URLSearchParams({ ...sourceOf(ref), ...(ref.agent === "claude" && ref.sessionId ? { sessionId: ref.sessionId } : {}) });
+    const result = await api(`/api/session/recover?${params}`, { authEpoch });
+    if (!current()) return;
+    const resolved = result?.session;
+    if (!sameRecoverySource(ref, resolved)) throw new Error("원래 대화의 기기·계정·식별자를 확인하지 못했습니다.");
+    const key = [resolved.host, resolved.agent, resolved.home || "", resolved.id].join("|");
+    state.nativeSessions.set(key, { ...resolved, key, recoverySource: true, nativeSource: false,
+      title: resolved.title || ref.title || "이전에 연결한 대화", hostLabel: resolved.hostLabel || ref.hostLabel || ref.host });
+    state.recoveryBusy = null;
+    select(key);
+  } catch (err) {
+    if (current() && !err.unauthorized && !err.staleAuth) state.recoveryError = err.message || "원래 대화를 확인하지 못했습니다. 잠시 뒤 다시 확인해 주세요.";
+  } finally {
+    if (run === state.recoveryRun && authEpoch === state.authEpoch) state.recoveryBusy = null;
+    if (authEpoch === state.authEpoch) renderRecoveries();
+  }
+}
 function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
   if (s.phase === "needs_input") return "needs_input";
   if (s.phase === "working") return "working";
   if (sessionTidied(s) || sessionRemoved(s)) return "rest";
   if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
   return "rest";
+}
+function sessionRecentAt(s) {
+  return Math.max(Number(s.updatedAt) || 0, Number(s.openedAt) || 0, state.openedLocal?.get(s.key) || 0);
 }
 function matches(s, now, { phase = true, category = true, initiator = true } = {}) {
   // A bot picked in 시작 주체 lists the sessions it opened (its requests' own too) in any tab.
@@ -1128,7 +1364,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   if (
     !state.showOld && !removed && !sessionPinned(s) &&
     groupOf(s, now) === "rest" &&
-    (now - (s.updatedAt || 0) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
+    (now - sessionRecentAt(s) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
     return false;
   if (!state.search) return true;
@@ -1152,6 +1388,7 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
 
 function renderSessionList(sessions, now) {
   setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
+  renderRecoveries();
   if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
   // Updating list conditions must not redraw a retained conversation or reset
   // its scroll anchor when the same source is opened again from a work card.
@@ -1164,6 +1401,7 @@ function renderSessionList(sessions, now) {
 }
 function render() {
   if (!state.snapshot) return;
+  if (state.inlineTerminal && !inlineTerminalCurrent(state.inlineTerminal)) leaveInlineTerminal({ loadChat: false });
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
@@ -1196,7 +1434,11 @@ function render() {
     syncBeside();
     return;
   }
-  if (selected) refreshDetail(selected);
+  if (selected) {
+    refreshDetail(selected); renderSessionRelations(selected, sessions);
+    const list = $("messages"), entry = state.chats.get(chatKey(sourceOf(selected)));
+    if (list?.conversationSource === chatKey(sourceOf(selected))) renderWorkContext(selected, entry, (list.conversationRows || []).map((row) => row.message));
+  }
   else if (state.selected) {
     state.selected = null;
     state.detailFor = null;
@@ -2017,7 +2259,7 @@ function prepareSessionListFor(session) {
   if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
   const now = state.snapshot?.serverTime || Date.now() / 1000;
   if (!sessionRemoved(session) && !state.showOld && groupOf(session) === "rest" &&
-      (now - (session.updatedAt || 0) > RECENT_SECONDS || sessionTidied(session))) {
+      (now - sessionRecentAt(session) > RECENT_SECONDS || sessionTidied(session))) {
     state.showOld = true; $("show-old").checked = true; changed = true;
   }
   if (state.search && !matches(session, now)) {
@@ -2649,7 +2891,7 @@ function goToSessionTerminal(key) {
     renderDetailTerminal(s);
     return;
   }
-  openTerminal(terminal);
+  openTerminal(terminal, { inline: inlineTerminalRef(s) });
 }
 function openSessionTerminal(s) {
   if (!s || state.launchBusy || !state.authenticated) return;
@@ -2773,7 +3015,7 @@ async function showSessionAgain(s) {
 }
 function keepRestoredSession(s) {
   const now = state.snapshot?.serverTime || Date.now() / 1000;
-  if (sessionTidied(s) || now - (s.updatedAt || 0) > RECENT_SECONDS) {
+  if (sessionTidied(s) || now - sessionRecentAt(s) > RECENT_SECONDS) {
     state.showOld = true;
     $("show-old").checked = true;
   }
@@ -3123,6 +3365,9 @@ function restoreConversationView(list) {
 }
 function select(key) {
   if (state.launchBusy) return;
+  if (state.inlineTerminal && (state.inlineTerminal.key !== key || !inlineTerminalCurrent(state.inlineTerminal))) leaveInlineTerminal({ loadChat: false });
+  state.recoveryRun++;
+  state.recoveryBusy = null;
   // Another session (a click, a notification) drops a keyboard entry's pending input focus.
   if (state.inputFocusFor !== key) state.inputFocusFor = null;
   // A docked terminal stays beside its own conversation; another one shows without it.
@@ -3174,10 +3419,14 @@ function select(key) {
 }
 // What redraws an open conversation's header and reads it again. The device's list time counts
 // only while the header says how old a stale list is: every listing of the device changed it.
-function detailRevision(s) {
+function detailReadRevision(s) {
   return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.stale ? s.fetchedAt : null,
-    s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence, s.parentSessionId,
+    s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence,
     s.executionMode, s.transcriptAvailability, s.historyNotice]);
+}
+function detailRevision(s) {
+  return JSON.stringify([detailReadRevision(s), normalizedRuntimeReason(s.runtimeReason), normalizedRuntimeReason(s.runtimeReadReason),
+    s.runtimeObservation || null, s.runtimeLastKnown || null, !!s.runtimeHeld]);
 }
 function refreshDetail(s) {
   const revision = detailRevision(s);
@@ -3188,11 +3437,15 @@ function refreshDetail(s) {
   )
     return;
   const fresh = state.detailFor !== s.key;
+  let previousReadRevision;
+  try { previousReadRevision = JSON.parse(state.detailRevision)?.[0]; } catch { /* first draw */ }
+  const metadataOnly = !fresh && state.detailUpdatedAt === s.updatedAt && previousReadRevision === detailReadRevision(s);
   state.detailFor = s.key;
   state.detailUpdatedAt = s.updatedAt;
   state.detailRevision = revision;
   if (fresh) drawDetail(s);
   else patchDetailMetadata(s);
+  if (metadataOnly) return;
   // A conversation opened: the ones not used for a while give back what was read for them.
   if (fresh) trimChatMemory(chatEntry(s));
   const reading = loadDetail(s, fresh);
@@ -3212,7 +3465,20 @@ function detailMetaChildren(s) {
     el("span", null, [AGENTS[s.agent], s.account, s.hostLabel].filter(Boolean).join(" · ")),
     el("span", null, initiatorLabel(s)), ...(sessionOneShot(s) ? [el("span", "detail-execution", "일회성 실행")] : []), el("span", null, clock(s.updatedAt)),
     // Why a PC record's state is what it is (its project server off, a codex exec running).
-    ...(typeof s.runtimeReason === "string" && s.runtimeReason ? [el("span", "detail-runtime", s.runtimeReason)] : [])];
+    ...(typeof s.runtimeReason === "string" && s.runtimeReason ? [el("span", "detail-runtime", s.runtimeReason)] : []),
+    ...(s.runtimeReadReason ? [el("span", "detail-runtime", `이번 조회: ${s.runtimeReadReason}`)] : []),
+    ...runtimeEvidenceChildren(s)];
+}
+function runtimeEvidenceChildren(s) {
+  const labels = { project_app_server: "프로젝트 서버", claude_registry_process: "Claude 프로세스", exec_writer_lock: "실행 기록 잠금",
+    external_cli_open: "외부 CLI", saved_record: "저장 기록", unsupported: "실행 확인 불가" };
+  const observed = s.runtimeDisplayObservation || s.runtimeLastKnown || s.runtimeObservation;
+  if (!observed) return [];
+  const age = Math.max(0, Math.floor(runtimeNow() - observed.observedAt));
+  const when = age < 60 ? `${age}초 전` : `${Math.floor(age / 60)}분 전`;
+  const previous = !s.runtimeDisplayObservation || s.runtimeHeld;
+  const phase = observed.known ? BADGES[observed.phase]?.[0] : null;
+  return [el("span", "detail-runtime-evidence", `${previous ? "이전 확인" : "확인"}: ${when} · ${labels[observed.evidence] || "실행 확인 불가"}${previous && phase ? ` · ${phase}` : ""}`)];
 }
 function patchDetailMetadata(s) {
   const pane = $("detail");
@@ -3301,6 +3567,7 @@ async function loadDetail(s, fresh = false) {
 }
 
 function drawDetail(s) {
+  if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if ($("board-status")) $("board-status").open = false;
   // The questions sheet belongs to the conversation drawn before.
   if ($("questions-dialog")?.open) closeSheet("questions-dialog");
@@ -3370,7 +3637,12 @@ function drawDetail(s) {
   headActions.append(focusToggle);
   head.append(headActions);
   window.SessionholicGoals?.attachSessionDetail?.(s, head);
-  pane.append(head);
+  pane.append(head, buildDetailModeTabs(s));
+  const terminalHost = el("div", "detail-terminal-host"); terminalHost.id = "detail-terminal-host";
+  terminalHost.setAttribute("role", "tabpanel"); terminalHost.setAttribute("aria-labelledby", "detail-mode-terminal");
+  terminalHost.hidden = true; pane.append(terminalHost);
+  const relations = el("details", "session-relations"); relations.id = "session-relations"; relations.hidden = true;
+  pane.append(relations);
   renderDetailTerminal(s);
   if (s.stale)
     pane.append(
@@ -3408,6 +3680,7 @@ function drawDetail(s) {
   list.lastScrollTop = 0;
   observeMessages(list);
   list.setAttribute("aria-label", "최근 대화 읽기");
+  list.setAttribute("role", "tabpanel"); list.setAttribute("aria-labelledby", "detail-mode-chat");
   const loading = progress("대화를 불러오고 있습니다…");
   loading.classList?.add?.("conversation-loading");
   loading.setAttribute?.("role", "status");
@@ -3437,29 +3710,128 @@ function drawDetail(s) {
   prompt.setAttribute("aria-live", "polite");
   // 내 질문: between the sync line and the conversation, also in 집중 모드 (not for a bot's chat).
   const bot = sessionCategoryOf(s) === "bot";
-  pane.append(bar, sync, ...(bot ? [] : [buildQuestionPin()]), list, jump, hint, prompt,
+  const context = el("details", "work-context"); context.id = "work-context"; context.hidden = true;
+  pane.append(bar, ...(bot ? [] : [context]), sync, ...(bot ? [] : [buildQuestionPin()]), list, jump, hint, prompt,
     ...(bot ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
   setChromeVisible(state.chromeVisible);
+  renderSessionRelations(s);
   if (!state.chromeVisible && touchDevice()) showTapHint();
+}
+function renderSessionRelations(s, sessions = allSessions()) {
+  const api = window.SessionholicRelations, host = $("session-relations");
+  if (!api || !host || $("detail").dataset.key !== s.key) return;
+  const index = api.buildRelationIndex(sessions), relations = api.relationsFor(index, s);
+  const revision = api.relationRevision(index, s);
+  if (host.relationRevision === revision) return;
+  host.relationRevision = revision;
+  const parent = relations.parent, children = relations.children, ownerIdentity = conversationIdentity(s), authEpoch = state.authEpoch;
+  host.hidden = parent.status === "none" && !children.length && !relations.ambiguous;
+  if (host.hidden) return;
+  const summary = el("summary", null, `관련 작업${children.length ? ` · 하위 ${children.length}개` : ""}`);
+  const body = el("div", "session-relations-body");
+  const openRelated = (target) => {
+    if (!state.authenticated || authEpoch !== state.authEpoch || state.selected !== s.key || conversationIdentity(selectedSession()) !== ownerIdentity) return;
+    const identity = api.sessionIdentity(target), matches = allSessions().filter((row) => api.sessionIdentity(row) === identity);
+    if (matches.length !== 1 || conversationIdentity(matches[0]) !== conversationIdentity(target)) {
+      toast("작업의 연결 정보가 바뀌었습니다. 관련 작업을 다시 확인해 주세요."); return;
+    }
+    select(matches[0].key);
+  };
+  const row = (label, relation) => {
+    const target = relation.session, line = el("div", "session-relation");
+    line.append(el("span", "session-relation-label", label));
+    if (relation.status === "linked" && target) {
+      const go = button(target.title || "제목 없는 작업", "session-relation-link", () => openRelated(target));
+      go.setAttribute("aria-label", `${label}: ${target.title || "제목 없는 작업"} 열기`);
+      line.append(go, el("span", "session-relation-phase", BADGES[target.runtimeKnown === false ? "unknown" : target.phase]?.[0] || "상태 확인 필요"));
+    } else {
+      const copy = { missing: "현재 목록 밖에 있어 확인할 수 없습니다.", ambiguous: "같은 식별자가 여럿이라 확인할 수 없습니다.",
+        unresolved: "원본 관계를 확인하지 못했습니다.", self_reference: "자기 자신을 가리켜 이동할 수 없습니다.", cycle: "순환 관계라 이동할 수 없습니다." };
+      line.append(el("span", "session-relation-unresolved", copy[relation.status] || "관계를 확인하지 못했습니다."));
+    }
+    return line;
+  };
+  if (relations.ambiguous) body.append(el("p", null, "같은 식별자가 여럿이라 작업 관계를 확인할 수 없습니다."));
+  if (parent.status !== "none") body.append(row("상위 작업", parent));
+  for (const child of children) body.append(row("하위 작업", child));
+  keepReadingPlace(() => host.replaceChildren(summary, body));
+}
+function renderWorkContext(s, entry, messages) {
+  const api = window.SessionholicContext, host = $("work-context");
+  if (!api || !host || !entry || !currentChat(entry) || $("detail").dataset.key !== s.key || sessionCategoryOf(s) === "bot") return;
+  const cached = entry.conversation, identity = conversationIdentity(s), authEpoch = state.authEpoch;
+  const meta = cached?.identity === identity && cached.authEpoch === authEpoch ? cached : {};
+  const projection = api.project(messages, { ...meta, stale: !!s.stale || !!meta.stale, offline: networkOffline() });
+  const revision = JSON.stringify([identity, projection]);
+  if (host.contextRevision === revision) return;
+  host.contextRevision = revision; host.hidden = !messages?.length;
+  if (host.hidden) return;
+  const body = el("div", "work-context-body"), scope = projection.scope;
+  const limitations = [scope.olderOmitted ? "이전 대화 일부 제외" : null, scope.truncated ? "긴 메시지 일부 생략" : null,
+    scope.offline ? "오프라인 저장 내용" : scope.stale ? "최신 내용 미확인" : null].filter(Boolean);
+  body.append(el("p", "work-context-scope", `불러온 대화 ${scope.messageCount}개에서 발췌${limitations.length ? ` · ${limitations.join(" · ")}` : ""}. 완료 여부는 원문에서 확인하세요.`));
+  for (const [key, label, limit, empty] of [["lastRequest", "최근 요청", 180, "불러온 범위에 요청이 없습니다."],
+    ["lastResult", "저장된 답변", 260, "최근 요청 뒤 저장된 답변이 아직 없습니다."],
+    ["next", "명시한 다음 행동", 180, "대화에 명시된 다음 행동이 없습니다."]]) {
+    const excerpt = projection[key], section = el("div", "work-context-item"); section.append(el("strong", null, label));
+    if (!excerpt) section.append(el("p", "work-context-empty", empty));
+    else {
+      const clipped = Array.from(excerpt.text).slice(0, limit).join("");
+      section.append(el("p", null, clipped + (clipped.length < excerpt.text.length || excerpt.truncated ? "…" : "")));
+      const message = messages[excerpt.index];
+      section.append(button("원문 위치", "work-context-origin", () => {
+        if (!state.authenticated || authEpoch !== state.authEpoch || !currentChat(entry) || conversationIdentity(selectedSession()) !== identity) return;
+        openContextExcerpt(s, entry, excerpt, message);
+      }));
+    }
+    body.append(section);
+  }
+  keepReadingPlace(() => host.replaceChildren(el("summary", null, "작업 맥락"), body));
+}
+function openContextExcerpt(s, entry, excerpt, message) {
+  const list = $("messages"), anchor = excerpt.anchor;
+  const rows = list.conversationSource === chatKey(entry.source) ? list.conversationRows || [] : [];
+  const exact = rows.filter((item) => item.message === message || anchor && item.message.bodyHash === anchor.bodyHash &&
+    item.message.recordOffset === anchor.recordOffset || !anchor && item.message.role === message?.role &&
+    item.message.text === message?.text && item.message.ts === message?.ts);
+  if (exact.length === 1) {
+    const row = exact[0].row, box = rowBox(list, row);
+    list.pendingView = null; list.pinned = false;
+    setMessagesScroll(list, Math.max(0, (box?.top || 0) - 8)); row.tabIndex = -1; row.focus?.({ preventScroll: true });
+    rememberConversationView(); renderJump(); return;
+  }
+  if (!anchor) { toast("이 발췌의 원문 위치를 현재 대화에서 확인하지 못했습니다. 대화를 다시 확인해 주세요."); return; }
+  entry.historyPreview = { source: questionSource(s), ...anchor, snippet: message?.text || excerpt.text,
+    fullLength: message?.fullLength, ts: excerpt.ts, label: "작업 맥락 · 저장 기록", item: null };
+  historyPreviewRow(s, entry); refreshConversationView(entry); showHistoryPreview(entry);
+  return loadLongMessage(s, entry.historyPreview.item);
 }
 // Questions and approvals drawn by the CLI in the board's terminal, answered
 // here with the same keys a person would press. Nothing is sent until the
 // second, explicit tap, and the server rechecks the exact menu first.
 const AGENT_NAMES = { claude: "Claude", codex: "Codex" };
 const PROMPT_INLINE_OPTIONS = 4;
+function promptRequestCopy(request) {
+  if (request?.status === "answered") return "선택 전달을 확인했습니다.";
+  if (request?.status === "not_found") return "저장된 전달 결과를 찾지 못했습니다. 자동으로 다시 보내지 않습니다. 터미널에서 확인해 주세요.";
+  return "선택 전달 결과를 확인하지 못했습니다. 같은 선택을 다시 보내지 않고 상태를 확인합니다.";
+}
 function renderPrompt(s, data, selected = selectedSession() || null) {
   const card = $("chat-prompt");
   if (!card || !currentChat(chatEntry(s), selected)) return;
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
+  const receipt = entry.promptRequest;
+  const unresolved = receipt && receipt.status !== "answered";
+  const sameRequest = !!prompt && receipt?.fingerprint === prompt.fingerprint;
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
   const asked = state.answerOnOpen;
   if (asked?.key === s.key && (prompt || Date.now() > asked.until)) state.answerOnOpen = null;
-  else if (asked?.key === s.key && openable && !entry.promptBusy && !entry.promptNote && !networkOffline()) {
+  else if (asked?.key === s.key && openable && !unresolved && !entry.promptBusy && !entry.promptNote && !networkOffline()) {
     state.answerOnOpen = null;
     Promise.resolve().then(() => promptAction(s, { action: "open" }));
   }
-  if (!prompt && !openable) {
+  if (!prompt && !openable && !unresolved) {
     card.hidden = true;
     card.chooseNumber = null;
     card.dataset.fingerprint = "";
@@ -3469,10 +3841,10 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
     entry.promptNote = "";
     return;
   }
-  const question = prompt ? prompt.fingerprint : "open";
+  const question = prompt ? prompt.fingerprint : openable ? "open" : `receipt:${receipt.requestId}`;
   if (card.dataset.question && card.dataset.question !== question) entry.promptNote = "";
-  const revision = prompt ? `${prompt.fingerprint}|${prompt.current}|${entry.promptChoice?.number || ""}|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`
-    : `open|${entry.promptBusy ? 1 : 0}|${entry.promptNote || ""}`;
+  const revision = JSON.stringify([question, prompt?.current, entry.promptChoice?.number, !!entry.promptBusy, entry.promptNote,
+    receipt?.requestId, receipt?.status, openable]);
   // A question that just appeared (or a different one) must not be missed:
   // the bars come back. Re-renders of the same question leave them alone.
   const appeared = card.hidden || card.dataset.question !== question;
@@ -3487,16 +3859,24 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   const focusNumber = entry.promptFocus ?? focusedNumber;
   entry.promptFocus = null;
   const head = el("div", "chat-prompt-head");
-  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : "답이 필요한 상태입니다"));
+  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : unresolved ? "선택 전달 상태 확인" : "답이 필요한 상태입니다"));
   const terminal = button("터미널", "chat-prompt-terminal", () => openChatTerminal(s));
   head.append(terminal);
   const nodes = [head];
+  if (unresolved) {
+    nodes.push(el("p", "chat-prompt-note", promptRequestCopy(receipt)));
+    if (!sameRequest) {
+      const check = button(entry.promptBusy ? "확인 중…" : "전달 상태 확인", "secondary", () => promptAction(s, { action: "status" }));
+      check.disabled = !!entry.promptBusy || networkOffline(); nodes.push(check);
+    }
+  }
   if (!prompt) {
     card.chooseNumber = null;
-    nodes.push(el("p", "chat-prompt-note", "질문 화면을 불러오면 여기서 바로 고를 수 있습니다."));
-    const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
-    open.disabled = !!entry.promptBusy || networkOffline();
-    nodes.push(open);
+    if (openable) {
+      nodes.push(el("p", "chat-prompt-note", "질문 화면을 불러오면 여기서 바로 고를 수 있습니다."));
+      const open = button(entry.promptBusy ? "불러오는 중…" : "질문 불러오기", "primary", () => promptAction(s, { action: "open" }));
+      open.disabled = !!entry.promptBusy || networkOffline(); nodes.push(open);
+    }
     // Why the last "질문 불러오기" did not work.
     if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
     card.replaceChildren(...nodes);
@@ -3509,7 +3889,7 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   const selectable = !prompt.multi && Number.isInteger(prompt.current);
   // A hardware keyboard's 1–9 (promptKeydown): the same choice as a tap,
   // among every option (the sheet's too); false when there is no such one.
-  card.chooseNumber = selectable ? (number) => {
+  card.chooseNumber = selectable && !sameRequest ? (number) => {
     const option = prompt.options.find((item) => item.number === number);
     if (!option || entry.promptBusy || !currentChat(entry) || card.dataset.question !== prompt.fingerprint) return false;
     if (entry.promptChoice?.number !== option.number) {
@@ -3530,20 +3910,20 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   for (const [index, option] of inline.entries()) {
     const chosen = entry.promptChoice?.number === option.number;
     const item = button("", `chat-prompt-option${chosen ? " is-chosen" : ""}${option.number === prompt.current ? " is-current" : ""}`, () => {
-      if (!selectable || entry.promptBusy) return;
+      if (!selectable || entry.promptBusy || sameRequest) return;
       entry.promptChoice = { fingerprint: prompt.fingerprint, number: option.number };
       haptic("select");
       renderPrompt(s, entry.data);
     });
     item.setAttribute("role", "radio");
     item.setAttribute("aria-checked", String(chosen));
-    item.disabled = !selectable || !!entry.promptBusy;
+    item.disabled = !selectable || !!entry.promptBusy || sameRequest;
     // One stop in the tab order; arrows move the choice, as in any radio group.
     item.dataset.promptNumber = String(option.number);
     item.tabIndex = (entry.promptChoice ? chosen : index === 0) ? 0 : -1;
     item.addEventListener?.("keydown", (event) => {
       const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[event.key];
-      if (!step || !selectable || entry.promptBusy) return;
+      if (!step || !selectable || entry.promptBusy || sameRequest) return;
       event.preventDefault?.();
       const next = inline[(index + step + inline.length) % inline.length];
       entry.promptChoice = { fingerprint: prompt.fingerprint, number: next.number };
@@ -3571,7 +3951,7 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
         })) });
     });
     all.setAttribute("aria-haspopup", "dialog");
-    all.disabled = !!entry.promptBusy;
+    all.disabled = !!entry.promptBusy || sameRequest;
     nodes.push(all);
   }
   if (!selectable) {
@@ -3579,11 +3959,13 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
       : "현재 선택 위치를 확인하지 못했습니다. 터미널에서 선택해 주세요."));
   } else {
     const choice = prompt.options.find((option) => option.number === entry.promptChoice?.number);
-    const send = button(entry.promptBusy ? "보내는 중…" : choice ? `${choice.number}번 보내기` : "선택지를 고르세요", "primary", () => {
+    const send = button(entry.promptBusy ? "확인 중…" : sameRequest ? receipt.status === "answered" ? "선택 전달됨" : "전달 상태 확인"
+      : choice ? `${choice.number}번 ${unresolved ? "새 응답 " : ""}보내기` : "선택지를 고르세요", "primary", () => {
+      if (sameRequest) return promptAction(s, { action: "status" });
       if (!choice) return;
       promptAction(s, { action: "answer", fingerprint: prompt.fingerprint, number: choice.number });
     });
-    send.disabled = !choice || !!entry.promptBusy || networkOffline();
+    send.disabled = (sameRequest ? receipt.status === "answered" : !choice) || !!entry.promptBusy || networkOffline();
     nodes.push(send);
   }
   if (entry.promptNote) nodes.push(el("p", "chat-prompt-note", entry.promptNote));
@@ -3592,33 +3974,57 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
 }
 async function promptAction(s, body) {
   const entry = chatEntry(s);
-  if (entry.promptBusy || !currentChat(entry)) return;
+  if (entry.promptBusy || !currentChat(entry) || networkOffline()) return;
+  const authEpoch = state.authEpoch, identity = entry.draftIdentity;
+  const belongs = () => authEpoch === state.authEpoch && state.authenticated &&
+    state.chats.get(chatKey(entry.source)) === entry && entry.draftIdentity === identity;
+  let action = body.action;
+  if (action === "answer" && entry.promptRequest?.fingerprint === body.fingerprint) action = "status";
+  if (action === "status" && !entry.promptRequest) return;
+  if (action === "answer") {
+    if (!/^[a-f0-9]{64}$/.test(body.fingerprint || "") || !Number.isInteger(body.number)) return;
+    entry.promptRequest = { requestId: requestId(), fingerprint: body.fingerprint, number: body.number, status: "unconfirmed" };
+    // Keep only the selector and receipt ID, never the question or terminal text.
+    persistChatDraft(entry);
+  }
+  const descriptor = entry.promptRequest;
+  const payload = action === "open" ? { action, requestId: requestId() }
+    : { action, requestId: descriptor.requestId, fingerprint: descriptor.fingerprint, number: descriptor.number };
   entry.promptBusy = true;
   entry.promptNote = "";
   // A state read begun before the answer still shows the question: it is not
   // drawn again (the read that follows the answer is).
-  entry.stateEpoch++;
+  if (action !== "status") entry.stateEpoch++;
   renderPrompt(s, entry.data);
   try {
     const result = await api("/api/chat/prompt", { method: "POST", body: {
-      source: entry.source, requestId: requestId(), ...body } });
-    if (!currentChat(entry)) return;
+      source: entry.source, ...payload }, authEpoch });
+    if (!belongs()) return;
+    if (action !== "open") {
+      if (result.requestId && result.requestId !== descriptor.requestId ||
+          result.number != null && result.number !== descriptor.number) throw new Error("선택 전달 확인 번호가 일치하지 않습니다.");
+      descriptor.status = ["answered", "unconfirmed", "not_found"].includes(result.status) ? result.status : "unconfirmed";
+      persistChatDraft(entry);
+    }
     entry.promptChoice = null;
-    if (body.action === "answer")
-      entry.promptNote = result.status === "answered" ? "" : "선택이 반영됐는지 확인하지 못했습니다. 터미널에서 확인해 주세요.";
-    if (body.action === "answer" && result.status === "answered") { toast("선택을 보냈습니다."); haptic("success"); }
-    entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
+    if (action !== "open") entry.promptNote = descriptor.status === "answered" ? "" : promptRequestCopy(descriptor);
+    if (action === "answer" && result.status === "answered" && currentChat(entry)) { toast("선택을 보냈습니다."); haptic("success"); }
+    if (action !== "status" && (Object.hasOwn(result, "prompt") || result.status === "answered"))
+      entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
     // "질문 불러오기" may have attached a board terminal: its marks show it now.
-    if (body.action === "open") refreshTerminals();
+    if (action === "open" && currentChat(entry)) refreshTerminals();
   } catch (err) {
-    if (!err.unauthorized && currentChat(entry)) { entry.promptNote = err.message; haptic("error"); }
+    if (belongs() && !err.unauthorized && !err.staleAuth) {
+      entry.promptNote = action === "open" ? err.message : promptRequestCopy(descriptor);
+      if (currentChat(entry)) haptic("error");
+    }
   } finally {
     entry.promptBusy = false;
-    entry.stateEpoch++;
-    if (currentChat(entry)) {
+    if (action !== "status") entry.stateEpoch++;
+    if (belongs() && currentChat(entry)) {
       renderPrompt(s, entry.data);
       state.chatPollCount = 0;
-      loadChatState(s, true);
+      if (action !== "status") loadChatState(s, true);
     }
   }
 }
@@ -3972,7 +4378,10 @@ function submissionRequestIds(entry, lastRequestId) {
 function chatEntry(s) {
   const source = sourceOf(s);
   const key = chatKey(source);
-  const draftIdentity = JSON.stringify([source, s.agent === "claude" ? s.sessionId || s.id : s.id]);
+  // The transcript already has its own slot in the existing draft format. Adding it to a
+  // recovered transport selector must not give the same conversation a different draft.
+  const draftSource = { ...source }; delete draftSource.sessionId;
+  const draftIdentity = JSON.stringify([draftSource, s.agent === "claude" ? s.sessionId || s.id : s.id]);
   const previous = state.chats.get(key);
   if (previous && previous.draftIdentity !== draftIdentity) {
     if (s.agent === "claude" && s.sessionId && !previous.draftTranscript) {
@@ -3993,14 +4402,17 @@ function chatEntry(s) {
     const entry = {
     source: Object.freeze({ ...source }), text: "", attachments: [], data: null, conversation: null,
     fullMessages: new Map(), historyPreview: null,
-    pending: null, receipt: null, sending: false, uploads: 0, outbox: [], outboxClaims: [], uploadQueue: [], thumbs: new Map(),
+    pending: null, receipt: null, promptRequest: null, sending: false, uploads: 0, outbox: [], outboxClaims: [], uploadQueue: [], thumbs: new Map(),
     composing: false, editorEpoch: 0, stateEpoch: 0, recheckQueued: false, expanded: false, inputCollapsed: false, checking: false, error: "", notice: "", revision: 0,
       draftIdentity, draftAuthEpoch: state.authEpoch, draftTranscript: s.agent === "claude" ? s.sessionId || null : null,
     };
     state.chats.set(key, entry);
     restoreChatDraft(entry);
   }
-  return state.chats.get(key);
+  const entry = state.chats.get(key);
+  if (source.sessionId && entry.source.sessionId !== source.sessionId)
+    entry.source = Object.freeze({ ...source });
+  return entry;
 }
 // `selected` lets a caller that already found the selected session pass it down:
 // allSessions() rebuilds every row, so one composer update finds it once.
@@ -4076,13 +4488,16 @@ function readSavedDraft(key) {
         row.commandRequest && (typeof row.commandRequest.requestId !== "string" || row.commandRequest.requestId.length > 128 ||
           !['model', 'effort', 'compact'].includes(row.commandRequest.command) ||
           !['pending', 'unknown', 'applied'].includes(row.commandRequest.status) ||
-          row.commandRequest.value !== null && (typeof row.commandRequest.value !== "string" || row.commandRequest.value.length > 128))) return null;
+          row.commandRequest.value !== null && (typeof row.commandRequest.value !== "string" || row.commandRequest.value.length > 128)) ||
+        row.promptRequest && (typeof row.promptRequest.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(row.promptRequest.requestId) ||
+          !/^[a-f0-9]{64}$/.test(row.promptRequest.fingerprint || "") || !Number.isInteger(row.promptRequest.number) ||
+          !["answered", "unconfirmed", "not_found"].includes(row.promptRequest.status))) return null;
     return row;
   } catch { return null; }
 }
 function savedDraftShape(row) {
   return JSON.stringify({ text: row.text, attachments: row.attachments, pending: row.pending ?? null,
-    revision: row.revision || 0, commandRequest: row.commandRequest ?? null });
+    revision: row.revision || 0, commandRequest: row.commandRequest ?? null, promptRequest: row.promptRequest ?? null });
 }
 function writeSavedDraft(key, row) {
   if (!state.authenticated || !draftRecoveryEnabled() || state.discardOnReload) return false;
@@ -4091,7 +4506,7 @@ function writeSavedDraft(key, row) {
     const shape = savedDraftShape(row), previousShape = state.draftSavedShapes.get(key);
     // Status polling in an idle tab must never overwrite another tab's newer edits.
     if (previousShape === shape && localStorage.getItem(key) !== null) return true;
-    if (!row.text && !row.attachments.length && !row.pending) {
+    if (!row.text && !row.attachments.length && !row.pending && !row.promptRequest) {
       const prior = readSavedDraft(key);
       if (!prior || previousShape === savedDraftShape(prior)) localStorage.removeItem(key);
       state.draftSavedShapes.set(key, shape); return true;
@@ -4128,6 +4543,8 @@ function chatDraftPayload(entry) {
     text: entry.pending.text, attachments: entry.pending.attachments,
     attachmentDetails: attachmentMetadata(entry.pending.attachmentDetails) } : null;
   return { text: entry.text || "", attachments: attachmentMetadata(entry.attachments), pending, revision: entry.revision || 0,
+    promptRequest: entry.promptRequest ? { requestId: entry.promptRequest.requestId, fingerprint: entry.promptRequest.fingerprint,
+      number: entry.promptRequest.number, status: entry.promptRequest.status } : null,
     commandRequest: entry.commandRequest ? { requestId: entry.commandRequest.requestId, command: entry.commandRequest.command,
       value: entry.commandRequest.value ?? null, status: entry.commandRequest.status } : null };
 }
@@ -4136,6 +4553,10 @@ function restoreChatDraft(entry) {
   if (!row) { state.draftSavedShapes.set(key, savedDraftShape(chatDraftPayload(entry))); return; }
   entry.text = row.text; entry.attachments = attachmentMetadata(row.attachments);
   entry.revision = Number.isInteger(row.revision) && row.revision >= 0 ? row.revision : 0;
+  if (row.promptRequest) {
+    entry.promptRequest = { ...row.promptRequest };
+    if (entry.promptRequest.status !== "answered") entry.notice = "선택 전달 확인 기록을 복원했습니다. 같은 선택을 다시 보내지 않고 전달 상태를 확인해 주세요.";
+  }
   if (row.commandRequest) {
     const command = row.commandRequest;
     const canonical = `/${command.command}${command.value === null ? "" : " " + command.value}`;
@@ -4184,7 +4605,7 @@ function persistAllDrafts() {
   return saved && ![...state.chats.values()].some((entry) => entry.uploads || entry.uploadQueue?.length);
 }
 function chatVisible() {
-  return !document.hidden && !boardCovered() && (!phoneLayout() || state.detailShown);
+  return !document.hidden && !boardCovered() && !state.inlineTerminal && (!phoneLayout() || state.detailShown);
 }
 function chatHostOffline(entry, session = selectedSession() || null) {
   return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
@@ -6243,6 +6664,7 @@ function applyChatReceipt(entry, receipt, selected) {
 const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
   const entry = chatEntry(s);
+  const authEpoch = state.authEpoch;
   // Found once before the read and once after it (the selection may change meanwhile).
   let selected = selectedSession() || null;
   if (!currentChat(entry, selected) || !chatVisible() || networkOffline()) return;
@@ -6301,7 +6723,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
       }
     }
     // A phase the read changed redraws the board: the selected row is found again after it.
-    if (noteLivePhase(s, data, selected)) selected = selectedSession() || null;
+    if (noteLivePhase(s, data, selected, authEpoch)) selected = selectedSession() || null;
     scheduleChatPoll(s, entry, selected);
   } catch (err) {
     selected = selectedSession() || null;
@@ -7376,7 +7798,7 @@ async function recoverChatSession(s) {
   if (!recovery || entry.recovering) return;
   if (recovery.action === "resume_session") {
     state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
-    return preparePlan({ resume: true });
+    return preparePlan({ resume: true, inline: true });
   }
   const authEpoch = state.authEpoch;
   entry.recovering = true;
@@ -7405,21 +7827,21 @@ function openChatTerminal(s) {
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
   if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (state.terminalAlive && chatKey(terminalInfo(state.terminal).nativeSource || {}) === chatKey(sourceOf(s))) {
-    openTerminal(state.terminal);
+    openTerminal(state.terminal, { inline: inlineTerminalRef(s) });
     return;
   }
   // The session already has a live board terminal (its "터미널 열림" mark): that one opens,
   // never a second connection to the same session.
   const open = terminalForSession(s);
   if (open) {
-    if (terminalEstimated(open)) toast("시작 시각으로 추정한 이 세션의 터미널을 엽니다.");
-    openTerminal(open);
+    if (!terminalMatchesDetail(open, s)) { toast("선택한 대화의 정확한 터미널 연결을 확인하지 못했습니다. 열린 터미널 목록에서 확인해 주세요."); return; }
+    openTerminal(open, { inline: inlineTerminalRef(s) });
     return;
   }
   if (s.nativeSource) { toast("이 실행의 터미널이 종료됐습니다. 새로고침 후 세션 목록에서 선택해 주세요."); return; }
   state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
   populateRoute(s);
-  preparePlan();
+  preparePlan({ inline: true });
 }
 function openNativeChat(terminal) {
   const info = terminalInfo(terminal);
@@ -8206,7 +8628,8 @@ function renderMessages(s, messages, error = "", fresh = false) {
   if (entry) {
     const live = entry.data && chatKey(entry.data.route || {}) === source ? entry.data : null;
     // A Claude row without an id is never read; its listed phase still says it works.
-    const phaseWorking = live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
+    const observed = observedSessionRuntime(s);
+    const phaseWorking = observed ? observed.phase === "working" : live ? live.phase === "working" : claudeWithoutId(s) && s.phase === "working";
     // The composer's receipt note follows a bubble that went (renderMessages
     // also runs for /api/read, which no composer update follows).
     if (settleOutbox(entry, messages, { working: phaseWorking, claimed })) updateChatComposer(entry);
@@ -8333,6 +8756,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   renderJump();
   // A new question of the user's (sent from here or read in the transcript) shows above.
   renderQuestionPin(s);
+  renderWorkContext(s, entry, messages);
 }
 
 // A row's top and height in the conversation's own scrolled content, or null
@@ -8509,6 +8933,7 @@ function backToList() {
   else setDetailShown(false, { direction: "pop", focus: true });
 }
 function backFromTerminal() {
+  if (state.inlineTerminal) { leaveInlineTerminal(); return; }
   // Opening beside the board replaces its history entry; a fresh page has no entry to go
   // back to. Hiding that pane is local and keeps the conversation and run available.
   if (state.docked) {
@@ -9046,7 +9471,7 @@ function updateContinue(s) {
               : "작업 맥락을 전달할 수 있는지 먼저 확인합니다.";
 }
 
-async function preparePlan({ resume = false } = {}) {
+async function preparePlan({ resume = false, inline = false } = {}) {
   const s = selectedSession();
   if (!s || !state.route) return;
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
@@ -9060,6 +9485,8 @@ async function preparePlan({ resume = false } = {}) {
   const target = resume ? { host: s.host, agent: s.agent, account: accountOf(s) } : { ...state.route };
   const run = ++state.planRun;
   state.plan = null;
+  state.planInline = inline ? inlineTerminalRef(s) : null;
+  const inlineRef = state.planInline;
   $("plan-title").textContent = "이어서 할 준비를 확인합니다";
   $("plan-error").textContent = "";
   $("plan-body").replaceChildren(
@@ -9076,6 +9503,7 @@ async function preparePlan({ resume = false } = {}) {
       body: { source: sourceOf(s), target, ...(resume ? { resume: true } : {}) },
     });
     if (run !== state.planRun || !$("plan-dialog").open) return;
+    if (inlineRef && !inlineTerminalCurrent(inlineRef)) { closePlan(); return; }
     state.plan = plan;
     renderPlan(s, plan, target);
     // Returning to the same session's own terminal needs no second confirmation.
@@ -9228,11 +9656,14 @@ function closePlan() {
   if (state.launchBusy) return;
   state.planRun++;
   state.plan = null;
+  state.planInline = null;
   $("plan-dialog").close();
 }
 async function launchPlan() {
   if (!state.plan?.allowed || state.launchBusy) return;
   const plan = state.plan;
+  const inline = state.planInline;
+  if (inline && !inlineTerminalCurrent(inline)) { closePlan(); return; }
   const authEpoch = state.authEpoch;
   state.launchBusy = true;
   $("plan-launch").disabled = true;
@@ -9260,9 +9691,10 @@ async function launchPlan() {
       throw new Error("터미널 연결 정보를 받지 못했습니다.");
     $("plan-dialog").close();
     state.plan = null;
+    state.planInline = null;
     // Its card and conversation header show "터미널 열림" at once.
     rememberTerminal(result.terminal);
-    await openTerminal(result.terminal);
+    await openTerminal(result.terminal, { inline });
     assertAuthEpoch(authEpoch);
     if (result.goalLinkWarning) notice(result.goalLinkWarning);
     window.SessionholicGoals?.refresh?.();
@@ -9437,7 +9869,7 @@ function terminalEndedCopy(terminal) {
   const copy = terminalCloseCopy(terminal);
   // Unread for 10 minutes, or for a minute when the board needed room for another terminal.
   if (terminal?.closedReason === "released")
-    return "한동안 보지 않아 이 보드의 보기 연결만 정리했습니다. 작업은 실행 기기에서 계속됩니다.";
+    return "한동안 보지 않아 이 보드의 연결을 정리했습니다. 현재 실행 상태는 원래 대화에서 다시 확인해 주세요.";
   const host = capsHost(terminalInfo(terminal).host);
   // "connection_ended" is any end of the terminal's run: its own exit or a lost host. A held
   // run outlasts a lost host, so its end is its own.
@@ -9464,17 +9896,34 @@ function sessionForTerminal(terminal) {
   }
   return null;
 }
+function recoveryForTerminal(terminal) {
+  const info = terminalInfo(terminal);
+  let source = info.nativeSource;
+  if (!source) try { source = JSON.parse(info.sourceKey || "null"); } catch { /* no source */ }
+  return source && recentRecoveries().find((ref) => sameRecoverySource(ref, source)) || null;
+}
 function showTerminalEnded() {
   terminalStatus(terminalEndedCopy(state.terminal));
   // A session closed by its user is not resumed from the board (the plan refuses it).
-  const s = state.terminal?.closedReason === "user" ? null : sessionForTerminal(state.terminal);
+  const s = state.terminal?.closedReason === "user" ? null : sessionForTerminal(state.terminal) || recoveryForTerminal(state.terminal);
   $("terminal-reopen").hidden = !s || sessionOneShot(s) || !!terminalForSession(s);
 }
 // Opening it again is reviewed like any new terminal (the conversation's plan sheet).
 function reopenEndedTerminal() {
   const s = sessionForTerminal(state.terminal);
-  if (!s || state.launchBusy || !state.authenticated) return;
+  if (state.launchBusy || !state.authenticated || state.terminal?.closedReason === "user") return;
+  if (!s) {
+    const ref = recoveryForTerminal(state.terminal);
+    if (!ref) return;
+    returnToBoard({ selectLaunchedSource: false });
+    return openRecovery(ref);
+  }
   $("terminal-reopen").hidden = true;
+  if (state.inlineTerminal) {
+    leaveInlineTerminal({ loadChat: false });
+    state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
+    return preparePlan({ inline: true });
+  }
   if (window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "terminal") {
     // The way back is asynchronous: the board opens it once back (popstate).
     state.reopenOnReturn = s.key;
@@ -9651,6 +10100,78 @@ function showTerminalScreen(visible) {
   $("terminal-screen").hidden = !visible;
   applyDock();
 }
+function inlineTerminalRef(s) {
+  return s ? { key: s.key, identity: conversationIdentity(s) } : null;
+}
+function inlineTerminalCurrent(ref) {
+  const selected = selectedSession();
+  return !!ref && !!selected && ref.key === selected.key && ref.identity === conversationIdentity(selected);
+}
+function terminalMatchesDetail(terminal, s) {
+  const info = terminalInfo(terminal);
+  if (terminalEstimated(terminal)) return false;
+  let source = info.nativeSource;
+  if (!source) {
+    try { source = JSON.parse(info.sourceKey || "null"); } catch { return false; }
+    if (typeof source?.cwd !== "string" || !source.cwd) return false;
+  }
+  if ((source.cwd || null) !== (s.cwd || null)) return false;
+  return !!source && sameRecoverySource(source, s) &&
+    (s.agent !== "claude" || !s.sessionId || source.sessionId === s.sessionId);
+}
+function buildDetailModeTabs(s) {
+  const tabs = el("div", "detail-mode-tabs"); tabs.id = "detail-mode-tabs";
+  const identity = conversationIdentity(s), authEpoch = state.authEpoch;
+  tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "작업 보기 방식");
+  for (const [mode, label, controls] of [["chat", "채팅", "messages"], ["terminal", "터미널", "detail-terminal-host"]]) {
+    const tab = button(label, "detail-mode-tab", () => {
+      if (!state.authenticated || authEpoch !== state.authEpoch || state.selected !== s.key || conversationIdentity(selectedSession()) !== identity) return;
+      if (mode === "chat") leaveInlineTerminal();
+      else openChatTerminal(selectedSession());
+    });
+    tab.id = `detail-mode-${mode}`; tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-controls", controls); tab.setAttribute("aria-selected", String(mode === "chat"));
+    tab.tabIndex = mode === "chat" ? 0 : -1;
+    tab.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      $(`detail-mode-${event.key === "Home" ? "chat" : event.key === "End" ? "terminal" : mode === "chat" ? "terminal" : "chat"}`)?.focus();
+    });
+    tabs.append(tab);
+  }
+  return tabs;
+}
+function renderDetailMode() {
+  const active = !!state.inlineTerminal && state.terminalVisible && inlineTerminalCurrent(state.inlineTerminal);
+  setClass($("detail"), "is-terminal-mode", active);
+  if ($("detail-terminal-host")) $("detail-terminal-host").hidden = !active;
+  for (const mode of ["chat", "terminal"]) {
+    const tab = $(`detail-mode-${mode}`);
+    if (!tab) continue;
+    const selected = mode === "terminal" ? active : !active;
+    tab.setAttribute("aria-selected", String(selected)); tab.tabIndex = selected ? 0 : -1;
+  }
+}
+function restoreTerminalHome() {
+  const screen = $("terminal-screen"), home = $("terminal-home");
+  if (screen && home?.parentNode && screen.parentNode !== home.parentNode)
+    home.parentNode.insertBefore(screen, home.nextSibling || null);
+}
+function leaveInlineTerminal({ loadChat = true } = {}) {
+  if (!state.inlineTerminal) return;
+  const ref = state.inlineTerminal;
+  saveDraft(); stopTerminalReader(); state.inputEpoch++; state.terminalOpenRun++;
+  state.inlineTerminal = null; state.terminalVisible = false;
+  restoreTerminalHome(); $("terminal-screen").hidden = true;
+  document.body.classList?.remove("terminal-inline"); renderDetailMode(); applyDock();
+  renderConnectivity(); renderTerminalReturn(); updateThemeColor(); schedule(); syncEvents();
+  const s = selectedSession();
+  if (s && ref.identity === conversationIdentity(s)) {
+    const view = state.conversationViews.get(ref.identity), list = $("messages");
+    if (view && list) { list.pendingView = view; requestAnimationFrame(() => { if (!state.inlineTerminal && inlineTerminalCurrent(ref)) restoreConversationView(list); }); }
+    if (loadChat && state.authenticated && chatVisible()) loadChatState(s, true);
+  }
+}
 // Docked, the terminal keeps 80 columns (64 at least, where a CLI's boxes still fit) and
 // leaves the conversation 420px; the list stays beside them when 820px are left.
 // chrome: the viewport's padding, xterm's scrollbar and the dock's border.
@@ -9680,7 +10201,7 @@ function dockWidth({ preferred = state.terminalDock } = {}) {
   return docked >= cell * DOCK.minCols + DOCK.chrome ? Math.floor(docked) : 0;
 }
 function boardCovered() {
-  return state.terminalVisible && !state.docked;
+  return state.terminalVisible && !state.docked && !state.inlineTerminal;
 }
 // Beside a terminal whose conversation is not listed yet: no other conversation stays there.
 function showDockWaiting() {
@@ -9740,6 +10261,15 @@ function noteDockSide(side) {
 }
 // Beside the conversation or over the board: decided on open, resize and font change.
 function applyDock() {
+  if (state.inlineTerminal) {
+    const changed = state.docked;
+    state.docked = false; state.dockSolo = false; state.dockWidth = 0;
+    document.body.classList?.remove("terminal-docked", "dock-solo");
+    document.body.classList?.add("terminal-inline");
+    $("app").hidden = false; $("terminal-screen").setAttribute("role", "region");
+    renderDetailMode(); renderDockToggle(); renderTerminalReturn();
+    return changed;
+  }
   const width = state.terminalVisible ? dockWidth() : 0;
   const docked = width > 0;
   const changed = docked !== state.docked;
@@ -9793,11 +10323,12 @@ function redock() {
 function renderDockToggle() {
   const toggle = $("terminal-dock");
   if (toggle) {
-    toggle.hidden = !state.terminalVisible || !(dockWidth({ preferred: true }) > 0);
+    toggle.hidden = !!state.inlineTerminal || !state.terminalVisible || !(dockWidth({ preferred: true }) > 0);
     toggle.textContent = state.docked ? "크게" : "나란히";
     toggle.setAttribute("aria-label", state.docked ? "터미널을 화면 가득 보기" : "터미널을 대화 옆에 보기");
   }
   const back = $("terminal-back");
+  if (state.inlineTerminal) { back.textContent = "채팅"; back.setAttribute("aria-label", "같은 작업의 채팅으로 돌아가기"); return; }
   // A phone names the screen back returns to, as iOS does: the conversation the terminal
   // was opened from, or the session list. Wider screens return to the whole board.
   const entry = window.history.state;
@@ -9887,10 +10418,18 @@ function loadXterm() {
   });
   return xtermLoading;
 }
-async function openTerminal(terminal, { recordHistory = true } = {}) {
-  const docking = dockWidth() > 0;
+async function openTerminal(terminal, { recordHistory = true, inline = null } = {}) {
+  if (inline && (!inlineTerminalCurrent(inline) || !terminalMatchesDetail(terminal, selectedSession()))) {
+    toast("선택한 대화와 터미널의 연결을 확인하지 못했습니다. 열린 터미널 목록에서 확인해 주세요."); return;
+  }
+  if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
+  if (inline) {
+    rememberConversationView(); state.inlineTerminal = inline;
+    $("detail-terminal-host")?.append($("terminal-screen"));
+  }
+  const docking = !inline && dockWidth() > 0;
   if (!docking) stopChatPolling();
-  if (recordHistory) navigateView("terminal", docking && window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "list");
+  if (recordHistory && !inline) navigateView("terminal", docking && window.history.state?.[INSTANCE.historyKey] && window.history.state.view === "list");
   const presenting = !state.terminalVisible;
   const openRun = ++state.terminalOpenRun;
   const current = () => openRun === state.terminalOpenRun && state.terminal?.id === terminal.id && state.terminalVisible;
@@ -9922,7 +10461,7 @@ async function openTerminal(terminal, { recordHistory = true } = {}) {
   renderConnectivity();
   // A phone pushes the terminal like its other screens (and an edge swipe pops it); a wider
   // screen presents it over the board.
-  const shown = presenting && !docking
+  const shown = presenting && !docking && !inline
     ? navTransition(phoneLayout() ? "push" : "present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
   releaseBoardFocus();
   updateThemeColor();
@@ -10191,6 +10730,7 @@ function sendInput(text) {
   return send;
 }
 function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat = true } = {}) {
+  if (state.inlineTerminal) { leaveInlineTerminal({ loadChat }); return; }
   saveDraft();
   stopTerminalReader();
   state.inputEpoch++;
@@ -11363,6 +11903,8 @@ function finishTerminalClose(closing) {
   if (state.terminal?.id === closing.id) {
     const wasVisible = state.terminalVisible;
     const wasDocked = state.docked;
+    const wasInline = !!state.inlineTerminal;
+    if (wasInline) leaveInlineTerminal({ loadChat: false });
     saveDraft();
     stopTerminalReader();
     state.inputEpoch++;
@@ -11378,7 +11920,7 @@ function finishTerminalClose(closing) {
     showTerminalScreen(false);
     updateThemeColor();
     renderTerminalReturn();
-    if (wasVisible) {
+    if (wasVisible && !wasInline) {
       const history = window.history;
       const closed = state.closedHistory ||= new Set();
       for (const key of [history.state?.navigationId, !wasDocked && history.state?.parentDetailId]) if (key) closed.add(key);
@@ -11389,12 +11931,13 @@ function finishTerminalClose(closing) {
       } else navigateView("list", true);
     }
     // A covering terminal returns to the list; beside the conversation, that stays.
-    if (wasVisible && !wasDocked) {
+    if (wasVisible && !wasDocked && !wasInline) {
       stopChatPolling();
       setDetailShown(false, { focus: true });
     }
     schedule();
     syncEvents();
+    if (wasInline && chatVisible()) loadChatState(selectedSession(), true);
   }
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
@@ -11481,10 +12024,11 @@ function syncEvents() {
   const s = selectedSession();
   const chat = s && chatVisible() && !claudeWithoutId(s) ? sourceOf(s) : null;
   const key = chat ? chatKey(chat) : "";
-  if (state.events?.key === key) return;
+  const identity = chat ? conversationIdentity(s) : null;
+  if (state.events?.key === key && state.events?.identity === identity) return;
   closeEvents();
   const params = new URLSearchParams();
-  for (const name of ["host", "agent", "home", "id"]) if (chat?.[name]) params.set(name, chat[name]);
+  for (const name of ["host", "agent", "home", "id", "sessionId"]) if (chat?.[name]) params.set(name, chat[name]);
   const query = params.toString();
   let source;
   try {
@@ -11493,7 +12037,7 @@ function syncEvents() {
     fallbackEvents();
     return;
   }
-  const events = { source, key, healthy: false, everOpen: false, errors: [], digest: null, authEpoch: state.authEpoch };
+  const events = { source, key, identity, healthy: false, everOpen: false, errors: [], digest: null, authEpoch: state.authEpoch };
   state.events = events;
   const current = () => state.events === events && events.authEpoch === state.authEpoch;
   const parse = (event) => {
@@ -11526,11 +12070,13 @@ function syncEvents() {
   });
   source.addEventListener("chat", (event) => {
     if (!current()) return;
-    const digest = parse(event).digest;
+    const payload = parse(event), digest = payload.digest;
+    const selected = selectedSession();
+    if (!selected || !events.key || chatKey(sourceOf(selected)) !== events.key ||
+        conversationIdentity(selected) !== events.identity || !chatVisible()) return;
+    if (rememberRuntimeObservation(selected, payload, events.authEpoch)) runtimeMetadataChanged();
     if (typeof digest === "string" && digest && digest === events.digest) return;
     events.digest = typeof digest === "string" ? digest : null;
-    const selected = selectedSession();
-    if (!selected || !events.key || chatKey(sourceOf(selected)) !== events.key || !chatVisible()) return;
     const entry = chatEntry(selected);
     if (entry.checking) entry.recheckQueued = true;
     else loadChatState(selected, false);
@@ -11633,6 +12179,9 @@ function serverBooted(bootId) {
     state.eventsTerminalsVersion = null;
   }
   state.serverBoot = bootId;
+  clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
+  state.runtimeObservations.clear(); state.livePhases.clear();
+  if (state.authenticated && state.snapshot) runtimeMetadataChanged({ refreshMessages: true });
   // A new process counts its versions from 0: remove marks waiting for a version are dropped.
   state.removedLocal?.clear?.();
 }
@@ -11889,6 +12438,7 @@ function bindPullToRefresh(root) {
   root.addEventListener("touchcancel", () => { start = null; distance = 0; if (!state.pullRefreshing) showPull(0); }, { passive: true });
 }
 function showLogin() {
+  if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (state.historySearch.mode && $("search")) $("search").value = state.search;
   cancelHistorySearch();
   state.historySearch.mode = false; state.historySearch.query = ""; state.historySearch.hits.clear();
@@ -11938,6 +12488,8 @@ function showLogin() {
   state.swipeOpen = null;
   state.pollFailures = 0;
   state.nativeSessions.clear();
+  if ($("session-recovery-list")) { $("session-recovery-list").replaceChildren(); $("session-recovery-list").recoveryRows?.clear(); }
+  if ($("session-recoveries")) $("session-recoveries").hidden = true;
   state.livePhases.clear();
   state.accountFilterRoutes = null;
   state.inputEpoch++;
@@ -12561,6 +13113,9 @@ window.addEventListener("DOMContentLoaded", () => {
   document.addEventListener("visibilitychange", () => {
     clearTimeout(state.pollTimer);
     stopChatPolling();
+    if (!document.hidden && state.authenticated && state.runtimeObservations.size) {
+      runtimeMetadataChanged({ refreshMessages: true }); scheduleRuntimeExpiry();
+    }
     // The working time stops counting while the page is hidden and catches up when shown.
     if (document.hidden) stopWorkingClock();
     else tickWorking();

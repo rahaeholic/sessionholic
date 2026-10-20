@@ -35,8 +35,8 @@ function client(fetchImpl) {
     Object.defineProperty(value, 'id', { get() { return this._id; }, set(id) { this._id = id; nodes.set(id, this); } });
     return value;
   }
-  const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false };
-  const context = vm.createContext({ console, state, el, $: (id) => nodes.get(id),
+  const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false, runtimeObservations: new Map() };
+  const context = vm.createContext({ console, state, el, clearTimeout() {}, $: (id) => nodes.get(id),
     document: { body: el('body') }, window: { SessionholicGoals: { async refresh() { counts.refresh++; } } },
     button(text, className, callback) { const value = el('button', className, text); value.events.click = callback; return value; },
     cardTitle: (s) => s.title, sourceOf: undefined, botRequestForNative: () => null,

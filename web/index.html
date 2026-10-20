@@ -27,6 +27,8 @@
     <script src="/message-format.js" defer></script>
     <script src="/session_labels.js" defer></script>
     <script src="/session_history.js" defer></script>
+    <script src="/session_relations.js" defer></script>
+    <script src="/session_context.js" defer></script>
     <script src="/push.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
@@ -239,6 +241,12 @@
             <div id="body-search-results"></div>
           </section>
           <div id="session-category-search" class="session-category-search" hidden><button id="session-category-search-action" type="button"></button></div>
+          <details id="session-recoveries" class="session-recoveries" hidden>
+            <summary>최근 돌아갈 작업 <span id="session-recovery-count"></span></summary>
+            <p class="session-recovery-help">연결이 끝나도 원래 대화부터 확인할 수 있습니다.</p>
+            <p id="session-recovery-status" class="session-recovery-status" role="status" hidden></p>
+            <div id="session-recovery-list" class="session-recovery-list"></div>
+          </details>
           <div id="groups" class="groups" role="tabpanel" aria-labelledby="session-category-general" aria-busy="true">
             <div class="skeleton-list" aria-hidden="true">
               <div class="skeleton-card"><span></span><span></span><span></span></div>
@@ -274,6 +282,7 @@
     <button id="update-banner" class="offline-banner update-banner" type="button" data-kind="update" hidden>
       <span class="offline-dot" aria-hidden="true"></span><span>새 버전이 있습니다 · 눌러서 새로고침</span>
     </button>
+    <div id="terminal-home" hidden></div>
     <section
       id="terminal-screen"
       class="terminal-screen"

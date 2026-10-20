@@ -171,6 +171,29 @@ def _phase(status, known=True):
     return 'idle' if kind == 'idle' else 'unknown'
 
 
+def _unknown_runtime(code, evidence='saved_record'):
+    reasons = {
+        'stored_only': '저장된 기록입니다. 현재 실행 상태는 확인되지 않았습니다.',
+        'process_unverified': '저장된 Claude 실행 기록의 프로세스 신원을 확인하지 못했습니다.',
+        'owner_ambiguous': '같은 대화의 실행 기록이 여러 개라 현재 실행 상태를 확인하지 못했습니다.',
+        'status_unsupported': 'CLI가 알려 준 상태를 이 보드에서 해석하지 못했습니다.',
+        'turn_status_unsupported': 'Codex 응답 상태를 이 보드에서 해석하지 못했습니다.',
+        'status_inconsistent': 'Codex 실행 상태와 응답 기록이 일치하지 않아 현재 상태를 확인하지 못했습니다.',
+        'server_status_unavailable': 'PC 프로젝트 서버 상태를 읽지 못해 저장된 대화를 표시합니다. 현재 실행 상태는 확인되지 않았습니다.',
+        'server_down': SERVER_DOWN,
+    }
+    return {'phase': 'unknown', 'runtimeKnown': False, 'runtimeReason': reasons[code],
+            'runtimeEvidence': evidence, 'runtimeReasonCode': code}
+
+
+def _codex_runtime(status):
+    phase = _phase(status)
+    if phase == 'unknown':
+        return _unknown_runtime('status_unsupported', 'unsupported')
+    return {'phase': phase, 'runtimeKnown': True, 'runtimeReason': None,
+            'runtimeEvidence': 'project_app_server', 'runtimeReasonCode': None}
+
+
 def _flags(status):
     values = status.get('activeFlags') if isinstance(status, dict) else None
     return [value for value in values[:20] if _metadata(value)] if isinstance(values, list) else []
@@ -756,11 +779,10 @@ class WindowsCollector:
                 'title': name or preview[:60] or '(제목 없음)', 'named': bool(name),
                 'project': project, 'account': '기기 Codex',
                 'state': status.get('type') if isinstance(status, dict) else 'unknown',
-                'phase': _phase(status), 'status': ','.join(_flags(status)),
-                'loaded': live is not None, 'runtimeKnown': live is not None and _phase(status) != 'unknown',
+                'status': ','.join(_flags(status)), 'loaded': live is not None,
                 'startedAt': _epoch(raw.get('created_at')), 'updatedAt': _epoch(raw.get('updated_at')),
                 'snippet': preview if name else '', 'readOnly': True, 'canRead': True,
-                'runtimeReason': None if live else '저장된 기록입니다. 현재 실행 상태는 확인되지 않았습니다.',
+                **(_codex_runtime(status) if live else _unknown_runtime('stored_only')),
                 **_origin({**raw, **(live or {})}), **self._held(raw, live, held, down)}
 
     @staticmethod
@@ -771,10 +793,12 @@ class WindowsCollector:
             return {}
         if held and raw.get('source') == 'exec':
             return {'state': 'active', 'phase': 'working', 'status': '', 'runtimeKnown': True,
+                    'runtimeEvidence': 'exec_writer_lock', 'runtimeReasonCode': 'exec_writer_lock',
                     'runtimeReason': 'codex exec로 실행 중입니다. 끝나면 저장된 기록으로 돌아갑니다.'}
         if held:
-            return {'runtimeReason': '서버 밖의 Codex가 이 기록을 열고 있습니다. 실행 상태는 그 터미널에서 확인해 주세요.'}
-        return {'runtimeReason': SERVER_DOWN} if down else {}
+            return {'runtimeEvidence': 'external_cli_open', 'runtimeReasonCode': 'external_cli_open',
+                    'runtimeReason': '서버 밖의 Codex가 이 기록을 열고 있습니다. 실행 상태는 그 터미널에서 확인해 주세요.'}
+        return _unknown_runtime('server_down') if down else {}
 
     def codex_rows(self, errors):
         rows = self.database_rows()
@@ -821,7 +845,10 @@ class WindowsCollector:
             observed = None if row['id'] in ambiguous else live.get(row['id'])
             if observed and _norm(observed.get('cwd')) != _norm(row.get('cwd')):
                 observed = None
-            output.append(self._row(row, observed, held=row['id'] in held, down=servers[row['id']] in self.down))
+            result = self._row(row, observed, held=row['id'] in held, down=servers[row['id']] in self.down)
+            if row['id'] in ambiguous:
+                result.update(_unknown_runtime('owner_ambiguous'), state='unknown', status='')
+            output.append(result)
         return output
 
     def _transcripts(self):
@@ -942,6 +969,7 @@ class WindowsCollector:
 
     def claude_rows(self, target_sid=None):
         records = {}
+        ambiguous = set()
         for path in list((self.claude_home / 'sessions').glob('[0-9]*.json'))[:256]:
             try:
                 row = _json(path, self.claude_home)
@@ -963,6 +991,7 @@ class WindowsCollector:
                              and self._claude_executable(process.get('exe')))
                 if sid in records:
                     records[sid] = (row, False, None)  # Multiple owners stay visible, with unknown runtime.
+                    ambiguous.add(sid)
                 else:
                     records[sid] = (row, exact, process)
             except (OSError, ValueError, TypeError):
@@ -1002,6 +1031,13 @@ class WindowsCollector:
                         break
             status = row.get('status')
             phase = ('working' if status == 'busy' else 'needs_input' if status == 'waiting' else 'idle' if status == 'idle' else 'unknown') if exact else 'unknown'
+            if phase != 'unknown':
+                runtime = {'runtimeKnown': True, 'runtimeReason': None,
+                           'runtimeEvidence': 'claude_registry_process', 'runtimeReasonCode': None}
+            else:
+                reason = ('owner_ambiguous' if sid in ambiguous else 'status_unsupported' if exact
+                          else 'process_unverified' if sid in records else 'stored_only')
+                runtime = _unknown_runtime(reason, 'unsupported' if exact else 'saved_record')
             project = self.project(cwd)
             title, snippet = _one_line(row.get('name'), 160), ''
             if path:
@@ -1013,7 +1049,7 @@ class WindowsCollector:
             output.append({'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude',
                 'kind': 'background' if row.get('kind') == 'bg' else row.get('kind'), 'entrypoint': entrypoint,
                 'title': title or '(Claude 대화)', 'cwd': cwd, 'project': project,
-                'phase': phase, 'state': phase, 'status': status if exact else None, 'runtimeKnown': exact and phase != 'unknown',
+                'phase': phase, 'state': phase, 'status': status if exact else None, **runtime,
                 'startedAt': _epoch(row.get('startedAt')), 'updatedAt': int(path.stat().st_mtime) if path else None,
                 'readOnly': True, 'canRead': path is not None or details.get('transcriptAvailability') == 'disabled',
                 'snippet': snippet, **_origin(row), **details})
@@ -1021,20 +1057,26 @@ class WindowsCollector:
 
     def snapshot(self):
         errors = []
+        statuses = {key: {'ok': True} for key in ('codex', 'claude', 'tmux')}
         # Something to check on this PC that is not a failed collection (a stopped server).
         self.warnings = []
         try:
             codex = self.codex_rows(errors)
+            if errors:
+                statuses['codex']['ok'] = False
         except (OSError, ValueError, sqlite3.Error):
             codex = []
+            statuses['codex']['ok'] = False
             errors.append('PC Codex 저장 목록을 읽지 못했습니다.')
         try:
             claude = self.claude_rows()
         except (OSError, ValueError):
             claude = []
+            statuses['claude']['ok'] = False
             errors.append('PC Claude 저장 목록을 읽지 못했습니다.')
         return {'collectedAt': int(time.time()), 'codex': codex, 'claude': claude, 'tmux': [],
-                'errors': errors, 'warnings': list(self.warnings), 'capabilities': dict(CAPABILITIES), 'platform': 'windows'}
+                'errors': errors, 'warnings': list(self.warnings), 'capabilities': dict(CAPABILITIES), 'platform': 'windows',
+                'sourceStatus': statuses}
 
     def saved_history_source(self, source):
         sid = source.get('id')
@@ -1066,6 +1108,7 @@ class WindowsCollector:
             if path is None:
                 if row.get('transcriptAvailability') == 'disabled':
                     return {'messages': [], 'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
+                            **{key: row[key] for key in ('runtimeReason', 'runtimeReasonCode', 'runtimeEvidence') if key in row},
                             'activeFlags': [], 'updatedAt': row.get('updatedAt'), 'readOnly': True,
                             'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
@@ -1073,6 +1116,7 @@ class WindowsCollector:
             # The work folder, as the list row derives it: an upload is checked against it (chat.Chat.upload).
             return {'messages': messages, 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
                     'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
+                    **{key: row[key] for key in ('runtimeReason', 'runtimeReasonCode', 'runtimeEvidence') if key in row},
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
                     **({'cwd': row['cwd']} if isinstance(row.get('cwd'), str) and row['cwd'] else {}),
                     **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
@@ -1085,9 +1129,11 @@ class WindowsCollector:
             raise ValueError('정확한 PC Codex 대화 기록을 찾지 못했습니다.')
         row = rows[0]
         observed = []
+        failed = False
         overall = time.monotonic() + 12
         for path in self.endpoints():
             if time.monotonic() >= overall:
+                failed = True
                 break
             try:
                 with self.proxy_factory(self.binary, path, min(overall, time.monotonic() + 5)) as client:
@@ -1100,12 +1146,11 @@ class WindowsCollector:
                     raise ValueError('PC 서버 대화의 소유 경계가 다릅니다.')
                 messages, dropped = _recent_window(_codex_rows(thread.get('turns') or []))
                 observed.append({'messages': messages, 'olderOmitted': dropped, 'modelSettings': _model_settings(thread),
-                        'phase': _phase(thread.get('status')),
-                        'runtimeKnown': _phase(thread.get('status')) != 'unknown',
+                        **_codex_runtime(thread.get('status')),
                         'activeFlags': _flags(thread.get('status')),
                         'updatedAt': _epoch(thread.get('updatedAt')), 'readOnly': True})
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError):
-                pass
+                failed = True
         if len(observed) == 1:
             return observed[0]
         rollout = row.get('rollout_path')
@@ -1120,9 +1165,21 @@ class WindowsCollector:
             raise ValueError('PC 저장 대화의 세션 신원을 확인하지 못했습니다.')
         # Like a closed Codex read on a Mac, this names no model or effort.
         unused, messages, older = _conversation(path, _rollout_rows)
-        return {'messages': messages, 'olderOmitted': older, 'phase': 'unknown', 'runtimeKnown': False,
-                'activeFlags': [], 'updatedAt': _epoch(row['updated_at']), 'readOnly': True,
-                'runtimeReason': '저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다.'}
+        # A saved conversation may belong to a running `codex exec`. Recheck only this
+        # exact writer with the same PID/start/executable and bounded probe as the list.
+        try:
+            held = self.writer_owners({sid})
+        except Exception:
+            held = {}
+        server = self.project_server(row.get('cwd'), self.servers)
+        runtime = self._row(row, held=sid in held, down=server in self.down)
+        if len(observed) > 1:
+            runtime.update(_unknown_runtime('owner_ambiguous'))
+        elif failed and runtime['runtimeReasonCode'] == 'stored_only':
+            runtime.update(_unknown_runtime('server_status_unavailable'))
+        return {'messages': messages, 'olderOmitted': older,
+                **{key: runtime[key] for key in ('phase', 'runtimeKnown', 'runtimeReason', 'runtimeReasonCode', 'runtimeEvidence')},
+                'activeFlags': [], 'updatedAt': _epoch(row['updated_at']), 'readOnly': True}
 
 
 def _head(path):

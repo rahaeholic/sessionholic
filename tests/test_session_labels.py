@@ -419,7 +419,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
             list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: closed.append(tid) or {'ok': True})
         self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('c' * 32), {})[0].status, 200)
-        self.assertEqual(type(self.claude_tidied()), int)
+        self.assertIsNone(self.claude_tidied(), 'closing a view does not tidy the native conversation')
         # 실행 종료 from 세션 관리 names the row the board resolved, sessionId included.
         self.claude_row()
         self.board.state[self.host['name']]['ok'] = True
@@ -953,7 +953,7 @@ class SnapshotResponseTest(unittest.TestCase):
         for name in self.STORES:
             snapshot = getattr(self.httpd, name).decorate(snapshot)
         snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
-                    'savedPrompts': self.httpd.prompts.summary()}
+                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': []}
         return json.dumps(snapshot, ensure_ascii=False).encode()
 
     def test_an_unchanged_snapshot_is_answered_without_copying_or_reading_any_store(self):

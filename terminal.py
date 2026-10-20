@@ -1144,7 +1144,8 @@ class TerminalManager:
                 if (not isinstance(native, dict) or terminal.record.get("closed", False)
                         or self._unrecorded(terminal) or self._foreign(terminal)):
                     continue
-                key = (native.get("host"), native.get("agent"), native.get("home") or "", native.get("id"))
+                key = (native.get("host"), native.get("agent"), native.get("home") or "", native.get("id"),
+                       native.get('cwd'), native.get('sessionId') if native.get('agent') == 'claude' else None)
                 groups.setdefault(key, []).append(terminal)
             spare = []
             for group in groups.values():
@@ -1171,7 +1172,18 @@ class TerminalManager:
     def close_terminal(self, terminal_id):
         """Stop one generated tmux session; retain its key as a closed record."""
         with self.lock:
-            self._end(self._get(terminal_id), "user")
+            terminal = self._get(terminal_id)
+            metadata = terminal.record["metadata"]
+            prior = metadata.get("closeEffect")
+            metadata["closeEffect"] = "view" if metadata.get("mode") == "attach" else "run"
+            try:
+                self._end(terminal, "user")
+            except BaseException:
+                if prior is None:
+                    metadata.pop("closeEffect", None)
+                else:
+                    metadata["closeEffect"] = prior
+                raise
         self._changed()
         return {"ok": True}
 
