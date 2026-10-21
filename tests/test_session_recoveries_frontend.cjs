@@ -35,7 +35,22 @@ test("reload 뒤 snapshot 참조만으로 최근 연결을 보이며 모든 종�
   assert.equal(c.get("running-terminals").hidden, true);
   assert.equal(c.get("session-recoveries").hidden, false);
   assert.equal(c.get("session-recovery-list").children.length, 1);
-  assert.match(c.get("session-recovery-list").children[0].recoveryMeta.textContent, /작업 PC.*Codex.*보기 연결 정리/);
+  assert.match(c.get("session-recovery-list").children[0].recoveryMeta.textContent, /작업 PC.*Codex.*터미널 연결 정리/);
+  assert.equal(c.calls.length, 0);
+});
+test("이미 목록에 있거나 정확한 터미널이 살아 있는 작업은 복귀 안내에 중복 표시하지 않는다", () => {
+  const c = client();
+  c.state.snapshot.hosts[0].data.codex = [row({ phase: 'working' })];
+  c.renderRecoveries();
+  assert.equal(c.get('session-recoveries').hidden, true);
+  c.state.snapshot.hosts[0].data.codex = [];
+  c.state.terminals = [{ alive: true, nativeSource: ref(), linkConfidence: 'exact' }];
+  c.renderRecoveries(); assert.equal(c.get('session-recoveries').hidden, true);
+  c.state.terminals[0].alive = false;
+  c.renderRecoveries(); assert.equal(c.get('session-recoveries').hidden, false);
+  assert.equal(c.get('session-recovery-list').children.length, 1);
+  assert.equal(c.get('session-recovery-list').children[0].children.at(-1).textContent, '대화 열기 ›');
+  assert.equal(c.recentRecoveries().length, 1, '표시를 숨겨도 원래 복귀 참조는 보존한다');
   assert.equal(c.calls.length, 0);
 });
 test("최근 참조는 최대 20개이며 명시 종료·제거·중복·계정 홈 누락을 노출하지 않는다", () => {

@@ -1271,7 +1271,14 @@ function recentRecoveries() {
 function renderRecoveries() {
   const section = $("session-recoveries"), list = $("session-recovery-list");
   if (!section || !list) return;
-  const refs = recentRecoveries(), sessions = allSessions();
+  const sessions = allSessions();
+  const sameConversation = (ref, source) => sameRecoverySource(ref, source) && (!ref.cwd || ref.cwd === source.cwd);
+  const refs = recentRecoveries().filter((ref) => !sessions.some((s) => sameConversation(ref, s)) &&
+    !state.terminals.some((terminal) => {
+      const native = terminal.nativeSource || terminal.metadata?.nativeSource;
+      return terminal.alive && terminal.linkConfidence !== "estimated" && terminal.metadata?.linkConfidence !== "estimated" &&
+        native && sameConversation(ref, native);
+    }));
   section.hidden = !state.authenticated || state.sessionCategory === "bot" || !refs.length;
   $("session-recovery-count").textContent = String(refs.length);
   const status = $("session-recovery-status");
@@ -1285,15 +1292,15 @@ function renderRecoveries() {
       row = button("", "session-recovery", () => openRecovery(row.recovery));
       row.recoveryTitle = el("strong", "session-recovery-title");
       row.recoveryMeta = el("span", "session-recovery-meta");
-      row.append(row.recoveryTitle, row.recoveryMeta);
+      row.append(row.recoveryTitle, row.recoveryMeta, el("span", "session-recovery-action", "대화 열기 ›"));
       list.recoveryRows.set(key, row);
     }
     row.recovery = ref;
     const listed = sessions.find((s) => sameRecoverySource(ref, s));
     row.recoveryTitle.textContent = listed?.title || ref.title || "이전에 연결한 대화";
     row.recoveryMeta.textContent = [ref.hostLabel || ref.host, AGENTS[ref.agent],
-      ref.account || (ref.agent === "codex" ? ref.home : ""), ref.lastSeenAt ? `${ago(ref.lastSeenAt)} 연결 확인` : "이전 연결",
-      ref.closedReason === "released" ? "보기 연결 정리됨" : ref.closedReason ? "연결 종료됨" : "최근 열어 본 작업"].filter(Boolean).join(" · ");
+      ref.account || (ref.agent === "codex" ? ref.home : ""), ref.lastSeenAt ? `${ago(ref.lastSeenAt)} 열었던 대화` : "이전 연결",
+      ref.closedReason === "released" ? "터미널 연결 정리됨" : ref.closedReason ? "터미널 연결 종료됨" : "목록에서 찾지 못한 대화"].filter(Boolean).join(" · ");
     row.disabled = !!state.recoveryBusy || state.launchBusy;
     row.setAttribute("aria-label", `${row.recoveryTitle.textContent}. ${row.recoveryMeta.textContent}. 원래 대화 열기`);
     return row;

@@ -242,12 +242,12 @@
             <div id="body-search-results"></div>
           </section>
           <div id="session-category-search" class="session-category-search" hidden><button id="session-category-search-action" type="button"></button></div>
-          <details id="session-recoveries" class="session-recoveries" hidden>
-            <summary>최근 돌아갈 작업 <span id="session-recovery-count"></span></summary>
-            <p class="session-recovery-help">연결이 끝나도 원래 대화부터 확인할 수 있습니다.</p>
+          <section id="session-recoveries" class="session-recoveries" aria-labelledby="session-recovery-heading" hidden>
+            <div class="session-recovery-heading"><h3 id="session-recovery-heading">목록에서 빠진 대화</h3><span id="session-recovery-count"></span></div>
+            <p class="session-recovery-help">이전에 연결했던 대화입니다. 열어서 기록과 연결 상태를 확인하세요.</p>
             <p id="session-recovery-status" class="session-recovery-status" role="status" hidden></p>
             <div id="session-recovery-list" class="session-recovery-list"></div>
-          </details>
+          </section>
           <div id="groups" class="groups" role="tabpanel" aria-labelledby="session-category-general" aria-busy="true">
             <div class="skeleton-list" aria-hidden="true">
               <div class="skeleton-card"><span></span><span></span><span></span></div>
