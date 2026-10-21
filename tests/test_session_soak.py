@@ -50,6 +50,9 @@ class SessionSoak(unittest.TestCase):
         for value in ('private-terminal', 'conversation', 'C:\\work', 'worker'):
             self.assertNotIn(value, text)
         self.assertNotEqual(soak.identity(source), soak.identity({**source, 'sessionId': 'another'}))
+        codex = {'host': 'pc', 'agent': 'codex', 'id': 'thread', 'home': '.codex', 'cwd': 'C:\\work', 'source': 'exec'}
+        self.assertIsNotNone(soak.identity(codex))
+        self.assertNotEqual(soak.identity(codex), soak.identity({**codex, 'home': '.other'}))
 
     def test_output_is_exclusive_private_and_symlinks_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

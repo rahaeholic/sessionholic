@@ -16,7 +16,9 @@ import urllib.request
 
 
 def identity(row):
-    source = row.get('nativeSource') or row.get('source') or row
+    source = row.get('nativeSource')
+    if not isinstance(source, dict):
+        source = row.get('source') if isinstance(row.get('source'), dict) else row
     if not isinstance(source, dict):
         return None
     parts = [source.get(k) for k in ('host', 'agent', 'home', 'id', 'cwd', 'sessionId')]
