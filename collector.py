@@ -1711,6 +1711,8 @@ def claude_transcript_fingerprint(rows, index):
 def watch_signatures(data):
     """(everything but collectedAt, the same without fields that move while agents work)."""
     body = {key: value for key, value in data.items() if key != "collectedAt"}
+    body = {**body, **{key: [{k: v for k, v in row.items() if k != 'runtimeReadToken'} for row in body.get(key, [])]
+                      for key in ('claude', 'codex')}}
 
     def digest(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).digest()
@@ -1833,6 +1835,9 @@ class Watch:
         self.input_closed = False
         self.local_refresh = False
         self.parts = {}
+        self.part_tokens = {}
+        self.read_epoch = os.urandom(8).hex()
+        self.read_seq = 0
         self.homes = {}
         self.order = []
         self.projects = []
@@ -1884,8 +1889,8 @@ class Watch:
     def publish(self, key, rows, errors, ok=None):
         part = (rows, errors, not errors if ok is None else ok)
         with self.lock:
-            if self.parts.get(key) == part:
-                return
+            self.read_seq += 1
+            self.part_tokens[key] = '%s:%d' % (self.read_epoch, self.read_seq)
             self.parts[key] = part
         self.wake.set()
 
@@ -2006,6 +2011,8 @@ class Watch:
         """The snapshot from every source read so far. A source still unread (the first
         snapshot waits at most WATCH_READY) is named in errors, never shown as empty."""
         with self.lock:
+            tokens = dict(self.part_tokens)
+            order = list(self.order)
             claude = self.parts.get("claude", ([], ["Claude 세션 목록을 아직 읽지 못했습니다."], False))
             tmux = self.parts.get("tmux", ([], ["tmux 세션 목록을 아직 읽지 못했습니다."], False))
             codex = [self.parts.get(("codex", key)) or
@@ -2013,10 +2020,11 @@ class Watch:
                            if key in self.homes else "Codex 작업 목록을 아직 읽지 못했습니다."], False)
                      for key in self.order]
         codex_rows, codex_errors = [], []
-        for part in codex:
-            codex_rows.extend(part[0])
+        for key, part in zip(order, codex):
+            codex_rows.extend({**r, 'runtimeReadToken': tokens.get(('codex', key))} for r in part[0])
             codex_errors.extend(part[1])
-        return {"host": self.hostname, "collectedAt": int(time.time()), "claude": claude[0],
+        return {"host": self.hostname, "collectedAt": int(time.time()),
+                "claude": [{**r, 'runtimeReadToken': tokens.get('claude')} for r in claude[0]],
                 "codex": codex_rows, "tmux": tmux[0], "errors": claude[1] + codex_errors + tmux[1],
                 'sourceStatus': {'claude': {'ok': claude[2]}, 'codex': {'ok': all(part[2] for part in codex)},
                                  'tmux': {'ok': tmux[2]}}}
@@ -2101,6 +2109,8 @@ class Watch:
         next_homes = started + WATCH_HOMES
         sent = (None, None)
         last_emit = None
+        observed = None
+        last_observation = started - 30
         while True:
             reason = self.stop_reason()
             if reason:
@@ -2113,6 +2123,7 @@ class Watch:
             if self.seq or self.ready() or now - started >= WATCH_READY:
                 data = self.compose()
                 signatures = watch_signatures(data)
+                tokens = tuple(r.get('runtimeReadToken') for key in ('claude', 'codex') for r in data[key])
                 if signatures[0] != sent[0]:
                     gap = WATCH_GAP if (signatures[1] != sent[1] or not self.seq) else WATCH_MINOR_GAP
                     if last_emit is None or now - last_emit >= gap:
@@ -2120,8 +2131,13 @@ class Watch:
                         self.emit({"type": "snapshot", "seq": self.seq,
                                    "reason": "initial" if self.seq == 1 else "change", "data": data})
                         sent, last_emit = signatures, now
+                        observed, last_observation = tokens, now
                     else:
                         dues.append(last_emit + gap)
+                elif tokens != observed and now - last_observation >= 30:
+                    self.seq += 1
+                    self.emit({'type': 'snapshot', 'seq': self.seq, 'reason': 'observation', 'data': data})
+                    observed, last_observation = tokens, now
             else:
                 dues.append(started + WATCH_READY)
             if self.clock() - self.last_output >= WATCH_HEARTBEAT:

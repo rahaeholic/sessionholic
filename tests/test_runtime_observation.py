@@ -188,6 +188,61 @@ class RuntimeObservationsTest(unittest.TestCase):
         self.assertEqual(row['runtimeObservation']['expiresAt'], self.now)
 
 
+class MacObservationTest(unittest.TestCase):
+    def test_real_unchanged_adapter_read_gets_token_but_same_signature(self):
+        import collector
+        watch = collector.Watch(None, None)
+        watch.publish('claude', [{'id': 'one', 'phase': 'idle'}], [], ok=True)
+        watch.publish('tmux', [], [], ok=True)
+        a = watch.compose()
+        watch.publish('claude', [{'id': 'one', 'phase': 'idle'}], [], ok=True)
+        b = watch.compose()
+        self.assertNotEqual(a['claude'][0]['runtimeReadToken'], b['claude'][0]['runtimeReadToken'])
+        self.assertEqual(collector.watch_signatures(a), collector.watch_signatures(b))
+
+    def test_only_actual_read_renews_and_body_revision_does_not_announce_semantic_change(self):
+        from types import SimpleNamespace
+        import server
+        now = [1000]
+        host = {'name': 'mac', 'label': 'Mac', 'local': True}
+        board = server.Board([host], 120, runner=lambda *_: {}, live=False)
+        board.clock = lambda: now[0]
+        stream = SimpleNamespace(name='mac', stopping=False, delivered=False)
+        board.streams['mac'] = stream
+        row = {'id': 'worker', 'cwd': '/work', 'phase': 'working', 'runtimeReadToken': 'a' * 16 + ':1'}
+        data = {'claude': [row], 'codex': [], 'sourceStatus': {'claude': {'ok': True}}}
+        board.apply_live(stream, data)
+        version, revision = board.version, board.observation_revision
+        first = board.state['mac']['data']['claude'][0]['runtimeObservation']
+        now[0] += 30
+        board.apply_live(stream, data)
+        self.assertEqual(board.state['mac']['data']['claude'][0]['runtimeObservation'], first)
+        self.assertEqual(board.observation_revision, revision)
+        fresh = {**data, 'claude': [{**row, 'runtimeReadToken': 'a' * 16 + ':2'}]}
+        board.apply_live(stream, fresh)
+        new = board.state['mac']['data']['claude'][0]['runtimeObservation']
+        self.assertGreater(new['expiresAt'], first['expiresAt'])
+        self.assertGreater(board.observation_revision, revision)
+        self.assertEqual(board.version, version)
+        failed = {**data, 'claude': [], 'sourceStatus': {'claude': {'ok': False}}}
+        now[0] += 30
+        board.apply_live(stream, failed)
+        preserved = board.state['mac']['data']['claude'][0]
+        self.assertFalse(preserved['runtimeKnown'])
+        self.assertEqual(preserved['lastKnown']['expiresAt'], new['expiresAt'])
+
+    def test_offline_and_legacy_never_claim_new_observation(self):
+        import server
+        from types import SimpleNamespace
+        host = {'name': 'mac', 'label': 'Mac', 'local': True}
+        board = server.Board([host], 120, runner=lambda *_: {}, live=False)
+        stream = SimpleNamespace(name='mac', stopping=False, delivered=False)
+        board.streams['mac'] = stream
+        board.apply_live(stream, {'codex': [{'id': 'old', 'home': '.codex', 'phase': 'idle'}], 'claude': []})
+        self.assertNotIn('runtimeObservation', board.state['mac']['data']['codex'][0])
+        self.assertFalse(obs.native_result({'phase': 'closed', 'appServer': 'off'}, 'codex')['runtimeKnown'])
+
+
 class ChatObservationTest(unittest.TestCase):
     def setUp(self):
         import chat

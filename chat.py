@@ -594,7 +594,7 @@ class Chat:
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
         read came in meanwhile."""
         observations = getattr(self.board, 'runtime_observations', None)
-        observation_request = observations.begin() if observations and host.get('platform') == 'windows' else None
+        observation_request = observations.begin() if observations else None
         if not self.board.state[host['name']]['ok']:
             stale = self._stale(key, source, request_ids)
             if stale is not None:
@@ -629,7 +629,7 @@ class Chat:
                 result = {'messages': [], 'conversationUnavailable': True,
                           'reason': '앱 서버 연결이 없어 대화 기록을 불러오지 못했습니다. 세션을 다시 열어 확인해 주세요.'}
             result = {**result, 'phase': result.get('phase', 'unknown') if host.get('platform') == 'windows' else 'closed',
-                      'capabilities': {'canSend': False}, 'readOnly': True}
+                      'runtimeKnown': False, 'capabilities': {'canSend': False}, 'readOnly': True}
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
         if phase == 'notLoaded': phase = 'closed'
@@ -748,8 +748,15 @@ class Chat:
         if isinstance(reason, str):
             response['runtimeReason'] = scrub_payload(reason[:600])
         if observation_request is not None:
-            annotation = observations.accept(source, {**result, 'phase': phase,
-                                                      'runtimeReason': response.get('runtimeReason')}, observation_request, 90)
+            observed = {**result, 'phase': phase, 'runtimeReason': response.get('runtimeReason')}
+            if host.get('platform') != 'windows':
+                from runtime_observation import native_result
+                observed = native_result(observed, source['agent'])
+            annotation = (observations.current(source) if kwargs.get('liveRow') else None)
+            if annotation is None:
+                if kwargs.get('liveRow'):
+                    observed['runtimeKnown'] = False
+                annotation = observations.accept(source, observed, observation_request, 90)
             response.update(annotation)
             # A later-started poll/read already won: do not publish the older status.
             accepted = annotation['runtimeObservation']
@@ -759,7 +766,7 @@ class Chat:
                                 capability={**response['capability'], 'supported': False,
                                             'reason': response.get('runtimeReason') or response['capability'].get('reason') or
                                             '현재 실행 상태를 확인하지 못했습니다. 터미널에서 확인해 주세요.'})
-            if accepted['requestSeq'] != observation_request:
+            if not kwargs.get('liveRow') and accepted['requestSeq'] != observation_request:
                 response.update(readOnly=True, prompt=None, promptOpenable=False, recovery=None,
                                 workingSince=None, requiresNativeTerminal=False,
                                 capability={'supported': False, 'attachments': False,

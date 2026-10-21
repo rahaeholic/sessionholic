@@ -25,7 +25,16 @@ def semantic(value):
         return value
     return {key: ({k: semantic(v) for k, v in item.items() if k not in TIMING_FIELDS}
                   if key in ('runtimeObservation', 'lastKnown') and isinstance(item, dict) else semantic(item))
-            for key, item in value.items()}
+            for key, item in value.items() if key != 'runtimeReadToken'}
+
+
+def native_result(result, agent):
+    """A successful native Mac read's recognized phase; saved records prove no runtime."""
+    known = (result.get('runtimeKnown') is not False and not result.get('error')
+             and not result.get('stale') and result.get('appServer') != 'off'
+             and isinstance(result.get('phase'), str) and result['phase'] in PHASES)
+    return {**result, 'runtimeKnown': known,
+            'runtimeEvidence': ('claude_registry_process' if agent == 'claude' else 'project_app_server') if known else 'unsupported'}
 
 
 class RuntimeObservations:
@@ -48,6 +57,10 @@ class RuntimeObservations:
         with self.lock:
             self.request_seq += 1
             return self.request_seq
+
+    def current(self, source):
+        with self.lock:
+            return copy.deepcopy(self.records.get(self.key(source)))
 
     def reject_scope(self, host, agent, request_seq):
         """A failed adapter advances ordering without extending any confirmed lease."""

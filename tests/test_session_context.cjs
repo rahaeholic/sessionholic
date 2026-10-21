@@ -96,3 +96,13 @@ test('browser global works without document, fetch or an automatic-work service'
   assert.equal(sandbox.SessionholicContext.project([user('질문')]).lastRequest.text, '질문');
   assert.equal(sandbox.SessionholicContext.project([]).scope.messageCount, 0);
 });
+
+test('result evidence contains only explicit safe links and file references, with quoted validation unverified', () => {
+  const result = context.project([user('현재 요청'), answer('[보고서](https://example.com/report) [소스](/work/app.py:12)\n' +
+    '`docs/report.md`\n검증: 단위 테스트 12개 통과\n\n[실행](javascript:alert) [비밀](https://user:password@example.com/)\n' +
+    '```md\n[예시](https://example.com/not-a-result)\n```\n> [인용](https://example.com/quote)')]);
+  assert.deepEqual(result.evidence.artifacts.map((r) => r.target), ['https://example.com/report', '/work/app.py:12', 'docs/report.md']);
+  assert.equal(result.evidence.verification, '단위 테스트 12개 통과');
+  assert.equal(result.completed, undefined);
+  assert.deepEqual(context.project([answer('[이전](https://example.com/old)'), user('새 요청')]).evidence.artifacts, []);
+});

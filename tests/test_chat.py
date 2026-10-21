@@ -288,7 +288,9 @@ class ChatTest(unittest.TestCase):
             self.assertEqual(result['runtimeReason'], '합성 관측 이유')
         with patch.object(self.chat, 'rpc', return_value={'phase': 'idle', 'messages': []}):
             self.chat.cache.clear()
-            self.assertNotIn('runtimeKnown', self.chat.state({'source': REF}))
+            result = self.chat.state({'source': REF})
+            self.assertTrue(result['runtimeKnown'])
+            self.assertEqual(result['runtimeObservation']['evidence'], 'project_app_server')
 
     def test_stale_read_does_not_carry_confirmed_runtime(self):
         with patch.object(self.chat, 'rpc', return_value={'phase': 'working', 'messages': [], 'runtimeKnown': True}):
@@ -401,7 +403,8 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
         self.assertEqual(set(state),{'route','phase','capability','messages','olderOmitted','receipts','maxAttachmentBytes','requiresNativeTerminal',
-                                     'prompt','promptOpenable','workingSince','workingSinceApprox','modelSettings'})
+                                     'prompt','promptOpenable','workingSince','workingSinceApprox','modelSettings',
+                                     'runtimeKnown','runtimeReason','runtimeObservation','lastKnown'})
         self.assertIs(state['olderOmitted'],False)
         self.assertIsNone(state['prompt'])
         self.assertFalse(state['promptOpenable'])

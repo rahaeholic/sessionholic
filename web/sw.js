@@ -17,6 +17,7 @@ const ASSETS = new Set([
   "/session_history.js",
   "/session_relations.js",
   "/session_context.js",
+  "/session_delegation.js",
   "/push.js",
   "/theme-init.js",
   "/message-format.js",

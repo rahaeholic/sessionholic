@@ -13978,6 +13978,74 @@ function loadContextModules(c) {
   return vm.runInContext('({renderSessionRelations,renderWorkContext,rememberConversation,detailRevision})', c.context);
 }
 
+test('위임 요청은 내용 확인 후 정확한 부모로 한 번 보내고 기존 초안·첨부는 보존한다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url === '/api/chat/state') return { ok: true, status: 200, json: async () => ({ route: body.source, phase: 'idle', capability: { supported: true }, messages: [] }) };
+    calls.push({ url, body });
+    return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, status: 'accepted', confirmed: true } }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); loadContextModules(c);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/session_delegation.js'), 'utf8'), c.context);
+  c.context.window.SessionholicDelegation = c.context.SessionholicDelegation;
+  const { openDelegation } = vm.runInContext('({openDelegation})', c.context);
+  entry.text = '기존 초안'; entry.attachments = [{ id: 'private-attachment', name: 'private.txt' }];
+  openDelegation(s, entry);
+  assert.equal(calls.length, 0); assert.equal(c.get('delegation-dialog').open, true);
+  assert.equal(c.get('delegation-send').disabled, true);
+  c.get('delegation-task').value = '이번 변경을 검토'; c.get('delegation-task').events.input();
+  assert.doesNotMatch(c.get('delegation-preview').textContent, /기존 초안|private-attachment/);
+  const send = c.get('delegation-send'); await send.events.click(); await send.events.click();
+  assert.equal(calls.length, 1); assert.equal(calls[0].url, '/api/chat/send');
+  assert.equal(calls[0].body.source.id, s.id); assert.deepEqual(calls[0].body.attachments, []);
+  assert.match(calls[0].body.text, /이번 변경을 검토/);
+  assert.equal(entry.text, '기존 초안'); assert.equal(entry.attachments[0].id, 'private-attachment');
+  openDelegation(s, entry); c.get('delegation-task').value = '늦은 전송'; c.get('delegation-task').events.input();
+  c.state.authEpoch++; await c.get('delegation-send').events.click(); assert.equal(calls.length, 1);
+});
+
+test('하위 결과는 펼친 대상만 읽고 부모 초안과 선택을 보존하며 늦은 다른 선택의 응답을 버린다', async () => {
+  const calls = []; let finish;
+  const c = client((url, options) => {
+    calls.push([url, JSON.parse(options.body)]);
+    return new Promise((resolve) => { finish = resolve; });
+  }, noChatTimers);
+  loadContextModules(c); const { s, entry } = selectChat(c);
+  const child = { ...s, id: 'child', key: s.key.replace(s.id, 'child'), title: '하위 작업', parentThreadId: s.id };
+  c.state.snapshot.hosts[0].data.codex.push(child); c.state.detailShown = true;
+  c.drawDetail(s); wireTree(c, c.get('detail')); entry.text = '부모 초안';
+  const panel = byClass(c.get('session-relations'), 'session-child-result')[0];
+  assert.equal(calls.length, 0); panel.open = true;
+  const pending = panel.events.toggle(); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, 1); assert.equal(calls[0][0], '/api/chat/state'); assert.equal(calls[0][1].source.id, 'child');
+  finish({ ok: true, status: 200, json: async () => ({ phase: 'idle', runtimeKnown: true, messages: [
+    { role: 'user', text: '검토 요청' }, { role: 'assistant', phase: 'final_answer', text: '검토 결과', ts: 1000 }] }) });
+  await pending;
+  assert.match(textOf(panel), /검토 결과.*답변 기록 시각.*작업 완료 여부/s);
+  assert.equal(entry.text, '부모 초안'); assert.equal(c.state.selected, s.key);
+  const retry = byClass(panel, 'work-context-origin').find((r) => r.textContent === '다시 확인');
+  const late = retry.events.click(); await new Promise((resolve) => setImmediate(resolve)); c.state.selected = child.key;
+  finish({ ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: '늦은 응답' }] }) });
+  await late; assert.doesNotMatch(textOf(panel), /늦은 응답/);
+});
+
+test('하위 결과의 동시 조회는 두 개로 제한되고 나머지를 자동 실행하지 않는다', async () => {
+  const waiting = [], paths = [];
+  const c = client((url) => { paths.push(url); return new Promise((resolve) => waiting.push(resolve)); }, noChatTimers);
+  loadContextModules(c); const { s } = selectChat(c);
+  for (let n = 0; n < 3; n++) c.state.snapshot.hosts[0].data.codex.push({ ...s, id: `child-${n}`,
+    key: s.key.replace(s.id, `child-${n}`), parentThreadId: s.id });
+  c.drawDetail(s); wireTree(c, c.get('detail'));
+  const panels = byClass(c.get('session-relations'), 'session-child-result');
+  const pending = panels.map((panel) => { panel.open = true; return panel.events.toggle(); });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(paths, ['/api/chat/state', '/api/chat/state']);
+  assert.match(textOf(panels[2]), /다른 결과를 읽는 중/);
+  for (const resolve of waiting) resolve({ ok: true, status: 200, json: async () => ({ messages: [], phase: 'idle' }) });
+  await Promise.all(pending); assert.equal(paths.length, 2);
+});
+
 test('관련 작업은 필터 전 전체 목록의 정확한 상위·하위를 연결하고 클릭할 때만 해당 대화를 읽는다', () => {
   const c = client(undefined, noChatTimers), helpers = loadContextModules(c);
   const { s } = selectChat(c); Object.assign(s, { title: '하위 작업', parentThreadId: 'parent' });

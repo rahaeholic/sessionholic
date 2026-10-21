@@ -988,6 +988,8 @@ class Board:
         self.clock = time.time
         from runtime_observation import RuntimeObservations
         self.runtime_observations = RuntimeObservations(clock=lambda: self.clock())
+        self.observation_revision = 0
+        self.runtime_tokens = {}
         self.lock = threading.RLock()
         # Lock order: a host lock, then save_lock, then self.lock, then a change
         # listener's own lock; never the reverse.
@@ -1039,7 +1041,8 @@ class Board:
 
     def state_signature(self):
         with self.lock:
-            return hashlib.sha256(json.dumps(self.state, sort_keys=True, ensure_ascii=False,
+            from runtime_observation import semantic
+            return hashlib.sha256(json.dumps(semantic(self.state), sort_keys=True, ensure_ascii=False,
                                              default=str).encode()).digest()
 
     def add_listener(self, callback):
@@ -1106,7 +1109,9 @@ class Board:
                     else:
                         if update.get('ok'):
                             update['data'] = self.merge_sources(name, update['data'])
-                            if host.get('platform') == 'windows':
+                            if host.get('platform') != 'windows':
+                                update['data'] = self.annotate_mac(name, update['data'], observation_request)
+                            else:
                                 for agent in ('claude', 'codex'):
                                     if ((update['data'].get('sourceStatus') or {}).get(agent) or {}).get('ok') is False:
                                         self.runtime_observations.reject_scope(name, agent, observation_request)
@@ -1135,6 +1140,35 @@ class Board:
                     self.changed()
             self.persist("snapshot.json", self.snapshot)
             return update["ok"]
+
+    def annotate_mac(self, name, data, request_seq, live=False):
+        """Only new adapter read tokens renew live leases; heartbeat/cached parts do not."""
+        from runtime_observation import native_result
+        for agent in ('claude', 'codex'):
+            failed = ((data.get('sourceStatus') or {}).get(agent) or {}).get('ok') is False
+            if failed:
+                self.runtime_observations.reject_scope(name, agent, request_seq)
+            for row in data.get(agent, []):
+                source = {**row, 'host': name, 'agent': agent}
+                key = self.runtime_observations.key(source)
+                token = row.get('runtimeReadToken')
+                if live and (not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{16}:\d{1,12}', token)):
+                    continue  # Legacy watcher: no new currentness claim.
+                if live and not failed and self.runtime_tokens.get(key) == token:
+                    annotation = self.runtime_observations.current(source)
+                else:
+                    result = {} if failed else native_result(row, agent)
+                    annotation = self.runtime_observations.accept(source, result, request_seq,
+                                                                  max(135, 2 * self.interval + 15))
+                    self.runtime_tokens[key] = token
+                    self.observation_revision += 1
+                if annotation:
+                    row.update(annotation)
+                    accepted = annotation['runtimeObservation']
+                    row.update(phase=accepted['phase'], runtimeKnown=accepted['known'])
+        while len(self.runtime_tokens) > 4096:
+            self.runtime_tokens.pop(next(iter(self.runtime_tokens)))
+        return data
 
     def merge_sources(self, name, data):
         """Preserve one failed adapter's last rows; a successful empty list clears them.
@@ -1399,10 +1433,13 @@ class Board:
             stream.delivered = True
             row = self.state[stream.name]
             data = self.merge_sources(stream.name, data)
+            data = self.annotate_mac(stream.name, data, self.runtime_observations.begin(), live=True)
             now = self.clock()
             self.live_at[stream.name] = now
-            same = (isinstance(row["data"], dict) and {k: v for k, v in row["data"].items() if k != "collectedAt"}
-                    == {k: v for k, v in data.items() if k != "collectedAt"})
+            from runtime_observation import semantic
+            same = (isinstance(row["data"], dict) and semantic({k: v for k, v in row["data"].items() if k != "collectedAt"})
+                    == semantic({k: v for k, v in data.items() if k != "collectedAt"}))
+            row['data'] = data  # Metadata renewals must invalidate the response body cache too.
             if not (same and row["ok"] and row["live"] and not row["paused"] and row["error"] is None):
                 row.update(data=data, ok=True, paused=False, error=None, fetchedAt=int(now), live=True)
                 self.backoff.pop(stream.name, None)
@@ -3007,7 +3044,7 @@ class SnapshotResponses:
             return None
         recovery = getattr(getattr(server, "workflow", None), "recoveries", None)
         recovery_key = recovery.state_key() if recovery is not None else None
-        return (server.board.version, server.boot_id, recovery_key) + tuple(store.state_key() for store in display_stores(server))
+        return (server.board.version, getattr(server.board, 'observation_revision', 0), server.boot_id, recovery_key) + tuple(store.state_key() for store in display_stores(server))
 
     def body(self, handler, gzip_ok):
         """(JSON body, its gzip when the client takes it, else None): the bytes
@@ -3500,7 +3537,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.goals.get(goal_match[1]))
                 if url.path == "/api/snapshot":
                     if query.get("refresh") == "1":
-                        self.server.board.request_refresh()
+                        self.server.board.request_refresh(query.get('host'))
                     return self.send_snapshot()
                 if url.path == "/api/session/recover":
                     source = self.server.workflow.resolve_source(query, verify=True)

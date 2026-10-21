@@ -76,6 +76,7 @@
     }
     const times = rows.map(({ message }) => stamp(message.ts)).filter((value) => value !== null);
     return { method: 'extractive', lastRequest, lastResult, next,
+      evidence: result ? artifactEvidence(result.message.text) : { artifacts: [], verification: '' },
       scope: { messageCount: rows.length, requestInRange: !!request, olderOmitted: meta.olderOmitted === true,
         truncated: rows.some(({ message }) => message.truncated === true) || [lastRequest, lastResult, next].some((part) => part?.truncated),
         stale: meta.stale === true || meta.offline === true || meta.online === false,
@@ -83,5 +84,40 @@
         firstTs: times[0] ?? null, lastTs: times[times.length - 1] ?? null },
       note: '이미 불러온 대화에서 발췌했습니다. 작업 완료 여부는 원문으로 확인하세요.' };
   }
-  return Object.freeze({ project, labeledNext, LIMITS });
+  function artifactEvidence(text) {
+    const lines = [], artifacts = [], seen = new Set(); let fence = null;
+    for (const raw of clean(text).split('\n')) {
+      const marker = raw.trim().match(/^(`{3,}|~{3,})/);
+      if (marker) { if (!fence) fence = marker[1]; else if (marker[1][0] === fence[0] && marker[1].length >= fence.length) fence = null; continue; }
+      if (!fence && !raw.trim().startsWith('>')) lines.push(raw);
+    }
+    const add = (label, target) => {
+      if (artifacts.length >= 12 || !target || target.length > 2048 || /[\x00-\x20\x7f]/.test(target)) return;
+      let type;
+      try {
+        if (/^https?:\/\//i.test(target)) {
+          const url = new URL(target);
+          if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) return;
+          type = 'link'; target = url.href;
+        } else if (!/^[a-z][a-z0-9+.-]*:/i.test(target.replace(/^[A-Za-z]:[\\/]/, '/')) &&
+          /(?:^\/|^[A-Za-z]:[\\/]|^[.\w-]+\/).*\.[A-Za-z0-9]{1,12}(?::\d+)?$/.test(target)) type = 'file';
+        else return;
+      } catch { return; }
+      const key = `${type}:${target}`;
+      if (!seen.has(key)) { seen.add(key); artifacts.push({ type, target, label: clean(label).slice(0, 160) || target }); }
+    };
+    const visible = lines.join('\n');
+    for (const match of visible.matchAll(/(?<!!)\[([^\]\n]{1,160})\]\(([^\s()]+)\)/g)) add(match[1], match[2]);
+    for (const match of visible.matchAll(/`([^`\n]{1,2048})`/g)) add(match[1], match[1]);
+    let active = false, verification = [];
+    for (const raw of lines) {
+      const label = raw.trim().replace(/^[#*\s]+|[*\s]+$/g, '');
+      const match = label.match(/^(?:검증(?: 결과)?|테스트(?: 결과)?|확인 결과|validation|verification|tests?)(?:\s*[:：]\s*(.*)|\s*)$/i);
+      if (match) { active = true; if (match[1]) verification.push(match[1]); }
+      else if (active && (!raw.trim() || /^#{1,6}\s/.test(raw.trim()))) active = false;
+      else if (active) verification.push(raw.trim());
+    }
+    return { artifacts, verification: verification.join('\n').slice(0, 1200) };
+  }
+  return Object.freeze({ project, labeledNext, artifactEvidence, LIMITS });
 });

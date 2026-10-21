@@ -237,6 +237,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(policy["default-src"], "'self'")
         self.assertNotIn("blob:", policy["script-src"])
 
+    def test_snapshot_refresh_can_target_one_registered_host(self):
+        with patch.object(self.board, 'request_refresh') as refresh:
+            response, _ = self.request('GET', '/api/snapshot?refresh=1&host=remote',
+                                       headers={'Authorization': 'Bearer ' + TOKEN})
+        self.assertEqual(response.status, 200)
+        refresh.assert_called_once_with('remote')
+
     def test_json_is_gzip_compressed_when_accepted_and_large(self):
         import gzip
         large = {"hosts": [{"name": "remote", "rows": ["정산 작업 %d" % index for index in range(200)]}]}
@@ -261,11 +268,11 @@ class ServerTest(unittest.TestCase):
                 self.assertIsNone(res.getheader("Content-Encoding"), header)
                 self.assertEqual(json.loads(data), served)
         # Small replies stay plain even for gzip clients.
-        res, data = self.request("GET", "/api/snapshot", headers={
+        res, data = self.request("GET", "/api/prompts", headers={
             "Authorization": "Bearer " + TOKEN, "Accept-Encoding": "gzip"})
         self.assertIsNone(res.getheader("Content-Encoding"))
         self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
-        self.assertIn("version", json.loads(data))
+        self.assertIn("revision", json.loads(data))
 
 
 WEB_INDEX = ('<!doctype html><html><head><meta charset="utf-8">\n'
