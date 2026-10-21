@@ -199,6 +199,9 @@ class MacObservationTest(unittest.TestCase):
         b = watch.compose()
         self.assertNotEqual(a['claude'][0]['runtimeReadToken'], b['claude'][0]['runtimeReadToken'])
         self.assertEqual(collector.watch_signatures(a), collector.watch_signatures(b))
+        watch.publish('claude', [{'id': 'one', 'phase': 'idle', 'snippet': 'new transcript'}], [], ok=True, runtime_read=False)
+        transcript_only = watch.compose()
+        self.assertEqual(transcript_only['claude'][0]['runtimeReadToken'], b['claude'][0]['runtimeReadToken'])
 
     def test_only_actual_read_renews_and_body_revision_does_not_announce_semantic_change(self):
         from types import SimpleNamespace

@@ -1886,11 +1886,12 @@ class Watch:
         self.local_wake.set()
 
     # ---------- sources ----------
-    def publish(self, key, rows, errors, ok=None):
+    def publish(self, key, rows, errors, ok=None, runtime_read=True):
         part = (rows, errors, not errors if ok is None else ok)
         with self.lock:
-            self.read_seq += 1
-            self.part_tokens[key] = '%s:%d' % (self.read_epoch, self.read_seq)
+            if runtime_read:
+                self.read_seq += 1
+                self.part_tokens[key] = '%s:%d' % (self.read_epoch, self.read_seq)
             self.parts[key] = part
         self.wake.set()
 
@@ -1989,7 +1990,8 @@ class Watch:
                         except OSError:
                             watched = None
                     transcripts = watched
-                    self.publish("claude", rows, errors, ok=agent_ok and row_status['ok'] and not errors)
+                    self.publish("claude", rows, errors, ok=agent_ok and row_status['ok'] and not errors,
+                                 runtime_read=call)
                 if refresh or now >= next_tmux:
                     errors = []
                     status = {'ok': True}

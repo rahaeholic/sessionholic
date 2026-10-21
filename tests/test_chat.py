@@ -299,6 +299,17 @@ class ChatTest(unittest.TestCase):
         result = self.chat.state({'source': REF})
         self.assertTrue(result['stale'])
         self.assertFalse(result['runtimeKnown'])
+    def test_offline_app_server_keeps_saved_read_after_runtime_becomes_unknown(self):
+        self.source.update(phase='unknown', appServer='off', runtimeKnown=False)
+        self.board.poll(HOST)
+        with patch.object(self.chat, 'rpc', side_effect=RuntimeError('offline')), \
+             patch.object(self.flow, 'resume_preview', return_value={'allowed': False, 'reason': 'offline'}), \
+             patch.object(self.board, 'read', return_value={'error': 'app_server_off'}):
+            result = self.chat.state({'source': REF})
+        self.assertTrue(result['conversationUnavailable'])
+        self.assertTrue(result['readOnly'])
+        self.assertFalse(result['runtimeKnown'])
+        self.assertFalse(result['capability']['supported'])
     def test_upload_bytes_exact_and_bound_to_session(self):
         raw=b'\x00\xfffile\r\n'
         result=self.chat.upload(REF,'한글 파일.bin',raw)['attachment']

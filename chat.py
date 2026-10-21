@@ -607,7 +607,9 @@ class Chat:
         try:
             result = self.rpc(host, 'read', source, **kwargs)
         except (RuntimeError, OSError, ValueError) as exc:
-            if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
+            saved_codex = (source.get('phase') in ('closed', 'notLoaded') or source.get('appServer') == 'off'
+                           or source.get('state') == 'notLoaded')
+            if source.get('agent') != 'codex' or not saved_codex:
                 from transfer import WorkerError
                 from transfer_native import DEADLINE_EXCEEDED
                 # Only a host that could not be reached, or did not answer in time (its helper's
