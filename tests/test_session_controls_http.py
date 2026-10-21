@@ -125,7 +125,8 @@ class SessionControlsHTTPTest(unittest.TestCase):
             response, result = self.request('/api/session/action', self.action(action='terminate'))
         self.assertEqual(response.status, 200, result)
         self.assertEqual(closed, ['a' * 32])
-        self.assertFalse(result['cleanup']['complete'])
+        self.assertTrue(result['cleanup']['complete'])
+        self.assertEqual(result['cleanup']['list'], 'done')
         self.assertEqual(result['cleanup']['unverified'], ['b' * 32, 'c' * 32])
 
     def test_partial_cleanup_retry_reads_existing_receipt_after_row_disappears(self):

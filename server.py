@@ -3421,7 +3421,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.terminal_inputs.prune_closed(info["id"], self.server.terminals.list())
             except (ValueError, RuntimeError, OSError):
                 outcome["inputCleanupPending"] = True
-        if outcome["failed"] or outcome["unverified"] or outcome["remotePending"]:
+        # An estimated/changed/new terminal is outside the confirmed termination
+        # target. Keep it open for review, but do not trap a finished session in
+        # an endlessly retryable cleanup: another read cannot prove that link.
+        if outcome["failed"] or outcome["remotePending"]:
             return outcome
         try:
             # Use the already verified source, even after archive removed its row.

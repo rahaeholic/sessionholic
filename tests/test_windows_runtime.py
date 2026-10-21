@@ -299,6 +299,16 @@ class WindowsRuntimeTest(unittest.TestCase):
         return self.runtime.chat({'action': 'send', 'source': source or self.source, 'requestId': request,
                                   'input': [{'type': 'text', 'text': text}] if text else [], 'attachmentIds': ids})
 
+    def test_32_files_are_sent_once_and_33_is_rejected_before_native_write(self):
+        files = [self.stored(f'file-{n}.txt', b'fixture') for n in range(33)]
+        result = self.send_files([file['id'] for file in files[:32]])
+        self.assertEqual(len(result['attachments']), 32)
+        mutation = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertEqual(len(mutation['input']), 33)
+        with self.assertRaises(ValueError):
+            self.send_files([file['id'] for file in files], request='request-too-many')
+        self.assertEqual(self.reader.send_calls, 1)
+
     def test_files_go_once_as_native_images_and_path_lines_with_their_names(self):
         image = self.stored('screen.png', b'\x89PNG\r\n\x1a\nfixture-image')
         memo = self.stored('memo.txt', b'fixture-memo')

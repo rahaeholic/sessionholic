@@ -876,7 +876,7 @@ class WindowsRuntime:
         session cwd as native_chat._send does: an image becomes a native image input, any
         other file a "첨부 파일:" path line (never its contents)."""
         ids = args.get('attachmentIds', [])
-        if (not isinstance(ids, list) or len(ids) > 8 or len(set(map(str, ids))) != len(ids)
+        if (not isinstance(ids, list) or len(ids) > wa.MAX_ATTACHMENTS or len(set(map(str, ids))) != len(ids)
                 or any(not isinstance(value, str) or not wa.ID.fullmatch(value) for value in ids)):
             raise ValueError('첨부 식별자가 올바르지 않습니다.')
         if ids and not (args.get('source') or {}).get('cwd'):

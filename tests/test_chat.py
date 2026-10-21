@@ -428,7 +428,7 @@ class ChatTest(unittest.TestCase):
                 'queueState':{'available':True,'complete':True,'total':1,'truncated':False,'reason':'PRIVATE'}}
         self.flow.transfers.rpc=lambda *a,**k:result
         state=self.chat.state({'source':REF,'requestId':'request-0001'})
-        self.assertEqual(set(state),{'route','phase','capability','messages','olderOmitted','receipts','maxAttachmentBytes','requiresNativeTerminal',
+        self.assertEqual(set(state),{'route','phase','capability','messages','olderOmitted','receipts','maxAttachmentBytes','maxAttachments','requiresNativeTerminal',
                                      'prompt','promptOpenable','workingSince','workingSinceApprox','modelSettings',
                                      'runtimeKnown','runtimeReason','runtimeObservation','lastKnown'})
         self.assertIs(state['olderOmitted'],False)
@@ -729,9 +729,17 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(self.chat.state({'source':ref})['route'],ref)
         with self.assertRaises(ValueError): self.chat.state({'source':{**ref,'home':'.codex-other'}})
     def test_file_count_text_size_and_missing_attachment(self):
-        for fields in ({'attachments':['a'*32]*9},{'text':'x'*32769},{'attachments':['b'*32]}):
+        for fields in ({'attachments':['a'*32]*33},{'text':'x'*32769},{'attachments':['b'*32]}):
             with self.assertRaises(ValueError):
                 self.chat.send({'source':REF,'requestId':'request-0001','text':'ok',**fields})
+
+    def test_32_files_cross_the_coordinator_without_losing_receipt_metadata(self):
+        files = [self.chat.upload(REF, f'file-{n}.txt', b'fixture')['attachment'] for n in range(32)]
+        result = self.chat.send({'source': REF, 'requestId': 'request-32-files', 'text': '확인',
+                                 'attachments': [file['id'] for file in files]})
+        self.assertEqual(len(result['receipt']['attachments']), 32)
+        self.assertEqual(len(self.calls[-1][2]['attachmentIds']), 32)
+        self.assertEqual(self.chat.state({'source': REF})['maxAttachments'], 32)
 
     def codex_terminal(self, metadata=False, **native):
         terms = FakeTerminals()

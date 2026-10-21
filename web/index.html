@@ -400,6 +400,13 @@
           ><button type="button" data-key="enter" class="enter-key">Enter</button>
         </div>
         <div id="draft-panel" class="draft-panel">
+          <div id="terminal-attachments" class="chat-attachments terminal-attachments" aria-label="터미널에 보낼 첨부" hidden></div>
+          <div id="terminal-attachment-actions" class="terminal-attachment-actions" hidden>
+            <span id="terminal-attachment-status" role="status"></span>
+            <button id="terminal-attachment-retry" type="button" hidden>첨부 다시 올리기</button>
+            <button id="terminal-attachment-cancel" type="button" hidden>올리지 않은 첨부 취소</button>
+          </div>
+          <input id="terminal-files" type="file" multiple hidden>
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
@@ -412,6 +419,7 @@
               autocapitalize="off"
               spellcheck="false"
             ></textarea
+            ><button id="draft-attach" class="draft-attach" type="button" aria-label="사진 또는 파일 첨부" title="파일 첨부 · 입력창에 바로 붙여넣어도 됩니다">＋</button
             ><button id="draft-mic" class="draft-mic" type="button" aria-label="음성 입력" aria-pressed="false" title="음성 입력 (브라우저 음성 인식)" hidden>
               <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
             </button

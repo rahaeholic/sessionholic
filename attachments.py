@@ -21,6 +21,7 @@ import instance
 DIRECTORY = instance.current()['remote']['attachmentsDir']
 _EXCLUDE_LINE = DIRECTORY + '/'
 MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENTS = 32
 MAX_FILES = 20000
 MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
 _ID = re.compile(r'[a-f0-9]{32}\Z')

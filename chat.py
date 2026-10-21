@@ -12,6 +12,7 @@ import threading
 import time
 
 import instance
+from attachments import MAX_ATTACHMENTS
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -704,7 +705,7 @@ class Chat:
                     # Rows before these were left out (collector.recent_window, the read's range).
                     'olderOmitted': result.get('olderOmitted') is True,
                     'modelSettings': self.model_settings(result.get('modelSettings')),
-                    'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
+                    'receipts': receipts, 'maxAttachmentBytes': MAX_FILE, 'maxAttachments': MAX_ATTACHMENTS,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else
                     result.get('requiresNativeTerminal', phase == 'needs_input'),
                     # A menu on the board terminal's screen; the web may answer it.
@@ -1426,8 +1427,8 @@ class Chat:
         if not isinstance(text, str) or len(text.encode()) > 32768:
             raise ValueError('메시지는 32KiB까지 보낼 수 있습니다.')
         ids = data.get('attachments', [])
-        if not isinstance(ids, list) or len(ids) > 8 or len(set(str(i) for i in ids)) != len(ids):
-            raise ValueError('한 메시지에는 첨부 파일을 8개까지 보낼 수 있습니다.')
+        if not isinstance(ids, list) or len(ids) > MAX_ATTACHMENTS or len(set(str(i) for i in ids)) != len(ids):
+            raise ValueError(f'한 메시지에는 첨부 파일을 {MAX_ATTACHMENTS}개까지 보낼 수 있습니다.')
         if not text.strip() and not ids:
             raise ValueError('메시지나 첨부 파일을 추가해 주세요.')
         manifest = []

@@ -3267,8 +3267,10 @@ function terminationRecord(s, value) {
 function terminationCopy(result) {
   if (result.confirmed !== true) return result.reason || "실행 종료 결과를 확인하지 못했습니다. 기존 결과 확인만 다시 시도할 수 있습니다.";
   const cleanup = result.cleanup;
+  if (cleanup?.complete && cleanup.unverified?.length)
+    return `실행을 종료하고 목록에서 정리했습니다. 연결을 확인하지 못한 터미널 ${cleanup.unverified.length}개는 열어 두었습니다. 열린 터미널 목록에서 확인할 수 있습니다.`;
   if (cleanup?.complete) return "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.";
-  if (cleanup?.unverified?.length) return "실행 종료는 확인했습니다. 추정 연결된 터미널은 자동으로 닫지 않았습니다. 해당 터미널을 확인한 뒤 남은 정리를 다시 시도해 주세요.";
+  if (cleanup?.unverified?.length) return "실행 종료는 확인했습니다. 연결을 확인하지 못한 터미널은 열어 두었습니다. 터미널 또는 목록 정리가 남아 있습니다.";
   if (cleanup?.remotePending?.length) return "실행 종료는 확인했습니다. 실행 기기의 터미널 정리가 남았습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
   return "실행 종료는 확인했습니다. 터미널 또는 목록 정리가 남아 있습니다. 남은 정리만 다시 시도할 수 있습니다.";
 }
@@ -3283,6 +3285,7 @@ async function terminateAndCleanup(context) {
   if (result.cleanup?.complete || result.applied === false) terminationRecord(context.s, null);
   if (result.confirmed === true) {
     for (const id of result.cleanup?.closed || []) {
+      clearTerminalAttachmentDraft(id);
       const terminal = state.terminals?.find((row) => row.id === id);
       if (terminal) { terminal.alive = false; terminal.closed = true; terminal.closedReason = "user"; }
     }
@@ -4662,6 +4665,8 @@ function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
 }
 const DRAFT_PREFIX = INSTANCE.storagePrefix + "draft:v1:";
+const MAX_ATTACHMENTS = 32;
+const terminalAttachmentDrafts = new Map();
 const DRAFT_TTL = 7 * 24 * 60 * 60 * 1000;
 function draftRecoveryEnabled() { return prefs.get("draftRecovery", true) === true; }
 function savedDraftKeys() {
@@ -4686,13 +4691,13 @@ function readSavedDraft(key) {
     const row = JSON.parse(raw);
     if (row?.version !== 1 || typeof row.text !== "string" || new TextEncoder().encode(row.text).length > 32768 ||
         !Number.isFinite(row.at) || row.at > Date.now() + 60000 || Date.now() - row.at > DRAFT_TTL ||
-        !Array.isArray(row.attachments) || row.attachments.length > 8 ||
+        !Array.isArray(row.attachments) || row.attachments.length > MAX_ATTACHMENTS ||
         row.attachments.some((item) => !item || typeof item.id !== "string" || item.id.length > 128) ||
         row.pending && (typeof row.pending.requestId !== "string" || row.pending.requestId.length > 128 ||
           row.pending.preserveDraft !== undefined && typeof row.pending.preserveDraft !== "boolean" ||
           !Number.isInteger(row.pending.revision) || row.pending.revision < 0 ||
           typeof row.pending.text !== "string" || new TextEncoder().encode(row.pending.text).length > 32768 ||
-          !Array.isArray(row.pending.attachments) || row.pending.attachments.length > 8 ||
+          !Array.isArray(row.pending.attachments) || row.pending.attachments.length > MAX_ATTACHMENTS ||
           row.pending.attachments.some((id) => typeof id !== "string" || id.length > 128)) ||
         row.commandRequest && (typeof row.commandRequest.requestId !== "string" || row.commandRequest.requestId.length > 128 ||
           !['model', 'effort', 'compact'].includes(row.commandRequest.command) ||
@@ -4793,17 +4798,23 @@ function persistTerminalDraft(terminal) {
   // Terminal inputs have a separate idempotent queue; retain a locked marker while it drains.
   const key = draftStorageKey("terminal", terminalDraftIdentity(terminal));
   const text = state.drafts.get(draftKey(terminal)) || "";
+  const files = terminalAttachmentDrafts.get(terminal.id)?.attachments || [];
   const prior = readSavedDraft(key);
   const uncertain = state.draftPaste?.id === terminal.id && state.draftPaste.dispatched || prior?.pending && prior.text === text;
   const pending = uncertain ? { requestId: "terminal-input-pending", revision: 0,
-    text: state.drafts.get(draftKey(terminal)) || "", attachments: [] } : null;
+    text: state.drafts.get(draftKey(terminal)) || "", attachments: files.map((file) => file.id) } : null;
   return writeSavedDraft(key, {
-    text: state.drafts.get(draftKey(terminal)) || "", attachments: [], pending, revision: 0 });
+    text: state.drafts.get(draftKey(terminal)) || "", attachments: files, pending, revision: 0 });
 }
 function restoreTerminalDraft(terminal) {
   if (state.drafts.has(draftKey(terminal))) return;
   const row = readSavedDraft(draftStorageKey("terminal", terminalDraftIdentity(terminal)));
-  if (row && !row.pending) state.drafts.set(draftKey(terminal), row.text);
+  if (row && !row.pending) {
+    state.drafts.set(draftKey(terminal), row.text);
+    const entry = terminalAttachmentEntry(terminal);
+    if (entry && !entry.attachments.length) entry.attachments = row.attachments.filter((file) =>
+      validTerminalAttachment(file) && entry.source && file.terminalSourceKey === chatKey(entry.source));
+  }
   else if (row?.pending) draftStorageNotice("전송 중이던 터미널 입력은 자동 복원하지 않습니다. 터미널에서 반영 여부를 확인해 주세요.");
 }
 function persistAllDrafts() {
@@ -4812,7 +4823,7 @@ function persistAllDrafts() {
   let saved = true;
   for (const entry of state.chats.values()) saved = persistChatDraft(entry) && saved;
   for (const terminal of state.terminals) if (state.drafts.has(draftKey(terminal))) saved = persistTerminalDraft(terminal) && saved;
-  return saved && ![...state.chats.values()].some((entry) => entry.uploads || entry.uploadQueue?.length);
+  return saved && ![...state.chats.values(), ...terminalAttachmentDrafts.values()].some((entry) => entry.uploads || entry.uploadQueue?.length);
 }
 function chatVisible() {
   return window.SessionholicWorkspace?.visible() !== false && !document.hidden && !boardCovered() && !state.inlineTerminal && (!phoneLayout() || state.detailShown);
@@ -6790,7 +6801,11 @@ function attachmentTile(entry, file, { key, uploading = null } = {}) {
     entry.attachments = entry.attachments.filter((item) => item.id !== file.id);
     revokeThumb(entry, file.id);
     entry.revision++;
-    updateChatComposer(entry);
+    if (entry.terminalId) {
+      if (!entry.attachments.length && !entry.uploadQueue.length) entry.error = "";
+      persistTerminalDraft(entry.terminal);
+      renderTerminalAttachments();
+    } else updateChatComposer(entry);
   });
   remove.setAttribute("aria-label", `${file.name || "첨부파일"} 제거`);
   remove.disabled = entry.sending || !!entry.pending;
@@ -7079,8 +7094,8 @@ async function sendChat(entry, message = null) {
   }
   if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
       (!text.trim() && !attachments.length)) return;
-  if (new TextEncoder().encode(text).length > 32768 || attachments.length > 8) {
-    entry.error = entry.inputError = "메시지는 32KiB, 첨부는 8개까지 보낼 수 있습니다. 초안은 유지됩니다.";
+  if (new TextEncoder().encode(text).length > 32768 || attachments.length > MAX_ATTACHMENTS) {
+    entry.error = entry.inputError = `메시지는 32KiB, 첨부는 ${MAX_ATTACHMENTS}개까지 보낼 수 있습니다. 초안은 유지됩니다.`;
     updateChatComposer(entry);
     return;
   }
@@ -7507,8 +7522,8 @@ function refreshConversationView(entry, toEnd = false) {
 async function uploadChatFiles(entry, files) {
   if (networkOffline()) { updateChatComposer(entry); return; }
   if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.pending || entry.uploads || !files.length) return;
-  if (entry.attachments.length + files.length > 8) {
-    entry.error = entry.inputError = "한 메시지에는 첨부 파일을 8개까지 추가할 수 있습니다.";
+  if (entry.attachments.length + files.length > MAX_ATTACHMENTS) {
+    entry.error = entry.inputError = `한 메시지에는 첨부 파일을 ${MAX_ATTACHMENTS}개까지 추가할 수 있습니다.`;
     updateChatComposer(entry);
     return;
   }
@@ -10055,6 +10070,7 @@ function terminalStatus(text, connected = false) {
   $("draft-paste").disabled = !connected || !!state.draftPaste;
   $("draft-type").disabled = !connected || !!state.draftPaste;
   $("terminal-reconnect").hidden = connected || !state.terminalAlive;
+  renderTerminalAttachments();
 }
 function terminalInfo(terminal) {
   return { ...terminal?.metadata, ...terminal };
@@ -10333,6 +10349,141 @@ function prepareDraftPaste(event) {
   // Retain textarea focus until the explicit click can request an IME commit.
   event.preventDefault();
 }
+function clipboardFiles(clipboard) {
+  const files = [...(clipboard?.files || [])];
+  if (!files.length) for (const item of clipboard?.items || []) {
+    if (item.kind === "file") { const file = item.getAsFile?.(); if (file) files.push(file); }
+  }
+  return files;
+}
+function terminalAttachmentSource(terminal) {
+  const info = terminalInfo(terminal), source = info.nativeSource;
+  if (terminalEstimated(terminal) || !source?.host || !source.id || !["codex", "claude"].includes(source.agent)) return null;
+  return Object.freeze({ ...source });
+}
+function terminalAttachmentEntry(terminal = state.terminal) {
+  if (!terminal?.id) return null;
+  let entry = terminalAttachmentDrafts.get(terminal.id);
+  if (!entry) {
+    entry = { terminalId: terminal.id, terminal, source: null, attachments: [], uploadQueue: [], thumbs: new Map(),
+      uploads: 0, sending: false, error: "", revision: 0, authEpoch: state.authEpoch };
+    terminalAttachmentDrafts.set(terminal.id, entry);
+  }
+  entry.terminal = terminal;
+  if (!entry.attachments.length && !entry.uploads) entry.source = terminalAttachmentSource(terminal);
+  return entry;
+}
+function validTerminalAttachment(file) {
+  return !!file && typeof file.id === "string" && /^[a-f0-9]{32}$/.test(file.id) &&
+    typeof file.path === "string" && file.path.length <= 4096 && !/[\x00-\x1f\x7f]/.test(file.path) &&
+    (/^\//.test(file.path) || /^[A-Za-z]:[\\/]/.test(file.path));
+}
+function terminalAttachmentMatches(entry, terminal = state.terminal) {
+  const source = terminalAttachmentSource(terminal);
+  return !!entry && terminal?.id === entry.terminalId && !!entry.source && !!source &&
+    chatKey(entry.source) === chatKey(source);
+}
+function renderTerminalAttachments() {
+  const box = $("terminal-attachments"), actions = $("terminal-attachment-actions");
+  if (!box || !actions) return;
+  const entry = state.authenticated && state.terminal ? terminalAttachmentEntry() : null;
+  const count = entry ? entry.attachments.length + entry.uploadQueue.length : 0;
+  const changed = box.hidden !== !count;
+  box.hidden = !count; actions.hidden = !count && !entry?.error;
+  if (entry) {
+    renderAttachmentTiles(entry, box);
+    $("terminal-attachment-status").textContent = entry.error || (entry.uploads ? "첨부를 올리고 있습니다… 글은 계속 입력할 수 있습니다."
+      : count ? `첨부 ${count}/${MAX_ATTACHMENTS}개 · 보내기 전` : "");
+  } else box.replaceChildren();
+  const busy = !!entry?.uploads || !!entry?.sending || state.draftPaste?.id === state.terminal?.id;
+  $("terminal-attachment-retry").hidden = !entry?.uploadQueue.length || busy;
+  $("terminal-attachment-cancel").hidden = !entry?.uploadQueue.length || busy;
+  $("draft-attach").disabled = !state.authenticated || !state.terminalAlive || !!entry?.sending || !!state.draftPaste;
+  for (const id of ["draft-paste", "draft-type"]) $(id).disabled = !state.connected || !!state.draftPaste ||
+    !!entry?.uploads || !!entry?.uploadQueue.length;
+  if (changed && state.terminalVisible) requestAnimationFrame(fitTerminal);
+}
+async function uploadTerminalFiles(files = []) {
+  if (!state.authenticated || !state.terminal || !state.terminalVisible) return;
+  const entry = terminalAttachmentEntry(), authEpoch = state.authEpoch;
+  const retained = () => authEpoch === state.authEpoch && state.authenticated && terminalAttachmentDrafts.get(entry.terminalId) === entry;
+  if (entry.sending || state.draftPaste) return;
+  if (entry.attachments.length + entry.uploadQueue.length + files.length > MAX_ATTACHMENTS) {
+    entry.error = `한 번에 첨부 파일을 ${MAX_ATTACHMENTS}개까지 추가할 수 있습니다.`;
+    renderTerminalAttachments(); return;
+  }
+  for (const file of files) {
+    const key = `terminal-upload-${requestId()}`;
+    attachmentThumb(entry, key, file);
+    entry.uploadQueue.push({ key, file, state: "waiting", progress: null });
+  }
+  if (entry.uploads) { renderTerminalAttachments(); return; }
+  if (!entry.uploadQueue.length) return;
+  entry.error = ""; entry.uploads = 1; renderTerminalAttachments();
+  try {
+    if (networkOffline()) throw new Error("오프라인입니다. 첨부는 남겨 두었습니다. 연결 후 다시 올려 주세요.");
+    let terminal = state.terminals.find((item) => item.id === entry.terminalId) || entry.terminal;
+    if (!terminalAttachmentSource(terminal)) {
+      await refreshTerminals(authEpoch);
+      if (!retained()) return;
+      terminal = state.terminals.find((item) => item.id === entry.terminalId) || terminal;
+    }
+    const source = terminalAttachmentSource(terminal);
+    if (!source || terminal.alive === false || terminal.closed) throw new Error("이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
+    if (entry.source && chatKey(entry.source) !== chatKey(source)) throw new Error("터미널의 연결 세션이 바뀌었습니다. 이전 첨부를 제거한 뒤 다시 추가해 주세요.");
+    entry.source = source;
+    while (entry.uploadQueue.length && retained()) {
+      const item = entry.uploadQueue[0], file = item.file;
+      if (networkOffline()) throw new Error("연결이 끊겼습니다. 남은 첨부를 다시 올려 주세요.");
+      if (!Number.isFinite(file.size) || file.size < 1 || file.size > 20 * 1024 * 1024)
+        throw new Error(`${file.name || "파일"}: 1바이트부터 20MiB까지 첨부할 수 있습니다. 올리지 않은 첨부를 취소한 뒤 다시 선택해 주세요.`);
+      item.state = "uploading"; item.progress = 0; renderTerminalAttachments();
+      const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+        "X-Chat-Source": encodeURIComponent(JSON.stringify(source)),
+        "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) }, (ratio) => {
+          item.progress = ratio; setUploadProgress(item.tile, item);
+        });
+      if (!retained()) return;
+      if (response.status === 401) { showLogin(); return; }
+      const attachment = response.data?.attachment;
+      if (!response.ok || !validTerminalAttachment(attachment)) throw new Error(response.data?.error || "첨부 전송을 확인하지 못했습니다. 다시 올려 주세요.");
+      const thumb = entry.thumbs.get(item.key);
+      if (thumb) { entry.thumbs.delete(item.key); entry.thumbs.set(attachment.id, thumb); }
+      entry.attachments.push({ ...attachment, terminalSourceKey: chatKey(source) });
+      entry.uploadQueue.shift(); entry.revision++;
+      persistTerminalDraft(entry.terminal);
+    }
+  } catch (err) {
+    if (retained()) entry.error = err.message || "첨부파일을 올리지 못했습니다. 다시 올려 주세요.";
+  } finally {
+    entry.uploads = 0;
+    if (retained()) renderTerminalAttachments();
+  }
+}
+function pasteTerminalFiles(event) {
+  const files = clipboardFiles(event.clipboardData);
+  if (!files.length) return; // Keep native text paste and its IME/selection behavior.
+  event.preventDefault(); event.stopPropagation?.();
+  if (!state.authenticated || !state.terminal || !state.terminalVisible) return;
+  const input = $("terminal-draft"), text = event.clipboardData?.getData?.("text/plain") || "";
+  const insertText = () => {
+    if (!text || state.terminal?.id !== terminalId || input !== $("terminal-draft")) return;
+    const start = input.selectionStart ?? input.value.length, end = input.selectionEnd ?? start;
+    input.value = input.value.slice(0, start) + text + input.value.slice(end);
+    input.setSelectionRange?.(start + text.length, start + text.length);
+    dictationTyped(input, { inputType: "insertFromPaste" });
+    state.draftRevision++; saveDraft(); resizeDraft();
+  };
+  const terminalId = state.terminal.id;
+  if (text && state.composing) input.addEventListener("compositionend", insertText, { once: true });
+  else insertText();
+  uploadTerminalFiles(files);
+}
+function clearTerminalAttachmentDraft(id) {
+  const entry = terminalAttachmentDrafts.get(id);
+  if (entry) for (const key of [...entry.thumbs.keys()]) revokeThumb(entry, key);
+  terminalAttachmentDrafts.delete(id);
+}
 function bindDraftInput(node) {
   node.addEventListener("input", (event) => {
     dictationTyped(node, event);
@@ -10343,6 +10494,7 @@ function bindDraftInput(node) {
   node.addEventListener("beforeinput", draftBeforeInput);
   node.addEventListener("compositionstart", startDraftComposition);
   node.addEventListener("compositionend", endDraftComposition);
+  node.addEventListener("paste", pasteTerminalFiles);
 }
 // Korean needs monospace fallbacks that keep two-cell glyphs aligned. Only
 // fonts already on the device are named; no web font is bundled.
@@ -11633,6 +11785,11 @@ function draftKeydown(event) {
 }
 async function pasteDraft(submit = false) {
   if (state.draftPaste) return;
+  const attachmentEntry = terminalAttachmentEntry();
+  if (attachmentEntry?.uploads || attachmentEntry?.uploadQueue.length) {
+    $("draft-note").textContent = "첨부를 올린 뒤 보낼 수 있습니다. 글은 계속 입력할 수 있습니다.";
+    return;
+  }
   stopDictation({ abort: true, field: $("terminal-draft") });
   if (!state.connected || !state.terminal) {
     $("draft-note").textContent = "터미널에 다시 연결한 뒤 붙여넣어 주세요.";
@@ -11659,8 +11816,14 @@ async function pasteDraft(submit = false) {
     if (pending.cancelled || state.terminal?.id !== pending.id ||
         state.inputEpoch !== pending.epoch || !state.connected) return;
     const text = $("terminal-draft").value;
+    const attached = attachmentEntry?.attachments.slice() || [];
+    if (attached.length && (!terminalAttachmentMatches(attachmentEntry) || attached.some((file) => !validTerminalAttachment(file) ||
+        file.terminalSourceKey !== chatKey(attachmentEntry.source)))) {
+      $("draft-note").textContent = "첨부를 올린 세션과 현재 터미널 연결이 다릅니다. 첨부를 제거하고 다시 추가해 주세요.";
+      return;
+    }
     const revision = state.draftRevision;
-    if (!text) return;
+    if (!text && !attached.length) return;
     if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(text)) {
       $("draft-note").textContent =
         "초안에 제어 문자가 포함되어 있습니다. 일반 텍스트만 붙여넣을 수 있습니다.";
@@ -11672,13 +11835,16 @@ async function pasteDraft(submit = false) {
         "현재 터미널 입력칸은 안전한 여러 줄 붙여넣기를 지원하지 않습니다. 한 줄씩 전달해 주세요.";
       return;
     }
-    if (new TextEncoder().encode(text).length > 32750) {
+    const separator = bracketed ? "\n" : " ";
+    const payload = [text, ...attached.map((file) => `첨부 파일: ${JSON.stringify(file.path)}`)].filter(Boolean).join(separator);
+    if (new TextEncoder().encode(payload).length > 32750) {
       $("draft-note").textContent =
         "한 번에 붙여넣을 수 있는 길이를 넘었습니다. 초안을 나누어 전달해 주세요.";
       return;
     }
-    const normalized = text.replace(/\r\n?/g, "\n");
+    const normalized = payload.replace(/\r\n?/g, "\n");
     pending.dispatched = true;
+    if (attachmentEntry) attachmentEntry.sending = true;
     saveDraft();
     await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
@@ -11693,6 +11859,12 @@ async function pasteDraft(submit = false) {
       state.drafts.delete(pending.key);
       resizeDraft();
     }
+    if (attachmentEntry) {
+      const sent = new Set(attached.map((file) => file.id));
+      attachmentEntry.attachments = attachmentEntry.attachments.filter((file) => !sent.has(file.id));
+      for (const id of sent) revokeThumb(attachmentEntry, id);
+      persistTerminalDraft(attachmentEntry.terminal);
+    }
     $("draft-note").textContent = submit ? "" : "입력했습니다. 확인한 뒤 Enter를 눌러 실행하세요.";
     if (submit) haptic("success");
     state.terminalScrollLines = 0;
@@ -11705,6 +11877,7 @@ async function pasteDraft(submit = false) {
       haptic("error");
     }
   } finally {
+    if (attachmentEntry) attachmentEntry.sending = false;
     clearTimeout(pending.compositionTimer);
     if (state.draftPaste === pending) {
       state.draftPaste = null;
@@ -12291,8 +12464,10 @@ function closeTerminal(id, { thenRemove = null, trigger = null } = {}) {
   $("close-terminal-description").textContent = copy.description;
   $("close-terminal-name").textContent = state.closingTerminal.title;
   const draft = state.terminal?.id === id ? $("terminal-draft").value : state.drafts.get(draftKey(terminal));
-  $("close-terminal-draft-note").hidden = !draft;
-  $("close-terminal-draft-note").textContent = draft
+  const attachmentDraft = terminalAttachmentDrafts.get(id);
+  const attachmentCount = (attachmentDraft?.attachments.length || 0) + (attachmentDraft?.uploadQueue.length || 0);
+  $("close-terminal-draft-note").hidden = !draft && !attachmentCount;
+  $("close-terminal-draft-note").textContent = attachmentCount ? `보내기 전 첨부 ${attachmentCount}개가 있습니다. 이 터미널을 닫으면 첨부 선택은 해제됩니다.` : draft
     ? "같은 작업을 같은 기기·에이전트·계정으로 열면 초안을 다시 볼 수 있습니다. 새로고침하거나 브라우저를 닫으면 사라집니다."
     : "";
   $("close-terminal-error").textContent = "";
@@ -12310,6 +12485,7 @@ function cancelTerminalClose() {
   if (trigger?.isConnected !== false) trigger?.focus();
 }
 function finishTerminalClose(closing) {
+  clearTerminalAttachmentDraft(closing.id);
   // Cards and the conversation header drop "터미널 열림" at once.
   if (state.terminals.some((item) => item.id === closing.id && item.alive !== false && !item.closed))
     rememberTerminal({ id: closing.id }, { alive: false, closed: true });
@@ -12936,6 +13112,7 @@ function showLogin() {
   state.planRun++;
   state.plan = null;
   state.drafts.clear();
+  for (const id of [...terminalAttachmentDrafts.keys()]) clearTerminalAttachmentDraft(id);
   state.terminal = null;
   state.terminalVisible = false;
   state.term?.dispose();
@@ -13193,6 +13370,7 @@ function pageShown() {
 // Unsent words or files on this page: what leaving or reloading it would lose.
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
+    [...terminalAttachmentDrafts.values()].some((entry) => entry.attachments.length || entry.uploadQueue.length || entry.uploads) ||
     [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
 }
 function warnDraftUnload(event) {
@@ -13325,8 +13503,8 @@ function workspaceHooks() {
       return true;
     },
     canClose: () => {
-      const busy = state.launchBusy || state.newSessionBusy || state.terminalCloseBusy || workspaceComposing() ||
-        [...state.chats.values()].some((entry) => entry.sending || entry.pending || entry.commandBusy || entry.uploads || entry.uploadQueue?.length);
+      const busy = state.launchBusy || state.newSessionBusy || state.terminalCloseBusy || state.draftPaste || workspaceComposing() ||
+        [...state.chats.values(), ...terminalAttachmentDrafts.values()].some((entry) => entry.sending || entry.pending || entry.commandBusy || entry.uploads || entry.uploadQueue?.length);
       if (busy) { toast("입력·전송 중인 작업이 끝난 뒤 창을 닫아 주세요. 세션은 계속 실행됩니다."); return false; }
       if (state.dictation && !window.confirm("이 창의 음성 입력을 멈추고 창만 닫을까요? 세션 실행은 유지됩니다.")) return false;
       const saved = persistAllDrafts();
@@ -13646,6 +13824,18 @@ window.addEventListener("DOMContentLoaded", () => {
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
   bindDraftInput($("terminal-draft"));
+  // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
+  $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
+  $("draft-attach").addEventListener("click", () => $("terminal-files").click());
+  $("terminal-files").addEventListener("change", () => {
+    uploadTerminalFiles([...( $("terminal-files").files || [])]); $("terminal-files").value = "";
+  });
+  $("terminal-attachment-retry").addEventListener("click", () => uploadTerminalFiles());
+  $("terminal-attachment-cancel").addEventListener("click", () => {
+    const entry = terminalAttachmentEntry();
+    if (!entry || entry.uploads || entry.sending) return;
+    entry.uploadQueue = []; entry.error = ""; renderTerminalAttachments();
+  });
   for (const [id, delta] of [
     ["terminal-font-down", -1],
     ["terminal-font-up", 1],

@@ -1787,8 +1787,8 @@ test('native chat input limits are enforced before any uncertain transport is st
   assert.equal(entry.text.length, 11000);
   assert.match(entry.error, /32KiB/);
   entry.text = '';
-  await c.uploadChatFiles(entry, Array.from({ length: 9 }, (_, i) => ({ name: i + '.txt', size: 1 })));
-  assert.match(entry.error, /8개/);
+  await c.uploadChatFiles(entry, Array.from({ length: 33 }, (_, i) => ({ name: i + '.txt', size: 1 })));
+  assert.match(entry.error, /32개/);
   assert.equal(requests, 0);
 });
 
@@ -4886,6 +4886,23 @@ test('end keys ask to end a session only off a field and without a text selectio
   assert.equal(c.get('end-session-dialog').open, false);
   assert.match(c.get('toast').textContent, /실행을 끝내고 터미널과 목록을 정리/);
   assert.equal(focused.slice(next).at(-1), 3, 'the next card takes the focus');
+});
+
+test('실행 종료 뒤 추정 터미널만 남으면 목록을 정리하고 종료 창을 닫으며 같은 종료를 반복하지 않는다', async () => {
+  const preview = { targetProof: 'proof', capabilities: { terminate: { supported: true }, interrupt: { supported: false } } };
+  const { c, cards, press, requests } = keyboardBoard({ fetchImpl: async url => ({ ok: true, status: 200, json: async () =>
+    url === '/api/session/preview' ? preview : url === '/api/session/action' ? {
+      confirmed: true, cleanup: { complete: true, unverified: ['ambiguous-terminal'], closed: [], version: 4 }
+    } : {} }) });
+  c.context.document.body.append = () => {};
+  press(cards[2], 'Delete'); await settle();
+  await c.get('end-session-terminate').events.click(); await settle();
+  assert.equal(c.get('end-session-dialog').open, false);
+  assert.match(c.get('toast').textContent, /실행을 종료하고 목록에서 정리/);
+  assert.match(c.get('toast').textContent, /터미널 1개는 열어/);
+  assert.equal(requests.filter(call => call.url === '/api/session/action').length, 1);
+  assert.equal(requests.filter(call => /\/api\/terminal\/.*\/close/.test(call.url)).length, 0);
+  assert.equal(vm.runInContext('state.terminationRequests.size', c.context), 0);
 });
 
 test('a session whose run cannot be ended is offered the list part only, and a refused end removes nothing', async () => {
@@ -14474,4 +14491,167 @@ test('새 세션 시작·대기 채팅·터미널 복귀는 모바일과 데스�
     assert.equal(c.state.docked, false); assert.equal(calls.filter((url) => url === '/api/new-session').length, 1);
     assert.equal(calls.some((url) => /\/input|\/launch|\/send|\/close/.test(url)), false);
   }
+});
+
+function terminalFilesClient(fetchImpl) {
+  const c = client(fetchImpl);
+  Object.assign(c, vm.runInContext('({ uploadTerminalFiles, pasteTerminalFiles, terminalAttachmentEntry, terminalAttachmentDrafts, renderTerminalAttachments, restoreTerminalDraft, unsavedWork })', c.context));
+  Object.assign(c.state, { authenticated: true, terminalAlive: true, terminalVisible: true, connected: true,
+    terminal: { id: 'a'.repeat(32), alive: true, nativeSource: { host: 'fixture', agent: 'codex', home: '.codex', id: 'native-fixture' } },
+    term: { modes: { bracketedPasteMode: true }, scrollToBottom() {} } });
+  c.state.terminals = [c.state.terminal];
+  return c;
+}
+function fileReply(index = 1, path = `/fixture/work/file-${index}.png`) {
+  return { ok: true, status: 200, json: async () => ({ attachment: { id: index.toString(16).padStart(32, '0'), name: `file-${index}.png`, size: 9, type: 'image/png', path } }) };
+}
+
+test('터미널 파일 paste는 올린 뒤 미리보기만 표시하고 보내기를 눌러야 경로와 Enter를 전달한다', async () => {
+  const calls = [];
+  const c = terminalFilesClient(async (url, options) => {
+    calls.push({ url, options });
+    return url === '/api/chat/upload' ? fileReply() : { ok: true, status: 200, json: async () => ({ ok: true }) };
+  });
+  c.get('terminal-draft').value = '검토해 줘';
+  let prevented = 0;
+  c.pasteTerminalFiles({ clipboardData: { files: [{ name: 'shot.png', size: 9, type: 'image/png' }], getData: () => '' },
+    preventDefault() { prevented++; }, stopPropagation() {} });
+  await new Promise(setImmediate);
+  assert.equal(prevented, 1);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/chat/upload');
+  assert.equal(JSON.parse(decodeURIComponent(calls[0].options.headers['X-Chat-Source'])).id, 'native-fixture');
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+  assert.equal(c.get('terminal-attachments').hidden, false);
+  await c.pasteDraft(true);
+  const inputs = calls.filter(call => call.url.endsWith('/input')).map(call => JSON.parse(call.options.body).text);
+  assert.equal(inputs.length, 2);
+  assert.match(inputs[0], /검토해 줘\n첨부 파일: "\/fixture\/work\/file-1.png"/);
+  assert.equal(inputs[1], '\r');
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
+});
+
+test('터미널의 일반 텍스트 paste는 가로채지 않고 혼합 paste는 커서 위치에 초안으로 삽입한다', async () => {
+  const c = terminalFilesClient(async () => fileReply());
+  const plain = { clipboardData: { files: [], getData: () => 'plain' }, preventDefault() { throw Error('native text must stay native'); } };
+  c.pasteTerminalFiles(plain);
+  c.get('terminal-draft').value = '앞뒤'; c.get('terminal-draft').selectionStart = c.get('terminal-draft').selectionEnd = 1;
+  c.pasteTerminalFiles({ clipboardData: { items: [{ kind: 'file', getAsFile: () => ({ name: 'shot.png', size: 9 }) }], getData: () => '중간' }, preventDefault() {} });
+  await new Promise(setImmediate);
+  assert.equal(c.get('terminal-draft').value, '앞중간뒤');
+});
+
+test('터미널 첨부 업로드 중에도 글과 IME는 유지되며 전송만 기다린다', async () => {
+  let done;
+  const c = terminalFilesClient(() => new Promise(resolve => { done = resolve; }));
+  c.state.composing = true;
+  c.get('terminal-draft').value = '작성 중';
+  const pending = c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  assert.equal(c.get('terminal-draft').disabled, false);
+  assert.equal(c.state.composing, true);
+  await c.pasteDraft();
+  assert.match(c.get('draft-note').textContent, /첨부를 올린 뒤/);
+  c.get('terminal-draft').value += ' 계속';
+  done(fileReply()); await pending;
+  assert.equal(c.get('terminal-draft').value, '작성 중 계속');
+  assert.equal(c.state.composing, true);
+});
+
+test('터미널 이동 중 업로드 응답은 원래 터미널에만 보관한다', async () => {
+  let done;
+  const c = terminalFilesClient(() => new Promise(resolve => { done = resolve; }));
+  const first = c.state.terminal;
+  const pending = c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  c.state.terminal = { ...first, id: 'b'.repeat(32), nativeSource: { ...first.nativeSource, id: 'other-session' } };
+  done(fileReply()); await pending;
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
+  assert.equal(c.terminalAttachmentDrafts.get(first.id).attachments.length, 1);
+});
+
+test('세션 연결이 추정뿐이면 파일을 쓰지 않고 선택을 남겨 두며 다시 시도할 수 있다', async () => {
+  let uploads = 0;
+  const c = terminalFilesClient(async url => {
+    if (url === '/api/chat/upload') { uploads++; return fileReply(); }
+    return { ok: true, status: 200, json: async () => ({ terminals: c.state.terminals }) };
+  });
+  c.state.terminal.linkConfidence = 'estimated';
+  await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  assert.equal(uploads, 0);
+  assert.equal(c.terminalAttachmentEntry().uploadQueue.length, 1);
+  delete c.state.terminal.linkConfidence;
+  for (const terminal of c.state.terminals) delete terminal.linkConfidence;
+  await c.uploadTerminalFiles();
+  assert.equal(uploads, 1);
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+});
+
+test('터미널 첨부 32개는 허용하고 33개 선택은 업로드 없이 거부한다', async () => {
+  let uploads = 0;
+  const c = terminalFilesClient(async () => fileReply(++uploads));
+  await c.uploadTerminalFiles(Array.from({ length: 33 }, (_, i) => ({ name: `file-${i}.txt`, size: 9 })));
+  assert.equal(uploads, 0);
+  assert.match(c.terminalAttachmentEntry().error, /32개/);
+  await c.uploadTerminalFiles(Array.from({ length: 32 }, (_, i) => ({ name: `file-${i}.txt`, size: 9 })));
+  assert.equal(uploads, 32);
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 32);
+});
+
+test('터미널 전송 결과 불명과 연결 세션 변경은 첨부를 유지하며 다른 세션으로 보내지 않는다', async () => {
+  let inputs = 0;
+  const c = terminalFilesClient(async url => {
+    if (url === '/api/chat/upload') return fileReply();
+    inputs++; throw Error('synthetic lost response');
+  });
+  await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  c.state.terminal.nativeSource = { ...c.state.terminal.nativeSource, id: 'changed' };
+  await c.pasteDraft(); assert.equal(inputs, 0);
+  c.state.terminal.nativeSource.id = 'native-fixture';
+  await c.pasteDraft();
+  assert.equal(inputs, 1);
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+  assert.match(c.get('draft-note').textContent, /전달 여부/);
+});
+
+test('PC 터미널은 PC에 저장된 경로를 전달하고 32개 첨부 초안도 새 화면에서 복원한다', async () => {
+  const storage = draftStorage(); let count = 0;
+  const c = terminalFilesClient(async () => fileReply(++count, `C:\\fixture\\work\\file-${count}.png`));
+  c.context.localStorage = storage;
+  await c.uploadTerminalFiles(Array.from({ length: 32 }, (_, i) => ({ name: `file-${i}.png`, size: 9 })));
+  const restored = terminalFilesClient(async () => { throw Error('restoration must not upload'); });
+  restored.context.localStorage = storage;
+  restored.restoreTerminalDraft(restored.state.terminal);
+  assert.equal(restored.terminalAttachmentEntry().attachments.length, 32);
+  assert.match(restored.terminalAttachmentEntry().attachments[0].path, /^C:\\fixture/);
+});
+
+test('결과 불명인 터미널 첨부 전송은 새 화면에서 재전송 가능한 초안으로 자동 복원하지 않는다', async () => {
+  const storage = draftStorage();
+  const c = terminalFilesClient(async url => {
+    if (url === '/api/chat/upload') return fileReply();
+    throw Error('synthetic lost response');
+  });
+  c.context.localStorage = storage;
+  await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  await c.pasteDraft();
+  const restored = terminalFilesClient(async () => { throw Error('never replay'); });
+  restored.context.localStorage = storage;
+  restored.restoreTerminalDraft(restored.state.terminal);
+  assert.equal(restored.terminalAttachmentEntry().attachments.length, 0);
+  assert.match(restored.get('draft-recovery-status').textContent, /자동 복원하지 않습니다/);
+});
+
+test('터미널 첨부 업로드 실패는 재시도할 선택을 보관하고 로그아웃 후 늦은 응답은 버린다', async () => {
+  let done, fail = true;
+  const c = terminalFilesClient(async () => {
+    if (fail) throw Error('offline');
+    return new Promise(resolve => { done = resolve; });
+  });
+  await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  assert.equal(c.terminalAttachmentEntry().uploadQueue.length, 1);
+  assert.equal(c.unsavedWork(), true);
+  fail = false;
+  const pending = c.uploadTerminalFiles();
+  c.beginAuthEpoch(); c.state.authenticated = false; c.terminalAttachmentDrafts.clear();
+  done(fileReply()); await pending;
+  assert.equal(c.terminalAttachmentDrafts.size, 0);
 });
