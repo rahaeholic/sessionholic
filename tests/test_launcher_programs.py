@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -42,6 +44,77 @@ class TableTest(unittest.TestCase):
         self.assertEqual(commands, [[lp.PS, "-axww", "-o", "uid=,pid=,ppid=,lstart=,command="]])
         self.assertEqual(len(rows), 12, "another user's processes are never read")
         self.assertEqual(rows[1], (57597, 501, started("Mon Oct 12 15:16:52 2026"), "/bin/zsh -lic zz"))
+
+
+class ExactCodexTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="sh-link-evidence-")
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.native = {"agent": "codex", "home": ".codex-work", "cwd": "/work/project",
+                       "id": "019a0000-0000-7000-8000-000000000001"}
+
+    def rollout(self, identifier=None, source="vscode", key=".codex-work"):
+        identifier = identifier or self.native["id"]
+        path = self.home / key / "sessions/2026/10/21" / ("rollout-now-" + identifier + ".jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": identifier, "cwd": self.native["cwd"], "source": source}}) + "\n")
+        return path
+
+    def read(self, files):
+        output = "p20\n" + "".join("f%d\na%s\nn%s\n" % (i, access, path)
+                                     for i, (access, path) in enumerate(files))
+        with patch.object(lp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)):
+            return lp.writable_codex_source({20}, home=self.home)
+
+    def test_writable_original_is_unique_even_when_subagent_and_read_only_records_are_open(self):
+        root = self.rollout()
+        child = self.rollout("019a0000-0000-7000-8000-000000000002", {"subagent": {"thread_spawn": {}}})
+        other = self.rollout("019a0000-0000-7000-8000-000000000003")
+        self.assertEqual(self.read([("u", child), ("r", other), ("u", root), ("w", root)]), self.native)
+        self.assertIsNone(self.read([("u", root), ("u", other)]), "two original writers prove no single conversation")
+
+    def test_invalid_paths_metadata_and_failed_reads_never_confirm_a_link(self):
+        original = self.rollout()
+        original.unlink()
+        target = self.rollout(key="other")
+        original.symlink_to(target)
+        self.assertIsNone(self.read([("u", original), ("u", target)]))
+        original.unlink()
+        for source in ("exec", {"subagent": {}}, None):
+            self.assertIsNone(self.read([("u", self.rollout(source=source))]))
+        wrong = self.rollout()
+        wrong.write_text(json.dumps({"type": "session_meta", "payload": {
+            **self.native, "id": "019a0000-0000-7000-8000-000000000009", "source": "cli"}}))
+        self.assertIsNone(self.read([("u", wrong)]))
+        wrong.write_text("x" * 65537)
+        self.assertIsNone(self.read([("u", wrong)]))
+
+    def test_hold_pane_owns_the_cli_and_embedded_server_without_following_tools_or_daemon(self):
+        rows = [(10, 1, 1, "zsh"), (20, 10, 2, "node /bin/codex"),
+                (21, 20, 2, "/vendor/codex"), (22, 21, 2, "/vendor/codex app-server"),
+                (23, 21, 2, "/vendor/codex app-server daemon"), (30, 21, 3, "bash -c tool"),
+                (31, 30, 3, "/vendor/codex"), (40, 1, 2, "/vendor/codex")]
+        done = subprocess.CompletedProcess([], 0, "10\n")
+        with patch("collector.which", return_value="/fixture/tmux"), patch.object(lp.subprocess, "run", return_value=done) as run, \
+                patch.object(lp, "writable_codex_source", return_value=self.native) as read:
+            self.assertEqual(lp.held_codex("sh-0123456789abcdef", rows),
+                             {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native})
+            read.assert_called_once_with({20, 21, 22})
+            self.assertIn("list-panes", run.call_args.args[0])
+            run.return_value = subprocess.CompletedProcess([], 0, "10\n40\n")
+            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
+            run.side_effect = subprocess.TimeoutExpired("tmux", 3)
+            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
+            self.assertIsNone(lp.held_codex("../other", rows))
+
+    def test_exact_hold_evidence_overrides_only_the_program_time_description(self):
+        terminal = {"id": FIRST, "createdAt": 1, "holdName": "sh-0123456789abcdef"}
+        evidence = {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native}
+        with patch("launch.new_session", return_value={"argv": LAUNCHER}), \
+                patch.object(lp, "table", return_value=[]), patch.object(lp, "held_codex", return_value=evidence):
+            self.assertEqual(lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST], evidence)
 
 
 class ProgramTest(unittest.TestCase):
@@ -135,6 +208,32 @@ class ProgramTest(unittest.TestCase):
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_host_owned_exact_evidence_is_recorded_and_unconfirmed_holds_are_read_after_a_minute(self):
+        import server
+        from unittest.mock import Mock
+        native = {"agent": "codex", "home": ".codex-work", "cwd": "/work/project",
+                  "id": "019a0000-0000-7000-8000-000000000001", "host": "untrusted-helper-host"}
+        row = {"id": FIRST, "mode": "new-session", "alive": True, "host": "laptop", "createdAt": 100,
+               "holdName": "sh-0123456789abcdef", "program": "codex", "programAt": int(time.time()) - 65,
+               "linkConfidence": "estimated"}
+        board = Mock(hosts=[{"name": "laptop"}], state={"laptop": {"ok": True}})
+        terminals = Mock()
+        terminals.list.return_value = [row]
+        evidence = {"program": "codex", "cwd": "/work/project", "nativeSource": native}
+        with tempfile.TemporaryDirectory() as directory:
+            flow = server.Workflow(board, terminals, directory)
+            with patch.object(flow.transfers, "rpc", return_value={"terminals": {FIRST: evidence}}):
+                rows = [{"id": FIRST, "createdAt": 100, "holdName": row["holdName"]}]
+                flow._describe_host(board.hosts[0], rows)
+            terminals.link_native.assert_called_once_with(FIRST, {**native, "host": "laptop"}, confidence="exact")
+            with patch.object(flow, "_describe_host") as describe:
+                flow.describe_launchers()
+                for _ in range(50):
+                    if describe.called:
+                        break
+                    time.sleep(0.02)
+                describe.assert_called_once_with(board.hosts[0], rows, {FIRST})
+
     def test_reads_run_in_the_background_once_a_minute_per_host_and_save_the_program(self):
         import server
 

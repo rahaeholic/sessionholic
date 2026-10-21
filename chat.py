@@ -749,6 +749,9 @@ class Chat:
         reason = result.get('runtimeReason')
         if isinstance(reason, str):
             response['runtimeReason'] = scrub_payload(reason[:600])
+        reason_code = result.get('runtimeReasonCode')
+        if isinstance(reason_code, str) and re.fullmatch(r'[a-z_]{1,80}', reason_code):
+            response['runtimeReasonCode'] = reason_code
         if observation_request is not None:
             observed = {**result, 'phase': phase, 'runtimeReason': response.get('runtimeReason')}
             if host.get('platform') != 'windows':

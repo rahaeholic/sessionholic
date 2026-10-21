@@ -1097,6 +1097,27 @@ class TmuxFixtureTest(unittest.TestCase):
         self.managers.append(replacement)
         self.assertEqual(next(row for row in replacement.list() if row["id"] == created["id"])["nativeSource"], native)
 
+    def test_exact_evidence_confirms_only_the_same_estimated_native_and_survives_restart(self):
+        created = self.create()
+        native = {"host": "local", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": "/tmp/work"}
+        self.assertTrue(self.manager.link_native(created["id"], native, confidence="estimated"))
+        for changed in ({"home": ".codex-other"}, {"cwd": "/other"},
+                        {"id": "019a0000-0000-7000-8000-000000000002"}):
+            self.assertFalse(self.manager.link_native(created["id"], {**native, **changed}))
+        with patch.object(self.manager, "_save", side_effect=OSError("fixture save failure")):
+            with self.assertRaises(OSError):
+                self.manager.link_native(created["id"], native)
+        self.assertEqual(self.manager.terminals[created["id"]].record["metadata"]["linkConfidence"], "estimated")
+        self.assertTrue(self.manager.link_native(created["id"], native))
+        self.assertFalse(self.manager.link_native(created["id"], native, confidence="estimated"))
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        saved = next(row for row in replacement.list() if row["id"] == created["id"])
+        self.assertEqual(saved["nativeSource"], native)
+        self.assertEqual(saved["linkConfidence"], "exact")
+
     def test_windows_native_cwd_survives_terminal_creation_and_restart(self):
         native = {"host": "windows-fixture", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
                   "home": ".codex", "cwd": r"\\?\C:\Users\example\Work"}

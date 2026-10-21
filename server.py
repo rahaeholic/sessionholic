@@ -1815,9 +1815,11 @@ class Workflow:
                     or type(terminal.get("createdAt")) is not int):
                 continue
             # Every live one is sent, so a launcher is weighed against all of them; only those due are saved.
-            live.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"]})
+            live.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"],
+                **({"holdName": terminal["holdName"]} if terminal.get("holdName") else {})})
             seen = terminal.get("programAt")
-            if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") else self.PROGRAM_REFRESH):
+            confirming = terminal.get("holdName") and terminal.get("program") == "codex" and terminal.get("linkConfidence") != "exact"
+            if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") and not confirming else self.PROGRAM_REFRESH):
                 continue
             due.setdefault(terminal.get("host"), set()).add(terminal["id"])
         for name, wanted in due.items():
@@ -1845,6 +1847,11 @@ class Workflow:
                 if identifier in asked and isinstance(info, dict):
                     try:
                         self.terminals.set_program(identifier, info)
+                        native = info.get("nativeSource")
+                        if isinstance(native, dict) and native.get("agent") == "codex":
+                            native = self._native_of(host["name"], "codex", native)
+                            if native is not None:
+                                self.terminals.link_native(identifier, native, confidence="exact")
                     except (RuntimeError, OSError, ValueError, KeyError):
                         continue
         except (RuntimeError, OSError, ValueError, KeyError, AttributeError):

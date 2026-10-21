@@ -1683,6 +1683,31 @@ test('selected native polling backs off during long turns, stays bounded and sto
   assert.equal(timers.length, count);
 });
 
+test('PC 상태 읽기가 저장 대화로 대체돼도 자동 재확인을 계속하고 복구 뒤 초안을 유지한다', async () => {
+  const timers = [], reads = [];
+  const c = client(async (url, options) => {
+    reads.push(url);
+    const route = JSON.parse(options.body).source;
+    return { ok: true, status: 200, json: async () => ({ route, phase: 'idle', runtimeKnown: true,
+      capability: { supported: true }, messages: [], receipts: [] }) };
+  }, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c);
+  entry.text = '아직 보내지 않은 초안';
+  entry.data = { route: c.sourceOf(s), phase: 'unknown', runtimeKnown: false, readOnly: true,
+    capability: { supported: false }, runtimeObservation: { reasonCode: 'server_status_unavailable' }, messages: [] };
+  c.scheduleChatPoll(s, entry);
+  assert.equal(timers.at(-1)?.delay, 3000, 'HTTP 200인 읽기 대체 응답도 실제 실행 상태를 다시 확인한다');
+  assert.equal(c.chatRecovery(entry).action, 'refresh_host');
+  await c.loadChatState(s, false);
+  assert.equal(c.chatSupported(entry), true); assert.equal(entry.text, '아직 보내지 않은 초안');
+  assert.ok(reads.every((url) => url === '/api/chat/state'));
+  entry.data = { route: c.sourceOf(s), phase: 'unknown', runtimeKnown: false, readOnly: true,
+    runtimeObservation: { reasonCode: 'stored_only' } };
+  const count = timers.length;
+  c.scheduleChatPoll(s, entry); assert.equal(timers.length, count, '보관 기록은 연결 장애로 취급하지 않는다');
+  assert.equal(c.chatRecovery(entry), null);
+});
+
 test('accepted native receipts are read back until completion and interrupted pending work unlocks', async () => {
   const requests = [];
   const c = client(async (url, options) => {
@@ -13817,6 +13842,15 @@ test('채팅의 터미널 버튼은 같은 상세영역의 탭을 바꾸며 대�
   assert.equal(messages.scrollTop, 350); assert.equal(term.disposed, 0); assert.equal(reads(), 1);
   c.get('detail-mode-terminal').events.click(); await settle();
   assert.equal(c.get('terminal-screen').parentNode, host); assert.equal(term.disposed, 0);
+});
+
+test('PC 상태 읽기가 실패해도 살아 있는 정확한 터미널로는 같은 상세영역에서 돌아간다', async () => {
+  const { c, s, entry, host } = inlineDetailClient();
+  entry.data = { route: c.sourceOf(s), phase: 'unknown', runtimeKnown: false, readOnly: true,
+    capability: { supported: false }, runtimeObservation: { reasonCode: 'server_status_unavailable' } };
+  c.openChatTerminal(s); await settle();
+  assert.equal(c.state.inlineTerminal?.key, s.key);
+  assert.equal(c.get('terminal-screen').parentNode, host);
 });
 
 test('같은 상세영역 터미널은 Codex 계정과 Claude 대화 UUID를 정확히 확인한다', async () => {

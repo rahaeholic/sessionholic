@@ -292,6 +292,14 @@ class ChatTest(unittest.TestCase):
             self.assertTrue(result['runtimeKnown'])
             self.assertEqual(result['runtimeObservation']['evidence'], 'project_app_server')
 
+    def test_runtime_read_failure_reason_code_survives_the_saved_conversation_fallback(self):
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'unknown', 'messages': [],
+                'readOnly': True, 'runtimeKnown': False, 'runtimeReasonCode': 'server_status_unavailable',
+                'runtimeReason': '합성 서버 읽기 실패'}):
+            result = self.chat.state({'source': REF})
+        self.assertEqual(result['runtimeReasonCode'], 'server_status_unavailable')
+        self.assertFalse(result['capability']['supported'])
+
     def test_stale_read_does_not_carry_confirmed_runtime(self):
         with patch.object(self.chat, 'rpc', return_value={'phase': 'working', 'messages': [], 'runtimeKnown': True}):
             self.chat.state({'source': REF})

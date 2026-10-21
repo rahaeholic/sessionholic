@@ -4701,12 +4701,19 @@ function conversationHistoryNotice(s, entry) {
   if (notice?.code === "not_persisted") return typeof notice.message === "string" && notice.message.trim() ? notice.message : ONE_SHOT_HISTORY;
   return "";
 }
+function chatReadUnavailable(entry) {
+  const data = entry.data, code = data?.runtimeReasonCode || data?.runtimeObservation?.reasonCode;
+  return data?.runtimeKnown === false && (data.stale === true ||
+    ["server_status_unavailable", "read_unavailable"].includes(code));
+}
 function chatRecovery(entry, selected = selectedSession() || null) {
   if (botRequestForNative(entry.source)) return null;
   if (chatHostOffline(entry, selected)) return { supported: true, action: "refresh_host",
     reason: chatOneShot(entry, selected) ? "기기에 연결되지 않았습니다. 연결을 확인한 뒤 실행 상태를 확인해 주세요." : "기기에 연결되지 않았습니다. 연결을 확인한 뒤 같은 세션을 이어갈 수 있습니다." };
   if (chatOneShot(entry, selected)) return null;
   if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
+  if (chatReadUnavailable(entry)) return { supported: true, action: "refresh_host",
+    reason: "실행 상태를 읽지 못했습니다. 대화와 초안은 유지하며 자동으로 다시 확인합니다." };
   const recovery = entry.data?.recovery;
   if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
   return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
@@ -6708,6 +6715,7 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
   // goes when the message (or an answer after it) shows, or when it times out.
   if (networkOffline() || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
+       !chatReadUnavailable(entry) &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
@@ -7958,7 +7966,6 @@ function openChatTerminal(s) {
   const bot = botRequestForNative(sourceOf(s));
   if (bot) { selectBotRequest(botGroupKey(bot)); return; }
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
-  if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (state.terminalAlive && chatKey(terminalInfo(state.terminal).nativeSource || {}) === chatKey(sourceOf(s))) {
     openTerminal(state.terminal, { inline: inlineTerminalRef(s) });
     return;
@@ -7971,6 +7978,7 @@ function openChatTerminal(s) {
     openTerminal(open, { inline: inlineTerminalRef(s) });
     return;
   }
+  if (chatRecovery(chatEntry(s))) return recoverChatSession(s);
   if (s.nativeSource) { toast("이 실행의 터미널이 종료됐습니다. 새로고침 후 세션 목록에서 선택해 주세요."); return; }
   state.route = { host: s.host, agent: s.agent, account: accountOf(s) };
   populateRoute(s);

@@ -7,11 +7,14 @@ Claude, or Codex. Only `ps` is read; nothing is signalled. A terminal whose laun
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
 import itertools
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import stat
 import time
+import uuid
 
 # The launcher's process starts a little after the board created the terminal (SSH setup).
 BEFORE, AFTER = 3, 15
@@ -160,4 +163,123 @@ def launcher_programs(args):
         raise ValueError("터미널 목록 형식이 올바르지 않습니다.")
     if os.name == "nt":
         return {"terminals": {}}
-    return {"terminals": describe(terminals, launcher, table())}
+    rows = table()
+    result = describe(terminals, launcher, rows)
+    for terminal in terminals[:MAX_TERMINALS]:
+        identifier = terminal.get("id")
+        if identifier not in result:
+            continue
+        exact = held_codex(terminal.get("holdName"), rows)
+        if exact:
+            result[identifier] = exact
+    return {"terminals": result}
+
+
+def held_codex(hold, rows):
+    """Read the exact hold pane's CLI and its writable original rollout, never a time guess."""
+    if not isinstance(hold, str) or not re.fullmatch(r"sh-[0-9a-f]{16}", hold):
+        return None
+    from transfer_worker import HOLD_SOCKET
+    from collector import which
+    tmux = which("tmux")
+    if not tmux:
+        return None
+    try:
+        done = subprocess.run([tmux, "-L", HOLD_SOCKET, "-f", "/dev/null", "list-panes", "-t", "=" + hold,
+                               "-F", "#{pane_pid}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=3, text=True)
+        panes = done.stdout.splitlines()
+        if done.returncode or len(panes) != 1 or not panes[0].isdigit():
+            return None
+        by_pid = {pid: command for pid, _, _, command in rows}
+        children = {}
+        for pid, parent, _, _ in rows:
+            children.setdefault(parent, []).append(pid)
+        queue, seen, agents = [int(panes[0])], set(), []
+        while queue and len(seen) < 128:
+            pid = queue.pop(0)
+            if pid in seen or pid not in by_pid:
+                continue
+            seen.add(pid)
+            program = program_of(by_pid[pid])
+            if program:
+                agents.append((pid, program["program"]))
+            else:
+                queue.extend(children.get(pid, []))
+        if queue or len(agents) != 1 or agents[0][1] != "codex":
+            return None
+        # The Node wrapper, native TUI and its embedded app-server can own the writer.
+        # Do not descend through command tools, MCP servers or independently launched agents.
+        first = agents[0][0]
+        queue, pids = [first], set()
+        while queue and len(pids) < 8:
+            pid = queue.pop(0)
+            pids.add(pid)
+            for child in children.get(pid, []):
+                command = by_pid[child]
+                words = command.split()
+                if (program_of(command) or {}).get("program") == "codex" or (
+                        Path(words[0]).name == "codex" and words[1:2] == ["app-server"]
+                        and words[2:3] != ["daemon"]):
+                    if child not in pids:
+                        queue.append(child)
+        if queue:
+            return None
+        source = writable_codex_source(pids)
+        if source:
+            return {"program": "codex", "pid": first, "cwd": source["cwd"], "nativeSource": source}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def writable_codex_source(pids, home=None):
+    """Only metadata from one writable, user-owned interactive rollout is evidence."""
+    from launch import HOME_KEY
+    home = Path.home() if home is None else Path(home)
+    done = subprocess.run(["/usr/sbin/lsof", "-a", "-p", ",".join(str(pid) for pid in sorted(pids)), "-Ffan"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True)
+    if done.returncode or len(done.stdout) > 2 * 1024 * 1024:
+        return None
+    paths, access = set(), None
+    for line in done.stdout.splitlines():
+        if line.startswith("f"):
+            access = None
+        elif line.startswith("a"):
+            access = line[1:]
+        elif line.startswith("n") and access in ("w", "u") and line.endswith(".jsonl"):
+            paths.add(line[1:])
+    if len(paths) > 32:
+        return None
+    sources = {}
+    for name in paths:
+        path = Path(name)
+        try:
+            parts = path.relative_to(home).parts
+            position = parts.index("sessions")
+            key = "/".join(parts[:position])
+            if not HOME_KEY.fullmatch(key) or not path.name.startswith("rollout-"):
+                continue
+            if any(p.is_symlink() for p in (path, *path.parents) if p != home and home in p.parents):
+                continue
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+                line = stream.readline(65537)
+            if len(line) > 65536:
+                continue
+            record = json.loads(line)
+            meta = record.get("payload") if record.get("type") == "session_meta" else None
+            if not isinstance(meta, dict) or meta.get("source") not in ("cli", "vscode"):
+                continue
+            identifier = str(uuid.UUID(meta.get("id")))
+            cwd = meta.get("cwd")
+            if (identifier != meta.get("id") or not path.name.endswith("-" + identifier + ".jsonl")
+                    or not isinstance(cwd, str) or not cwd.startswith("/") or "\0" in cwd):
+                continue
+            source = {"agent": "codex", "id": identifier, "home": key, "cwd": cwd}
+            sources[json.dumps(source, sort_keys=True)] = source
+        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+            continue
+    return next(iter(sources.values())) if len(sources) == 1 else None
