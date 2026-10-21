@@ -2996,12 +2996,9 @@ function cardActions(s) {
     const copy = terminalCloseCopy(terminal);
     actions.push({ label: copy.action, danger: copy.danger, run: () => closeTerminal(terminal.id) });
   }
-  // 목록에서 지우기 only changes the list; with a board terminal open, it can close that first.
+  // Native termination and its terminal/list cleanup use one checked server operation.
   const removed = sessionRemoved(s);
-  if (terminal && !removed) {
-    const copy = terminalCloseCopy(terminal);
-    actions.push({ label: `${copy.action} 뒤 목록에서 지우기`, danger: copy.danger, run: () => closeTerminal(terminal.id, { thenRemove: s }) });
-  }
+  if (!removed) actions.push({ label: "실행 종료하고 정리", danger: true, run: () => confirmEndSession(s) });
   if (!removed) actions.push({ label: "목록에서 지우기", run: () => removeSession(s, true) });
   if (removed || sessionTidied(s)) actions.push({ label: "목록에 다시 표시", run: () => showSessionAgain(s) });
   return actions;
@@ -3191,6 +3188,58 @@ function closeActionSheet({ restoreFocus = true } = {}) {
 }
 
 // Original execution controls are separate from closing the board's attached terminal.
+function terminationRecord(s, value) {
+  const source = sourceOf(s);
+  const key = (typeof INSTANCE === "undefined" ? "sessionholic:" : INSTANCE.storagePrefix) + "termination:" +
+    JSON.stringify([source.host, source.agent, source.home || (source.agent === "claude" ? ".claude" : ""),
+      source.id || s.sessionId, source.sessionId || null, s.cwd || null]);
+  const records = state.terminationRequests ||= new Map();
+  if (value !== undefined) {
+    if (value === null) records.delete(key); else records.set(key, value);
+    try {
+      if (value === null) sessionStorage.removeItem(key); else sessionStorage.setItem(key, JSON.stringify(value));
+    } catch { /* the in-memory request still prevents duplicate native dispatch */ }
+    return value;
+  }
+  if (records.has(key)) return records.get(key);
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(key) || "null");
+    if (saved && /^[A-Za-z0-9_-]{8,100}$/.test(saved.requestId) && saved.source?.host === source.host &&
+        saved.source?.agent === source.agent && saved.source?.id === (source.id || s.sessionId)) {
+      records.set(key, saved); return saved;
+    }
+  } catch { /* no saved request */ }
+  return null;
+}
+function terminationCopy(result) {
+  if (result.confirmed !== true) return result.reason || "실행 종료 결과를 확인하지 못했습니다. 기존 결과 확인만 다시 시도할 수 있습니다.";
+  const cleanup = result.cleanup;
+  if (cleanup?.complete) return "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.";
+  if (cleanup?.unverified?.length) return "실행 종료는 확인했습니다. 추정 연결된 터미널은 자동으로 닫지 않았습니다. 해당 터미널을 확인한 뒤 남은 정리를 다시 시도해 주세요.";
+  if (cleanup?.remotePending?.length) return "실행 종료는 확인했습니다. 실행 기기의 터미널 정리가 남았습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
+  return "실행 종료는 확인했습니다. 터미널 또는 목록 정리가 남아 있습니다. 남은 정리만 다시 시도할 수 있습니다.";
+}
+async function terminateAndCleanup(context) {
+  const pending = terminationRecord(context.s);
+  const source = { ...context.source, ...(context.s.cwd ? { cwd: context.s.cwd } : {}) };
+  const record = pending || { requestId: requestId(), source };
+  if (!pending) terminationRecord(context.s, record);
+  const result = await api("/api/session/action", { method: "POST", body: { source: record.source, action: "terminate",
+    requestId: record.requestId, ...(pending ? { cleanupOnly: true } : { targetProof: context.preview.targetProof }) },
+    authEpoch: context.authEpoch, csrfRetry: false });
+  if (result.cleanup?.complete || result.applied === false) terminationRecord(context.s, null);
+  if (result.confirmed === true) {
+    for (const id of result.cleanup?.closed || []) {
+      const terminal = state.terminals?.find((row) => row.id === id);
+      if (terminal) { terminal.alive = false; terminal.closed = true; terminal.closedReason = "user"; }
+    }
+    if (result.cleanup?.complete) {
+      (state.removedLocal ||= new Map()).set(context.s.key, { removed: true, after: state.snapshot,
+        version: result.cleanup.version });
+    }
+  }
+  return result;
+}
 let sessionControl = null;
 function closeSessionControl(force = false) {
   if (!force && sessionControl?.busy) return;
@@ -3231,7 +3280,7 @@ async function manageSession(s, trigger = null) {
   const actions = el("div", "session-control-actions");
   for (const [action, label, explanation] of [
     ["interrupt", "응답 중단", "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다."],
-    ["terminate", "실행 종료", "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다."],
+    ["terminate", "실행 종료하고 정리", "원본 실행 종료를 확인한 뒤 연결된 터미널과 목록을 정리합니다. 대화 기록은 남습니다."],
   ]) {
     const row = el("div", "session-control-row");
     const actionButton = button(label, action === "terminate" ? "secondary danger" : "secondary", () => confirmSessionAction(context, action));
@@ -3250,6 +3299,12 @@ async function manageSession(s, trigger = null) {
   const confirmation = el("div", "session-control-confirmation"); confirmation.id = "session-control-confirmation"; confirmation.hidden = true;
   body.append(confirmation); dialog.append(top, body);
   sheet(dialog.id).open();
+  if (terminationRecord(s)) {
+    context.pendingCleanup = true;
+    status.textContent = "이전 종료 요청이 있습니다. 기존 결과를 확인하고 남은 정리만 다시 시도합니다.";
+    const retry = $("session-control-terminate"); retry.disabled = false; retry.textContent = "종료 결과 확인 · 남은 정리";
+    return;
+  }
   try {
     const result = await api("/api/session/preview", { method: "POST", body: { source: context.source }, authEpoch: context.authEpoch });
     if (sessionControl !== context) return;
@@ -3266,12 +3321,13 @@ async function manageSession(s, trigger = null) {
   }
 }
 function confirmSessionAction(context, action) {
-  if (sessionControl !== context || context.busy || context.used || !context.preview?.capabilities?.[action]?.supported) return;
+  if (sessionControl !== context || context.busy || (context.used && !terminationRecord(context.s)) ||
+      (!context.preview?.capabilities?.[action]?.supported && !(action === "terminate" && context.pendingCleanup))) return;
   const confirmation = $("session-control-confirmation"); confirmation.hidden = false;
   const label = action === "terminate" ? "실행 종료" : "응답 중단";
   const confirm = button(label, "primary", () => executeSessionAction(context, action));
   confirm.id = "session-control-confirm";
-  const effect = context.preview.capabilities[action].effect || (action === "terminate" ? "이 세션의 원본 실행을 끝냅니다. 대화 기록은 남습니다." : "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다.");
+  const effect = context.preview?.capabilities?.[action]?.effect || (action === "terminate" ? "원본 실행 종료를 확인하고 연결된 터미널과 목록을 정리합니다. 대화 기록은 남습니다." : "현재 생성 중인 응답을 멈춥니다. 대화 기록은 유지됩니다.");
   confirmation.replaceChildren(el("p", "", `${cardTitle(context.s)} · ${context.s.hostLabel || context.s.host}: ${effect}`),
     confirm, button("취소", "secondary", () => { confirmation.hidden = true; }));
   confirm.focus();
@@ -3280,19 +3336,21 @@ function sessionControlBusy(context, busy) {
   context.busy = busy;
   for (const item of $("session-control-dialog").querySelectorAll("button")) item.disabled = busy;
   if (!busy) for (const action of ["interrupt", "terminate"])
-    $(`session-control-${action}`).disabled = context.used || !context.preview?.capabilities?.[action]?.supported;
+    $(`session-control-${action}`).disabled = action === "terminate" && terminationRecord(context.s) ? false
+      : context.used || !context.preview?.capabilities?.[action]?.supported;
 }
 async function executeSessionAction(context, action) {
-  if (sessionControl !== context || context.busy || context.used) return;
+  if (sessionControl !== context || context.busy || (context.used && !(action === "terminate" && terminationRecord(context.s)))) return;
   context.used = true;
   sessionControlBusy(context, true);
   $("session-control-status").textContent = "요청 결과를 확인하고 있습니다…";
   try {
-    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action,
-      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    const result = action === "terminate" ? await terminateAndCleanup(context) : await api("/api/session/action", {
+      method: "POST", body: { source: context.source, action, targetProof: context.preview.targetProof, requestId: requestId() },
+      authEpoch: context.authEpoch, csrfRetry: false });
     if (sessionControl !== context) return;
-    $("session-control-status").textContent = result.confirmed === true
-      ? (action === "terminate" ? "이 세션의 실행 종료를 확인했습니다. 기록은 남아 있습니다." : "현재 응답이 중단된 것을 확인했습니다.")
+    $("session-control-status").textContent = action === "terminate" ? terminationCopy(result) : result.confirmed === true
+      ? "현재 응답이 중단된 것을 확인했습니다."
       : result.reason || "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 자동으로 재요청하지 않습니다.";
     if (result.confirmed === true) {
       await window.SessionholicGoals?.refresh?.();
@@ -3304,6 +3362,8 @@ async function executeSessionAction(context, action) {
   } finally {
     if (sessionControl === context) {
       $("session-control-confirmation").hidden = true;
+      context.pendingCleanup = !!terminationRecord(context.s);
+      if (context.pendingCleanup) $("session-control-terminate").textContent = "종료 결과 확인 · 남은 정리";
       sessionControlBusy(context, false);
     }
   }
@@ -6350,7 +6410,7 @@ async function confirmEndSession(s, trigger = null) {
   const body = el("div", "dialog-body end-session-body");
   const status = el("p", "end-session-status", "실행 상태를 확인하고 있습니다…");
   status.id = "end-session-status"; status.setAttribute("role", "status");
-  const terminate = button("실행 종료하고 목록에서 지우기", "primary danger", () => endSessionRun(context));
+  const terminate = button("실행 종료하고 정리", "primary danger", () => endSessionRun(context));
   terminate.id = "end-session-terminate"; terminate.disabled = true;
   const removed = sessionRemoved(s);
   const remove = button(removed ? "이미 목록에서 지운 세션입니다" : "목록에서만 지우기", "secondary", () => endSessionRemove(context));
@@ -6365,6 +6425,11 @@ async function confirmEndSession(s, trigger = null) {
   sheet("end-session-dialog").open();
   // Enter does nothing until the run's choices are known (the title holds the focus).
   title.focus?.({ preventScroll: true });
+  if (terminationRecord(s)) {
+    status.textContent = "이전 종료 요청이 있습니다. 기존 결과를 확인하고 남은 정리만 다시 시도합니다.";
+    terminate.textContent = "종료 결과 확인 · 남은 정리"; terminate.disabled = false; terminate.focus?.();
+    return;
+  }
   try {
     const result = await api("/api/session/preview", { method: "POST", body: { source }, authEpoch: context.authEpoch });
     if (endSession !== context) return;
@@ -6372,7 +6437,7 @@ async function confirmEndSession(s, trigger = null) {
     const end = result.capabilities?.terminate, stop = result.capabilities?.interrupt;
     terminate.disabled = !end?.supported;
     interrupt.hidden = !stop?.supported;
-    status.textContent = end?.supported ? `${end.effect || "원본 실행을 종료합니다."} 이어서 목록에서 지웁니다.`
+    status.textContent = end?.supported ? `${end.effect || "원본 실행을 종료합니다."} 이어서 터미널과 목록을 정리합니다.`
       : `실행 종료: ${end?.reason || "현재 실행에서 지원하지 않습니다."}`;
     (end?.supported ? terminate : removed ? cancel : remove).focus?.();
   } catch (err) {
@@ -6385,7 +6450,9 @@ function endSessionBusy(context, busy) {
   context.busy = busy;
   for (const item of $("end-session-dialog")?.querySelectorAll?.("button") || []) item.disabled = busy;
   if (!busy) {
-    $("end-session-terminate").disabled = context.used || !context.preview?.capabilities?.terminate?.supported;
+    const pending = !!terminationRecord(context.s);
+    $("end-session-terminate").disabled = !pending && (context.used || !context.preview?.capabilities?.terminate?.supported);
+    if (pending) $("end-session-terminate").textContent = "종료 결과 확인 · 남은 정리";
     $("end-session-remove").disabled = sessionRemoved(context.s);
   }
 }
@@ -6400,24 +6467,23 @@ function focusCardKey(key) {
   (card || $("search"))?.focus?.({ preventScroll: true });
 }
 async function endSessionRun(context) {
-  if (endSession !== context || context.busy || context.used || !context.preview?.capabilities?.terminate?.supported) return;
+  if (endSession !== context || context.busy || (!terminationRecord(context.s) &&
+      (context.used || !context.preview?.capabilities?.terminate?.supported))) return;
   context.used = true;
   endSessionBusy(context, true);
   $("end-session-status").textContent = "실행을 끝내고 있습니다…";
   const next = cardAfter(context.s);
   try {
-    const result = await api("/api/session/action", { method: "POST", body: { source: context.source, action: "terminate",
-      targetProof: context.preview.targetProof, requestId: requestId() }, authEpoch: context.authEpoch, csrfRetry: false });
+    const result = await terminateAndCleanup(context);
     if (endSession !== context) return;
-    if (result.confirmed !== true) {
-      $("end-session-status").textContent = result.reason || "실행 종료를 확인하지 못했습니다. 상태를 다시 확인해 주세요. 자동으로 다시 요청하지 않습니다.";
+    $("end-session-status").textContent = terminationCopy(result);
+    if (result.confirmed !== true || result.cleanup?.complete !== true) {
+      if (result.confirmed === true) poll(false);
       return;
     }
-    const removed = sessionRemoved(context.s) || await removeSession(context.s, true, { quiet: true });
     endSessionBusy(context, false);
     closeEndSession(true);
-    toast(removed ? "실행을 끝내고 목록에서 지웠습니다. 필터의 '지운 세션 포함'에서 다시 볼 수 있습니다."
-      : "실행은 끝냈지만 목록에서 지우지 못했습니다. 세션 관리에서 다시 시도해 주세요.");
+    toast(terminationCopy(result));
     focusCardKey(next);
     window.SessionholicGoals?.refresh?.();
     poll(false);
@@ -9999,27 +10065,12 @@ function terminalCloseCopy(terminal) {
     ended: "이 보드의 연결이 종료되었습니다. 기존 작업 상태는 실행 기기에서 확인하세요.",
     done: "연결을 닫았습니다. 기존 작업에 중단 명령을 보내지 않았습니다.",
   };
-  if (mode === "new-session") return {
-    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
-    description: "이 보드에서 연 새 세션을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
-    context: "보드에서 새로 연 세션입니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
-    ended: "새 세션의 실행이 종료되었습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
-    done: "새 세션의 실행을 종료했습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
-  };
-  // A PC conversation resumed in this terminal runs in it: closing it ends that run.
-  if (mode === "resume") return {
-    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
-    description: "이 보드에서 다시 연 대화의 실행을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다.",
-    context: "저장된 대화를 이 보드 터미널에서 다시 열었습니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.",
-    ended: "다시 연 대화의 실행이 종료되었습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
-    done: "다시 연 대화의 실행을 종료했습니다. 대화 기록은 보드의 세션 목록에서 확인하세요.",
-  };
-  if (mode === "handoff" || mode === "transfer") return {
-    action: "실행 종료", title: "이 터미널의 실행을 종료할까요?", danger: true,
-    description: "이 보드에서 새로 시작한 작업을 종료합니다. 진행 중인 응답이 중단될 수 있고, 대화 기록은 남습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",
-    context: `${mode === "transfer" ? "기기를 옮겨 새로 실행한" : "맥락을 전달해 새로 실행한"} 작업입니다. 보드로 돌아가거나 브라우저를 닫아도 실행은 유지됩니다.`,
-    ended: "이 터미널의 새 실행이 종료되었습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",
-    done: "이 터미널의 실행을 종료했습니다. 이어서 하려면 실행 기기의 최근 작업을 선택하세요.",
+  if (["new-session", "resume", "handoff", "transfer"].includes(mode)) return {
+    action: "터미널 닫기", title: "이 터미널을 닫을까요?", danger: true,
+    description: "이 보드의 터미널을 닫습니다. 진행 중인 작업이 중단될 수 있지만 원본 작업의 종료를 보장하지는 않습니다. 작업까지 끝내려면 세션의 '실행 종료하고 정리'를 선택하세요.",
+    context: "이 보드에서 연 터미널입니다. 보드로 돌아가거나 브라우저를 닫아도 터미널은 유지됩니다.",
+    ended: "터미널을 닫았습니다. 원본 작업 상태는 대화에서 확인하세요.",
+    done: "터미널을 닫았습니다. 원본 작업의 종료와 목록 정리는 별도로 확인해야 합니다.",
   };
   return {
     action: "터미널 닫기", title: "이 터미널을 닫을까요?", danger: true,
@@ -11933,7 +11984,7 @@ async function tidyTerminals(terminals) {
   }
   if (inputPending !== null) updateInputCleanupNotice(inputPending);
   toast(`터미널 ${closed}개를 정리했습니다.${failed ? ` ${failed}개는 결과를 확인하지 못했습니다. 목록을 다시 확인해 주세요.` : ""}` +
-    (remote ? " 실행 기기에 연결되면 그 기기의 실행도 종료합니다." : ""));
+    (remote ? " 실행 기기에 연결되면 그 기기의 터미널도 정리합니다. 원본 작업 상태는 별도로 확인해 주세요." : ""));
   await refreshTerminals(authEpoch);
   renderTerminals();
 }
@@ -12170,6 +12221,7 @@ function chooseTerminalMenu(key) {
 }
 
 function closeTerminal(id, { thenRemove = null, trigger = null } = {}) {
+  if (thenRemove) return confirmEndSession(thenRemove, trigger);
   if (state.terminalCloseBusy) return;
   if ($("close-terminal-dialog").open) {
     $("close-terminal-cancel").focus();
@@ -12255,9 +12307,6 @@ function finishTerminalClose(closing) {
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
   toast(closing.copy.done);
-  if (closing.thenRemove) removeSession(closing.thenRemove, true, { quiet: true }).then((done) => {
-    if (done) toast(`${closing.copy.done} 목록에서도 지웠습니다.`);
-  });
 }
 async function confirmTerminalClose() {
   if (!state.closingTerminal || state.closingTerminal.uncertain || state.terminalCloseBusy) return;
@@ -12278,7 +12327,7 @@ async function confirmTerminalClose() {
     finishTerminalClose(closing);
     updateInputCleanupNotice(result.inputCleanupPending === true);
     // The run its host keeps ends once that host is back (the board's sweep).
-    if (result.remoteCleanupPending === true) toast("실행 기기에 연결되면 그 기기의 실행도 종료합니다.");
+    if (result.remoteCleanupPending === true) toast("실행 기기에 연결되면 그 기기의 터미널도 정리합니다. 원본 작업 상태는 별도로 확인해 주세요.");
   } catch (err) {
     if (!err.unauthorized && !err.staleAuth) {
       closing.uncertain = true;
@@ -13146,6 +13195,13 @@ function showHistoryEntry(event, swiped = false) {
 
 // Pane layout never starts or resumes a native execution. Each pane owns the
 // original editor, IME, terminal and recognition state in its own document.
+function workspaceComposing() {
+  // compositionOwner identifies late terminal events; it is not an active IME
+  // flag. Samsung can also omit compositionend after a blur.
+  if (state.composing && document.activeElement === $("terminal-draft")) return true;
+  const s = selectedSession();
+  return !!s && !!chatEntry(s).composing && document.activeElement === $("chat-input");
+}
 function workspaceHooks() {
   let lastField = null;
   document.addEventListener("focusin", (event) => {
@@ -13161,15 +13217,24 @@ function workspaceHooks() {
       title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,
-      composing: state.composing || !!state.compositionOwner,
+      composing: workspaceComposing(),
       dictation: !!state.dictation || !!state.dictationParked,
       dialog: !!document.querySelector?.("dialog[open]") };
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    commitComposition: async () => {
+      if (!workspaceComposing()) return true;
+      const field = document.activeElement;
+      field?.blur?.();
+      // Pane documents remain mounted, so any late final input still belongs to
+      // its original editor. No message/paste is sent by this focus change.
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      return document.activeElement !== field;
+    },
     prepareSplit: () => {
       if (!state.terminalVisible || state.inlineTerminal) return true;
-      if (state.composing || state.compositionOwner) { toast("한글 조합을 마친 뒤 분할해 주세요."); return false; }
+      if (workspaceComposing()) { toast("입력창 밖을 누른 뒤 다시 분할해 주세요."); return false; }
       const s = allSessions().find((s) => terminalMatchesDetail(state.terminal, s));
       if (!s) { toast("채팅 화면으로 돌아간 뒤 분할해 주세요."); return false; }
       if (state.selected !== s.key) select(s.key);
@@ -13207,7 +13272,7 @@ function workspaceHooks() {
       return true;
     },
     canClose: () => {
-      const busy = state.launchBusy || state.newSessionBusy || state.terminalCloseBusy || state.composing || state.compositionOwner ||
+      const busy = state.launchBusy || state.newSessionBusy || state.terminalCloseBusy || workspaceComposing() ||
         [...state.chats.values()].some((entry) => entry.sending || entry.pending || entry.commandBusy || entry.uploads || entry.uploadQueue?.length);
       if (busy) { toast("입력·전송 중인 작업이 끝난 뒤 창을 닫아 주세요. 세션은 계속 실행됩니다."); return false; }
       if (state.dictation && !window.confirm("이 창의 음성 입력을 멈추고 창만 닫을까요? 세션 실행은 유지됩니다.")) return false;

@@ -1274,6 +1274,8 @@ class TmuxFixtureTest(unittest.TestCase):
         rows = {row["id"]: row for row in self.manager.list()}
         self.assertFalse(rows[first["id"]]["alive"])
         self.assertTrue(rows[first["id"]]["closed"])
+        self.assertNotEqual(rows[first["id"]]["metadata"].get("closeEffect"), "run",
+                            "killing a board tmux never proves its native daemon stopped")
         self.assertTrue(all(rows[tid]["alive"] for tid in other_ids))
         self.assertFalse(self.manager.read(first["id"], wait=0)["alive"])
         with self.assertRaises(RuntimeError):

@@ -1175,7 +1175,9 @@ class TerminalManager:
             terminal = self._get(terminal_id)
             metadata = terminal.record["metadata"]
             prior = metadata.get("closeEffect")
-            metadata["closeEffect"] = "view" if metadata.get("mode") == "attach" else "run"
+            # A thin TUI can share a daemon. Killing this tmux is never proof that
+            # its native conversation/turn ended.
+            metadata["closeEffect"] = "view" if metadata.get("mode") == "attach" else "terminal"
             try:
                 self._end(terminal, "user")
             except BaseException:

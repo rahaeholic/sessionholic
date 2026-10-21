@@ -687,7 +687,8 @@ class WindowsHTTPTest(unittest.TestCase):
             response, result = self.request('POST', '/api/session/action', {'source': REF, 'action': 'terminate',
                                             'requestId': 'fixture-control-0001', 'targetProof': 'aaa.' + 'a' * 64})
             self.assertEqual(response.status, 200)
-            self.assertEqual(result, receipt)
+            self.assertEqual({key: result[key] for key in receipt}, receipt)
+            self.assertTrue(result['cleanup']['complete'])
             self.assertEqual(rpc.call_count, 1)
             self.assertEqual(rpc.call_args.args[1], 'control_execute')
             response, result = self.request('POST', '/api/session/archive', {'source': REF, 'archived': True})

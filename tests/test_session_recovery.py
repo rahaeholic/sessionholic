@@ -132,10 +132,10 @@ class SessionRecoveryTest(unittest.TestCase):
                 patch.object(self.flow, 'resume_preview', side_effect=AssertionError('offline RPC')):
             self.assertFalse(self.plan()['allowed'])
 
-    def test_only_explicit_terminal_close_is_recovery_block(self):
+    def test_terminal_tombstone_alone_never_proves_native_termination(self):
         native = {**REF, 'cwd': SOURCE['cwd']}
         # "released": the board freed an idle connection for another terminal.
-        for reason, blocked in ((None, False), ('connection_ended', False), ('released', False), ('user', True)):
+        for reason, blocked in ((None, False), ('connection_ended', False), ('released', False), ('user', False)):
             with self.subTest(reason=reason):
                 self.terms.records = [{'id': 'fixture', 'closed': True, 'alive': False,
                                        'closedReason': reason, 'nativeSource': native}]

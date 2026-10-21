@@ -103,7 +103,8 @@
       if (ref?.terminalId) terminals.add(ref.terminalId);
       panes[id] = ref;
     }
-    return { version: 1, tree: copy(value.tree), active: ids(value.tree).includes(value.active) ? value.active : ids(value.tree)[0], panes };
+    return { version: 1, tree: copy(value.tree), active: ids(value.tree).includes(value.active) ? value.active : ids(value.tree)[0], panes,
+      ...(value.single === true ? { single: true } : {}) };
   }
   const model = { MAX_PANES, ids, leaf, validTree, remove, split, move, geometry, ratioAt, neighbor, shortcut, validRef, restoreLayout };
   if (typeof module !== "undefined" && module.exports) { module.exports = model; return; }
@@ -115,6 +116,7 @@
   const ownId = embedded ? new URLSearchParams(root.location.search).get("pane") : "p1";
   let hooks, parent, tree = leaf("p1"), active = "p1", maximized = false, restored = false, enabled = false, internal = 0;
   let frameReady = false, restoring = false, drag = null, pointer = null, refreshTimer = null;
+  let pendingFocus = null;
   const panes = new Map(), shared = new Map();
   const make = (tag, className, text) => {
     const node = doc.createElement(tag);
@@ -190,7 +192,7 @@
     if (restoring || !hooks?.describe().authenticated) return;
     const refs = {};
     for (const id of ids(tree)) refs[id] = validRef(panes.get(id)?.ref || panes.get(id)?.hooks?.describe().ref);
-    hooks.prefs.set("workspace", { version: 1, tree: copy(tree), active, panes: refs });
+    hooks.prefs.set("workspace", { version: 1, tree: copy(tree), active, panes: refs, ...(maximized ? { single: true } : {}) });
   }
   function fit(row) { row.hooks?.resize(); }
   function layout({ save = true } = {}) {
@@ -199,6 +201,13 @@
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
+    const viewToggle = $("workspace-view-toggle");
+    if (viewToggle) {
+      viewToggle.hidden = !enabled;
+      viewToggle.textContent = maximized ? "분할 복원" : "단일 화면";
+      viewToggle.title = maximized ? "저장된 창 분할로 돌아가기" : "현재 창만 크게 보기 · 다른 창과 초안은 유지";
+      viewToggle.setAttribute("aria-pressed", String(maximized));
+    }
     const rects = geometry(tree).panes;
     const bounds = rootNode.getBoundingClientRect();
     const compact = root.innerWidth <= 700 || list.length > 1 && Object.values(rects).some((r) => r.w * bounds.width < 280 || r.h * bounds.height < 170);
@@ -267,6 +276,17 @@
   function focus(id, editor = true) {
     if (!ids(tree).includes(id)) return false;
     if (active !== id && panes.get(active)?.hooks?.describe().composing) {
+      const from = active, owner = panes.get(from)?.hooks;
+      if (owner?.commitComposition) {
+        const request = pendingFocus = { id, editor };
+        Promise.resolve(owner.commitComposition()).then((ok) => {
+          if (pendingFocus !== request) return;
+          pendingFocus = null;
+          if (ok && active === from && !owner.describe().composing) focus(id, editor);
+          else if (!ok) notify("입력창 밖을 누른 뒤 창을 이동해 주세요.");
+        }).catch(() => { if (pendingFocus === request) pendingFocus = null; });
+        return false;
+      }
       notify("한글 조합을 마친 뒤 창을 이동해 주세요."); return false;
     }
     const changed = active !== id;
@@ -277,7 +297,7 @@
     }
     return true;
   }
-  function maximize() { maximized = !maximized; layout({ save: false }); }
+  function maximize() { maximized = !maximized; layout(); }
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));
     if (!action || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
@@ -340,7 +360,7 @@
       restored = true;
       const saved = restoreLayout(hooks.prefs.get("workspace", null));
       if (saved) {
-        restoring = true; tree = saved.tree; active = saved.active;
+        restoring = true; tree = saved.tree; active = saved.active; maximized = saved.single === true;
         for (const id of ids(tree)) record(id, saved.panes[id]);
         panes.get("p1").ref = saved.panes.p1 || null;
         layout({ save: false });
@@ -565,6 +585,7 @@
     keys.value = hooks.prefs.get("workspaceKeys", "ctrl-meta");
     keys.addEventListener("change", () => hooks.prefs.set("workspaceKeys", keys.value === "ctrl-alt-meta" ? keys.value : "ctrl-meta"));
     $("workspace-split-open").addEventListener("click", () => add(null));
+    $("workspace-view-toggle")?.addEventListener("click", () => maximize());
     $("home").addEventListener("click", (event) => {
       if (!enabled) return;
       event.preventDefault(); event.stopImmediatePropagation();

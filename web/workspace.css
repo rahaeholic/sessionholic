@@ -2,6 +2,7 @@
 .session-workspace, .workspace-pane { display: contents; }
 .workspace-pane[hidden], .workspace-pane-bar[hidden], #workspace-switcher[hidden], #workspace-drop-cue[hidden] { display: none !important; }
 .workspace-split-open { white-space: nowrap; min-height: 36px; padding: 0 10px; color: var(--accent); }
+.workspace-view-toggle { white-space: nowrap; min-height: 36px; padding: 0 8px; color: var(--accent); }
 .workspace-keys { display: block; width: 100%; min-height: 40px; margin: 8px 0; padding: 8px; border: 1px solid var(--sep); border-radius: 8px; color: var(--label); background: var(--surface); }
 #workspace-switcher { display: flex; gap: 2px; margin-left: auto; }
 .workspace-button { flex: none; min-width: 30px; min-height: 32px; padding: 0 7px; border: 0; border-radius: 7px; background: transparent; color: var(--label-2); cursor: pointer; font-size: 16px; }
@@ -42,7 +43,7 @@ body.workspace-embedded .back { visibility: hidden; pointer-events: none; }
 body.workspace-embedded .detail-head { padding-top: 4px; }
 @media (max-width: 700px) {
   body.workspace-split .top { display: flex; min-height: 42px; }
-  body.workspace-split .top > :not(#home):not(#workspace-switcher):not(#workspace-split-open) { display: none; }
+  body.workspace-split .top > :not(#home):not(#workspace-switcher):not(#workspace-split-open):not(#workspace-view-toggle) { display: none; }
   body.workspace-split #task-list-pane { display: none; }
   body.workspace-split #session-layout { display: flex; flex-direction: column; }
   body.workspace-split #session-workspace { flex: 1; }

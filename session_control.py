@@ -465,9 +465,32 @@ class SessionControl:
         with self._lock() as folder:
             return self._view(observed, folder)
 
-    def execute(self, source, action, target_proof, request_id, timeout=8):
+    def receipt(self, source, action, request_id):
+        """Read an existing outcome; never observe or apply a native operation."""
+        if action != "terminate" or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
+            raise ValueError("종료 요청 식별자를 확인해 주세요.")
+        with self._lock() as folder:
+            try:
+                record = json.loads(_private_read(folder / (request_id + ".json"), private=True))
+            except FileNotFoundError:
+                raise ValueError("기존 종료 결과가 없습니다. 원본 종료를 다시 요청하지 않았습니다.") from None
+            result = record.get("result", {})
+            if (record.get("binding") != self._binding(source) or result.get("source") != native._identity(source)
+                    or result.get("action") != action or result.get("requestId") != request_id):
+                raise ValueError("기존 종료 요청의 대상과 다릅니다. 추가 정리를 하지 않았습니다.")
+            return {**result, "replayed": True}
+
+    @staticmethod
+    def _binding(source):
+        keys = ("cwd", "kind", "sessionId") if source.get("agent") == "claude" else ("cwd",)
+        return {**native._identity(source), **{key: source.get(key) for key in keys}}
+
+    def execute(self, source, action, target_proof, request_id, timeout=8, cleanup_terminals=None):
         if action not in ("interrupt", "terminate") or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise ValueError("세션 제어 요청이 올바르지 않습니다.")
+        if cleanup_terminals is not None and (not isinstance(cleanup_terminals, list) or len(cleanup_terminals) > 64
+                or any(not isinstance(tid, str) or not re.fullmatch(r"[a-f0-9]{32}", tid) for tid in cleanup_terminals)):
+            raise ValueError("정리할 터미널 식별자가 올바르지 않습니다.")
         identity = native._identity(source)
         deadline = time.monotonic() + min(max(float(timeout), 0.05), 12)
         digest = _digest([identity, action, target_proof])
@@ -478,7 +501,7 @@ class SessionControl:
             except FileNotFoundError:
                 previous = None
             if previous is not None:
-                if previous.get("digest") != digest:
+                if previous.get("digest") != digest or (previous.get("binding") is not None and previous["binding"] != self._binding(source)):
                     raise ValueError("같은 요청 식별자를 다른 세션 제어에 사용할 수 없습니다.")
                 return {**previous["result"], "replayed": True}
             proof = self._verify(target_proof, self._secret(folder))
@@ -494,8 +517,9 @@ class SessionControl:
                     raise ValueError("이미 사용한 확인 정보입니다. 다른 제어를 하려면 상태를 다시 확인해 주세요.")
                 return {**used["result"], "replayed": True}
             observed = self._observe(source, deadline)
-            result = {"action": action, "requestId": request_id, "source": identity,
-                      "confirmed": False, "applied": False, "status": "rejected"}
+            result = {"action": action, "requestId": request_id, "source": identity, "requestedAt": int(time.time()),
+                      "confirmed": False, "applied": False, "status": "rejected",
+                      **({"cleanupTerminals": cleanup_terminals} if cleanup_terminals is not None else {})}
             if proof.get("revision") != _digest(observed["target"]):
                 return {**result, "status": "stale", "reason": "원본 실행이 변경되었습니다. 새 상태를 확인해 주세요.",
                         "preview": self._view(observed, folder)}
@@ -503,7 +527,7 @@ class SessionControl:
             if not capability["supported"]:
                 return {**result, "reason": capability["reason"]}
             pending = {**result, "applied": None, "status": "unconfirmed", "reason": "실행 요청 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다."}
-            _save(receipt_path, {"digest": digest, "result": pending})
+            _save(receipt_path, {"digest": digest, "binding": self._binding(source), "result": pending})
             _save(proof_path, {"result": pending})
             marker_path = folder / ("closed-" + _digest(identity) + ".json")
             prior_marker = None
@@ -519,7 +543,7 @@ class SessionControl:
                 result.update(details)
             except (OSError, ValueError, sqlite3.Error, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
                 result = pending
-            _save(receipt_path, {"digest": digest, "result": result})
+            _save(receipt_path, {"digest": digest, "binding": self._binding(source), "result": result})
             _save(proof_path, {"result": result})
             if action == "terminate":
                 if result.get("applied") is False:

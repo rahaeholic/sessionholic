@@ -426,6 +426,20 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertFalse(result['confirmed'])
         self.assertTrue(result['applied'])
 
+    def test_cleanup_receipt_only_never_archives_or_observes_again(self):
+        first = self.execute(self.runtime.preview(self.source))
+        args = {'source': self.source, 'action': 'terminate', 'requestId': first['requestId'], 'receiptOnly': True}
+        with patch.object(self.runtime, '_observe') as observe, patch.object(self.runtime, '_apply') as apply:
+            result = self.runtime.execute(args)
+            self.assertTrue(result['replayed'])
+            self.assertTrue(result['confirmed'])
+            self.assertIsInstance(result['requestedAt'], int)
+            for change in ({'requestId': 'unknown-request'}, {'source': {**self.source, 'cwd': 'C:/other'}}):
+                with self.assertRaises(ValueError):
+                    self.runtime.execute({**args, **change})
+            observe.assert_not_called()
+            apply.assert_not_called()
+
     def test_archive_without_unloaded_readback_is_unconfirmed(self):
         self.reader.mutate_hook = lambda method: self.reader.loaded.append(self.source['id'])
         result = self.execute(self.runtime.preview(self.source))

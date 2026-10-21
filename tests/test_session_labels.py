@@ -384,7 +384,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/session/opened', payload)[0].status, 400)
         self.assertEqual(self.request('POST', '/api/session/opened', {'source': self.source}, csrf=False)[0].status, 403)
 
-    def test_a_terminal_its_user_closes_puts_its_session_away(self):
+    def test_closing_a_terminal_never_proves_native_termination_or_hides_its_card(self):
         closed = []
         linked = {'id': 'a' * 32, 'mode': 'new-session', 'alive': True, 'closed': False, 'linkConfidence': 'estimated',
                   'nativeSource': {**self.source, 'cwd': '/example/workspace', 'kind': None}}
@@ -397,7 +397,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
         self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('a' * 32), {})[0].status, 200)
         self.assertEqual(closed, ['b' * 32, 'a' * 32])
-        self.assertEqual(type(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt']), int)
+        self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
 
     def claude_row(self, phase='done'):
         sid = str(uuid.uuid4())
@@ -442,14 +442,14 @@ class SessionLabelsHTTPTest(unittest.TestCase):
                     list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
                 self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('d' * 32), {})[0].status, 200)
                 self.assertIsNone(self.claude_tidied())
-        # A run the board ends (not just a view) is put away even while it was working.
+        # Closing a resume TUI also does not prove its daemon's native turn ended.
         row = self.claude_row('working')
         native = self.httpd.workflow.native_of({**row, 'host': self.host['name'], 'agent': 'claude', 'home': '.claude'})
         terminal = {'id': 'e' * 32, 'mode': 'resume', 'alive': True, 'closed': False, 'nativeSource': native}
         self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
             list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
         self.request('POST', '/api/terminal/%s/close' % ('e' * 32), {})
-        self.assertEqual(type(self.claude_tidied()), int)
+        self.assertIsNone(self.claude_tidied())
 
     def test_a_confirmed_terminate_puts_the_session_away_and_an_interrupt_does_not(self):
         self.board.state[self.host['name']]['ok'] = True

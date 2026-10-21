@@ -104,7 +104,7 @@ function fixture(saved = null) {
       return { left, top, width, height, right: left + width, bottom: top + height };
     }
   }
-  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-split-open", "groups", "home", "workspace-keys"])
+  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-split-open", "workspace-view-toggle", "groups", "home", "workspace-keys"])
     nodes.set(id, new Node());
   nodes.get("workspace-primary").dataset.paneId = "p1";
   nodes.get("session-workspace").append(nodes.get("workspace-primary"), nodes.get("workspace-dividers"), nodes.get("workspace-drop-cue"));
@@ -198,6 +198,37 @@ test("IME blocks pane changes and ongoing voice remains bound to its original pa
   assert.equal(f.workspace.claimDictation(), false);
   assert.equal(f.calls.filter(([name]) => name === "close-view").length, 0);
   second.info.dictation = false; assert.equal(f.workspace.claimDictation(), true);
+});
+
+test("single-screen button preserves every frame/editor and restores the split, including after reload", () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
+  const toggle = f.nodes.get("workspace-view-toggle"), editor = second.info.editor;
+  assert.equal(toggle.textContent, "단일 화면");
+  toggle.fire("click", {});
+  assert.equal(toggle.textContent, "분할 복원");
+  assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), true);
+  assert.equal(second.row.classList.contains("workspace-pane-covered"), false);
+  assert.equal(second.frame.appendCount, 1);
+  assert.equal(second.info.editor, editor);
+  assert.equal(f.preferences.get("workspace").single, true);
+  const restored = fixture(f.preferences.get("workspace"));
+  assert.equal(restored.nodes.get("workspace-view-toggle").textContent, "분할 복원");
+  toggle.fire("click", {});
+  assert.equal(toggle.textContent, "단일 화면");
+  assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), false);
+  assert.equal(f.calls.filter(([name]) => name === "api" || name === "close-view").length, 0);
+});
+
+test("pane focus waits for Samsung IME blur without replacing the original editor or sending", async () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
+  second.info.composing = true;
+  let commit; second.child.commitComposition = () => new Promise((done) => { commit = done; });
+  assert.equal(f.workspace.focus("p1"), false);
+  assert.equal(f.preferences.get("workspace").active, "p2");
+  second.info.composing = false; commit(true); await Promise.resolve();
+  assert.equal(f.preferences.get("workspace").active, "p1");
+  assert.equal(second.info.editor.text, "초안 p2");
+  assert.equal(f.calls.filter(([name]) => name === "api" || name === "close-view").length, 0);
 });
 
 test("snapshot reads reuse parent data and concurrent common reads share one request with strict frame ownership", async () => {

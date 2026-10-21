@@ -425,6 +425,36 @@ class SessionControlTest(unittest.TestCase):
             cls.return_value.preview.assert_called_once_with(self.codex)
             transfer_worker.rpc({'op': 'control_execute', 'args': {'source': self.codex, 'action': 'interrupt', 'targetProof': 'fixture-proof', 'requestId': 'request-1234'}})
             cls.return_value.execute.assert_called_once_with(self.codex, 'interrupt', 'fixture-proof', 'request-1234')
+            transfer_worker.rpc({'op': 'control_execute', 'args': {'source': self.codex, 'action': 'terminate',
+                                'requestId': 'request-1234', 'receiptOnly': True}})
+            cls.return_value.receipt.assert_called_once_with(self.codex, 'terminate', 'request-1234')
+            self.assertEqual(cls.return_value.execute.call_count, 1)
+
+    def test_cleanup_receipt_survives_restart_and_never_observes_or_executes_again(self):
+        observed = self.observed()
+        with patch.object(self.api, '_observe', return_value=observed), \
+                patch.object(self.api, '_apply', return_value={'confirmed': True, 'applied': True, 'status': 'terminated'}) as apply:
+            preview = self.api.preview(self.claude)
+            first = self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-cleanup',
+                                     cleanup_terminals=['a' * 32])
+            self.assertEqual(apply.call_count, 1)
+        restarted = control.SessionControl(self.home, self.home / 'control')
+        with patch.object(restarted, '_observe') as observe, patch.object(restarted, '_apply') as apply:
+            second = restarted.receipt(self.claude, 'terminate', 'request-cleanup')
+            self.assertEqual(second, {**first, 'replayed': True})
+            self.assertIsInstance(second['requestedAt'], int)
+            self.assertEqual(second['cleanupTerminals'], ['a' * 32])
+            for altered in ({**self.claude, 'cwd': '/other'}, {**self.claude, 'sessionId': 'different'}, self.codex):
+                with self.assertRaises(ValueError):
+                    restarted.receipt(altered, 'terminate', 'request-cleanup')
+                with self.assertRaises(ValueError):
+                    restarted.execute(altered, 'terminate', preview['targetProof'], 'request-cleanup')
+            with self.assertRaises(ValueError):
+                restarted.receipt(self.claude, 'terminate', 'missing-request')
+            with self.assertRaises(ValueError):
+                restarted.receipt(self.claude, 'interrupt', 'request-cleanup')
+            observe.assert_not_called()
+            apply.assert_not_called()
 
 
 if __name__ == '__main__':

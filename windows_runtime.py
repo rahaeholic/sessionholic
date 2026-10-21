@@ -911,7 +911,7 @@ class WindowsRuntime:
         with self.store.lock():
             prior = self.store.read(name)
             if prior:
-                if prior.get('digest') != digest:
+                if prior.get('digest') != digest or (prior.get('binding') is not None and prior['binding'] != binding):
                     raise ValueError('같은 요청 ID로 다른 메시지를 보낼 수 없습니다.')
                 return prior['result']
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
@@ -996,11 +996,24 @@ class WindowsRuntime:
         identity = _identity(source)
         if action not in ('interrupt', 'terminate') or not isinstance(request_id, str) or not CONTROL_REQUEST.fullmatch(request_id):
             raise ValueError('PC 세션 제어 요청이 올바르지 않습니다.')
-        if not isinstance(proof, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,3900}\.[a-f0-9]{64}', proof):
+        cleanup_terminals = args.get('cleanupTerminals')
+        if cleanup_terminals is not None and (not isinstance(cleanup_terminals, list) or len(cleanup_terminals) > 64
+                or any(not isinstance(tid, str) or not re.fullmatch(r'[a-f0-9]{32}', tid) for tid in cleanup_terminals)):
+            raise ValueError('정리할 터미널 식별자가 올바르지 않습니다.')
+        receipt_only = args.get('receiptOnly') is True
+        if not receipt_only and (not isinstance(proof, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,3900}\.[a-f0-9]{64}', proof)):
             raise ValueError('PC 세션 확인 정보가 올바르지 않습니다.')
         digest, name = _digest([identity, action, proof]), 'control-' + _digest(request_id) + '.json'
+        binding_keys = ('cwd', 'kind', 'sessionId') if identity['agent'] == 'claude' else ('cwd',)
+        binding = {**identity, **{key: source.get(key) for key in binding_keys}}
         with self.store.lock():
             prior = self.store.read(name)
+            if receipt_only:
+                if (action != 'terminate' or not prior or prior.get('binding') != binding
+                        or prior.get('result', {}).get('source') != identity
+                        or prior['result'].get('action') != action or prior['result'].get('requestId') != request_id):
+                    raise ValueError('기존 종료 결과의 대상을 확인하지 못했습니다. 종료를 다시 요청하지 않았습니다.')
+                return {**prior['result'], 'replayed': True}
             if prior:
                 if prior.get('digest') != digest:
                     raise ValueError('같은 요청 ID로 다른 세션을 제어할 수 없습니다.')
@@ -1018,21 +1031,23 @@ class WindowsRuntime:
                     raise ValueError('이미 사용한 세션 확인 정보입니다.')
                 return {**used['result'], 'replayed': True}
             observed = self._observe(source)
-            result = {'source': identity, 'action': action, 'requestId': request_id, 'confirmed': False, 'applied': False, 'status': 'rejected'}
+            result = {'source': identity, 'action': action, 'requestId': request_id, 'requestedAt': int(time.time()), 'confirmed': False, 'applied': False, 'status': 'rejected'}
+            if cleanup_terminals is not None:
+                result['cleanupTerminals'] = cleanup_terminals
             if payload.get('revision') != _digest(observed['target']):
                 return {**result, 'status': 'stale', 'reason': '원본 실행이 변경되었습니다. 다시 확인해 주세요.', 'preview': self._view(observed)}
             cap = observed['capabilities'][action]
             if not cap['supported']:
                 return {**result, 'reason': cap['reason']}
             pending = {**result, 'applied': None, 'status': 'unconfirmed', 'reason': 'PC 실행 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다.'}
-            self.store.save(name, {'digest': digest, 'result': pending})
+            self.store.save(name, {'digest': digest, 'binding': binding, 'result': pending})
             self.store.save(proof_name, {'result': pending})
             try:
                 details = self._apply(observed, action)
                 result.update(details)
             except (OSError, ValueError, TimeoutError):
                 result = pending
-            self.store.save(name, {'digest': digest, 'result': result})
+            self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
             self.store.save(proof_name, {'result': result})
             return result
 

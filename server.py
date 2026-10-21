@@ -1722,7 +1722,7 @@ class Workflow:
         source = {**native, **{key: info[key] for key in ("title", "account", "hostLabel", "updatedAt", "openedAt")
                              if key in info}}
         reason = info.get("closedReason")
-        if reason == "user" and info.get("closeEffect") == "view":
+        if reason == "user" and info.get("closeEffect") in ("view", "terminal"):
             reason = "view_closed"
         try:
             self.recoveries.remember(source, terminal_id=info.get("id"), closed_reason=reason)
@@ -2055,7 +2055,7 @@ class Workflow:
     # An unused run closes once its screen rested at an empty prompt on sweeps this far apart.
     RUN_REST_SECONDS = 300
 
-    def end_hold(self, terminal):
+    def end_hold(self, terminal, wait=False, timeout=12):
         """The run a closed terminal kept on its host ends too, in the background (a remote
         call never runs under a lock). Returns True when its host is offline now: the sweep
         ends it once the host is back."""
@@ -2067,9 +2067,12 @@ class Workflow:
             return True
         def end():
             try:
-                self.transfers.rpc(host, "hold_kill", {"name": hold}, timeout=12)
+                result = self.transfers.rpc(host, "hold_kill", {"name": hold}, timeout=timeout)
+                return not isinstance(result, dict) or result.get("alive") is not False
             except (RuntimeError, OSError, ValueError):
-                pass  # The sweep ends it later.
+                return True  # The sweep may end it later; never report completion yet.
+        if wait:
+            return end()
         threading.Thread(target=end, daemon=True).start()
         return False
 
@@ -2460,15 +2463,8 @@ class Workflow:
         if not self.board.state[host["name"]]["ok"]:
             return {"allowed": False, "blockedByBoard": False,
                     "reason": "기기가 다시 연결되면 같은 세션을 열 수 있습니다."}
-        # A tmux disconnect is recorded separately from an explicit close. Old
-        # ambiguous tombstones are not proof that the user ended the session.
-        for terminal in self.terminals.list():
-            native = terminal.get("nativeSource") or (terminal.get("metadata") or {}).get("nativeSource")
-            if (terminal.get("closedReason") == "user" and terminal.get("linkConfidence") != "estimated"
-                    and (terminal.get("closeEffect") or (terminal.get("metadata") or {}).get("closeEffect")) != "view"
-                    and self.same_native(native, source)):
-                return {"allowed": False, "blockedByBoard": True,
-                        "reason": "웹보드에서 직접 닫은 세션입니다. 자동으로 다시 시작하지 않습니다."}
+        # Only the native termination marker proves board termination intent.
+        # Legacy tmux/TUI tombstones never prove a native conversation ended.
         selector = {key: source.get(key) for key in ("host", "agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
         result = self.transfers.rpc(host, "resume_preview", {"source": selector}, timeout=12)
         if not isinstance(result, dict) or type(result.get("allowed")) is not bool:
@@ -3287,7 +3283,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def session_control(self, path, data):
         ref = data.get("source")
-        source = self.server.board.source(ref)
+        cleanup_only = data.get("cleanupOnly", False)
+        if type(cleanup_only) is not bool or (cleanup_only and (path != "/api/session/action" or data.get("action") != "terminate")):
+            raise ValueError("종료 후 정리 요청을 확인해 주세요.")
+        if cleanup_only:
+            # An archived native row may already have left the bounded list. Only
+            # a server-kept locator and its native receipt authorize later cleanup.
+            record = self.server.workflow.recoveries.get(ref)
+            if record is None:
+                raise ValueError("기존 종료 대상의 기록을 찾지 못했습니다. 추가 종료를 요청하지 않았습니다.")
+            source = dict(record["source"])
+            source["online"] = self.server.board.state.get(source["host"], {}).get("ok") is True
+        else:
+            source = self.server.board.source(ref)
         source["agent"] = ref.get("agent")
         source["home"] = source.get("home") or (".codex" if source["agent"] == "codex" else ".claude")
         if path == "/api/session/archive":
@@ -3306,10 +3314,28 @@ class Handler(BaseHTTPRequestHandler):
             if (data.get("action") not in ("interrupt", "terminate")
                     or not isinstance(data.get("requestId"), str)
                     or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", data["requestId"])
-                    or not isinstance(data.get("targetProof"), str) or len(data["targetProof"]) > 4096
-                    or not re.fullmatch(r"[A-Za-z0-9_-]+\.[a-f0-9]{64}", data["targetProof"])):
+                    or (not cleanup_only and (not isinstance(data.get("targetProof"), str) or len(data["targetProof"]) > 4096
+                    or not re.fullmatch(r"[A-Za-z0-9_-]+\.[a-f0-9]{64}", data["targetProof"])))):
                 raise ValueError("실행 대상과 요청 정보를 다시 확인해 주세요.")
-            args.update({key: data[key] for key in ("action", "requestId", "targetProof")})
+            args.update({key: data[key] for key in ("action", "requestId")})
+            if cleanup_only:
+                args["receiptOnly"] = True
+            else:
+                args["targetProof"] = data["targetProof"]
+                if data["action"] == "terminate":
+                    # Persist the trusted locator BEFORE native dispatch, so a
+                    # lost response/restart can still look up that receipt safely.
+                    native = self.server.workflow.native_of(source)
+                    if source["agent"] == "codex":
+                        native.pop("kind", None)
+                    self.server.workflow.recoveries.remember(native)
+                    args["cleanupTerminals"] = []
+                    for row in self.server.terminals.list():
+                        info = {**(row.get("metadata") or {}), **row}
+                        if (info.get("host") == source["host"] and
+                                (not info.get("closed") or info.get("holdName")) and
+                                self.server.workflow.same_native(info.get("nativeSource"), source)):
+                            args["cleanupTerminals"].append(info["id"])
         try:
             result = self.server.workflow.transfers.rpc(host, "control_execute" if action else "control_preview",
                                                        args, timeout=12 if action else 8)
@@ -3320,14 +3346,83 @@ class Handler(BaseHTTPRequestHandler):
         if action and result.get("confirmed"):
             self.server.chat._forget_state(source)
             if data.get("action") == "terminate":
-                # The listed row the board resolved (a Claude row carries its sessionId).
-                self.tidy_after_close(source)
+                result = {**result, "cleanup": self.cleanup_terminated_session(source, result)}
                 try:
-                    self.server.workflow.recoveries.remember({**source, "explicitTermination": True})
+                    native = self.server.workflow.native_of(source)
+                    if source["agent"] == "codex":
+                        native.pop("kind", None)
+                    self.server.workflow.recoveries.remember({**native, "explicitTermination": True})
                 except (ValueError, RuntimeError, OSError):
                     pass
             self.server.board.request_refresh(host["name"], force=False)
         return result
+
+    def cleanup_terminated_session(self, source, receipt):
+        """Only a confirmed native termination reaches here. Failures remain visible;
+        a retry reads the same receipt and repeats only these idempotent steps."""
+        outcome = {"closed": [], "failed": [], "unverified": [], "remotePending": [],
+                   "list": "pending", "complete": False}
+        workflow = self.server.workflow
+        try:
+            rows = self.server.terminals.list()
+        except (ValueError, RuntimeError, OSError):
+            return {**outcome, "terminalScanPending": True}
+        targets = receipt.get("cleanupTerminals", [])
+        if not isinstance(targets, list) or len(targets) > 64:
+            return {**outcome, "terminalScanPending": True}
+        deadline = time.monotonic() + 12
+        for row in rows:
+            info = {**(row.get("metadata") or {}), **row}
+            if info["id"] in targets and (info.get("host") != source["host"] or
+                    not workflow.same_native(info.get("nativeSource"), source)):
+                outcome["unverified"].append(info["id"])
+                continue
+            if not workflow.same_native(info.get("nativeSource"), source):
+                continue
+            if info.get("host") != source["host"]:
+                continue
+            if info["id"] not in targets:
+                if not info.get("closed"):
+                    outcome["unverified"].append(info["id"])
+                continue
+            if info.get("linkConfidence") == "estimated":
+                if not info.get("closed"):
+                    outcome["unverified"].append(info["id"])
+                continue
+            # IDs were captured by the board BEFORE native dispatch and persisted
+            # in its receipt. Remote/local clock skew cannot select a later TUI.
+            try:
+                workflow.ensure_direct_terminal(info["id"])
+                self.server.terminals.close_terminal(info["id"])
+                outcome["closed"].append(info["id"])
+            except (ValueError, KeyError, RuntimeError, OSError):
+                outcome["failed"].append(info["id"])
+                continue
+            remaining = deadline - time.monotonic()
+            if (remaining <= 0 and info.get("holdName")) or workflow.end_hold(info, wait=True, timeout=max(.1, remaining)):
+                outcome["remotePending"].append(info["id"])
+            try:
+                self.server.terminal_inputs.prune_closed(info["id"], self.server.terminals.list())
+            except (ValueError, RuntimeError, OSError):
+                outcome["inputCleanupPending"] = True
+        if outcome["failed"] or outcome["unverified"] or outcome["remotePending"]:
+            return outcome
+        try:
+            # Use the already verified source, even after archive removed its row.
+            stamp = int(time.time())
+            removed, changed = self.server.session_removed.mark(source, stamp)
+            # Optional legacy tidy follows the required durable removed write.
+            try:
+                _tidy, tidy_changed = self.server.session_tidied.mark(source, stamp)
+                changed = changed or tidy_changed
+            except (GoalError, ValueError, RuntimeError, OSError):
+                pass
+            if changed:
+                self.server.board.changed(force=True)
+            outcome.update(list="done", complete=True, removedAt=removed["seenAt"], version=self.server.board.version)
+        except (GoalError, ValueError, RuntimeError, OSError):
+            pass
+        return outcome
 
     def session_seen(self, data):
         """A listed session was looked at as of its update time: every device then shows it read."""
@@ -4077,13 +4172,9 @@ class Handler(BaseHTTPRequestHandler):
                     if row is not None:
                         info = {**(row.get("metadata") or {}), **row}
                         self.server.workflow.remember_recovery({**info, "closedReason": "user",
-                            "closeEffect": "view" if info.get("mode") == "attach" else "run"})
+                            "closeEffect": "view" if info.get("mode") == "attach" else "terminal"})
                     hold_pending = bool(row) and self.server.workflow.end_hold(row)
-                    # Only a terminal still running when closed: one that already ended (a host
-                    # that went to sleep) was not ended from the board.
-                    if row is not None and row.get("alive") and not row.get("closed"):
-                        self.tidy_after_close(row.get("nativeSource") or (row.get("metadata") or {}).get("nativeSource"),
-                                              ended=(row.get("mode") or (row.get("metadata") or {}).get("mode")) != "attach")
+                    # Closing a tmux/TUI alone never proves native execution ended.
                     try:
                         self.server.terminal_inputs.prune_closed(tid, self.server.terminals.list())
                     except (ValueError, RuntimeError, OSError):

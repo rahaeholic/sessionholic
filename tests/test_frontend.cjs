@@ -177,6 +177,19 @@ test("workspace GET sharing preserves auth epochs and never proxies a write", as
   await assert.rejects(pending, (error) => error.staleAuth === true);
 });
 
+test("workspace IME guard ignores an ended terminal composition owner and observes only the focused editor", () => {
+  const c = client();
+  const hooks = vm.runInContext("workspaceHooks()", c.context);
+  c.state.compositionOwner = "an-existing-terminal";
+  c.state.composing = false;
+  assert.equal(hooks.describe().composing, false);
+  c.state.composing = true;
+  c.context.document.activeElement = c.get("terminal-draft");
+  assert.equal(hooks.describe().composing, true);
+  c.context.document.activeElement = c.get("workspace-split-open");
+  assert.equal(hooks.describe().composing, false);
+});
+
 test("embedded panes never create global EventSources and layout restore never starts a missing session", () => {
   const c = client(() => { throw new Error("layout cannot launch a session"); });
   let created = 0;
@@ -858,8 +871,8 @@ test("close wording and tone distinguish attachment, fresh execution, and unknow
   const c = client();
   for (const [terminal, label, danger, description] of [
     [{ id: "attach", mode: "attach" }, "연결 닫기", false, /중단 명령을 보내지/],
-    [{ id: "handoff", mode: "handoff" }, "실행 종료", true, /새로 시작한 작업/],
-    [{ id: "transfer", metadata: { mode: "transfer" } }, "실행 종료", true, /실행 기기의 최근 작업/],
+    [{ id: "handoff", mode: "handoff" }, "터미널 닫기", true, /종료를 보장하지는 않습니다/],
+    [{ id: "transfer", metadata: { mode: "transfer" } }, "터미널 닫기", true, /실행 종료하고 정리/],
     [{ id: "unknown" }, "터미널 닫기", true, /종류를 확인하지 못/],
   ]) {
     await c.openTerminal(terminal);
@@ -970,7 +983,7 @@ test("failed terminal listing keeps previous rows and exposes retry; a closed ro
   assert.equal(c.get("running-refresh").hidden, true);
   assert.equal(c.get("terminal-return").hidden, true);
   assert.equal(c.get("terminal-reconnect").hidden, true);
-  assert.match(c.get("terminal-status").textContent, /실행 기기의 최근 작업/);
+  assert.match(c.get("terminal-status").textContent, /원본 작업 상태/);
 });
 
 test("a PC Codex terminal states its permissions once the board has checked them, and drops a cleared notice", async () => {
@@ -3122,7 +3135,7 @@ test('a successful close with delayed input cleanup stays closed, reports pendin
   c.state.authenticated = true; c.state.terminal = { id: 'term-1', mode: 'attach' }; c.state.terminalVisible = true;
   c.closeTerminal('term-1'); await c.confirmTerminalClose();
   assert.equal(c.state.terminal, null); assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.get('close-terminal-dialog').open, false);
+  assert.equal(!!c.get('close-terminal-dialog').open, false);
   assert.match(c.get('connection-notice').textContent, /터미널은 닫혔지만.*정리가 남았습니다.*목록을 새로고침/);
   assert.equal(c.get('connection-notice').hidden, false);
   cleanupPending = false; await c.refreshTerminals();
@@ -4839,7 +4852,7 @@ test('end keys ask to end a session only off a field and without a text selectio
   const preview = { targetProof: 'synthetic-proof', capabilities: { terminate: { supported: true, effect: '원본 CLI 실행을 종료합니다.' },
     interrupt: { supported: false, reason: '진행 중인 응답이 없습니다.' } } };
   const board = keyboardBoard({ fetchImpl: async (url) => ({ ok: true, status: 200, json: async () =>
-    url === '/api/session/preview' ? preview : url === '/api/session/action' ? { confirmed: true } : url === '/api/session/remove' ? { version: 3 } : {} }) });
+    url === '/api/session/preview' ? preview : url === '/api/session/action' ? { confirmed: true, cleanup: { complete: true, version: 3 } } : url === '/api/session/remove' ? { version: 3 } : {} }) });
   const { c, s, cards, detail, press, requests, focused } = board;
   c.context.document.body.append = () => {};
   const selection = { isCollapsed: true, toString: () => '' };
@@ -4861,7 +4874,7 @@ test('end keys ask to end a session only off a field and without a text selectio
   assert.deepEqual(press(detail, 'Delete'), [true, true]);
   await settle();
   assert.equal(requests.filter((r) => r.url === '/api/session/preview').length, 1);
-  assert.match(c.get('end-session-status').textContent, /원본 CLI 실행을 종료합니다\. 이어서 목록에서 지웁니다/);
+  assert.match(c.get('end-session-status').textContent, /원본 CLI 실행을 종료합니다\. 이어서 터미널과 목록을 정리합니다/);
   const terminate = c.get('end-session-terminate');
   assert.equal(terminate.disabled, false); assert.equal(terminate.focusCount, 1, 'Enter takes the default once it is known');
   assert.equal(c.get('end-session-interrupt').hidden, true);
@@ -4869,10 +4882,9 @@ test('end keys ask to end a session only off a field and without a text selectio
   await terminate.events.click(); await settle();
   const action = requests.find((r) => r.url === '/api/session/action');
   assert.deepEqual([action.body.action, action.body.targetProof], ['terminate', 'synthetic-proof']);
-  assert.equal(requests.filter((r) => r.url === '/api/session/remove').length, 1);
-  assert.equal(requests.find((r) => r.url === '/api/session/remove').body.removed, true);
+  assert.equal(requests.filter((r) => r.url === '/api/session/remove').length, 0, 'the server completes list cleanup in the native action');
   assert.equal(c.get('end-session-dialog').open, false);
-  assert.match(c.get('toast').textContent, /실행을 끝내고 목록에서 지웠습니다/);
+  assert.match(c.get('toast').textContent, /실행을 끝내고 터미널과 목록을 정리/);
   assert.equal(focused.slice(next).at(-1), 3, 'the next card takes the focus');
 });
 
@@ -7482,7 +7494,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   c.state.terminals = [{ id: 'gone', alive: false, sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) },
     { id: 'launched', alive: true, mode: 'handoff', sourceKey: JSON.stringify({ agent: s.agent, home: s.home, host: s.host, id: s.id }) }];
   assert.equal(c.terminalForSession(s).id, 'launched', 'a terminal launched from the session counts; a closed one does not');
-  assert.equal(c.swipeActionFor(s).label, '실행 종료');
+  assert.equal(c.swipeActionFor(s).label, '터미널 닫기');
   // Touch drag on the list: the card follows the finger and stays open past half the button.
   const groups = c.get('groups');
   vm.runInContext('bindCardGestures', c.context)(groups);
@@ -7494,7 +7506,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   groups.events.pointermove({ target, pointerId: 3, clientX: 200, clientY: 106, cancelable: true, preventDefault() {} });
   assert.equal(row.swipeOffset, -100);
   assert.equal(prevented, 1, 'a swiping finger does not also scroll the list');
-  assert.equal(row.swipeAction.textContent, '실행 종료');
+  assert.equal(row.swipeAction.textContent, '터미널 닫기');
   groups.events.pointerup({ pointerId: 3 });
   assert.equal(c.state.swipeOpen, row); assert.equal(row.swipeOffset, -c.GESTURE.swipeRevealPx);
   assert.match(row.className, /is-open/);
@@ -7515,11 +7527,11 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   // The action asks for confirmation (the existing close sheet); nothing closes directly.
   c.prepareSwipe(row); c.settleSwipe(row, 'action');
   assert.equal(c.get('close-terminal-dialog').open, true);
-  assert.equal(c.get('close-terminal-confirm').textContent, '실행 종료');
+  assert.equal(c.get('close-terminal-confirm').textContent, '터미널 닫기');
   c.cancelTerminalClose();
   c.openCardMenu(row);
   assert.deepEqual(c.get('action-list').children.map((item) => item.textContent),
-    ['대화 열기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '실행 종료', '실행 종료 뒤 목록에서 지우기', '목록에서 지우기']);
+    ['대화 열기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '터미널 닫기', '실행 종료하고 정리', '목록에서 지우기']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
@@ -9506,30 +9518,19 @@ test('목록 옆에 띄운 대화는 보는 동안 이전 묶음의 자리를 �
   assert.deepEqual(order(), ['b', 'c', 'a']);
 });
 
-test('닫고 지우기 removes the session from the list only after its board terminal closed', async () => {
-  const requests = [];
-  let closeFails = true;
-  const c = client(async (url, options) => {
-    requests.push([url, options?.body && JSON.parse(options.body)]);
-    if (url.endsWith('/close') && closeFails) return { ok: false, status: 409, json: async () => ({ error: 'fixture: busy' }) };
-    return { ok: true, status: 200, json: async () => ({ ok: true, removedAt: 1, hosts: [] }) };
+test('닫고 지우기 uses checked native termination rather than a terminal close followed by hide', async () => {
+  const calls = [];
+  const c = client(async (url) => {
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => ({ capabilities: { terminate: { supported: false } } }) };
   }, noChatTimers);
-  const s = recentSession('close-me');
-  setRecentSnapshot(c, [s]);
-  const open = () => { c.state.terminals = [{ id: 'a'.repeat(32), alive: true, mode: 'attach',
-    metadata: { nativeSource: { host: s.host, agent: s.agent, home: s.home, id: s.id }, mode: 'attach' } }]; };
-  open();
-  const terminal = c.terminalForSession(s);
-  c.closeTerminal(terminal.id, { thenRemove: s });
-  await c.confirmTerminalClose();
-  assert.equal(requests.filter(([url]) => url === '/api/session/remove').length, 0, 'a close that failed removes nothing');
-  closeFails = false;
-  c.cancelTerminalClose();
-  open();
-  c.closeTerminal(terminal.id, { thenRemove: s });
-  await c.confirmTerminalClose();
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(requests.filter(([url]) => url === '/api/session/remove').map(([, body]) => body.removed), [true]);
+  const s = recentSession('close-me'); setRecentSnapshot(c, [s]);
+  c.state.terminals = [{ id: 'a'.repeat(32), alive: true, mode: 'attach' }];
+  await c.closeTerminal('a'.repeat(32), { thenRemove: s });
+  assert.deepEqual(calls, ['/api/session/preview']);
+  assert.equal(c.get('end-session-dialog').open, true);
+  assert.equal(c.get('end-session-terminate').disabled, true);
+  assert.equal(!!c.get('close-terminal-dialog').open, false);
 });
 
 test('이전 lists the most recently opened first (on any device), then the most recently changed; opening is kept once a minute', async () => {
@@ -10111,13 +10112,13 @@ test('opening a new session posts once per host and request, then opens its term
   assert.deepEqual(opened, [terminal.id]);
   assert.equal(c.get('new-session-dialog').open, false);
   assert.ok(c.state.terminals.some((item) => item.id === terminal.id));
-  assert.equal(c.terminalCloseCopy(terminal).action, '실행 종료');
+  assert.equal(c.terminalCloseCopy(terminal).action, '터미널 닫기');
   assert.equal(c.terminalCloseCopy(terminal).danger, true);
   // A PC conversation resumed in a board terminal runs there: closing it ends the run.
   const resumed = c.terminalCloseCopy({ metadata: { mode: 'resume', launchMode: 'attach' } });
-  assert.equal(resumed.action, '실행 종료');
+  assert.equal(resumed.action, '터미널 닫기');
   assert.equal(resumed.danger, true);
-  assert.match(resumed.description, /다시 연 대화/);
+  assert.match(resumed.description, /종료를 보장하지는 않습니다/);
 });
 
 // The conversation keeps its newest message in view (pinnedToEnd, keepAtEnd).
