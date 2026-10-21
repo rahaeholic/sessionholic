@@ -1840,6 +1840,49 @@ test('a confirmed native turn failure clears its submitted draft while an unacce
   assert.match(c.chatReceiptCopy(entry.receipt), /초안은 유지/);
 });
 
+test('a confirmed old failure stops claiming a current error only after the same conversation proves a later turn', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const classes = new Map(); c.get('chat-composer').classList.toggle = (key, value) => classes.set(key, value);
+  entry.text = '계속 작성 중인 초안';
+  entry.receipt = { requestId: 'old-failed-request', turnId: 'old-turn', status: 'failed', confirmed: true };
+  Object.assign(entry.data, { phase: 'working', turns: [{ id: 'old-turn', status: 'failed' }] });
+  c.updateChatComposer(entry, s);
+  assert.match(c.get('chat-status').textContent, /처리 중 오류/);
+  entry.data.turns.push({ id: 'new-turn', status: 'inProgress' });
+  c.updateChatComposer(entry, s);
+  assert.doesNotMatch(c.get('chat-status').textContent, /오류/);
+  assert.match(c.get('chat-status').textContent, /작업 중/);
+  assert.equal(classes.get('is-error'), false);
+  assert.equal(entry.receipt.status, 'failed', 'the receipt remains an accurate historical record');
+  assert.equal(entry.text, '계속 작성 중인 초안');
+  entry.data.turns = [{ id: 'new-turn', status: 'completed' }]; entry.data.phase = 'idle';
+  c.updateChatComposer(entry, s);
+  assert.doesNotMatch(c.get('chat-status').textContent, /오류/);
+  entry.receipt = { requestId: 'new-failed-request', turnId: 'new-turn', status: 'failed', confirmed: true };
+  c.updateChatComposer(entry, s);
+  assert.match(c.get('chat-status').textContent, /처리 중 오류/);
+  entry.receipt = { ...entry.receipt, dispatchState: 'not_started', confirmed: false };
+  entry.data.turns.push({ id: 'other-turn', status: 'completed' });
+  c.updateChatComposer(entry, s);
+  assert.match(c.get('chat-status').textContent, /전송되지 않았습니다/);
+});
+
+test('server overload is explained without raw Native details and stale or unrelated turns cannot clear a current failure', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const classes = new Map(); c.get('chat-composer').classList.toggle = (key, value) => classes.set(key, value);
+  entry.receipt = { requestId: 'overloaded-request', turnId: 'failed-turn', status: 'failed', confirmed: true, failureCode: 'server_overloaded' };
+  entry.data.turns = [{ id: 'failed-turn', status: 'failed' }, { id: 'later-turn', status: 'inProgress' }];
+  entry.data.stale = true;
+  c.updateChatComposer(entry, s);
+  assert.match(c.get('chat-status').textContent, /응답 서버.*혼잡/);
+  assert.equal(classes.get('is-error'), true);
+  entry.data.stale = false; entry.data.turns = [{ id: 'unrelated-turn', status: 'completed' }];
+  c.updateChatComposer(entry, s);
+  assert.match(c.get('chat-status').textContent, /응답 서버.*혼잡/);
+});
+
 test('switching away and back resets chat IME ownership and ignores the detached editor final input', async () => {
   const requests = [];
   const c = client(async (url, options) => {

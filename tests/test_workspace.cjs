@@ -267,6 +267,69 @@ test("list drops create a new view only for known sessions and duplicate drops m
   drag(); assert.equal(f.frames.length, 1);
 });
 
+test("dropping another session at an occupied pane center previews and creates a split without replacing the conversation", () => {
+  const f = fixture();
+  const transfer = { setData() {}, getData() {}, types: [] };
+  const card = { dataset: { sessionKey: "session-b" } };
+  f.nodes.get("groups").fire("dragstart", { target: { closest: () => card }, dataTransfer: transfer });
+  f.document.fire("dragover", { clientX: 740, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.equal(f.nodes.get("workspace-drop-cue").textContent, "여기에 분할");
+  f.document.fire("drop", { clientX: 740, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.equal(f.frames.length, 1);
+  assert.deepEqual(f.infos.get("p1").ref, { key: "session-a", mode: "chat" });
+  const second = f.attach("p2");
+  assert.deepEqual(second.info.ref, { key: "session-b", mode: "chat" });
+  assert.equal(f.nodes.get("workspace-primary").style.width, "50%");
+  assert.equal(second.row.style.width, "50%");
+});
+
+test("a center drop into a loading empty pane is retained until its document is ready", () => {
+  const f = fixture(); f.workspace.add(null);
+  const transfer = { setData() {}, types: [] };
+  const card = { dataset: { sessionKey: "session-b" } };
+  f.nodes.get("groups").fire("dragstart", { target: { closest: () => card }, dataTransfer: transfer });
+  f.document.fire("dragover", { clientX: 990, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.equal(f.nodes.get("workspace-drop-cue").textContent, "빈 창에서 열기");
+  f.document.fire("drop", { clientX: 990, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.equal(f.frames.length, 1, "the empty pane is filled rather than split again");
+  assert.deepEqual(f.preferences.get("workspace").panes.p2, { key: "session-b", mode: "chat" });
+  assert.deepEqual(f.attach("p2").info.ref, { key: "session-b", mode: "chat" });
+  assert.equal(f.calls.filter(([name]) => name === "api").length, 0);
+});
+
+test("dropping a session onto its own pane explains the unchanged layout", () => {
+  const f = fixture(), transfer = { setData() {}, types: [] };
+  const card = { dataset: { sessionKey: "session-a" } };
+  f.nodes.get("groups").fire("dragstart", { target: { closest: () => card }, dataTransfer: transfer });
+  f.document.fire("dragover", { clientX: 1230, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.match(f.nodes.get("workspace-drop-cue").textContent, /이미 이 창에/);
+  f.document.fire("drop", { clientX: 1230, clientY: 400, dataTransfer: transfer, preventDefault() {} });
+  assert.equal(f.frames.length, 0);
+  assert.ok(f.calls.some(([name, message]) => name === "toast" && message.includes("이미 이 창에")));
+  assert.deepEqual(f.infos.get("p1").ref, { key: "session-a", mode: "chat" });
+});
+
+test("a center drop of an already open session swaps existing panes and a full workspace explains its limit", () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
+  const transfer = { setData() {}, types: [] }, card = { dataset: { sessionKey: "session-b" } };
+  const start = () => f.nodes.get("groups").fire("dragstart", { target: { closest: () => card }, dataTransfer: transfer });
+  const event = { clientX: 490, clientY: 400, dataTransfer: transfer, preventDefault() {} };
+  start(); f.document.fire("dragover", event);
+  assert.equal(f.nodes.get("workspace-drop-cue").textContent, "창 위치 교환");
+  f.document.fire("drop", event);
+  assert.equal(f.frames.length, 1); assert.equal(second.frame.appendCount, 1);
+  assert.equal(f.preferences.get("workspace").tree.children[0].pane, "p2");
+  f.workspace.add(null, "p1", "bottom"); f.workspace.add(null, "p2", "bottom");
+  card.dataset.sessionKey = "session-c";
+  const full = { ...event, clientX: 990, clientY: 227 };
+  start(); f.document.fire("dragover", full);
+  assert.match(f.nodes.get("workspace-drop-cue").textContent, /최대 4개/);
+  f.document.fire("drop", full);
+  assert.equal(f.frames.length, 3);
+  assert.ok(f.calls.some(([name, message]) => name === "toast" && message.includes("최대 4개")));
+  assert.deepEqual(f.infos.get("p1").ref, { key: "session-a", mode: "chat" });
+});
+
 test("terminal list entries target the focused pane, and unlinked terminals cannot cover the whole workspace", () => {
   const f = fixture(); f.workspace.add({ key: "session-b" }); f.attach("p2");
   assert.equal(f.workspace.routeTerminal({ id: "a".repeat(32), key: "session-b" }), true);

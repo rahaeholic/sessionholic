@@ -502,32 +502,49 @@
     }
     return null;
   }
+  function dropTarget(x, y, data) {
+    const target = targetAt(x, y);
+    if (!target || !data) return null;
+    const from = data.pane && ids(tree).includes(data.pane) ? data.pane
+      : typeof data.key === "string" && hooks.sessionExists(data.key) ? findRef({ key: data.key }) : null;
+    if (!from && (typeof data.key !== "string" || !hooks.sessionExists(data.key))) return null;
+    if (from === target.id) return { ...target, blocked: "이 세션은 이미 이 창에 열려 있습니다. 다른 세션을 끌어 분할해 주세요." };
+    if (from) return { ...target, from };
+    const row = panes.get(target.id), occupied = validRef(row.ref || row.hooks?.describe().ref);
+    // A list drop onto a conversation adds a view. Replacing that conversation
+    // made a successful center drop look like the split had done nothing.
+    const edge = target.edge === "center" && occupied ? "right" : target.edge;
+    return { ...target, edge, ...(edge !== "center" && ids(tree).length >= MAX_PANES
+      ? { blocked: "창은 최대 4개까지 열 수 있습니다." } : {}) };
+  }
   function cue(x, y) {
-    const target = targetAt(x, y), node = $("workspace-drop-cue");
+    const target = dropTarget(x, y, drag), node = $("workspace-drop-cue");
     if (!target) { node.hidden = true; return; }
     const outer = $("session-workspace").getBoundingClientRect(), box = target.box;
     let left = box.left - outer.left, top = box.top - outer.top, width = box.width, height = box.height;
     if (["left", "right"].includes(target.edge)) { width /= 2; if (target.edge === "right") left += width; }
     if (["top", "bottom"].includes(target.edge)) { height /= 2; if (target.edge === "bottom") top += height; }
     Object.assign(node.style, { left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px` });
-    node.textContent = target.edge === "center" ? drag?.pane ? "창 위치 교환" : "이 창에서 열기" : "여기에 분할";
+    node.textContent = target.blocked || (target.edge === "center" ? target.from ? "창 위치 교환" : "빈 창에서 열기" : "여기에 분할");
     node.hidden = false;
+    return target;
   }
   function clearDrag() { drag = null; $("workspace-drop-cue").hidden = true; doc.body.classList.remove("workspace-dragging"); }
   function drop(x, y, data) {
-    const target = targetAt(x, y);
-    if (!target || !data || [...panes.values()].some((row) => row.hooks?.describe().composing)) return;
-    doc.body.classList.remove("workspace-list-open");
-    if (data.pane && ids(tree).includes(data.pane)) {
-      tree = move(tree, data.pane, target.id, target.edge); active = data.pane; maximized = false; layout(); focus(active);
-    } else if (typeof data.key === "string" && hooks.sessionExists(data.key)) {
-      const existing = findRef({ key: data.key });
-      if (existing) {
-        tree = move(tree, existing, target.id, target.edge); active = existing; maximized = false; layout(); focus(active);
-      } else if (target.edge === "center") {
-        focus(target.id, false); local(() => panes.get(target.id).hooks?.select(data.key)); changed();
-      } else add({ key: data.key, mode: "chat" }, target.id, target.edge);
+    const target = dropTarget(x, y, data);
+    if (!hooks?.describe().authenticated || !data) return;
+    if (!target) { notify("세션을 대화 영역 안에 놓아 주세요."); return; }
+    if ([...panes.values()].some((row) => row.hooks?.describe().composing)) {
+      notify("한글 조합을 마친 뒤 분할해 주세요."); return;
     }
+    if (target.blocked) { notify(target.blocked); return; }
+    doc.body.classList.remove("workspace-list-open");
+    if (target.from) {
+      tree = move(tree, target.from, target.id, target.edge); active = target.from; maximized = false; layout(); focus(active);
+    } else if (target.edge === "center") {
+      const row = panes.get(target.id);
+      focus(target.id, false); row.ref = { key: data.key, mode: "chat" }; applyRef(row); changed();
+    } else add({ key: data.key, mode: "chat" }, target.id, target.edge);
   }
   function init(appHooks) {
     hooks = appHooks;
@@ -564,17 +581,22 @@
       $("session-workspace").classList.add("workspace-drop-ready");
       doc.body.classList.add("workspace-dragging");
     });
+    doc.addEventListener("dragenter", (event) => {
+      if (drag || Array.from(event.dataTransfer?.types || []).includes(MIME)) event.preventDefault();
+    }, true);
     doc.addEventListener("dragover", (event) => {
       if (!drag && !Array.from(event.dataTransfer?.types || []).includes(MIME)) return;
-      event.preventDefault(); cue(event.clientX, event.clientY);
-    });
+      event.preventDefault();
+      const target = cue(event.clientX, event.clientY);
+      if (target && event.dataTransfer) event.dataTransfer.dropEffect = target.from ? "move" : "copy";
+    }, true);
     doc.addEventListener("drop", (event) => {
       if (!drag && !Array.from(event.dataTransfer?.types || []).includes(MIME)) return;
       event.preventDefault();
       let data = drag;
       try { data ||= JSON.parse(event.dataTransfer.getData(MIME)); } catch { /* untrusted or foreign drag */ }
       drop(event.clientX, event.clientY, data); clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready");
-    });
+    }, true);
     doc.addEventListener("dragend", () => { clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready"); });
     root.addEventListener("resize", () => layout({ save: false }));
     root.addEventListener("beforeunload", (event) => {

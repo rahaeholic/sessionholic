@@ -6479,7 +6479,9 @@ function chatReceiptCopy(receipt) {
   if (receipt?.dispatchState === "not_started")
     return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
   if (receipt?.status === "failed" && receipt.confirmed === true)
-    return "요청 처리 중 오류가 발생했습니다. 대화를 확인해 주세요.";
+    return receipt.failureCode === "server_overloaded"
+      ? "응답 서버가 혼잡해 응답이 중단됐습니다. 메시지는 전달됐습니다. 잠시 후 이어서 요청해 주세요."
+      : "요청 처리 중 오류가 발생했습니다. 대화를 확인해 주세요.";
   const labels = {
     accepted: "메시지를 접수했습니다. 작업 완료는 대화에서 확인해 주세요.",
     queued: "메시지를 접수했습니다. 답변은 대화에서 확인해 주세요.",
@@ -6495,9 +6497,25 @@ function chatReceiptCopy(receipt) {
 function receiptSettled(entry) {
   return !entry.pending && !!entry.receipt?.requestId && entry.settledRequestId === entry.receipt.requestId;
 }
+function receiptSuperseded(entry) {
+  const receipt = entry.receipt;
+  if (entry.source?.agent !== "codex" || receipt?.status !== "failed" || receipt.confirmed !== true ||
+      receipt.dispatchState === "not_started" || !receipt.requestId || !receipt.turnId) return false;
+  if (entry.resolvedFailureRequestId === receipt.requestId) return true;
+  const data = entry.data;
+  if (!data || data.stale || chatKey(data.route || {}) !== chatKey(entry.source) || !Array.isArray(data.turns)) return false;
+  const index = data.turns.findIndex((turn) => turn.id === receipt.turnId);
+  if (index < 0 || !data.turns.slice(index + 1).some((turn) => typeof turn.id === "string" &&
+      turn.id !== receipt.turnId && ["inProgress", "completed", "interrupted", "failed"].includes(turn.status))) return false;
+  // Remember proven later progress when the bounded history pages out this turn.
+  // Preserve the failure receipt itself; this resolves only its composer notice.
+  entry.resolvedFailureRequestId = receipt.requestId;
+  return true;
+}
 function receiptNotice(entry) {
   const status = entry.receipt?.status;
   const phase = entry.data?.phase;
+  if (receiptSuperseded(entry)) return "";
   // A refusal keeps saying the draft was not sent; anything else waits while
   // the agent asks something (the phase says so).
   if (phase === "needs_input" && entry.receipt?.dispatchState !== "not_started" && status !== "failed") return "";
@@ -6514,7 +6532,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   const supported = chatSupported(entry, selected);
   const oneShot = chatOneShot(entry, selected);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
-  $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed");
+  $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed" && !receiptSuperseded(entry));
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();

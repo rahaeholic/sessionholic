@@ -17,6 +17,7 @@
   "docs/architecture.md",
   "docs/limitations.md",
   "docs/plan/2026-10-21-session-splits.md",
+  "docs/plan/2026-10-21-workspace-drop-repair.md",
   "docs/plan/mainboard-improvement-20261021.md",
   "docs/plan/sequential-followups-20261021.md",
   "docs/plan/session-history-retention.md",

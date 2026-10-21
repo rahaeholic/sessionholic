@@ -260,6 +260,9 @@ def _receipt(identity, request_id, thread):
                 delivery = delivery if delivery in ("completed", "interrupted", "failed") else "accepted"
                 return {"source": identity, "requestId": request_id, "delivery": delivery,
                         "confirmed": True, "readbackConfirmed": True, "turnId": turn.get("id"),
+                        **({"failureCode": "server_overloaded"} if delivery == "failed"
+                           and isinstance(turn.get("error"), dict)
+                           and turn["error"].get("codexErrorInfo") == "serverOverloaded" else {}),
                         "canRetry": False}
     return {"source": identity, "requestId": request_id, "delivery": "unknown", "confirmed": False,
             "readbackConfirmed": False, "turnId": None, "canRetry": False,

@@ -383,6 +383,13 @@ class ChatTest(unittest.TestCase):
         self.assertEqual(self.chat.receipt({'delivery':'rejected'},'request-0001')['status'],'failed')
         # A Claude send that attached its board terminal names it, for the screen's terminal list.
         self.assertEqual(self.chat.receipt({'delivery':'accepted','terminalId':TERMINAL_ID},'request-0001')['terminalId'],TERMINAL_ID)
+    def test_receipt_exposes_only_a_confirmed_allowlisted_native_failure_code(self):
+        result = {'delivery': 'failed', 'confirmed': True, 'failureCode': 'server_overloaded'}
+        self.assertEqual(self.chat.receipt(result, 'request-0001')['failureCode'], 'server_overloaded')
+        self.assertNotIn('failureCode', self.chat.receipt({**result, 'failureCode': 'private diagnostic'}, 'request-0001'))
+        self.assertNotIn('failureCode', self.chat.receipt({**result, 'confirmed': False}, 'request-0001'))
+        self.assertNotIn('failureCode', self.chat.receipt({**result, 'delivery': 'completed'}, 'request-0001'))
+
     def test_batch_receipts_use_one_read_and_plain_cache_hits_show_no_receipts(self):
         def rpc(host,op,args,timeout):
             self.calls.append((host['name'],op,args))

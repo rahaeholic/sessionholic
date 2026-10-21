@@ -23,6 +23,9 @@ body.workspace-split #workspace-primary > #detail { display: flex; position: rel
 .workspace-divider:hover, .workspace-divider:focus-visible { background: var(--accent); opacity: 0.45; }
 body.workspace-resizing { cursor: grabbing; user-select: none; -webkit-user-select: none; }
 body.workspace-resizing iframe, body.workspace-dragging iframe { pointer-events: none; }
+#workspace-drop-surface { display: none; }
+/* A parent-document target receives the native drop even above child documents. */
+body.workspace-dragging #workspace-drop-surface { display: block; position: absolute; inset: 0; z-index: 11; }
 #workspace-drop-cue { position: absolute; display: grid; place-content: center; z-index: 12; pointer-events: none; color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); border: 3px solid var(--accent); border-radius: 8px; font-weight: 600; }
 #session-workspace.workspace-drop-ready { display: block; position: relative; min-width: 0; min-height: 0; }
 #session-workspace.workspace-drop-ready #workspace-primary { display: flex; height: 100%; flex-direction: column; }

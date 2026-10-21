@@ -505,6 +505,8 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
+                **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
+                   and result.get('failureCode') == 'server_overloaded' else {}),
                 'attachments': Chat.attachment_history(result.get('attachments', [])),
                 # A Claude send that attached the session's board terminal names it: the screen
                 # reads its terminal list then (its marks show the terminal at once).

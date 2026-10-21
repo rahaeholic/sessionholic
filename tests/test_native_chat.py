@@ -962,6 +962,22 @@ class NativeChatTests(unittest.TestCase):
 
 
 class StoppedOnErrorTest(unittest.TestCase):
+    def test_failed_receipt_explains_server_overload_without_exposing_native_error_text(self):
+        request_id = 'request-overloaded-001'
+        turn = {'id': 'failed-turn', 'status': 'failed',
+                'items': [{'type': 'userMessage', 'clientId': request_id}],
+                'error': {'codexErrorInfo': 'serverOverloaded', 'message': 'private Native diagnostic'}}
+        result = chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]})
+        self.assertEqual(result['delivery'], 'failed')
+        self.assertTrue(result['confirmed'])
+        self.assertFalse(result['canRetry'])
+        self.assertEqual(result['failureCode'], 'server_overloaded')
+        self.assertNotIn('private', json.dumps(result))
+        turn['error']['codexErrorInfo'] = 'private-arbitrary-code'
+        self.assertNotIn('failureCode', chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]}))
+        turn['error'] = 'private invalid Native error'
+        self.assertNotIn('failureCode', chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]}))
+
     def test_a_codex_stopped_on_an_error_reads_as_waiting_and_says_why_input_is_locked(self):
         source = {'agent': 'codex', 'home': '.codex-isolated', 'id': str(uuid.uuid4()), 'cwd': '/tmp/project'}
         thread = {'id': source['id'], 'cwd': '/tmp/project', 'status': {'type': 'systemError'}, 'canAcceptDirectInput': True,
