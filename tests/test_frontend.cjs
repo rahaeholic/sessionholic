@@ -3825,11 +3825,11 @@ test('changing list filters removes hidden cards without changing the selected s
 test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'up', 'left', 'down', 'right', 'enter'])
+  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
     assert.match(html, new RegExp(`data-key="${key}"`));
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
-  assert.match(css, /"ctrl k1 k2 k3 k4 meta up\s+\.\s+enter"/);
+  assert.match(css, /"ctrl k1 k2 k3 k4 meta up\s+word\s+enter"/);
   assert.match(css, /"alt\s+k5 k6 k7 k8 left down right enter"/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
@@ -3920,6 +3920,17 @@ test('held bar modifiers combine with the next key from the bar, the input bar o
   }, noChatTimers);
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   c.state.connected = true;
+  c.state.terminal = { id: 'term-1' };
+  c.pressTerminalKey('alt-left');
+  await settle();
+  assert.deepEqual(calls.splice(0), ['\x1bb']);
+  c.state.capabilities = { hosts: [{ name: 'pc', platform: 'windows' }] };
+  c.state.terminal = { id: 'term-1', host: 'pc' };
+  c.toggleTerminalMod('ctrl');
+  c.pressTerminalKey('alt-left');
+  await settle();
+  assert.deepEqual(calls.splice(0), ['\x1b[1;5D']);
+  assert.equal(c.state.terminalMods.ctrl, false, 'the preset releases a held modifier');
   c.state.terminal = { id: 'term-1' };
   c.pressTerminalKey('up');
   await settle();

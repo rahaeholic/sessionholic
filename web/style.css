@@ -2860,7 +2860,7 @@ li[data-task] {
   grid-template-columns: minmax(0, 1fr) repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
   grid-template-rows: repeat(2, 42px);
   grid-template-areas:
-    "ctrl k1 k2 k3 k4 meta up   .     enter"
+    "ctrl k1 k2 k3 k4 meta up   word  enter"
     "alt  k5 k6 k7 k8 left down right enter";
   gap: 5px;
   max-width: 620px;
@@ -2892,6 +2892,7 @@ li[data-task] {
 .terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
 .terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
 .terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
+.terminal-keys [data-key="alt-left"] { grid-area: word; }
 .terminal-keys [data-key="up"] { grid-area: up; }
 .terminal-keys [data-key="left"] { grid-area: left; }
 .terminal-keys [data-key="down"] { grid-area: down; }

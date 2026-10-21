@@ -11138,6 +11138,11 @@ function sendTerminalBytes(bytes) {
 // A key on the bar: its own bytes, or combined with the held modifiers (then released).
 function pressTerminalKey(name) {
   if (state.composing || state.draftPaste) return;
+  if (name === "alt-left") {
+    clearTerminalMods();
+    sendTerminalBytes(terminalKeyBytes("ArrowLeft", { alt: true }, { windows: terminalOnWindows() }));
+    return;
+  }
   let bytes = TERMINAL_BAR_BYTES[name];
   if (anyTerminalMod()) {
     const [key, base = {}] = TERMINAL_BAR_KEYS[name] || [];
