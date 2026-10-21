@@ -159,6 +159,42 @@ function textOf(node) {
   return [node.textContent || "", ...(node.children || []).map(textOf)].join(" ");
 }
 
+test("workspace GET sharing preserves auth epochs and never proxies a write", async () => {
+  const requests = [], shared = [];
+  const c = client(async (path, options) => { requests.push([path, options.method]); return { ok: true, status: 200, json: async () => ({ posted: true }) }; });
+  c.context.window.SessionholicWorkspace = {
+    sharedRead: (path) => { shared.push(path); return Promise.resolve({ version: 7 }); }, mutated() {},
+  };
+  assert.equal((await c.api("/api/snapshot?refresh=1")).version, 7);
+  assert.deepEqual(requests, []);
+  await c.api("/api/chat/send", { method: "POST", body: { source: { id: "test" }, text: "fixture" } });
+  assert.deepEqual(requests, [["/api/chat/send", "POST"]]);
+  assert.deepEqual(shared, ["/api/snapshot?refresh=1"]);
+  let resolve;
+  c.context.window.SessionholicWorkspace.sharedRead = () => new Promise((done) => { resolve = done; });
+  const pending = c.api("/api/capabilities");
+  c.beginAuthEpoch(); resolve({ csrfToken: "stale-test" });
+  await assert.rejects(pending, (error) => error.staleAuth === true);
+});
+
+test("embedded panes never create global EventSources and layout restore never starts a missing session", () => {
+  const c = client(() => { throw new Error("layout cannot launch a session"); });
+  let created = 0;
+  c.context.EventSource = class { constructor() { created++; } };
+  c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true };
+  c.state.authenticated = true; c.state.snapshot = { hosts: [] };
+  c.syncEvents();
+  assert.equal(created, 0);
+  const hooks = vm.runInContext("workspaceHooks()", c.context);
+  assert.equal(hooks.restore({ key: "no-longer-listed", mode: "terminal" }), false);
+  assert.equal(hooks.restore({ terminalId: "a".repeat(32), mode: "terminal" }), false);
+  const entry = { text: "keep this draft", pending: { requestId: "uncertain" } };
+  c.state.chats.set("fixture", entry);
+  assert.equal(hooks.canClose(), false);
+  assert.equal(entry.text, "keep this draft");
+  assert.equal(entry.pending.requestId, "uncertain");
+});
+
 test("routing uses runtime identity; Codex accounts preserve home isolation", () => {
   const c = client();
   assert.equal(
@@ -2773,7 +2809,7 @@ test('service worker evicts only its own old shells and offline reads use the cu
   listeners.fetch({ request: { method: 'GET', url: 'https://app.example/' },
     respondWith: (promise) => { response = promise; }, waitUntil() {} });
   assert.equal(await response, currentShell);
-  assert.deepEqual(opened, ['sessionholic-shell-v14']);
+  assert.deepEqual(opened, ['sessionholic-shell-v15']);
 });
 
 test('an offline first launch restores authentication and already-open terminal rows without reopening their sessions', async () => {
@@ -6374,7 +6410,7 @@ test('service worker keeps only responses the server marked immutable, so a mism
   const cached = sw.fetched.length;
   assert.equal(await (await sw.run('/app.js?v=bbbbbbbb')).text(), '/app.js@bbbbbbbb');
   assert.equal(sw.fetched.length, cached, 'served from the cache');
-  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v14";/,
+  assert.match(fs.readFileSync(path.join(__dirname, '../web/sw.js'), 'utf8'), /const CACHE = "sessionholic-shell-v15";/,
     'a new cache name drops entries stored by the older rule');
 });
 
@@ -10768,16 +10804,55 @@ test('the terminal button opens the session terminal already open instead of pla
   assert.equal(c.context.openedTerminal.id, exact.id);
   assert.equal(c.context.planned, undefined, 'no second connection is planned');
   assert.equal(c.context.toasts, undefined);
-  // A start-time estimate stays reachable from the independent list, never mounted as this conversation's terminal.
+  // A start-time estimate cannot trap this conversation: review an exact attach
+  // to the same native ID without mounting the estimated terminal or sending input.
   const estimated = { ...exact, id: 'b'.repeat(32), mode: 'new-session', linkConfidence: 'estimated' };
   c.state.terminals = [estimated];
   c.openChatTerminal(s);
   assert.equal(c.context.openedTerminal.id, exact.id);
-  assert.match(c.context.toasts[0], /정확한 터미널 연결/);
+  assert.match(c.context.toasts[0], /같은 대화에 연결/);
+  assert.equal(c.context.planned, 1);
+  assert.equal(c.state.route.host, s.host);
+  assert.equal(c.state.route.account, 'codex:' + s.home);
   // None live for this session (ended, or another session's): a plan as before.
   c.state.terminals = [{ ...exact, alive: false }, { ...exact, id: 'c'.repeat(32), nativeSource: { ...exact.nativeSource, id: 'other' } }];
   c.openChatTerminal(s);
-  assert.equal(c.context.planned, 1);
+  assert.equal(c.context.planned, 2);
+});
+
+test('a later exact attach wins over an earlier estimated launcher and another cwd', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  s.cwd = '/work/project';
+  const source = { ...c.sourceOf(s), cwd: s.cwd };
+  const estimated = { id: 'a'.repeat(32), alive: true, mode: 'new-session', linkConfidence: 'estimated', nativeSource: source };
+  const wrongCwd = { id: 'b'.repeat(32), alive: true, mode: 'attach', nativeSource: { ...source, cwd: '/work/other' } };
+  const exact = { id: 'c'.repeat(32), alive: true, mode: 'attach', nativeSource: source };
+  c.state.terminals = [estimated, wrongCwd, exact];
+  c.state.terminal = estimated; c.state.terminalAlive = true;
+  entry.text = '아직 보내지 않은 초안';
+  vm.runInContext('openTerminal = (terminal) => { globalThis.openedTerminal = terminal; };'
+    + 'preparePlan = () => { throw new Error("an exact terminal already exists"); };', c.context);
+  assert.equal(c.terminalForSession(s).id, exact.id);
+  c.openChatTerminal(s);
+  assert.equal(c.context.openedTerminal.id, exact.id);
+  assert.equal(entry.text, '아직 보내지 않은 초안');
+});
+
+test('a failed launcher exposes account mismatch after wrapped output and clears obsolete menu buttons', () => {
+  const c = client(undefined, noChatTimers);
+  const functions = vm.runInContext('({terminalLaunchFailure,currentTerminalLaunchFailure,showTerminalEnded})', c.context);
+  const lines = ['선택: 1', '실행하지 않았습니다: 선택 계정과 이 Mac에 로그인된', '계정이 다릅니다. 실행을 중단했습니다.', '[exited]'];
+  assert.match(functions.terminalLaunchFailure(lines), /실제 로그인 계정이 달라/);
+  assert.equal(functions.terminalLaunchFailure(['일반 메시지', '[exited]']), '');
+  c.state.terminal = { id: 'a'.repeat(32), mode: 'new-session', alive: false, closedReason: 'connection_ended' };
+  c.state.term = { buffer: { active: { length: lines.length, getLine: (i) => ({ translateToString: () => lines[i] }) } } };
+  c.get('terminal-menu').hidden = false;
+  functions.showTerminalEnded();
+  assert.equal(c.get('terminal-menu').hidden, true);
+  assert.equal(c.get('terminal-reopen').hidden, false);
+  assert.equal(c.get('terminal-reopen').textContent, '새 세션 다시 열기');
+  c.state.terminal.nativeSource = { host: 'workstation', id: 'confirmed-session' };
+  assert.equal(functions.currentTerminalLaunchFailure(), '', 'an established session is not classified by quoted output');
 });
 
 test('a listening shows the mic screen with the words it heard, large, and its 끝내기 ends it as the mic does', async () => {

@@ -4135,7 +4135,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def static(self, path, query=""):
-        name = "index.html" if path in ("/", "") else path.lstrip("/")
+        pane = path == "/pane"
+        name = "index.html" if path in ("/", "", "/pane") else path.lstrip("/")
         assets = self.server.assets
         entry = assets.index() if name == "index.html" else assets.file(name)
         if entry is None:
@@ -4145,6 +4146,12 @@ class Handler(BaseHTTPRequestHandler):
         packed = entry["gzip"] if self.accepts_gzip() else None
         etag = '"%s%s"' % (entry["etag"], "-gz" if packed else "")
         extra = {"Cache-Control": IMMUTABLE if immutable else "no-cache", "ETag": etag, "Vary": "Accept-Encoding"}
+        if pane:
+            # Only the pane entry can be embedded, and only by this installation.
+            # The normal entry and every API retain DENY / frame-ancestors 'none'.
+            extra["Content-Security-Policy"] = SECURITY_HEADERS["Content-Security-Policy"].replace(
+                "frame-ancestors 'none'", "frame-ancestors 'self'")
+            extra["X-Frame-Options"] = "SAMEORIGIN"
         if name == "sw.js":
             extra["Service-Worker-Allowed"] = "/"
         if etag_matches(self.headers.get("If-None-Match"), etag):

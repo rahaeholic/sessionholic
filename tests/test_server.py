@@ -230,6 +230,22 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/", headers={"Host": "remote.tail-example.ts.net"})
         self.assertEqual(res.status, 200)
 
+    def test_only_workspace_entry_allows_same_origin_framing(self):
+        response, page = self.request('GET', '/pane?pane=p2')
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'workspace.js', page)
+        self.assertEqual(response.getheader('X-Frame-Options'), 'SAMEORIGIN')
+        self.assertIn("frame-ancestors 'self'", response.getheader('Content-Security-Policy'))
+        self.assertEqual(response.getheader('Cache-Control'), 'no-cache')
+        etag = response.getheader('ETag')
+        response, _ = self.request('GET', '/pane?pane=p2', headers={'If-None-Match': etag})
+        self.assertEqual(response.status, 304)
+        self.assertEqual(response.getheader('X-Frame-Options'), 'SAMEORIGIN')
+        for path in ('/', '/index.html', '/api/snapshot', '/workspace.js'):
+            response, _ = self.request('GET', path)
+            self.assertEqual(response.getheader('X-Frame-Options'), 'DENY', path)
+            self.assertIn("frame-ancestors 'none'", response.getheader('Content-Security-Policy'), path)
+
     def test_csp_allows_blob_images_only_in_img_src(self):
         res, _ = self.request("GET", "/")
         policy = dict(part.strip().split(" ", 1) for part in res.getheader("Content-Security-Policy").split(";"))

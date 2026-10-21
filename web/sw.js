@@ -10,9 +10,11 @@
 // - The same assets without a version: network first (pages served before
 //   versioned URLs, or by a server that does not fill them in).
 // - Anything else (API, login, terminal, other queries) is never touched.
-const CACHE = "sessionholic-shell-v14";
+const CACHE = "sessionholic-shell-v15";
 const ASSETS = new Set([
   "/app.js",
+  "/workspace.js",
+  "/workspace.css",
   "/session_labels.js",
   "/session_history.js",
   "/session_relations.js",

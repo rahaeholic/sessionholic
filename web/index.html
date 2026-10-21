@@ -23,6 +23,7 @@
     <!-- Applies the stored theme and text size before the first paint. -->
     <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/workspace.css" />
     <!-- The terminal library (vendor/xterm.*, addon-fit) loads on first terminal open. -->
     <script src="/message-format.js" defer></script>
     <script src="/session_labels.js" defer></script>
@@ -31,6 +32,7 @@
     <script src="/session_context.js" defer></script>
     <script src="/session_delegation.js" defer></script>
     <script src="/push.js" defer></script>
+    <script src="/workspace.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -144,6 +146,8 @@
             <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
           </svg>
         </button>
+        <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
+        <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>◫ 분할</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
       <div
@@ -268,6 +272,8 @@
             ><button id="return-terminal" type="button">돌아가기</button>
           </div>
         </aside>
+        <section id="session-workspace" class="session-workspace" aria-label="세션 작업 공간">
+        <section id="workspace-primary" class="workspace-pane" data-pane-id="p1">
         <main id="detail" class="detail-pane" aria-label="세션 대화">
           <div class="welcome">
             <img class="welcome-mark" src="/icon.svg" alt="" />
@@ -275,6 +281,10 @@
             <p>세션을 고르면 최근 대화를 볼 수 있습니다.<br />이어서 사용할 에이전트와 계정도 여기서 선택하세요.</p>
           </div>
         </main>
+        </section>
+        <div id="workspace-dividers"></div>
+        <div id="workspace-drop-cue" hidden></div>
+        </section>
       </div>
     </div>
     <div id="offline-banner" class="offline-banner" role="status" hidden>
@@ -556,6 +566,12 @@
           <button id="saved-prompts-save" class="push-button" type="button">프롬프트 저장</button>
           <button id="saved-prompts-reload" class="push-button" type="button">최신 프롬프트 불러오기</button>
         </div>
+        <label class="theme-label settings-section" for="workspace-keys">창 이동 단축키 · Mac / iPad</label>
+        <select id="workspace-keys" class="workspace-keys">
+          <option value="ctrl-meta">Control + Command (기본)</option>
+          <option value="ctrl-alt-meta">Control + Option + Command</option>
+        </select>
+        <p class="plan-preserve">선택한 조합 + 방향키: 창 이동 · 1~4: 바로 이동 · Enter: 확대·복원</p>
         <p id="push-label" class="theme-label settings-section">알림</p>
         <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
         <div class="push-actions">
@@ -694,6 +710,12 @@
           <dt><kbd>Enter</kbd> <kbd>I</kbd></dt><dd>입력창으로</dd>
           <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>질문 카드의 선택지 고르기</dd>
           <dt><kbd>⌘↩</kbd> <kbd>Ctrl+Enter</kbd></dt><dd>보내기</dd>
+        </dl>
+        <p class="theme-label">창 분할 · Mac / iPad 외장 키보드</p>
+        <dl class="shortcuts">
+          <dt><kbd>Control+Command+← ↑ ↓ →</kbd></dt><dd>해당 방향의 세션 창으로 이동</dd>
+          <dt><kbd>Control+Command+1</kbd>–<kbd>4</kbd></dt><dd>배치 순서의 창으로 바로 이동</dd>
+          <dt><kbd>Control+Command+Enter</kbd></dt><dd>현재 창 확대·원래 배치 복원</dd>
         </dl>
         <p class="theme-label">세션 끝내기</p>
         <dl class="shortcuts">
