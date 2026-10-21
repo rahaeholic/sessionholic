@@ -14640,6 +14640,21 @@ test('결과 불명인 터미널 첨부 전송은 새 화면에서 재전송 가
   assert.match(restored.get('draft-recovery-status').textContent, /자동 복원하지 않습니다/);
 });
 
+test('서버 재연결 뒤 첨부 403은 상태만 새로 읽고 명시적 재시도에 새 토큰을 사용한다', async () => {
+  const uploads = []; let caps = 0;
+  const c = terminalFilesClient(async (url, options) => {
+    if (url === '/api/capabilities') { caps++; return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'new-fixture-token' }) }; }
+    uploads.push(options.headers['X-CSRF-Token']);
+    return uploads.length === 1 ? { ok: false, status: 403, json: async () => ({ error: 'expired' }) } : fileReply();
+  });
+  await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
+  assert.equal(uploads.length, 1); assert.equal(caps, 1);
+  assert.equal(c.terminalAttachmentEntry().uploadQueue.length, 1);
+  await c.uploadTerminalFiles();
+  assert.deepEqual(uploads, ['csrf-test', 'new-fixture-token']);
+  assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+});
+
 test('터미널 첨부 업로드 실패는 재시도할 선택을 보관하고 로그아웃 후 늦은 응답은 버린다', async () => {
   let done, fail = true;
   const c = terminalFilesClient(async () => {

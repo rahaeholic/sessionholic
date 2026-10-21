@@ -10445,6 +10445,10 @@ async function uploadTerminalFiles(files = []) {
         });
       if (!retained()) return;
       if (response.status === 401) { showLogin(); return; }
+      if (response.status === 403) {
+        await loadCapabilities(authEpoch, { refreshView: false });
+        throw new Error("연결 상태를 새로 확인했습니다. 첨부 다시 올리기를 눌러 주세요.");
+      }
       const attachment = response.data?.attachment;
       if (!response.ok || !validTerminalAttachment(attachment)) throw new Error(response.data?.error || "첨부 전송을 확인하지 못했습니다. 다시 올려 주세요.");
       const thumb = entry.thumbs.get(item.key);
