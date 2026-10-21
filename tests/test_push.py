@@ -214,6 +214,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         endpoint, headers = self.sent[0]
         self.assertEqual((endpoint, headers["TTL"], headers["Urgency"], headers["Content-Length"]), (APPLE, "86400", "high", "0"))
+        self.clock.now += push.FINISH_SETTLE
         pending = self.service.pending_for(self.service.subscriptions[0]["id"])["notifications"]
         self.assertEqual(len(pending), 2)
         waiting = next(item for item in pending if item["kind"] == "needs_input")
@@ -235,6 +236,7 @@ class ServiceTest(unittest.TestCase):
                        row("019a0000-0000-7000-8000-000000000002", phase="done", updatedAt=self.clock.now))
         with patch("sys.stderr", new_callable=io.StringIO) as log:
             self.service.step()
+        self.clock.now += push.FINISH_SETTLE
         self.assertEqual(len(self.service.pending_for(self.service.subscriptions[0]["id"])["notifications"]), 2)
         self.assertIn("알림 2건(답 필요 1) · 기기 1대 중 1대 전달", log.getvalue())
 
@@ -318,6 +320,53 @@ class ServiceTest(unittest.TestCase):
         self.board.set(row(phase="needs_input"), row("019a0000-0000-7000-8000-000000000011", phase="idle", source="exec",
                                                      updatedAt=self.clock.now))
         self.assertEqual(self.service.step(), [])
+
+    def test_resuming_work_cancels_old_queued_notices_before_retry_or_browser_read(self):
+        self.subscribe()
+        target = self.service.subscriptions[0]
+        self.board.set(row(phase='working')); self.service.step()
+        self.clock.now += push.MIN_WORK
+        self.board.set(row(phase='idle', updatedAt=self.clock.now)); self.service.step()
+        self.assertEqual(self.service.pending_for(target['id'], retain=True)['notifications'], [])
+        self.assertEqual(len(self.service.pending[target['id']]), 1, 'completion waits for a stable resting state')
+        sent = len(self.sent)
+        self.board.set(row(phase='working', updatedAt=self.clock.now))
+        current = self.service.pending_for(target['id'], retain=True)
+        self.assertEqual(current['notifications'], [])
+        self.assertTrue(any(tag.startswith('session:') for tag in current['dismissTags']))
+        self.clock.now += push.ACK_RETRY
+        self.service.retry()
+        self.assertEqual(len(self.sent), sent)
+        self.assertEqual(self.make().pending_for(target['id'], retain=True)['notifications'], [])
+
+    def test_finished_alert_waits_for_a_stable_pause_and_needs_input_remains_immediate(self):
+        self.subscribe(); target = self.service.subscriptions[0]
+        self.board.set(row(phase='working')); self.service.step()
+        self.clock.now += push.MIN_WORK
+        self.board.set(row(phase='idle', updatedAt=self.clock.now)); self.service.step()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.service.pending_for(target['id'])['notifications'], [])
+        self.assertEqual(len(self.service.pending[target['id']]), 1, 'legacy reads retain deferred notices')
+        self.clock.now += push.FINISH_SETTLE
+        self.service.retry()
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.service.pending_for(target['id'], retain=True)['notifications']), 1)
+        self.board.set(row(phase='needs_input', updatedAt=self.clock.now)); self.service.step()
+        self.assertEqual(len(self.sent), 2)
+
+    def test_unknown_runtime_holds_a_notice_without_showing_or_waking_then_rechecks(self):
+        self.subscribe(); target = self.service.subscriptions[0]
+        self.board.set(row(phase='working')); self.service.step()
+        self.board.set(row(phase='needs_input', updatedAt=self.clock.now)); self.service.step()
+        self.board.set(row(phase='unknown', runtimeKnown=False)); sent = len(self.sent)
+        self.clock.now += push.ACK_RETRY
+        self.service.retry()
+        self.assertEqual(len(self.sent), sent)
+        self.assertEqual(self.service.pending_for(target['id'], retain=True)['notifications'], [])
+        self.assertEqual(len(self.service.pending[target['id']]), 1)
+        self.board.set(row(phase='needs_input', updatedAt=self.clock.now))
+        self.service.retry()
+        self.assertEqual(len(self.sent), sent + 1)
 
     def test_a_passing_failure_is_retried_and_one_device_never_stops_the_others(self):
         import http.client

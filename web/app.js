@@ -242,6 +242,7 @@ const state = {
   // A wide screen shows the terminal beside the conversation ("나란히"); "크게" covers the board.
   terminalDock: prefs.get("terminalDock", true) !== false,
   inlineTerminal: null,
+  launcherWorkspace: null,
   docked: false,
   dockSolo: false,
   dockWidth: 0,
@@ -493,6 +494,7 @@ function navTransition(direction, update) {
 // reads depend on it); only the visible switch may wait for the transition.
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
   if (!shown && state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
+  if (!shown) state.launcherWorkspace = null;
   if (!shown) rememberConversationView();
   const changed = state.detailShown !== shown;
   state.detailShown = shown;
@@ -1409,6 +1411,7 @@ function renderSessionList(sessions, now) {
 function render() {
   if (!state.snapshot) return;
   if (state.inlineTerminal && !inlineTerminalCurrent(state.inlineTerminal)) leaveInlineTerminal({ loadChat: false });
+  syncLauncherWorkspace();
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
@@ -3373,6 +3376,7 @@ function restoreConversationView(list) {
 function select(key) {
   if (state.launchBusy) return;
   if (state.inlineTerminal && (state.inlineTerminal.key !== key || !inlineTerminalCurrent(state.inlineTerminal))) leaveInlineTerminal({ loadChat: false });
+  state.launcherWorkspace = null;
   state.recoveryRun++;
   state.recoveryBusy = null;
   // Another session (a click, a notification) drops a keyboard entry's pending input focus.
@@ -4703,7 +4707,7 @@ function conversationHistoryNotice(s, entry) {
 }
 function chatReadUnavailable(entry) {
   const data = entry.data, code = data?.runtimeReasonCode || data?.runtimeObservation?.reasonCode;
-  return data?.runtimeKnown === false && (data.stale === true ||
+  return data?.stateReadSuperseded === true || data?.runtimeKnown === false && (data.stale === true ||
     ["server_status_unavailable", "read_unavailable"].includes(code));
 }
 function chatRecovery(entry, selected = selectedSession() || null) {
@@ -4713,7 +4717,7 @@ function chatRecovery(entry, selected = selectedSession() || null) {
   if (chatOneShot(entry, selected)) return null;
   if (chatKey(entry.data?.route || {}) !== chatKey(entry.source)) return null;
   if (chatReadUnavailable(entry)) return { supported: true, action: "refresh_host",
-    reason: "실행 상태를 읽지 못했습니다. 대화와 초안은 유지하며 자동으로 다시 확인합니다." };
+    reason: "최신 상태를 확인하고 있습니다. 메시지 작성과 음성 입력은 계속할 수 있습니다." };
   const recovery = entry.data?.recovery;
   if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
   return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
@@ -6511,7 +6515,9 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   // next ⌘↩. sendChat itself refuses a second send meanwhile.
   const input = $("chat-input");
   input.placeholder = chatPlaceholder(oneShot);
-  input.disabled = !supported && !gateOn && recovery?.action !== "resume_session";
+  // Drafting belongs to this conversation, not to a transient send capability.
+  // A refresh/offline read must never blur IME or interrupt speech recognition.
+  input.disabled = !state.authenticated || oneShot || !!botRequestForNative(entry.source);
   input.readOnly = !input.disabled && (entry.sending || !!entry.pending || !!entry.commandBusy);
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
@@ -10245,6 +10251,7 @@ function inlineTerminalRef(s) {
   return s ? { key: s.key, identity: conversationIdentity(s) } : null;
 }
 function inlineTerminalCurrent(ref) {
+  if (ref?.terminalId) return launcherWorkspaceCurrent(ref.terminalId);
   const selected = selectedSession();
   return !!ref && !!selected && ref.key === selected.key && ref.identity === conversationIdentity(selected);
 }
@@ -10260,16 +10267,11 @@ function terminalMatchesDetail(terminal, s) {
   return !!source && sameRecoverySource(source, s) &&
     (s.agent !== "claude" || !s.sessionId || source.sessionId === s.sessionId);
 }
-function buildDetailModeTabs(s) {
+function buildModeTabs(choose, chatControls = "messages") {
   const tabs = el("div", "detail-mode-tabs"); tabs.id = "detail-mode-tabs";
-  const identity = conversationIdentity(s), authEpoch = state.authEpoch;
   tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "작업 보기 방식");
-  for (const [mode, label, controls] of [["chat", "채팅", "messages"], ["terminal", "터미널", "detail-terminal-host"]]) {
-    const tab = button(label, "detail-mode-tab", () => {
-      if (!state.authenticated || authEpoch !== state.authEpoch || state.selected !== s.key || conversationIdentity(selectedSession()) !== identity) return;
-      if (mode === "chat") leaveInlineTerminal();
-      else openChatTerminal(selectedSession());
-    });
+  for (const [mode, label, controls] of [["chat", "채팅", chatControls], ["terminal", "터미널", "detail-terminal-host"]]) {
+    const tab = button(label, "detail-mode-tab", () => choose(mode));
     tab.id = `detail-mode-${mode}`; tab.setAttribute("role", "tab");
     tab.setAttribute("aria-controls", controls); tab.setAttribute("aria-selected", String(mode === "chat"));
     tab.tabIndex = mode === "chat" ? 0 : -1;
@@ -10281,6 +10283,82 @@ function buildDetailModeTabs(s) {
     tabs.append(tab);
   }
   return tabs;
+}
+function buildDetailModeTabs(s) {
+  const identity = conversationIdentity(s), authEpoch = state.authEpoch;
+  return buildModeTabs((mode) => {
+    if (!state.authenticated || authEpoch !== state.authEpoch || state.selected !== s.key || conversationIdentity(selectedSession()) !== identity) return;
+    if (mode === "chat") leaveInlineTerminal();
+    else openChatTerminal(selectedSession());
+  });
+}
+function launcherWorkspaceCurrent(terminalId) {
+  return !!terminalId && state.launcherWorkspace?.terminalId === terminalId &&
+    state.launcherWorkspace.authEpoch === state.authEpoch && !state.selected && !state.selectedBotRequest;
+}
+function launcherConversation(terminal) {
+  const source = terminalInfo(terminal).nativeSource;
+  return source && terminalMatchesDetail(terminal, source) ? source : null;
+}
+function launcherWorkspaceTerminal() {
+  const id = state.launcherWorkspace?.terminalId;
+  return state.terminals.find((terminal) => terminal.id === id) || (state.terminal?.id === id ? state.terminal : null);
+}
+function showLauncherChat(terminalId) {
+  if (!launcherWorkspaceCurrent(terminalId)) return;
+  const terminal = launcherWorkspaceTerminal();
+  if (!terminal) return;
+  if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
+  if (launcherConversation(terminal)) {
+    state.launcherWorkspace = null;
+    openNativeChat(terminal);
+  }
+}
+function syncLauncherWorkspace() {
+  const id = state.launcherWorkspace?.terminalId;
+  // A user already waiting on the chat tab follows only a verified native identity.
+  // Never redraw underneath terminal input or infer the conversation from its title/time.
+  if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.detailShown &&
+      launcherConversation(launcherWorkspaceTerminal())) showLauncherChat(id);
+}
+async function openNewSessionTerminal(terminal, { recordHistory = true } = {}) {
+  if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false, animate: false, loadChat: false });
+  if (launcherConversation(terminal)) {
+    openNativeChat(terminal);
+    const selected = selectedSession();
+    if (selected && terminalMatchesDetail(terminal, selected))
+      return openTerminal(terminal, { inline: inlineTerminalRef(selected), recordHistory: false });
+    return;
+  }
+  if (!launcherWorkspaceCurrent(terminal.id)) {
+    rememberConversationView(); stopChatPolling();
+    state.selected = null; state.selectedBotRequest = null;
+    state.detailFor = null; state.detailRevision = null; state.detailRun++;
+    state.launcherWorkspace = { terminalId: terminal.id, authEpoch: state.authEpoch };
+    const head = el("div", "detail-head");
+    const back = button("←", "back", backToList); back.setAttribute("aria-label", "세션 목록으로 돌아가기");
+    const titles = el("div", "detail-titles");
+    titles.append(el("h1", "detail-title", "새 세션"), el("span", "detail-device", hostLabel(terminalInfo(terminal).host)));
+    head.append(back, titles);
+    const id = terminal.id;
+    const tabs = buildModeTabs((mode) => {
+      if (!state.authenticated || !launcherWorkspaceCurrent(id)) return;
+      if (mode === "chat") showLauncherChat(id);
+      else {
+        const current = launcherWorkspaceTerminal();
+        if (current) openTerminal(current, { inline: { terminalId: id } });
+      }
+    }, "launcher-chat-waiting");
+    const waiting = el("div", "welcome", "아직 연결된 대화가 없습니다. 터미널에서 작업을 시작하면 대화 연결을 확인합니다.");
+    waiting.id = "launcher-chat-waiting"; waiting.setAttribute("role", "tabpanel");
+    const host = el("div", "detail-terminal-host"); host.id = "detail-terminal-host";
+    host.setAttribute("role", "tabpanel"); host.hidden = true;
+    $("detail").dataset.key = "";
+    $("detail").replaceChildren(head, tabs, waiting, host);
+  }
+  if (recordHistory) navigateView("detail");
+  setDetailShown(true);
+  return openTerminal(terminal, { inline: { terminalId: terminal.id }, recordHistory: false });
 }
 function renderDetailMode() {
   const active = !!state.inlineTerminal && state.terminalVisible && inlineTerminalCurrent(state.inlineTerminal);
@@ -10300,6 +10378,8 @@ function restoreTerminalHome() {
 }
 function leaveInlineTerminal({ loadChat = true } = {}) {
   if (!state.inlineTerminal) return;
+  const active = document.activeElement;
+  if (active?.closest?.("#terminal-screen")) active.blur?.();
   const ref = state.inlineTerminal;
   saveDraft(); stopTerminalReader(); state.inputEpoch++; state.terminalOpenRun++;
   state.inlineTerminal = null; state.terminalVisible = false;
@@ -10560,7 +10640,10 @@ function loadXterm() {
   return xtermLoading;
 }
 async function openTerminal(terminal, { recordHistory = true, inline = null } = {}) {
-  if (inline && (!inlineTerminalCurrent(inline) || !terminalMatchesDetail(terminal, selectedSession()))) {
+  if (!inline && terminalInfo(terminal).mode === "new-session") return openNewSessionTerminal(terminal, { recordHistory });
+  if (inline && (!inlineTerminalCurrent(inline) || (inline.terminalId
+      ? inline.terminalId !== terminal.id || terminalInfo(terminal).mode !== "new-session"
+      : !terminalMatchesDetail(terminal, selectedSession())))) {
     toast("선택한 대화와 터미널의 연결을 확인하지 못했습니다. 열린 터미널 목록에서 확인해 주세요."); return;
   }
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
@@ -11480,6 +11563,7 @@ async function refreshTerminals(authEpoch = state.authEpoch) {
         $("terminal-close").disabled = true;
       }
       renderTerminalReturn();
+      syncLauncherWorkspace();
     }
     const closing = state.closingTerminal;
     if (closing?.uncertain && state.terminals.some((t) => t.id === closing.id && (t.closed || t.alive === false)))
@@ -12083,7 +12167,12 @@ function finishTerminalClose(closing) {
     }
     schedule();
     syncEvents();
-    if (wasInline && chatVisible()) loadChatState(selectedSession(), true);
+    if (wasInline && chatVisible() && selectedSession()) loadChatState(selectedSession(), true);
+  }
+  if (state.launcherWorkspace?.terminalId === closing.id) {
+    state.launcherWorkspace = null;
+    $("detail").replaceChildren(el("div", "welcome", closing.copy.done));
+    setDetailShown(false, { focus: true });
   }
   state.closingTerminal = null;
   $("close-terminal-dialog").close();
@@ -12585,6 +12674,7 @@ function bindPullToRefresh(root) {
 }
 function showLogin() {
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
+  state.launcherWorkspace = null;
   if (state.historySearch.mode && $("search")) $("search").value = state.search;
   cancelHistorySearch();
   state.historySearch.mode = false; state.historySearch.query = ""; state.historySearch.hits.clear();

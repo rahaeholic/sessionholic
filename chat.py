@@ -773,6 +773,7 @@ class Chat:
                                             '현재 실행 상태를 확인하지 못했습니다. 터미널에서 확인해 주세요.'})
             if not kwargs.get('liveRow') and accepted['requestSeq'] != observation_request:
                 response.update(readOnly=True, prompt=None, promptOpenable=False, recovery=None,
+                                stateReadSuperseded=True,
                                 workingSince=None, requiresNativeTerminal=False,
                                 capability={'supported': False, 'attachments': False,
                                             'reason': '더 최근 상태가 도착했습니다. 상태를 다시 확인해 주세요.'})

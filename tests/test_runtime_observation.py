@@ -291,6 +291,7 @@ class ChatObservationTest(unittest.TestCase):
         self.assertEqual(result['phase'], 'working')
         self.assertEqual(result['runtimeReason'], 'new reason')
         self.assertFalse(result['capability']['supported'])
+        self.assertTrue(result['stateReadSuperseded'])
 
     def test_windows_missing_certainty_is_unknown_and_readonly(self):
         with patch.object(self.service, 'rpc', return_value={
