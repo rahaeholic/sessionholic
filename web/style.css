@@ -3298,11 +3298,12 @@ li[data-task] {
     font-size: 0.8125rem;
   }
 
-  /* Dialogs become bottom sheets: title on top, actions at the bottom,
-     body scrolls between them. */
-  .plan-dialog {
+  /* The shared mobile width outranks later desktop dialog variants (e.g.
+     end-session-dialog), which otherwise leave a one-sided 32px gap. */
+  dialog.plan-dialog.sheet {
     width: 100%;
     max-width: 100%;
+    inset-inline: 0;
     max-height: calc(var(--app-height, 100dvh) - 24px);
     margin: auto 0 0;
     padding-left: env(safe-area-inset-left);

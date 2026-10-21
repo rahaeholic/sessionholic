@@ -124,3 +124,10 @@ python3 scripts/check_public.py
 - 세션홀릭을 내부 도구로 사용해 만든 일반 업무 산출물은 판매 가능
 
 이는 상업적 재배포를 제한하는 **소스 공개(source-available)** 프로젝트이며 OSI 오픈소스 라이선스로 표시하지 않습니다. 별도 작성한 이용 조건의 원문은 [LICENSE](LICENSE)이며, 위 설명은 원문을 대체하지 않습니다. 포함된 xterm 등의 외부 구성요소에는 [원래 라이선스](THIRD_PARTY_NOTICES.md)가 계속 적용됩니다.
+# 기기별 CLI 갱신
+
+`cli_maintenance.py run`은 기기 사용자 예약 작업에서만 실행합니다. Codex npm 설치는 새 버전을 별도 폴더에 설치·검증한 뒤 실행 링크를 원자적으로 전환하고 이전 파일을 보존합니다. standalone은 공식 `codex update`, Claude native는 현재 채널을 유지하는 `claude --safe-mode update`를 사용합니다. 세션이나 daemon은 중지하지 않습니다.
+
+기기별 비공개 설정과 결과는 `~/.local/share/sessionholic/cli-maintenance/{config,status}.json`에 둡니다. 설정 schema 1은 codex의 절대 `path`, `installer`(npm/standalone), npm일 때 `node`·`npm` 절대 경로, claude의 절대 `path`, `schedule.daily`를 받습니다. 인증 정보는 필요하지 않습니다. macOS 사용자 LaunchAgent 또는 Windows 사용자 예약 작업으로 로그인 뒤와 매일 실행하며, 원본 패키지·이전 버전 정리는 하지 않습니다.
+
+보드 설정의 CLI 상태는 설치 버전과 최근 확인 결과입니다. 읽기 전용 `/api/cli-status`와 CSRF 보호 `/api/cli-status/refresh`는 결과 파일만 읽으며 업데이트를 실행하지 않습니다. 이틀 넘은 기록과 연결되지 않는 기기는 이전 정보로 표시합니다. 이미 실행 중인 프로세스의 버전은 별개입니다.

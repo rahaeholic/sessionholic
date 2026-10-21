@@ -46,6 +46,7 @@ WEB = HERE / "web"
 COLLECTOR = HERE / "collector.py"
 WINDOWS_COLLECTOR = HERE / "windows_collector.py"
 HARDWARE = HERE / "hardware.py"
+CLI_MAINTENANCE = HERE / "cli_maintenance.py"
 WINDOWS_READ_ONLY = "이 Windows 작업은 아직 지원하지 않습니다. 기존 세션의 대화·터미널·종료 기능을 사용해 주세요."
 # A PC Codex terminal's permissions, as its screen states them (windows_runtime terminal_settle).
 PERMISSIONS_RESTRICTED = ("이 대화는 '승인 없이 · 제한된 샌드박스'라 커넥터 쓰기처럼 승인이 필요한 작업이 거절됩니다. "
@@ -435,6 +436,21 @@ def run_hardware(host, state_dir=None, timeout=20):
     if not isinstance(result, dict) or result.get("error"):
         raise ValueError("기기 정보를 읽지 못했습니다.")
     return result
+
+
+def run_cli_status(host, state_dir=None, timeout=20):
+    """Only the sidecar's snapshot reader; HTTP never invokes its updater."""
+    if host["local"]:
+        command, stdin = [sys.executable, "-I", str(CLI_MAINTENANCE), "snapshot"], None
+    else:
+        command, stdin = collector_command(host, [], state_dir), CLI_MAINTENANCE.read_bytes()
+    try:
+        done = subprocess.run(command, input=stdin, capture_output=True, timeout=timeout)
+        if done.returncode:
+            raise RuntimeError("CLI 상태 연결 실패")
+        return json.loads(done.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        raise RuntimeError("CLI 상태를 읽지 못했습니다") from None
 
 
 def scrub_payload(value):
@@ -3652,6 +3668,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.usage.snapshot(refresh=True))
                 if url.path == "/api/hardware" and getattr(self.server, "hardware", None) is not None:
                     return self.send_json(200, self.server.hardware.snapshot(refresh=True))
+                if url.path == "/api/cli-status" and getattr(self.server, "cli_monitor", None) is not None:
+                    return self.send_json(200, self.server.cli_monitor.snapshot(refresh=True))
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
@@ -4119,6 +4137,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.usage.snapshot(force=True))
             if path == "/api/hardware/refresh" and getattr(self.server, "hardware", None) is not None:
                 return self.send_json(200, self.server.hardware.snapshot(force=True))
+            if path == "/api/cli-status/refresh" and getattr(self.server, "cli_monitor", None) is not None:
+                return self.send_json(200, self.server.cli_monitor.snapshot(force=True))
             if path == "/api/chat/state":
                 result = self.server.chat.state(data)
                 self.observe_work(result.get("route") or data.get("source"), result)
@@ -4282,7 +4302,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True):
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True, cli_monitor=None):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404.
     `work_list` False answers GET /api/work as retired (the screen no longer has the tab)."""
     if bind not in ("127.0.0.1", "::1"):
@@ -4296,6 +4316,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.board, server.token, server.tailscale_user = board, token, tailscale_user
     server.usage = usage
     server.hardware = hardware
+    server.cli_monitor = cli_monitor
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.preferences = BoardPreferences(state_dir)
@@ -4432,8 +4453,11 @@ def main(argv=None):
         hardware = HardwareMonitor(hosts, lambda host: run_hardware(host, args.state_dir),
                                    interval=config["hardware"]["intervalSeconds"],
                                    manual_interval=config["hardware"]["manualIntervalSeconds"])
+    from cli_monitor import CliMonitor
+    cli_monitor = CliMonitor(hosts, lambda host: run_cli_status(host, args.state_dir))
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
+                        cli_monitor=cli_monitor,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push,
                         work_list=args.auto_work and not args.no_auto_work)
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."

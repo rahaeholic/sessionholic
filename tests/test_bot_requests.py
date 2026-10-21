@@ -87,6 +87,17 @@ class BotRequestsTest(unittest.TestCase):
         self.native(str(uuid.uuid4()))
         self.assertIsNone(bots.read_source(self.source, self.home)['requests'][0]['nativeRef'])
 
+    def test_full_window_rolls_forward_after_new_request(self):
+        path = self.ledger(200)
+        before = bots.read_source(self.source, self.home)['requests']
+        with closing(sqlite3.connect(path)) as db, db:
+            db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)',
+                       (201, 'C_EXAMPLE', 'U_EXAMPLE', '새 요청', 'running', None, 1800000000, None, None))
+        after = bots.read_source(self.source, self.home)['requests']
+        self.assertEqual(len(after), 100)
+        self.assertEqual(after[0]['id'], bots._opaque(self.source, 201))
+        self.assertNotIn(before[-1]['id'], [row['id'] for row in after])
+
     def test_later_session_mapping_does_not_bind_old_task_and_invalid_uuid_stays_unlinked(self):
         path = self.ledger()
         self.native()

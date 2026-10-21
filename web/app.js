@@ -709,6 +709,59 @@ function openSettings() {
   window.SessionholicHistory?.load?.();
   window.SessionholicPush?.render?.();
   sheet("settings-dialog").open();
+  loadCliStatus();
+}
+
+let cliStatus = { data: null, busy: false, error: "", epoch: null, timer: null };
+function renderCliStatus() {
+  const box = $("cli-status");
+  if (!box || !state.authenticated) return;
+  const labels = { current: "최신 확인", updated: "갱신 완료", checking: "확인 중", failed: "갱신 실패", unknown: "미확인" };
+  const nodes = [];
+  if (cliStatus.error) nodes.push(el("p", "error", cliStatus.error));
+  if (!cliStatus.data) nodes.push(el("p", "plan-preserve", "기기 상태를 읽고 있습니다…"));
+  for (const host of cliStatus.data?.hosts || []) {
+    const card = el("div", "cli-status-machine");
+    const status = host.status === "offline" ? "연결 대기" : host.status === "stale" ? "이전 확인 정보" : host.status === "unconfigured" ? "자동 업데이트 미설정" : host.refreshing ? "읽는 중" : "";
+    card.append(el("strong", "", `${host.label}${status ? " · " + status : ""}`));
+    for (const [id, title] of [["codex", "Codex"], ["claude", "Claude Code"]]) {
+      const tool = host.data?.tools?.[id];
+      if (!tool) continue;
+      const checked = tool.checkedAt ? new Date(tool.checkedAt * 1000).toLocaleString("ko-KR") : "확인 기록 없음";
+      card.append(el("p", "plan-preserve", `${title} ${tool.version || "버전 미확인"}${tool.channel ? " · " + tool.channel : ""} · ${labels[tool.status] || "미확인"}`),
+        el("p", "plan-preserve", `최근 확인: ${checked}`));
+    }
+    nodes.push(card);
+  }
+  box.replaceChildren(...nodes);
+  const refresh = $("cli-status-refresh");
+  if (refresh) { refresh.disabled = cliStatus.busy; refresh.onclick = () => loadCliStatus(true); }
+}
+async function loadCliStatus(force = false, attempt = 0) {
+  if (!state.authenticated) return;
+  if (cliStatus.epoch !== state.authEpoch) {
+    clearTimeout(cliStatus.timer);
+    cliStatus = { data: null, busy: false, error: "", epoch: state.authEpoch, timer: null };
+  }
+  const cache = cliStatus, authEpoch = state.authEpoch;
+  if (cache.busy) return;
+  clearTimeout(cache.timer); cache.busy = true; cache.error = "";
+  renderCliStatus();
+  try {
+    const data = force ? await api("/api/cli-status/refresh", { method: "POST", body: {}, authEpoch })
+      : await api("/api/cli-status", { authEpoch });
+    assertAuthEpoch(authEpoch);
+    if (!Array.isArray(data?.hosts)) throw new Error("기기 갱신 상태를 읽지 못했습니다.");
+    cache.data = data;
+    if (data.refreshing && attempt < 10 && $("settings-dialog")?.open) cache.timer = setTimeout(() => {
+      if (authEpoch === state.authEpoch && $("settings-dialog")?.open && !document.hidden) loadCliStatus(false, attempt + 1);
+    }, 2000);
+  } catch (err) {
+    if (authEpoch === state.authEpoch && !err.staleAuth && !err.unauthorized) cache.error = "기기 갱신 상태를 읽지 못했습니다. 다시 읽어 주세요.";
+  } finally {
+    cache.busy = false;
+    if (authEpoch === state.authEpoch) renderCliStatus();
+  }
 }
 // A notification tap opens its session: from the page address on a cold start, or
 // from the service worker while the board is already open. The session may arrive
@@ -911,7 +964,7 @@ function beginAuthEpoch() {
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
 const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
-  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh",
+  "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh", "/api/cli-status/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
   "/api/session/opened", "/api/chat/warm", "/api/diagnostics/dictation"]);
 // A terminal's size and scrolling; its keys never (sendInput reads the token instead).
@@ -1946,7 +1999,7 @@ function botSnapshot(data) {
   for (const request of data.requests) unique.set(botRequestKey(request), request);
   return { requests: [...unique.values()], sources: data.sources, fetchedAt: data.fetchedAt };
 }
-async function loadBotRequests({ refresh = false } = {}) {
+async function loadBotRequests({ refresh = false, background = false } = {}) {
   if (!state.authenticated) return;
   const cache = state.botRequests;
   if (cache.promise) return cache.promise;
@@ -1956,8 +2009,8 @@ async function loadBotRequests({ refresh = false } = {}) {
   cache.busy = true; cache.error = "";
   cache.promise = (async () => {
     try {
-      // Refresh is explicit and bounded to this bot source service. A normal
-      // category visit is one GET; render/poll never starts another request.
+      // Automatic reads share the cache and in-flight request. Only an explicit
+      // refresh bypasses the source TTL; background reads never change the open view.
       const data = refresh
         ? await api("/api/bot-requests/refresh", { method: "POST", body: {}, authEpoch, csrfRetry: false })
         : await api("/api/bot-requests", { authEpoch });
@@ -1966,7 +2019,7 @@ async function loadBotRequests({ refresh = false } = {}) {
       Object.assign(cache, botSnapshot(data), { loaded: true, readAt: Date.now() });
       const selected = selectedSession();
       const moved = selected && botRequestForNative(sourceOf(selected));
-      if (moved) selectBotRequest(botGroupKey(moved));
+      if (moved && !background) selectBotRequest(botGroupKey(moved));
     } catch (err) {
       if (authEpoch === state.authEpoch && state.botRequests === cache && !err.staleAuth && !err.unauthorized)
         cache.error = err.message || "봇 요청을 확인하지 못했습니다. 다시 확인해 주세요.";
@@ -1991,7 +2044,7 @@ function renderBotRequests() {
   const tools = el("div", "bot-list-tools");
   // One card per conversation (a DM's requests together), so both counts are said.
   const note = el("p", "muted", cache.busy ? "봇 요청을 확인하고 있습니다…" : cache.loaded
-    ? `요청 ${cache.requests.length}개 · 대화 ${botGroups(cache.requests).length}개` : "봇 요청을 확인해 주세요.");
+    ? `최근 요청 ${cache.requests.length}개 · 대화 ${botGroups(cache.requests).length}개 · 자동 갱신` : "봇 요청을 확인해 주세요.");
   const refresh = button(cache.busy ? "확인 중…" : "새로고침", "secondary", () => loadBotRequests({ refresh: true }));
   refresh.id = "bot-requests-refresh"; refresh.disabled = cache.busy || networkOffline();
   tools.append(note, refresh);
@@ -12580,9 +12633,9 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
     savedPromptsAnnounced(snapshot.savedPrompts);
-    // One non-blocking metadata read separates known bot sessions immediately.
-    // An ordinary poll never retries this initial read, even after failure.
-    if (firstAuthentication) loadBotRequests();
+    // Keep the visible bot list current, even when it has reached the bounded
+    // source window. This read is independent of chat input and never navigates.
+    if (firstAuthentication || state.sessionCategory === "bot") loadBotRequests({ background: !firstAuthentication });
     $("login").hidden = true;
     $("app").hidden = false;
     notice();
