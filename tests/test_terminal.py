@@ -642,6 +642,78 @@ class ListingTest(unittest.TestCase):
             self.assertEqual([row["id"][0] for row in self.manager.list()], ["a", "b", "c"])
 
 
+class ActivityPersistenceTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.identifier = 'a' * 32
+        row = {'id': self.identifier, 'name': 'sb-' + self.identifier, 'key': 'fixture', 'socket': 'sb-activity-fixture',
+               'metadata': {'mode': 'new-session', 'program': 'codex', 'host': 'local'}}
+        (self.root / 'sessions.json').write_text(json.dumps([row]))
+
+    def manager(self):
+        manager = terminal.TerminalManager(state_dir=self.root, socket_name='sb-activity-fixture', tmux='/usr/bin/false')
+        self.addCleanup(manager.close)
+        return manager
+
+    def saved(self):
+        return json.loads((self.root / 'activity.json').read_text())['lastUsed'][self.identifier]
+
+    def test_restart_preserves_idle_age_but_protects_reconnection_before_reaping(self):
+        old = int(time.time()) - 4 * 3600
+        (self.root / 'activity.json').write_text(json.dumps({'version': 1, 'lastUsed': {self.identifier: old}}))
+        manager = self.manager(); row = manager.terminals[self.identifier]
+        self.assertGreaterEqual(manager._public(row)['idleSeconds'], 4 * 3600 - 1)
+        with patch.object(manager, '_exists', return_value=True):
+            self.assertEqual(manager.idle_runs(), [], 'a returning browser gets a bounded reconnect grace period')
+            with patch.object(terminal.time, 'monotonic', return_value=time.monotonic() + terminal.ACTIVITY_RECONNECT_GRACE + 1):
+                self.assertEqual([item['id'] for item in manager.idle_runs()], [self.identifier])
+        manager._use(self.identifier)
+        manager.close()
+        self.assertGreaterEqual(self.saved(), int(time.time()) - 1)
+        restored = self.manager()
+        self.assertLess(restored._public(restored.terminals[self.identifier])['idleSeconds'], 2)
+
+    def test_legacy_rows_seed_once_without_rewriting_the_terminal_registry(self):
+        before = (self.root / 'sessions.json').read_bytes()
+        manager = self.manager()
+        self.assertGreaterEqual(self.saved(), int(time.time()) - 1)
+        self.assertEqual((self.root / 'sessions.json').read_bytes(), before)
+        self.assertEqual((self.root / 'activity.json').stat().st_mode & 0o777, 0o600)
+        manager.close()
+        self.manager()
+        self.assertEqual((self.root / 'sessions.json').read_bytes(), before)
+
+    def test_screen_reads_coalesce_activity_writes_and_storage_failure_does_not_block_input(self):
+        manager = self.manager(); started = time.monotonic()
+        with patch.object(terminal, '_private_json', wraps=terminal._private_json) as save:
+            for unused in range(100): manager._use(self.identifier)
+            save.assert_not_called()
+            with patch.object(terminal.time, 'monotonic', return_value=started + terminal.ACTIVITY_SAVE_INTERVAL + 1):
+                manager._use(self.identifier)
+            self.assertEqual(save.call_count, 1)
+        with patch.object(terminal, '_private_json', side_effect=OSError('fixture full disk')), \
+                patch.object(terminal.time, 'monotonic', return_value=started + 2 * terminal.ACTIVITY_SAVE_INTERVAL + 3):
+            self.assertIs(manager._use(self.identifier), manager.terminals[self.identifier])
+
+    def test_bad_activity_files_are_not_followed_or_overwritten_and_do_not_disable_the_board(self):
+        other = self.root / 'other.json'; other.write_text('{}')
+        path = self.root / 'activity.json'; path.symlink_to(other)
+        manager = self.manager()
+        self.assertFalse(manager._activity_persistence_available)
+        manager._use(self.identifier); manager.close()
+        self.assertTrue(path.is_symlink()); self.assertEqual(other.read_text(), '{}')
+        path.unlink()
+        for stamp in (True, -1, 'yesterday'):
+            path.write_text(json.dumps({'version': 1, 'lastUsed': {self.identifier: stamp}}))
+            before = path.read_bytes(); manager = self.manager()
+            self.assertFalse(manager._activity_persistence_available)
+            self.assertLess(manager._public(manager.terminals[self.identifier])['idleSeconds'], 2)
+            manager._use(self.identifier); manager.close()
+            self.assertEqual(path.read_bytes(), before)
+
+
 class SocketRecordTest(unittest.TestCase):
     """A board started on another tmux socket must never tombstone live sessions (R1)."""
 
@@ -1133,6 +1205,21 @@ class TmuxFixtureTest(unittest.TestCase):
         saved = next(row for row in replacement.list() if row["id"] == created["id"])
         self.assertEqual(saved["nativeSource"], native)
         self.assertEqual(saved["linkConfidence"], "exact")
+
+    def test_exact_host_evidence_can_correct_a_wrong_new_session_estimate(self):
+        created = self.create()
+        self.manager.terminals[created['id']].record['metadata']['mode'] = 'new-session'
+        old = {'host': 'local', 'agent': 'codex', 'id': '019a0000-0000-7000-8000-000000000001',
+               'home': '.codex', 'cwd': '/tmp/old'}
+        actual = {**old, 'id': '019a0000-0000-7000-8000-000000000002', 'cwd': '/tmp/actual'}
+        self.assertTrue(self.manager.link_native(created['id'], old, confidence='estimated'))
+        self.assertFalse(self.manager.link_native(created['id'], {**actual, 'host': 'other-host'}))
+        with patch.object(self.manager, '_save', side_effect=OSError('fixture disk failure')):
+            with self.assertRaises(OSError): self.manager.link_native(created['id'], actual)
+        self.assertEqual(self.manager.terminals[created['id']].record['metadata']['nativeSource'], old)
+        self.assertTrue(self.manager.link_native(created['id'], actual))
+        self.assertEqual(self.manager.terminals[created['id']].record['metadata']['linkConfidence'], 'exact')
+        self.assertFalse(self.manager.link_native(created['id'], old), 'an already exact link is never overwritten')
 
     def test_windows_native_cwd_survives_terminal_creation_and_restart(self):
         native = {"host": "windows-fixture", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",

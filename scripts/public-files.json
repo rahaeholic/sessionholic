@@ -182,5 +182,6 @@
   "docs/plan/2026-10-22-conversation-session-menu.md",
   "docs/plan/2026-10-22-mac-terminal-ime-and-view-key.md",
   "web/terminal-ime.js",
-  "tests/test_terminal_ime.cjs"
+  "tests/test_terminal_ime.cjs",
+  "docs/plan/2026-10-22-terminal-session-lifecycle.md"
 ]
