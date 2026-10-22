@@ -53,6 +53,7 @@ TICK = 15.0
 SEND_TIMEOUT = 10
 AGENTS = {"claude": "Claude Code", "codex": "Codex"}
 FINISHED = ("idle", "done", "closed")
+FINISH_SETTLE = 30  # A brief pause between continuing turns is not a finished response alert.
 DISABLED = "이 보드는 알림을 끈 채 실행 중입니다(--no-push)."
 
 
@@ -308,12 +309,74 @@ class PushService:
     def pending_for(self, identifier, retain=False):
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):
             raise ValueError("알림 기기 정보가 올바르지 않습니다.")
+        phases = self.current_phases()
         with self.lock:
-            notices = self._fresh(self.pending.get(identifier, []))
+            removed = self.prune_pending(phases)
+            notices = [item for item in self._fresh(self.pending.get(identifier, []))
+                       if self.notice_current(item, phases) is True]
             if not retain:
-                self.pending.pop(identifier, None)  # Compatibility with workers deployed before ACK support.
+                # Older workers consume only what was returned; an unconfirmed/deferred
+                # notice must remain queued until it can actually be displayed.
+                delivered = {item['noticeId'] for item in notices}
+                self.pending[identifier] = [item for item in self.pending.get(identifier, [])
+                                            if item.get('noticeId') not in delivered]
+            if not retain or removed:
                 self._save_seen(int(self.clock()))
-            return {"notifications": [dict(item) for item in notices]}
+            result = {"notifications": [dict(item) for item in notices]}
+            if retain:
+                result['dismissTags'] = sorted(removed | {tag for tag, phase in phases.items() if phase == 'working'})[:500]
+            return result
+
+    @staticmethod
+    def row_key(host, agent, row):
+        identifier = row.get('id')
+        if not identifier and agent == 'claude':
+            identifier = '~{}:{}:{}:{}'.format(*(row.get(name) if row.get(name) is not None else ''
+                                                 for name in ('pid', 'sessionId', 'cwd', 'startedAt')))
+        return '|'.join([host['name'], agent, row.get('home') or '', str(identifier)]) if identifier else None
+
+    def current_phases(self, snapshot=None):
+        phases = {}
+        snapshot = self.board.snapshot() if snapshot is None else snapshot
+        registry = getattr(self.board, 'runtime_observations', None)
+        for host in snapshot.get('hosts') or []:
+            data = host.get('data') if isinstance(host.get('data'), dict) else {}
+            for agent in ('codex', 'claude'):
+                for row in data.get(agent) or []:
+                    if not isinstance(row, dict):
+                        continue
+                    key = self.row_key(host, agent, row)
+                    if not key:
+                        continue
+                    annotation = registry.current({**row, 'host': host['name'], 'agent': agent}) if registry else None
+                    observation = (annotation or {}).get('runtimeObservation') or row.get('runtimeObservation')
+                    phase = str(row.get('phase') or 'unknown') if row.get('runtimeKnown') is not False else 'unknown'
+                    if isinstance(observation, dict):
+                        phase = observation.get('phase', 'unknown') if observation.get('known') and observation.get('expiresAt', 0) > self.clock() else 'unknown'
+                    phases['session:' + key] = phase if host.get('ok') else 'unknown'
+        return phases
+
+    def notice_current(self, notice, phases):
+        tag = notice.get('tag', '')
+        if not tag.startswith('session:'):
+            return True  # Explicit connection tests have no native session.
+        phase = phases.get(tag, 'unknown')
+        if phase == 'unknown':
+            return None  # Keep it queued, without waking/showing it until a current read.
+        current = phase == 'needs_input' if notice.get('kind') == 'needs_input' else phase in FINISHED
+        if not current:
+            return False
+        not_before = notice.get('notBefore')
+        return None if isinstance(not_before, (int, float)) and self.clock() < not_before else True
+
+    def prune_pending(self, phases):
+        """Called under the push lock. A resumed run invalidates its queued old alert."""
+        removed = set()
+        for identifier, notices in list(self.pending.items()):
+            fresh = self._fresh(notices)
+            removed.update(item['tag'] for item in fresh if self.notice_current(item, phases) is False)
+            self.pending[identifier] = [item for item in fresh if self.notice_current(item, phases) is not False]
+        return removed
 
     def acknowledge(self, data):
         if (not isinstance(data, dict) or set(data) != {"id", "notices"}
@@ -395,10 +458,11 @@ class PushService:
         snapshot = self.labels(self.board.snapshot())
         with self.lock:
             events = self.observe(snapshot, persist=False)
+            removed = self.prune_pending(self.current_phases(snapshot))
             targets = list(self.subscriptions)
             for event in events:
                 self._queue(targets, self.notice(event), persist=False)
-            if events or self.observation_changed:
+            if events or self.observation_changed or removed:
                 self._save_seen(int(self.clock()))
         if events:
             self.notify(events, queued=True, targets=targets)
@@ -409,13 +473,16 @@ class PushService:
         """Wake again a device whose last wake-up failed for a passing reason (network, 429,
         5xx) while its notices still wait; a refusal like 400 or 403 waits for the next alert."""
         now = self.monotonic()
+        phases = self.current_phases()
         with self.lock:
+            if self.prune_pending(phases):
+                self._save_seen(int(self.clock()))
             for identifier in list(self.pending):
                 self.pending[identifier] = self._fresh(self.pending[identifier])
             due = []
             for target in self.subscriptions:
                 failed = self.failed.get(target["id"])
-                if not self.pending.get(target["id"]):
+                if not any(self.notice_current(item, phases) is True for item in self.pending.get(target["id"], [])):
                     continue
                 if not failed:
                     if self.clock() - self.last_wake.get(target["id"], 0) >= ACK_RETRY:
@@ -435,6 +502,7 @@ class PushService:
         """Phase transitions worth an alert since the last look; records every row seen."""
         now = int(self.clock())
         events, changed = [], False
+        phases = self.current_phases(snapshot)
         for host in snapshot.get("hosts") or []:
             if not host.get("ok") or not isinstance(host.get("data"), dict):
                 continue
@@ -449,7 +517,7 @@ class PushService:
                     if not identifier:
                         continue
                     key = "|".join([host["name"], agent, row.get("home") or "", str(identifier)])
-                    phase = "unknown" if row.get("runtimeKnown") is False else str(row.get("phase") or "unknown")
+                    phase = phases.get('session:' + key, 'unknown')
                     previous = self.seen.get(key)
                     previous = previous if isinstance(previous, dict) else None
                     if phase == "unknown":
@@ -515,12 +583,13 @@ class PushService:
     def notice(self, event):
         row, host = event["row"], event["host"]
         title = str(row.get("displayTitle") or row.get("title") or "제목 없는 세션")[:120]
-        state = "답이 필요해요" if event["kind"] == "needs_input" else "작업이 끝났어요"
+        state = "답이 필요해요" if event["kind"] == "needs_input" else "응답이 끝났어요"
         where = " · ".join(part for part in (host.get("label") or host.get("name"), AGENTS.get(row["agent"])) if part)
         snippet = re.sub(r"\s+", " ", str(row.get("snippet") or "")).strip()
         body = state + (" · " + where if where else "") + ("\n" + snippet[:140] if snippet else "")
         return {"title": title, "body": body, "tag": "session:" + event["key"],
                 "url": "/?session=" + quote(event["key"], safe=""), "kind": event["kind"],
+                **({'notBefore': int(self.clock()) + FINISH_SETTLE} if event['kind'] == 'finished' else {}),
                 "createdAt": int(self.clock())}
 
     def notify(self, events, queued=False, targets=None):
@@ -533,8 +602,10 @@ class PushService:
                     self._queue(targets, self.notice(event), persist=False)
                 self._save_seen(int(self.clock()))
         urgent = any(event["kind"] == "needs_input" for event in events)
+        phases = self.current_phases()
         statuses = [self._send(target, ttl=86400 if urgent else 3600, urgency="high" if urgent else "normal")
-                    for target in targets] if events else []
+                    for target in targets if any(self.notice_current(item, phases) is True
+                                                for item in self.pending.get(target['id'], []))] if events else []
         delivered = sum(status in (200, 201, 202) for status in statuses)
         sys.stderr.write("%s: 알림 %d건(답 필요 %d) · 기기 %d대 중 %d대 전달\n" % (
             self.log_prefix, len(events), sum(event["kind"] == "needs_input" for event in events),

@@ -475,6 +475,15 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual(self.db.read_bytes(), before)
         self.assertEqual(self.calls, [])
 
+    def test_snapshot_reports_adapter_failure_separately_from_valid_empty_list(self):
+        result = self.reader.snapshot()
+        self.assertEqual(result['sourceStatus'], {'codex': {'ok': True}, 'claude': {'ok': True}, 'tmux': {'ok': True}})
+        with patch.object(self.reader, 'database_rows', side_effect=sqlite3.OperationalError('fixture')):
+            failed = self.reader.snapshot()
+        self.assertEqual(failed['sourceStatus']['codex'], {'ok': False})
+        self.assertEqual(failed['sourceStatus']['claude'], {'ok': True})
+        self.assertEqual(failed['codex'], [])
+
     def test_saved_slack_exec_in_a_normal_project_is_a_bot_even_after_renaming(self):
         import collector
         envelope = '[슬랙 요청]\n- 요청자: 예제\n- 작업 번호: 12\n[처리 원칙] 봇 정책\n[요청]\n합성 요청'
@@ -703,6 +712,58 @@ class WindowsCollectorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.reader.read('codex', self.sid, '.codex')
 
+    def test_saved_read_rechecks_only_its_exact_exec_writer_and_does_not_infer_completion(self):
+        with sqlite3.connect(self.db) as connection:
+            connection.execute('UPDATE threads SET source=? WHERE id=?', ('exec', self.sid))
+        locks = self.reader.codex_home / 'thread-writer-locks'
+        locks.mkdir()
+        (locks / (self.sid + '.lock')).touch()
+        self.reader.binary.parent.mkdir(parents=True)
+        self.reader.binary.touch()
+        self.reader.owner_reader = lambda path: [{'pid': 77, 'start': '123456'}]
+        listed = self.reader.snapshot()['codex'][0]
+        with patch.object(self.reader, 'writer_owners', wraps=self.reader.writer_owners) as owners:
+            read = self.reader.read('codex', self.sid, '.codex')
+        owners.assert_called_once_with({self.sid})
+        for field in ('phase', 'runtimeKnown', 'runtimeReason', 'runtimeEvidence'):
+            self.assertEqual(read[field], listed[field])
+        self.assertEqual((read['phase'], read['runtimeEvidence']), ('working', 'exec_writer_lock'))
+        self.assertEqual(self.calls, [], 'a saved read neither loads nor resumes a native thread')
+        self.reader.owner_reader = lambda path: []
+        ended = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((ended['phase'], ended['runtimeKnown'], ended['runtimeReasonCode']), ('unknown', False, 'stored_only'))
+
+    def test_saved_read_does_not_promote_reused_pid_or_external_interactive_writer(self):
+        locks = self.reader.codex_home / 'thread-writer-locks'
+        locks.mkdir()
+        (locks / (self.sid + '.lock')).touch()
+        self.reader.binary.parent.mkdir(parents=True)
+        self.reader.binary.touch()
+        self.reader.owner_reader = lambda path: [{'pid': 77, 'start': 'different-generation'}]
+        with sqlite3.connect(self.db) as connection:
+            connection.execute('UPDATE threads SET source=? WHERE id=?', ('exec', self.sid))
+        self.assertFalse(self.reader.read('codex', self.sid, '.codex')['runtimeKnown'])
+        self.reader.owner_reader = lambda path: [{'pid': 77, 'start': '123456'}]
+        with sqlite3.connect(self.db) as connection:
+            connection.execute('UPDATE threads SET source=? WHERE id=?', ('cli', self.sid))
+        opened = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((opened['phase'], opened['runtimeKnown'], opened['runtimeEvidence']),
+                         ('unknown', False, 'external_cli_open'))
+        self.assertIn('서버 밖의 Codex', opened['runtimeReason'])
+        self.reader.owner_reader = lambda path: [{'pid': 77, 'start': '123456'}, {'pid': 78, 'start': '123456'}]
+        self.assertEqual(self.reader.read('codex', self.sid, '.codex')['runtimeReasonCode'], 'stored_only')
+
+    def test_unknown_native_status_keeps_an_explicit_reason_in_list_and_read(self):
+        self.endpoint()
+        self.live['status'] = {'type': 'future-status'}
+        listed = self.reader.snapshot()['codex'][0]
+        read = self.reader.read('codex', self.sid, '.codex')
+        for result in (listed, read):
+            self.assertEqual((result['phase'], result['runtimeKnown'], result['runtimeReasonCode']),
+                             ('unknown', False, 'status_unsupported'))
+            self.assertTrue(result['runtimeReason'])
+        self.assertFalse(any(method in ('thread/resume', 'turn/start') for method, _ in self.calls))
+
     def test_cross_home_ids_and_path_escape_are_rejected(self):
         for home in ('.codex-other', '../.codex', None):
             with self.subTest(home=home), self.assertRaises(ValueError):
@@ -734,6 +795,48 @@ class WindowsCollectorTest(unittest.TestCase):
         result = self.reader.read('claude', sid)
         self.assertEqual([row['text'] for row in result['messages']], ['합성 Claude 요청', '합성 Claude 결과'])
         self.assertFalse(result['runtimeKnown'])
+
+    def test_claude_unknown_reasons_follow_saved_unverified_duplicate_and_unsupported_branches(self):
+        sid, unused = self.claude_transcript()
+        directory = self.reader.claude_home / 'sessions'
+        directory.mkdir()
+        binary = self.home / '.local/bin/claude.exe'
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+        stamp = '134362358929022995'
+        state = {'sessionId': sid, 'kind': 'bg', 'cwd': self.cwd, 'status': 'busy', 'procStart': stamp,
+                 'pidDomain': 'win32:fixture-pc', 'pid': 77}
+        registry = directory / '77.json'
+        self.reader.process_reader = lambda pid: {'pid': pid, 'exe': str(binary), 'start': stamp}
+        self.reader.parent_reader = lambda deadline: {}
+        self.reader.flags_reader = lambda process, deadline: {}
+
+        def check(code):
+            listed = self.reader.claude_rows(target_sid=sid)[0]
+            read = self.reader.read('claude', sid)
+            for result in (listed, read):
+                self.assertEqual((result['phase'], result['runtimeKnown'], result['runtimeReasonCode']), ('unknown', False, code))
+                self.assertTrue(result['runtimeReason'])
+            self.assertEqual(read['runtimeReason'], listed['runtimeReason'])
+
+        check('stored_only')
+        registry.write_text(json.dumps({**state, 'procStart': 'reused'}))
+        check('process_unverified')
+        registry.write_text(json.dumps({**state, 'status': 'future-status'}))
+        check('status_unsupported')
+        registry.write_text(json.dumps({**state, 'status': 'shell'}))
+        for shell in (self.reader.snapshot()['claude'][0], self.reader.read('claude', sid)):
+            self.assertEqual((shell['phase'], shell['runtimeKnown'], shell['runtimeReason']), ('idle', True, None))
+            self.assertTrue(shell['backgroundShellRunning'])
+        registry.write_text(json.dumps({**state, 'status': 'shell', 'procStart': 'reused'}))
+        check('process_unverified')
+        registry.write_text(json.dumps(state))
+        (directory / '78.json').write_text(json.dumps({**state, 'pid': 78}))
+        check('owner_ambiguous')
+        (directory / '78.json').unlink()
+        known = self.reader.read('claude', sid)
+        self.assertEqual((known['phase'], known['runtimeKnown'], known['runtimeReason']), ('working', True, None))
+        self.assertEqual(known['runtimeEvidence'], 'claude_registry_process')
 
     def test_saved_claude_origin_survives_the_review_process_exiting(self):
         import collector
@@ -782,9 +885,13 @@ class WindowsCollectorTest(unittest.TestCase):
         self.claude_transcript(sid, entries)
         row = self.reader.snapshot()['claude'][0]
         self.assertEqual((row['title'], row['snippet']), ('에이전트 이름', '마지막 답변'))
+        self.assertEqual(row['initialTitle'], '첫 요청 둘째 줄')
+        self.assertEqual(row['manualNativeTitle'], '처음 바꾼 이름')
         entries.insert(-2, {'type': 'custom-title', 'customTitle': '새 이름', 'sessionId': sid})
         self.claude_transcript(sid, entries)
         self.assertEqual(self.reader.snapshot()['claude'][0]['title'], '새 이름')
+        self.assertEqual(self.reader.snapshot()['claude'][0]['initialTitle'], '첫 요청 둘째 줄')
+        self.assertEqual(self.reader.snapshot()['claude'][0]['manualNativeTitle'], '새 이름')
         # No title record in the end: the first real request, on one line.
         self.claude_transcript(sid, [entry for entry in entries if entry['type'] in ('user', 'progress')])
         row = self.reader.snapshot()['claude'][0]

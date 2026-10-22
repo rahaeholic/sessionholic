@@ -15,7 +15,7 @@ const settle = () => new Promise(setImmediate);
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function worker({ pending = [], fetchFails = false, shown = [], windows = [], subscribed = true,
-  csrfToken, failTags = [], ackFails = false } = {}) {
+  csrfToken, failTags = [], ackFails = false, dismissTags = [] } = {}) {
   const listeners = {}, notifications = [], fetches = [], opened = [];
   const self = {
     location: { origin: "https://board.example" },
@@ -41,7 +41,7 @@ function worker({ pending = [], fetchFails = false, shown = [], windows = [], su
         return { ok: true, json: async () => ({ ok: true }) };
       }
       if (fetchFails) throw new Error("offline");
-      return { ok: true, json: async () => ({ notifications: pending, csrfToken }) };
+      return { ok: true, json: async () => ({ notifications: pending, csrfToken, dismissTags }) };
     },
   });
   async function fire(type, event = {}) {
@@ -90,16 +90,18 @@ test('only displayed notice versions are acknowledged and an ACK failure keeps d
   assert.equal(repeat.fetches.filter((item) => item.url === '/api/push/ack').length, 1);
 });
 
-test("with nothing queued a push shows the latest notice again quietly, or a generic one, never nothing", async () => {
+test("an empty current queue never repeats old work alerts and closes obsolete notifications", async () => {
   const latest = { title: "이전 알림", body: "작업이 끝났어요", tag: "session:c", data: { url: "/?session=c" } };
-  const quiet = worker({ shown: [{ title: "older", tag: "x" }, latest] });
+  let closed = 0; latest.close = () => closed++;
+  const quiet = worker({ shown: [{ title: "older", tag: "x" }, latest], dismissTags: [latest.tag] });
   await quiet.fire("push");
-  assert.deepEqual(quiet.notifications.map((item) => [item.title, item.tag, item.renotify]), [["이전 알림", "session:c", false]]);
+  assert.equal(quiet.notifications.length, 0); assert.equal(closed, 1);
+  const empty = worker(); await empty.fire('push'); assert.equal(empty.notifications.length, 0);
   // The board could not be read: a new alert was sent, so the old notice is not reused.
-  for (const options of [{}, { fetchFails: true }, { subscribed: false }, { fetchFails: true, shown: [latest] }]) {
+  for (const options of [{ fetchFails: true }, { subscribed: false }, { fetchFails: true, shown: [latest] }]) {
     const generic = worker(options);
     await generic.fire("push");
-    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url, item.renotify]), [["확인할 세션이 있어요", "board-notice", "/", true]]);
+    assert.deepEqual(generic.notifications.map((item) => [item.title, item.tag, item.data.url, item.renotify, item.silent]), [["알림 상태를 확인하지 못했어요", "board-notice", "/", false, true]]);
   }
 });
 

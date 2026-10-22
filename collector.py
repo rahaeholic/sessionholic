@@ -58,6 +58,24 @@ SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 EXTRA_PATH = ["/opt/homebrew/bin", str(HOME / ".local/bin"), "/usr/local/bin", "/usr/bin", "/bin"]
 TEXT_LIMIT = 4000
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
+# Set only while collecting an adapter. Helpers can report a swallowed failure
+# without changing their public return type or treating compatibility warnings as failure.
+SOURCE_STATUS = ContextVar('source_status', default=None)
+
+
+def source_failed():
+    status = SOURCE_STATUS.get()
+    if status is not None:
+        status['ok'] = False
+
+
+def checked_source(collect, *args):
+    status = {'ok': True}
+    token = SOURCE_STATUS.set(status)
+    try:
+        return collect(*args), status['ok']
+    finally:
+        SOURCE_STATUS.reset(token)
 # A conversation read shows its newest MESSAGE_LIMIT questions and answers with every row
 # (tool records, notes) after the oldest of them, at most ROW_LIMIT rows (recent_window).
 MESSAGE_LIMIT = 80
@@ -109,12 +127,19 @@ def which(name):
     return shutil.which(name, path=os.pathsep.join(EXTRA_PATH + [os.environ.get("PATH", "")]))
 
 
-def run(args, timeout=20):
+def run(args, timeout=20, empty_tmux=False):
     try:
         done = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=tool_env())
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return done.stdout if done.returncode == 0 else None
+    if done.returncode == 0:
+        return done.stdout
+    if empty_tmux:
+        error = (done.stderr or '').strip()
+        if (error.startswith('no server running on ')
+                or error.startswith('error connecting to ') and error.endswith('(No such file or directory)')):
+            return ''
+    return None
 
 
 def clip(text, limit=TEXT_LIMIT):
@@ -248,11 +273,16 @@ def claude_phase(state, status):
         return "working"
     if state in ("done", "stopped"):
         return "done"
-    return "idle"
+    if state == "idle" or state is None and status in ("idle", "shell"):
+        return "idle"
+    return "unknown"
 
 
 def codex_phase(status):
-    status = status or {}
+    if not isinstance(status, dict) or status.get('type') not in ('active', 'idle', 'notLoaded', 'systemError'):
+        return 'unknown'
+    if status.get('activeFlags') is not None and not isinstance(status['activeFlags'], list):
+        return 'unknown'
     if status.get("type") == "systemError" or status.get("activeFlags"):
         return "needs_input"
     if status.get("type") == "active":
@@ -540,11 +570,16 @@ def claude_agent_rows(errors):
         return None
     raw = run([binary, "agents", "--json", "--all"], timeout=30)
     if raw is None:
+        source_failed()
         errors.append("Claude 세션 목록을 읽지 못했습니다.")
         return []
     try:
-        return json.loads(raw)
+        rows = json.loads(raw)
+        if not isinstance(rows, list):
+            raise ValueError('list')
+        return rows
     except ValueError:
+        source_failed()
         errors.append("Claude 세션 목록 형식이 예상과 다릅니다.")
         return []
 
@@ -573,20 +608,46 @@ def claude_session_rows(rows, errors, projects, transcripts=None):
         except Exception:
             skipped += 1
     if skipped:
+        source_failed()
         errors.append(f"Claude 세션 {skipped}건을 읽지 못했습니다.")
     return out
 
 
-def claude_snippet(path, size):
+def claude_snippet(path, size, metadata=None):
     """Last answer preview from a small tail first; widen only when the tail has none."""
     for limit in SNIPPET_TAILS:
-        messages = claude_messages(tail_entries(path, limit))
+        entries = list(tail_entries(path, limit))
+        if metadata is not None:
+            manual = next((e.get("customTitle") for e in reversed(entries)
+                           if e.get("type") == "custom-title" and _metadata_text(e.get("customTitle"), 160)), None)
+            if manual:
+                metadata["manualNativeTitle"] = manual
+        messages = claude_messages(entries)
         last = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
         if last:
             return one_line(last["text"], 140)
         if size <= limit:
             break
     return ""
+
+
+def claude_initial_titles(path, *, read_manual=True):
+    with path.open("rb") as stream:
+        raw = stream.read(65536)
+    head = []
+    for line in raw.splitlines()[:30]:
+        try:
+            entry = json.loads(line)
+            if isinstance(entry, dict):
+                head.append(entry)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+    first = next((m["text"] for m in claude_messages(head) if m["role"] == "user"
+                  and not m["text"].lstrip().startswith("<")), "")
+    manual = next((e.get("customTitle") for e in reversed(head + (list(tail_entries(path, 65536)) if read_manual else []))
+                   if e.get("type") == "custom-title" and _metadata_text(e.get("customTitle"), 160)), None)
+    return {"initialTitle": one_line(first, 60) or "(제목 없음)",
+            **({"manualNativeTitle": manual} if manual else {})}
 
 
 def _metadata_text(value, limit=256):
@@ -722,13 +783,14 @@ def claude_row(row, transcripts, projects):
         raise TypeError("Claude 세션 행 형식이 올바르지 않습니다.")
     session_id = str(row.get("sessionId") or "")
     path = transcripts.get(session_id) if SESSION_ID.match(session_id) else None
-    snippet, updated = "", to_epoch(row.get("startedAt"))
+    snippet, updated, titles = "", to_epoch(row.get("startedAt")), {}
     entrypoint = _metadata_text(row.get("entrypoint")) if not path else None
     if path:
         try:
             info = path.stat()
             updated = int(info.st_mtime)
-            snippet = claude_snippet(path, info.st_size)
+            titles = claude_initial_titles(path, read_manual=False)
+            snippet = claude_snippet(path, info.st_size, metadata=titles)
             entrypoint = claude_entrypoint(path, session_id)
         except OSError:
             # Removed or unreadable transcripts keep the session row without a preview.
@@ -743,11 +805,14 @@ def claude_row(row, transcripts, projects):
         "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
         **session_origin(row),
     }
+    out.update(titles)
     pid = row.get("pid")
     if not out["id"] and isinstance(pid, int) and not isinstance(pid, bool):
         # A row `claude agents` lists without an id (seen for a working interactive
         # session) cannot be read or sent to; its process id still tells two apart on the board.
         out["pid"] = pid
+    if out['phase'] == 'unknown':
+        out.update(runtimeKnown=False, runtimeReason='이 Claude CLI의 실행 상태를 해석하지 못했습니다.')
     return out
 
 
@@ -1152,6 +1217,8 @@ def codex_home_rows(key, project_id, account, reply, projects, offline=False):
     """(rows, errors) of one home's (listed, loaded, failure) reply; `offline` rows come from
     its state DB without a daemon and say so (`appServer: "off"`)."""
     listed, loaded, failure = reply
+    if failure:
+        source_failed()
     if failure and offline:
         return [], [f"Codex({account}) 기록을 읽지 못했습니다."]
     if failure == "connect":
@@ -1159,6 +1226,9 @@ def codex_home_rows(key, project_id, account, reply, projects, offline=False):
     if failure:
         return [], [f"Codex daemon({account}) 응답을 읽지 못했습니다."]
     threads = listed.get("data") if isinstance(listed, dict) else None
+    if not isinstance(threads, list):
+        source_failed()
+        return [], [f"Codex({account}) 목록 형식이 예상과 다릅니다."]
     rows, skipped = [], 0
     for thread in threads if isinstance(threads, list) else []:
         # Each thread row is isolated so one unexpected shape keeps the rest visible.
@@ -1170,6 +1240,8 @@ def codex_home_rows(key, project_id, account, reply, projects, offline=False):
         except Exception:
             skipped += 1
     errors = [f"Codex({account}) 작업 {skipped}건을 읽지 못했습니다."] if skipped else []
+    if skipped:
+        source_failed()
     if isinstance(listed, dict) and listed.get("_sourceCoverage") == "interactive":
         errors.append(f"Codex({account}) 버전이 시작 경로 필터를 지원하지 않아 대화형 기록만 표시합니다.")
     return rows, errors
@@ -1208,7 +1280,10 @@ def codex_row(thread, key, project_id, account, loaded, projects):
     cwd = str(thread.get("cwd") or "")
     name = thread.get("name")
     preview = one_line(thread.get("preview"), 140)
-    return {
+    initial = next((thread[k] for k in ("first_user_message", "preview")
+                    if isinstance(thread.get(k), str) and thread[k].strip()), "")
+    initial = bot_request_text(codex_user_text(initial) or "")
+    row = {
         "agent": "codex", "id": str(thread.get("id") or ""), "home": key,
         "title": name or preview[:60] or "(제목 없음)", "named": bool(name), "cwd": cwd,
         "project": project_label(project_id, projects) if project_id else project_for(cwd, projects),
@@ -1218,7 +1293,11 @@ def codex_row(thread, key, project_id, account, loaded, projects):
         "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
         "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
         **session_origin(thread),
+        "initialTitle": one_line(initial, 60) or "(제목 없음)",
     }
+    if row['phase'] == 'unknown':
+        row.update(runtimeKnown=False, runtimeReason='이 Codex CLI의 실행 상태를 해석하지 못했습니다.')
+    return row
 
 
 def codex_turn_rows(turn):
@@ -1464,11 +1543,16 @@ def tmux_sessions():
     title, task = options.get("titleOption"), options.get("taskOption")
     fields = (["#{session_name}", "#{session_attached}", "#{session_activity}", "#{pane_current_command}"]
               + ["#{%s}" % name for name in (title, task) if name] + ["#{pane_title}"])
-    raw = run([binary, "list-panes", "-a", "-F", "\t".join(fields)], timeout=8)
+    raw = run([binary, "list-panes", "-a", "-F", "\t".join(fields)], timeout=8, empty_tmux=True)
+    if raw is None:
+        source_failed()
     seen, out = set(), []
     for line in (raw or "").splitlines():
         row = line.split("\t")
-        if len(row) < len(fields) or row[0] in seen:
+        if len(row) < len(fields) or not row[0]:
+            source_failed()
+            continue
+        if row[0] in seen:
             continue
         seen.add(row[0])
         title_value = row[4] if title else ""
@@ -1481,24 +1565,39 @@ def tmux_sessions():
 
 # ---------- entry points ----------
 
-def section(errors, label, collect, *args):
+def section(errors, label, collect, *args, status=None):
     """Isolate one source; a failure is reported in `errors` and the others still return."""
+    status = status if status is not None else {'ok': True}
+    status['ok'] = True
+    before = len(errors)
+    token = SOURCE_STATUS.set(status)
     try:
-        rows = collect(*args)
-    except Exception:
-        errors.append(f"{label}을 읽는 중 오류가 발생했습니다.")
-        return []
-    return rows if isinstance(rows, list) else []
+        try:
+            rows = collect(*args)
+        except Exception:
+            source_failed()
+            errors.append(f"{label}을 읽는 중 오류가 발생했습니다.")
+            return []
+        if not isinstance(rows, list):
+            source_failed()
+            rows = []
+        if not status['ok'] and len(errors) == before:
+            errors.append(f"{label}을 확인하지 못했습니다.")
+        return rows
+    finally:
+        SOURCE_STATUS.reset(token)
 
 
 def snapshot(full=False):
     """`full` asks Codex to scan and repair its rollout metadata instead of its state DB only."""
     errors = []
+    statuses = {key: {'ok': True} for key in ('claude', 'codex', 'tmux')}
     projects = load_projects()
     return {"host": socket.gethostname(), "collectedAt": int(time.time()),
-            "claude": section(errors, "Claude 세션 목록", claude_sessions, errors, projects),
-            "codex": section(errors, "Codex 작업 목록", codex_threads, errors, projects, full),
-            "tmux": section(errors, "tmux 세션 목록", tmux_sessions), "errors": errors}
+            "claude": section(errors, "Claude 세션 목록", claude_sessions, errors, projects, status=statuses['claude']),
+            "codex": section(errors, "Codex 작업 목록", codex_threads, errors, projects, full, status=statuses['codex']),
+            "tmux": section(errors, "tmux 세션 목록", tmux_sessions, status=statuses['tmux']),
+            "errors": errors, "sourceStatus": statuses}
 
 
 def read(agent, session_id, home_key=None):
@@ -1643,6 +1742,8 @@ def claude_transcript_fingerprint(rows, index):
 def watch_signatures(data):
     """(everything but collectedAt, the same without fields that move while agents work)."""
     body = {key: value for key, value in data.items() if key != "collectedAt"}
+    body = {**body, **{key: [{k: v for k, v in row.items() if k != 'runtimeReadToken'} for row in body.get(key, [])]
+                      for key in ('claude', 'codex')}}
 
     def digest(value):
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str).encode()).digest()
@@ -1683,8 +1784,8 @@ class CodexHome:
 
     def publish(self, reply):
         project_id, account = self.label
-        rows, errors = codex_home_rows(self.key, project_id, account, reply, self.watch.projects)
-        self.watch.publish(("codex", self.key), with_login(rows, self.path), errors)
+        (rows, errors), ok = checked_source(codex_home_rows, self.key, project_id, account, reply, self.watch.projects)
+        self.watch.publish(("codex", self.key), with_login(rows, self.path), errors, ok=ok)
 
     def run(self):
         failures = 0
@@ -1765,6 +1866,9 @@ class Watch:
         self.input_closed = False
         self.local_refresh = False
         self.parts = {}
+        self.part_tokens = {}
+        self.read_epoch = os.urandom(8).hex()
+        self.read_seq = 0
         self.homes = {}
         self.order = []
         self.projects = []
@@ -1813,11 +1917,13 @@ class Watch:
         self.local_wake.set()
 
     # ---------- sources ----------
-    def publish(self, key, rows, errors):
+    def publish(self, key, rows, errors, ok=None, runtime_read=True):
+        part = (rows, errors, not errors if ok is None else ok)
         with self.lock:
-            if self.parts.get(key) == (rows, errors):
-                return
-            self.parts[key] = (rows, errors)
+            if runtime_read:
+                self.read_seq += 1
+                self.part_tokens[key] = '%s:%d' % (self.read_epoch, self.read_seq)
+            self.parts[key] = part
         self.wake.set()
 
     def load_projects(self):
@@ -1859,12 +1965,18 @@ class Watch:
         # A home without a daemon is listed from its state DB on each sync; a daemon that
         # appears later takes the home over on the next sync.
         for (key, path), (project_id, account) in zip(offline, codex_labels(offline)):
-            rows, errors = codex_home_rows(key, project_id, account, codex_db_threads(path), self.projects, offline=True)
-            self.publish(("codex", key), rows, errors)
+            token_status = {'ok': True}
+            token = SOURCE_STATUS.set(token_status)
+            try:
+                rows, errors = codex_home_rows(key, project_id, account, codex_db_threads(path), self.projects, offline=True)
+            finally:
+                SOURCE_STATUS.reset(token)
+            self.publish(("codex", key), rows, errors, ok=token_status['ok'])
 
     def watch_local(self):
         """Claude Code from stat fingerprints plus `claude agents`, and tmux every few seconds."""
         agents, agent_errors, registry, transcripts, index = None, [], None, None, {}
+        agent_ok = True
         last_agents, next_tmux = None, 0.0
         while not self.stopping.is_set():
             with self.lock:
@@ -1880,9 +1992,10 @@ class Watch:
                 if call:
                     agent_errors = []
                     try:
-                        agents = claude_agent_rows(agent_errors)
+                        agents, agent_ok = checked_source(claude_agent_rows, agent_errors)
+                        agent_ok = agent_ok and not agent_errors
                     except Exception:
-                        agents, agent_errors = [], ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
+                        agents, agent_errors, agent_ok = [], ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."], False
                     registry, last_agents = seen, self.clock()
                 try:
                     watched = claude_transcript_fingerprint(agents, index) if agents else None
@@ -1891,6 +2004,7 @@ class Watch:
                 if call or watched != transcripts:
                     errors = list(agent_errors)
                     rows = []
+                    row_status = {'ok': True}
                     if agents:
                         try:
                             index = claude_transcript_index()
@@ -1898,7 +2012,8 @@ class Watch:
                             index = {}
                             errors.append("Claude 대화 기록 폴더를 읽지 못했습니다.")
                         try:
-                            rows = claude_session_rows(agents, errors, self.projects, index)
+                            rows = section(errors, 'Claude 세션 목록', claude_session_rows,
+                                           agents, errors, self.projects, index, status=row_status)
                         except Exception:
                             rows, errors = [], errors + ["Claude 세션 목록을 읽는 중 오류가 발생했습니다."]
                         try:
@@ -1906,10 +2021,13 @@ class Watch:
                         except OSError:
                             watched = None
                     transcripts = watched
-                    self.publish("claude", rows, errors)
+                    self.publish("claude", rows, errors, ok=agent_ok and row_status['ok'] and not errors,
+                                 runtime_read=call)
                 if refresh or now >= next_tmux:
                     errors = []
-                    self.publish("tmux", section(errors, "tmux 세션 목록", tmux_sessions), errors)
+                    status = {'ok': True}
+                    rows = section(errors, "tmux 세션 목록", tmux_sessions, status=status)
+                    self.publish("tmux", rows, errors, ok=status['ok'])
                     next_tmux = now + WATCH_TMUX
             except Exception as exc:
                 # One unexpected failure ends neither this thread nor the watcher: the
@@ -1926,18 +2044,23 @@ class Watch:
         """The snapshot from every source read so far. A source still unread (the first
         snapshot waits at most WATCH_READY) is named in errors, never shown as empty."""
         with self.lock:
-            claude = self.parts.get("claude", ([], ["Claude 세션 목록을 아직 읽지 못했습니다."]))
-            tmux = self.parts.get("tmux", ([], ["tmux 세션 목록을 아직 읽지 못했습니다."]))
+            tokens = dict(self.part_tokens)
+            order = list(self.order)
+            claude = self.parts.get("claude", ([], ["Claude 세션 목록을 아직 읽지 못했습니다."], False))
+            tmux = self.parts.get("tmux", ([], ["tmux 세션 목록을 아직 읽지 못했습니다."], False))
             codex = [self.parts.get(("codex", key)) or
                      ([], ["Codex daemon(%s) 목록을 아직 읽지 못했습니다." % self.homes[key].label[1]
-                           if key in self.homes else "Codex 작업 목록을 아직 읽지 못했습니다."])
+                           if key in self.homes else "Codex 작업 목록을 아직 읽지 못했습니다."], False)
                      for key in self.order]
         codex_rows, codex_errors = [], []
-        for part in codex:
-            codex_rows.extend(part[0])
+        for key, part in zip(order, codex):
+            codex_rows.extend({**r, 'runtimeReadToken': tokens.get(('codex', key))} for r in part[0])
             codex_errors.extend(part[1])
-        return {"host": self.hostname, "collectedAt": int(time.time()), "claude": claude[0],
-                "codex": codex_rows, "tmux": tmux[0], "errors": claude[1] + codex_errors + tmux[1]}
+        return {"host": self.hostname, "collectedAt": int(time.time()),
+                "claude": [{**r, 'runtimeReadToken': tokens.get('claude')} for r in claude[0]],
+                "codex": codex_rows, "tmux": tmux[0], "errors": claude[1] + codex_errors + tmux[1],
+                'sourceStatus': {'claude': {'ok': claude[2]}, 'codex': {'ok': all(part[2] for part in codex)},
+                                 'tmux': {'ok': tmux[2]}}}
 
     # ---------- lifetime ----------
     def acquire_lock(self):
@@ -2019,6 +2142,8 @@ class Watch:
         next_homes = started + WATCH_HOMES
         sent = (None, None)
         last_emit = None
+        observed = None
+        last_observation = started - 30
         while True:
             reason = self.stop_reason()
             if reason:
@@ -2031,6 +2156,7 @@ class Watch:
             if self.seq or self.ready() or now - started >= WATCH_READY:
                 data = self.compose()
                 signatures = watch_signatures(data)
+                tokens = tuple(r.get('runtimeReadToken') for key in ('claude', 'codex') for r in data[key])
                 if signatures[0] != sent[0]:
                     gap = WATCH_GAP if (signatures[1] != sent[1] or not self.seq) else WATCH_MINOR_GAP
                     if last_emit is None or now - last_emit >= gap:
@@ -2038,8 +2164,13 @@ class Watch:
                         self.emit({"type": "snapshot", "seq": self.seq,
                                    "reason": "initial" if self.seq == 1 else "change", "data": data})
                         sent, last_emit = signatures, now
+                        observed, last_observation = tokens, now
                     else:
                         dues.append(last_emit + gap)
+                elif tokens != observed and now - last_observation >= 30:
+                    self.seq += 1
+                    self.emit({'type': 'snapshot', 'seq': self.seq, 'reason': 'observation', 'data': data})
+                    observed, last_observation = tokens, now
             else:
                 dues.append(started + WATCH_READY)
             if self.clock() - self.last_output >= WATCH_HEARTBEAT:

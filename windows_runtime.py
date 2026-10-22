@@ -342,11 +342,12 @@ def _state(thread):
         raise ValueError('PC 세션 응답 형식이 올바르지 않습니다.')
     known = all(isinstance(t, dict) and t.get('status') in ('inProgress', 'completed', 'interrupted', 'failed') for t in turns)
     active = [t for t in turns if isinstance(t, dict) and t.get('status') == 'inProgress']
-    phase = wc._phase(thread.get('status')) if known else 'unknown'
+    runtime = wc._codex_runtime(thread.get('status')) if known else wc._unknown_runtime('turn_status_unsupported', 'unsupported')
+    phase = runtime['phase']
     if phase == 'idle' and active:
-        phase = 'unknown'
-    return {'phase': phase, 'activeTurnId': active[0].get('id') if len(active) == 1 else None,
-            'activeFlags': wc._flags(thread.get('status')), 'runtimeKnown': phase != 'unknown',
+        runtime = wc._unknown_runtime('status_inconsistent', 'unsupported')
+    return {**runtime, 'activeTurnId': active[0].get('id') if len(active) == 1 else None,
+            'activeFlags': wc._flags(thread.get('status')),
             'turns': [{'id': t.get('id'), 'status': t.get('status')} for t in turns[-80:] if isinstance(t, dict)],
             'updatedAt': wc._epoch(thread.get('updatedAt'))}
 
@@ -420,6 +421,47 @@ class WindowsRuntime:
         self.home, self.proxy_factory = self.reader.home, proxy_factory
         self.store = Store(self.home)
         self.terminate_process = terminate_process
+
+    def recover_session(self, source):
+        """Read exact saved metadata only; no endpoint, process launch or native write."""
+        identity = _identity(source)
+        if identity['agent'] == 'codex':
+            rows = self.reader.database_rows(identity['id'])
+            cwd = source.get('cwd')
+            if (len(rows) != 1 or rows[0].get('id') != identity['id'] or rows[0].get('archived') != 0
+                    or not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_absolute()
+                    or not isinstance(rows[0].get('cwd'), str)
+                    or wc._norm(cwd) != wc._norm(rows[0]['cwd'])):
+                raise ValueError('PC 원본 세션과 저장된 작업 폴더를 확인하지 못했습니다.')
+            row = self.reader._row(rows[0])
+            row = {**row, **identity, 'cwd': rows[0]['cwd']}
+        else:
+            if source.get('home') not in (None, '', '.claude'):
+                raise ValueError('원본 PC Claude 계정 경로를 확인해 주세요.')
+            sid = source.get('sessionId') or identity['id']
+            if not isinstance(sid, str) or not wc.SID.fullmatch(sid):
+                raise ValueError('PC Claude 대화 식별자가 올바르지 않습니다.')
+            root = self.reader.claude_home / 'projects'
+            matches = list(root.glob('*/' + sid + '.jsonl'))
+            if len(matches) != 1:
+                raise ValueError('정확한 PC Claude 저장 대화를 확인하지 못했습니다.')
+            path = wc._safe(matches[0], root)
+            if path.stem != sid or not path.is_file():
+                raise ValueError('PC Claude 저장 대화의 식별자가 바뀌었습니다.')
+            header = wc._head(path)
+            ids = {entry['sessionId'] for entry in header if isinstance(entry.get('sessionId'), str) and entry['sessionId']}
+            cwds = {entry['cwd'] for entry in header if isinstance(entry.get('cwd'), str) and entry['cwd']}
+            cwd = source.get('cwd')
+            if (ids != {sid} or not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_absolute()
+                    or not cwds or any(wc._norm(value) != wc._norm(cwd) for value in cwds)):
+                raise ValueError('PC Claude 저장 대화의 식별자 또는 작업 폴더가 바뀌었습니다.')
+            row = {**identity, 'home': source.get('home'), 'cwd': cwd}
+            if source.get('sessionId'):
+                row['sessionId'] = sid
+            if source.get('kind') in ('interactive', 'background', 'bg'):
+                row['kind'] = source['kind']
+        return {'source': {**row, 'phase': 'unknown', 'runtimeKnown': False, 'readOnly': True, 'canRead': True,
+                           'runtimeReason': '저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다.'}}
 
     def _resume_record_name(self, identity):
         # Host aliases must not provide another route around an unresolved resume.
@@ -834,7 +876,7 @@ class WindowsRuntime:
         session cwd as native_chat._send does: an image becomes a native image input, any
         other file a "첨부 파일:" path line (never its contents)."""
         ids = args.get('attachmentIds', [])
-        if (not isinstance(ids, list) or len(ids) > 8 or len(set(map(str, ids))) != len(ids)
+        if (not isinstance(ids, list) or len(ids) > wa.MAX_ATTACHMENTS or len(set(map(str, ids))) != len(ids)
                 or any(not isinstance(value, str) or not wa.ID.fullmatch(value) for value in ids)):
             raise ValueError('첨부 식별자가 올바르지 않습니다.')
         if ids and not (args.get('source') or {}).get('cwd'):
@@ -869,7 +911,7 @@ class WindowsRuntime:
         with self.store.lock():
             prior = self.store.read(name)
             if prior:
-                if prior.get('digest') != digest:
+                if prior.get('digest') != digest or (prior.get('binding') is not None and prior['binding'] != binding):
                     raise ValueError('같은 요청 ID로 다른 메시지를 보낼 수 없습니다.')
                 return prior['result']
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
@@ -926,7 +968,7 @@ class WindowsRuntime:
                 return {**observed, 'target': target, 'phase': state['phase'], 'capabilities': capabilities}
             observed = self._claude(source)
             row = observed['row']
-            phase = {'busy': 'working', 'idle': 'idle', 'waiting': 'needs_input'}.get(row.get('status'), 'unknown')
+            phase = wc._claude_phase(row.get('status'))
             capabilities['interrupt']['reason'] = '이 Claude 실행 방식은 응답만 중단하는 제어를 제공하지 않습니다.'
             capabilities['terminate'] = {'supported': True, 'method': 'claude-cli-process', 'reason': None,
                 'effect': '선택한 Claude CLI 프로세스를 종료합니다. 대화 기록은 유지되며 별도 하위 도구 프로세스의 종료는 확인하지 않습니다.',
@@ -954,11 +996,24 @@ class WindowsRuntime:
         identity = _identity(source)
         if action not in ('interrupt', 'terminate') or not isinstance(request_id, str) or not CONTROL_REQUEST.fullmatch(request_id):
             raise ValueError('PC 세션 제어 요청이 올바르지 않습니다.')
-        if not isinstance(proof, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,3900}\.[a-f0-9]{64}', proof):
+        cleanup_terminals = args.get('cleanupTerminals')
+        if cleanup_terminals is not None and (not isinstance(cleanup_terminals, list) or len(cleanup_terminals) > 64
+                or any(not isinstance(tid, str) or not re.fullmatch(r'[a-f0-9]{32}', tid) for tid in cleanup_terminals)):
+            raise ValueError('정리할 터미널 식별자가 올바르지 않습니다.')
+        receipt_only = args.get('receiptOnly') is True
+        if not receipt_only and (not isinstance(proof, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,3900}\.[a-f0-9]{64}', proof)):
             raise ValueError('PC 세션 확인 정보가 올바르지 않습니다.')
         digest, name = _digest([identity, action, proof]), 'control-' + _digest(request_id) + '.json'
+        binding_keys = ('cwd', 'kind', 'sessionId') if identity['agent'] == 'claude' else ('cwd',)
+        binding = {**identity, **{key: source.get(key) for key in binding_keys}}
         with self.store.lock():
             prior = self.store.read(name)
+            if receipt_only:
+                if (action != 'terminate' or not prior or prior.get('binding') != binding
+                        or prior.get('result', {}).get('source') != identity
+                        or prior['result'].get('action') != action or prior['result'].get('requestId') != request_id):
+                    raise ValueError('기존 종료 결과의 대상을 확인하지 못했습니다. 종료를 다시 요청하지 않았습니다.')
+                return {**prior['result'], 'replayed': True}
             if prior:
                 if prior.get('digest') != digest:
                     raise ValueError('같은 요청 ID로 다른 세션을 제어할 수 없습니다.')
@@ -976,21 +1031,23 @@ class WindowsRuntime:
                     raise ValueError('이미 사용한 세션 확인 정보입니다.')
                 return {**used['result'], 'replayed': True}
             observed = self._observe(source)
-            result = {'source': identity, 'action': action, 'requestId': request_id, 'confirmed': False, 'applied': False, 'status': 'rejected'}
+            result = {'source': identity, 'action': action, 'requestId': request_id, 'requestedAt': int(time.time()), 'confirmed': False, 'applied': False, 'status': 'rejected'}
+            if cleanup_terminals is not None:
+                result['cleanupTerminals'] = cleanup_terminals
             if payload.get('revision') != _digest(observed['target']):
                 return {**result, 'status': 'stale', 'reason': '원본 실행이 변경되었습니다. 다시 확인해 주세요.', 'preview': self._view(observed)}
             cap = observed['capabilities'][action]
             if not cap['supported']:
                 return {**result, 'reason': cap['reason']}
             pending = {**result, 'applied': None, 'status': 'unconfirmed', 'reason': 'PC 실행 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다.'}
-            self.store.save(name, {'digest': digest, 'result': pending})
+            self.store.save(name, {'digest': digest, 'binding': binding, 'result': pending})
             self.store.save(proof_name, {'result': pending})
             try:
                 details = self._apply(observed, action)
                 result.update(details)
             except (OSError, ValueError, TimeoutError):
                 result = pending
-            self.store.save(name, {'digest': digest, 'result': result})
+            self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
             self.store.save(proof_name, {'result': result})
             return result
 
@@ -1116,4 +1173,6 @@ def handle(request, data=None):
         return runtime.terminal_settle(args.get('source'))
     if op == 'resume_preview':
         return runtime.resume_preview(args.get('source'))
+    if op == 'recover_session':
+        return runtime.recover_session(args.get('source'))
     raise ValueError('지원하지 않는 PC 작업 요청입니다.')

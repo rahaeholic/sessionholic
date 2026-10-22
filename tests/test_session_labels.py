@@ -79,6 +79,19 @@ class SessionLabelsTest(unittest.TestCase):
         self.assertEqual(self.labels.path.read_bytes(), before)
         self.assertEqual(json.loads(before)['labels'], {})
 
+    def test_first_request_title_stays_fixed_when_native_auto_names_change_and_manual_aliases_win(self):
+        source = {**self.source, 'initialTitle': '첫 요청의 목적', 'title': '마지막 답변으로 붙은 이름'}
+        first = self.row(self.labels.decorate(self.snapshot(source)))
+        self.assertEqual(first['displayTitle'], '첫 요청의 목적')
+        later = {**source, 'title': '진행 후 다시 바뀐 자동 이름', 'initialTitle': 'preview까지 바뀐 뒤의 문구'}
+        reloaded = SessionLabels(self.directory)
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(later)))['displayTitle'], first['displayTitle'])
+        reloaded.set(source, '직접 정한 이름')
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(later)))['displayTitle'], '직접 정한 이름')
+        self.assertEqual(reloaded.set(later, None)['displayTitle'], '첫 요청의 목적')
+        native_manual = {**later, 'manualNativeTitle': 'CLI에서 직접 바꾼 이름'}
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(native_manual)))['displayTitle'], 'CLI에서 직접 바꾼 이름')
+
     def test_aliases_are_separate_for_host_home_agent_and_claude_transcript(self):
         claude = {**self.source, 'agent': 'claude', 'home': '.claude', 'sessionId': str(uuid.uuid4())}
         sources = [self.source, {**self.source, 'home': '.codex-other'},
@@ -384,7 +397,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
             self.assertEqual(self.request('POST', '/api/session/opened', payload)[0].status, 400)
         self.assertEqual(self.request('POST', '/api/session/opened', {'source': self.source}, csrf=False)[0].status, 403)
 
-    def test_a_terminal_its_user_closes_puts_its_session_away(self):
+    def test_closing_a_terminal_never_proves_native_termination_or_hides_its_card(self):
         closed = []
         linked = {'id': 'a' * 32, 'mode': 'new-session', 'alive': True, 'closed': False, 'linkConfidence': 'estimated',
                   'nativeSource': {**self.source, 'cwd': '/example/workspace', 'kind': None}}
@@ -397,7 +410,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
         self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('a' * 32), {})[0].status, 200)
         self.assertEqual(closed, ['b' * 32, 'a' * 32])
-        self.assertEqual(type(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt']), int)
+        self.assertIsNone(self.request('GET', '/api/snapshot')[1]['hosts'][0]['data']['codex'][0]['tidiedAt'])
 
     def claude_row(self, phase='done'):
         sid = str(uuid.uuid4())
@@ -419,7 +432,7 @@ class SessionLabelsHTTPTest(unittest.TestCase):
         self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
             list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: closed.append(tid) or {'ok': True})
         self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('c' * 32), {})[0].status, 200)
-        self.assertEqual(type(self.claude_tidied()), int)
+        self.assertIsNone(self.claude_tidied(), 'closing a view does not tidy the native conversation')
         # 실행 종료 from 세션 관리 names the row the board resolved, sessionId included.
         self.claude_row()
         self.board.state[self.host['name']]['ok'] = True
@@ -442,14 +455,14 @@ class SessionLabelsHTTPTest(unittest.TestCase):
                     list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
                 self.assertEqual(self.request('POST', '/api/terminal/%s/close' % ('d' * 32), {})[0].status, 200)
                 self.assertIsNone(self.claude_tidied())
-        # A run the board ends (not just a view) is put away even while it was working.
+        # Closing a resume TUI also does not prove its daemon's native turn ended.
         row = self.claude_row('working')
         native = self.httpd.workflow.native_of({**row, 'host': self.host['name'], 'agent': 'claude', 'home': '.claude'})
         terminal = {'id': 'e' * 32, 'mode': 'resume', 'alive': True, 'closed': False, 'nativeSource': native}
         self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
             list=lambda: [terminal], close=lambda: None, close_terminal=lambda tid: {'ok': True})
         self.request('POST', '/api/terminal/%s/close' % ('e' * 32), {})
-        self.assertEqual(type(self.claude_tidied()), int)
+        self.assertIsNone(self.claude_tidied())
 
     def test_a_confirmed_terminate_puts_the_session_away_and_an_interrupt_does_not(self):
         self.board.state[self.host['name']]['ok'] = True
@@ -953,7 +966,7 @@ class SnapshotResponseTest(unittest.TestCase):
         for name in self.STORES:
             snapshot = getattr(self.httpd, name).decorate(snapshot)
         snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
-                    'savedPrompts': self.httpd.prompts.summary()}
+                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': []}
         return json.dumps(snapshot, ensure_ascii=False).encode()
 
     def test_an_unchanged_snapshot_is_answered_without_copying_or_reading_any_store(self):

@@ -118,10 +118,16 @@ class SessionLabels(_KeptRead, Goals):
     No goal, native process, conversation, SSH or external service is consulted.
     Storage is lazy so an unavailable alias file cannot stop the board server.
     """
+    LABEL_LIMIT = MAX_LABELS
+
     def __init__(self, state_dir):
         super().__init__(state_dir)
         self.path = self.directory / 'session-labels.json'
         self.lock_path = self.directory / 'session-labels.lock'
+        self.initial_titles = InitialTitles(state_dir)
+
+    def state_key(self):
+        return _KeptRead.state_key(self), self.initial_titles.state_key()
 
     @staticmethod
     def _unavailable():
@@ -145,7 +151,7 @@ class SessionLabels(_KeptRead, Goals):
             if (not isinstance(data, dict) or set(data) != {'version', 'revision', 'labels'}
                     or type(data['version']) is not int or data['version'] != 1
                     or type(data['revision']) is not int or data['revision'] < 0
-                    or not isinstance(data['labels'], dict) or len(data['labels']) > MAX_LABELS):
+                    or not isinstance(data['labels'], dict) or len(data['labels']) > self.LABEL_LIMIT):
                 raise ValueError('store')
             for key, label in data['labels'].items():
                 if (not isinstance(label, dict) or set(label) != {'source', 'title'}
@@ -158,7 +164,8 @@ class SessionLabels(_KeptRead, Goals):
 
     @staticmethod
     def _titles(source, title):
-        original = source.get('title') or source.get('name') or '제목 없는 작업'
+        original = next((source[key] for key in ('manualNativeTitle', 'initialTitle', 'title', 'name')
+                         if isinstance(source.get(key), str) and source[key].strip()), '제목 없는 작업')
         original = scrub_text(original) if isinstance(original, str) else '제목 없는 작업'
         return {'titleAlias': title, 'originalTitle': original, 'displayTitle': title or original}
 
@@ -169,6 +176,9 @@ class SessionLabels(_KeptRead, Goals):
     def set(self, source, title):
         identity, title = _identity(source), _title(title)
         key = _key(identity)
+        initial = self.initial_titles.capture([source]).get(key)
+        if initial:
+            source = {**source, 'initialTitle': initial}
         with self._storage(write=True):
             data = self._read()
             old = data['labels'].get(key)
@@ -176,7 +186,7 @@ class SessionLabels(_KeptRead, Goals):
                 if title is None:
                     data['labels'].pop(key, None)
                 else:
-                    if old is None and len(data['labels']) >= MAX_LABELS:
+                    if old is None and len(data['labels']) >= self.LABEL_LIMIT:
                         raise GoalError('보드 표시 제목의 저장 한도에 도달했습니다.', 'session_labels_full', 409)
                     data['labels'][key] = {'source': identity, 'title': title}
                 data['revision'] += 1
@@ -188,6 +198,14 @@ class SessionLabels(_KeptRead, Goals):
         rows are decorated as they are instead of in a copy."""
         if not in_place:
             snapshot = copy.deepcopy(snapshot)
+        sources = [{**row, 'host': host['name'], 'agent': agent}
+                   for host in snapshot.get('hosts', []) for agent in ('codex', 'claude')
+                   for row in (host.get('data') or {}).get(agent, [])]
+        initial_error = None
+        try:
+            initial = self.initial_titles.capture(sources)
+        except GoalError as exc:
+            initial, initial_error = {}, exc
         try:
             with self._storage():
                 data = self._read_cached()
@@ -199,8 +217,53 @@ class SessionLabels(_KeptRead, Goals):
                     key = _row_key({**row, 'host': host['name'], 'agent': agent})
                     if key is None:
                         continue  # Unidentifiable rows stay visible, without an alias.
+                    if key in initial:
+                        row['initialTitle'] = initial[key]
                     row.update(self._titles(row, data['labels'].get(key, {}).get('title')))
-        return {**snapshot, 'sessionLabels': {'ok': True, 'revision': data['revision']}}
+        return {**snapshot, 'sessionLabels': {'ok': initial_error is None, 'revision': data['revision'],
+                **(initial_error.payload if initial_error else {})}}
+
+
+class InitialTitles(SessionLabels):
+    """Immutable automatic titles, separate from the user's explicit aliases."""
+    LABEL_LIMIT = 20000
+
+    def __init__(self, state_dir):
+        Goals.__init__(self, state_dir)
+        self.path = self.directory / 'session-initial-titles.json'
+        self.lock_path = self.directory / 'session-initial-titles.lock'
+
+    def state_key(self):
+        return _KeptRead.state_key(self)
+
+    def capture(self, sources):
+        candidates = {}
+        for source in sources:
+            value = source.get('initialTitle')
+            if not isinstance(value, str) or not value.strip() or value == '(제목 없음)':
+                continue
+            try:
+                identity = _identity(source)
+                candidates[_key(identity)] = {'source': identity, 'title': _title(value)}
+            except (GoalError, ValueError):
+                continue
+        if not candidates and not self.path.exists():
+            return {}
+        with self._storage():
+            data = self._read_cached()
+            missing = set(candidates) - set(data['labels'])
+        if missing:
+            with self._storage(write=True):
+                data = self._read()
+                added = False
+                for key in missing:
+                    if key not in data['labels'] and len(data['labels']) < self.LABEL_LIMIT:
+                        data['labels'][key] = candidates[key]
+                        added = True
+                if added:
+                    data['revision'] += 1
+                    self._write(data)
+        return {key: row['title'] for key, row in data['labels'].items()}
 
 
 # ---------- read marks ----------

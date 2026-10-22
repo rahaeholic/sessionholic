@@ -295,6 +295,22 @@ class NativeChatTests(unittest.TestCase):
         self.assertNotIn('PRIVATE-FILE-CONTENT', json.dumps(read))
         self.assertNotIn(str(self.cwd), json.dumps(row['attachments']))
 
+    def test_32_attachments_survive_native_send_and_proven_history_33_is_rejected(self):
+        files = [attachments.store(str(self.cwd), f'file-{n}.txt', b'fixture') for n in range(32)]
+        client = FakeClient(self.thread())
+        sent = self.handle(client, {**self.args, 'attachmentIds': [file['id'] for file in files]})
+        self.assertEqual(len(self.writes(client)[0][1]['input']), 33)
+        self.assertEqual(len(sent['attachments']), 32)
+        with patch.object(attachments, 'resolve', side_effect=AssertionError('history must not read files')):
+            read = self.handle(FakeClient(client.thread), {'action': 'read', 'source': self.source})
+        row = next(message for message in read['messages'] if message.get('clientId') == self.request)
+        self.assertEqual(len(row['attachments']), 32)
+        extra = attachments.store(str(self.cwd), 'extra.txt', b'fixture')
+        rejected = FakeClient(self.thread())
+        with self.assertRaises(ValueError):
+            self.handle(rejected, {**self.args, 'attachmentIds': [file['id'] for file in files] + [extra['id']]})
+        self.assertEqual(self.writes(rejected), [])
+
     def test_batch_receipts_reuse_one_snapshot_beyond_display_window(self):
         completed, unknown, running = self.request + '-done', self.request + '-unknown', self.request + '-running'
         thread = self.thread('active')
@@ -962,6 +978,22 @@ class NativeChatTests(unittest.TestCase):
 
 
 class StoppedOnErrorTest(unittest.TestCase):
+    def test_failed_receipt_explains_server_overload_without_exposing_native_error_text(self):
+        request_id = 'request-overloaded-001'
+        turn = {'id': 'failed-turn', 'status': 'failed',
+                'items': [{'type': 'userMessage', 'clientId': request_id}],
+                'error': {'codexErrorInfo': 'serverOverloaded', 'message': 'private Native diagnostic'}}
+        result = chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]})
+        self.assertEqual(result['delivery'], 'failed')
+        self.assertTrue(result['confirmed'])
+        self.assertFalse(result['canRetry'])
+        self.assertEqual(result['failureCode'], 'server_overloaded')
+        self.assertNotIn('private', json.dumps(result))
+        turn['error']['codexErrorInfo'] = 'private-arbitrary-code'
+        self.assertNotIn('failureCode', chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]}))
+        turn['error'] = 'private invalid Native error'
+        self.assertNotIn('failureCode', chat._receipt({'agent': 'codex'}, request_id, {'turns': [turn]}))
+
     def test_a_codex_stopped_on_an_error_reads_as_waiting_and_says_why_input_is_locked(self):
         source = {'agent': 'codex', 'home': '.codex-isolated', 'id': str(uuid.uuid4()), 'cwd': '/tmp/project'}
         thread = {'id': source['id'], 'cwd': '/tmp/project', 'status': {'type': 'systemError'}, 'canAcceptDirectInput': True,

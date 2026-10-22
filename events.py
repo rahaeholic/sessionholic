@@ -57,7 +57,8 @@ def encode_event(name, data):
 
 
 def state_digest(state):
-    return hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
+    from runtime_observation import semantic
+    return hashlib.sha256(json.dumps(semantic(state), sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:24]
 
 
 def live_terminals(rows):
@@ -73,6 +74,8 @@ def chat_ref(query):
     ref = {key: query.get(key) for key in ("host", "agent", "id")}
     if query.get("home"):
         ref["home"] = query["home"]
+    if query.get('agent') == 'claude' and query.get('sessionId'):
+        ref['sessionId'] = query['sessionId']
     return ref
 
 
@@ -80,7 +83,10 @@ def watch_key(ref):
     """Key of a server-normalized conversation identity (chat.Chat.identity of the listed
     source): the same string as the conversation state cache key, so one watcher serves
     one conversation however the client spelled it."""
-    return json.dumps({key: ref.get(key) for key in CHAT_KEYS}, sort_keys=True)
+    identity = {key: ref.get(key) for key in CHAT_KEYS}
+    if ref.get('agent') == 'claude' and ref.get('sessionId'):
+        identity['sessionId'] = ref['sessionId']
+    return json.dumps(identity, sort_keys=True)
 
 
 class Stream:
@@ -92,6 +98,7 @@ class Stream:
         self.digest = None
         self.hello = 0
         self.sent_digest = None
+        self.observation = None
         # Terminal list versions: the one sent with hello and the newest announced since.
         self.hello_terminals = None
         self.terminals = None
@@ -111,6 +118,8 @@ class Watcher:
         self.reading = False
         # Asked to leave to make room; following it again before it has left revives it.
         self.retiring = False
+        self.observation_token = None
+        self.observation_at = None
 
 
 class EventHub:
@@ -332,6 +341,7 @@ class EventHub:
                 hello["terminalsVersion"] = stream.hello_terminals
             write(("retry: %d\n\n" % RETRY_MS).encode() + encode_event("hello", hello))
             sent_version, sent_digest = stream.hello, stream.sent_digest
+            sent_observation = None
             sent_terminals = stream.hello_terminals
             next_ping = self.clock() + self.heartbeat
             # When the last snapshot announcement went out, and whether a newer version waits.
@@ -345,6 +355,7 @@ class EventHub:
                     stream.ready.clear()
                     version, digest, closed = stream.version, stream.digest, self.closed
                     terminals = stream.terminals
+                    observation = stream.observation
                 if closed:
                     reason = "server"
                     return
@@ -362,9 +373,10 @@ class EventHub:
                         count += 1
                     else:
                         held = True
-                if digest is not None and digest != sent_digest:
-                    out += encode_event("chat", {"digest": digest})
+                if digest is not None and (digest != sent_digest or observation != sent_observation):
+                    out += encode_event("chat", {"digest": digest, **(observation or {})})
                     sent_digest = digest
+                    sent_observation = observation
                     count += 1
                 if terminals is not None and (sent_terminals is None or terminals > sent_terminals):
                     # Several changes since the last write are one announcement.
@@ -468,7 +480,19 @@ class EventHub:
             return False, None
         if not isinstance(state, dict):
             return False, None
-        return state.get("phase") == "working", state_digest(state)
+        digest = state_digest(state)
+        observation = state.get('runtimeObservation')
+        if isinstance(observation, dict) and not state.get('stale'):
+            token = (observation.get('bootId'), observation.get('acceptedSeq'))
+            with self.lock:
+                now = self.clock()
+                if (token != watcher.observation_token and
+                        (digest != watcher.digest or watcher.observation_at is None or now - watcher.observation_at >= 30)):
+                    watcher.observation_token, watcher.observation_at = token, now
+                    for stream in watcher.streams:
+                        stream.observation = {'runtimeObservation': observation, 'lastKnown': state.get('lastKnown')}
+                        stream.ready.set()
+        return state.get("phase") == "working", digest
 
     def _next_delay(self, watcher, working, digest, changed):
         with self.lock:

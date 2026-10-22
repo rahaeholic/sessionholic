@@ -23,11 +23,16 @@
     <!-- Applies the stored theme and text size before the first paint. -->
     <script src="/theme-init.js"></script>
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/workspace.css" />
     <!-- The terminal library (vendor/xterm.*, addon-fit) loads on first terminal open. -->
     <script src="/message-format.js" defer></script>
     <script src="/session_labels.js" defer></script>
     <script src="/session_history.js" defer></script>
+    <script src="/session_relations.js" defer></script>
+    <script src="/session_context.js" defer></script>
+    <script src="/session_delegation.js" defer></script>
     <script src="/push.js" defer></script>
+    <script src="/workspace.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -141,6 +146,9 @@
             <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
           </svg>
         </button>
+        <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
+        <button id="workspace-view-toggle" class="quiet workspace-view-toggle" type="button" hidden>단일 화면</button>
+        <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>◫ 분할</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
       <div
@@ -239,6 +247,12 @@
             <div id="body-search-results"></div>
           </section>
           <div id="session-category-search" class="session-category-search" hidden><button id="session-category-search-action" type="button"></button></div>
+          <section id="session-recoveries" class="session-recoveries" aria-labelledby="session-recovery-heading" hidden>
+            <div class="session-recovery-heading"><h3 id="session-recovery-heading">목록에서 빠진 대화</h3><span id="session-recovery-count"></span></div>
+            <p class="session-recovery-help">이전에 연결했던 대화입니다. 열어서 기록과 연결 상태를 확인하세요.</p>
+            <p id="session-recovery-status" class="session-recovery-status" role="status" hidden></p>
+            <div id="session-recovery-list" class="session-recovery-list"></div>
+          </section>
           <div id="groups" class="groups" role="tabpanel" aria-labelledby="session-category-general" aria-busy="true">
             <div class="skeleton-list" aria-hidden="true">
               <div class="skeleton-card"><span></span><span></span><span></span></div>
@@ -248,7 +262,7 @@
             </div>
             <p class="sr-only" role="status">세션을 확인하고 있습니다…</p>
           </div>
-          <p class="list-footnote">메시지는 여기서, 자세한 작업은 터미널에서.</p>
+          <p class="list-footnote">터미널에서 작업하고, 아래 작성창에서 메시지를 보내세요.</p>
           <!-- Shown where a hardware keyboard is (or was seen); opens the shortcuts. -->
           <button id="keyboard-hint" class="keyboard-hint" type="button" hidden aria-haspopup="dialog"
             aria-label="키보드 단축키 보기">↑↓ 이동 · → 열기 · ← 목록 · ⌫ 종료 · ? 단축키</button>
@@ -259,6 +273,8 @@
             ><button id="return-terminal" type="button">돌아가기</button>
           </div>
         </aside>
+        <section id="session-workspace" class="session-workspace" aria-label="세션 작업 공간">
+        <section id="workspace-primary" class="workspace-pane" data-pane-id="p1">
         <main id="detail" class="detail-pane" aria-label="세션 대화">
           <div class="welcome">
             <img class="welcome-mark" src="/icon.svg" alt="" />
@@ -266,6 +282,11 @@
             <p>세션을 고르면 최근 대화를 볼 수 있습니다.<br />이어서 사용할 에이전트와 계정도 여기서 선택하세요.</p>
           </div>
         </main>
+        </section>
+        <div id="workspace-dividers"></div>
+        <div id="workspace-drop-surface" aria-hidden="true"></div>
+        <div id="workspace-drop-cue" hidden></div>
+        </section>
       </div>
     </div>
     <div id="offline-banner" class="offline-banner" role="status" hidden>
@@ -274,6 +295,7 @@
     <button id="update-banner" class="offline-banner update-banner" type="button" data-kind="update" hidden>
       <span class="offline-dot" aria-hidden="true"></span><span>새 버전이 있습니다 · 눌러서 새로고침</span>
     </button>
+    <div id="terminal-home" hidden></div>
     <section
       id="terminal-screen"
       class="terminal-screen"
@@ -308,6 +330,7 @@
         <span id="terminal-status" role="status"></span
         ><button id="terminal-reconnect" type="button" hidden>다시 연결</button
         ><button id="terminal-reopen" type="button" hidden>이 세션 다시 열기</button
+        ><button id="terminal-compose" type="button" hidden>통합 입력 사용</button
         ><button
           id="terminal-copy"
           type="button"
@@ -370,6 +393,7 @@
           ><button type="button" data-key="ctrl-u" aria-label="Ctrl+U 줄 지우기">^U</button
           ><button type="button" data-key="ctrl-x" aria-label="Ctrl+X">^X</button
           ><button type="button" data-key="ctrl-l" aria-label="Ctrl+L 화면 다시 그리기">^L</button
+          ><button type="button" data-key="alt-left" aria-label="Option+왼쪽 화살표">⌥←</button
           ><button type="button" data-key="up" class="arrow-key" aria-label="위 방향키">↑</button
           ><button type="button" data-key="left" class="arrow-key" aria-label="왼쪽 방향키">←</button
           ><button type="button" data-key="down" class="arrow-key" aria-label="아래 방향키">↓</button
@@ -377,7 +401,15 @@
           ><button type="button" data-key="enter" class="enter-key">Enter</button>
         </div>
         <div id="draft-panel" class="draft-panel">
+          <div id="terminal-attachments" class="chat-attachments terminal-attachments" aria-label="터미널에 보낼 첨부" hidden></div>
+          <div id="terminal-attachment-actions" class="terminal-attachment-actions" hidden>
+            <span id="terminal-attachment-status" role="status"></span>
+            <button id="terminal-attachment-retry" type="button" hidden>첨부 다시 올리기</button>
+            <button id="terminal-attachment-cancel" type="button" hidden>올리지 않은 첨부 취소</button>
+          </div>
+          <input id="terminal-files" type="file" multiple hidden>
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
+          <p class="draft-mode-note">터미널에 직접 입력 · Enter로 실행</p>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
@@ -385,10 +417,11 @@
               aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
-              placeholder="입력 후 보내기"
+              placeholder="터미널에 직접 입력할 내용"
               autocapitalize="off"
               spellcheck="false"
             ></textarea
+            ><button id="draft-attach" class="draft-attach" type="button" aria-label="사진 또는 파일 첨부" title="파일 첨부 · 입력창에 바로 붙여넣어도 됩니다">＋</button
             ><button id="draft-mic" class="draft-mic" type="button" aria-label="음성 입력" aria-pressed="false" title="음성 입력 (브라우저 음성 인식)" hidden>
               <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
             </button
@@ -499,6 +532,12 @@
           보드의 글자 크기입니다. 터미널 글자 크기는 터미널 설정에서 따로
           바꿉니다. 이 선택들은 이 브라우저에만 저장됩니다.
         </p>
+        <details class="settings-section">
+          <summary class="theme-label">기기별 CLI 자동 업데이트</summary>
+          <p class="plan-preserve">매일 확인하며, 잠든 기기는 깨어난 뒤 실행합니다. 설치 버전은 새 실행부터 적용됩니다. 진행 중인 세션은 유지합니다.</p>
+          <div id="cli-status" aria-live="polite"></div>
+          <button id="cli-status-refresh" class="secondary" type="button">상태 다시 읽기</button>
+        </details>
         <p class="theme-label settings-section">초안 복원</p>
         <label class="draft-recovery-option"><input id="draft-recovery" type="checkbox" checked> 이 기기에 초안 보관</label>
         <p id="draft-recovery-status" class="plan-preserve" role="status">새로고침·탭 닫기 뒤 복원합니다. 잠그거나 로그인이 만료되면 삭제합니다.</p>
@@ -545,6 +584,12 @@
           <button id="saved-prompts-save" class="push-button" type="button">프롬프트 저장</button>
           <button id="saved-prompts-reload" class="push-button" type="button">최신 프롬프트 불러오기</button>
         </div>
+        <label class="theme-label settings-section" for="workspace-keys">창 이동 단축키 · Mac / iPad</label>
+        <select id="workspace-keys" class="workspace-keys">
+          <option value="ctrl-meta">Control + Command (기본)</option>
+          <option value="ctrl-alt-meta">Control + Option + Command</option>
+        </select>
+        <p class="plan-preserve">선택한 조합 + 방향키: 창 이동 · 1~4: 바로 이동 · Enter: 확대·복원</p>
         <p id="push-label" class="theme-label settings-section">알림</p>
         <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
         <div class="push-actions">
@@ -683,6 +728,12 @@
           <dt><kbd>Enter</kbd> <kbd>I</kbd></dt><dd>입력창으로</dd>
           <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>질문 카드의 선택지 고르기</dd>
           <dt><kbd>⌘↩</kbd> <kbd>Ctrl+Enter</kbd></dt><dd>보내기</dd>
+        </dl>
+        <p class="theme-label">창 분할 · Mac / iPad 외장 키보드</p>
+        <dl class="shortcuts">
+          <dt><kbd>Control+Command+← ↑ ↓ →</kbd></dt><dd>해당 방향의 세션 창으로 이동</dd>
+          <dt><kbd>Control+Command+1</kbd>–<kbd>4</kbd></dt><dd>배치 순서의 창으로 바로 이동</dd>
+          <dt><kbd>Control+Command+Enter</kbd></dt><dd>현재 창 확대·원래 배치 복원</dd>
         </dl>
         <p class="theme-label">세션 끝내기</p>
         <dl class="shortcuts">

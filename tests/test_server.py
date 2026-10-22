@@ -230,12 +230,35 @@ class ServerTest(unittest.TestCase):
         res, _ = self.request("GET", "/", headers={"Host": "remote.tail-example.ts.net"})
         self.assertEqual(res.status, 200)
 
+    def test_only_workspace_entry_allows_same_origin_framing(self):
+        response, page = self.request('GET', '/pane?pane=p2')
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'workspace.js', page)
+        self.assertEqual(response.getheader('X-Frame-Options'), 'SAMEORIGIN')
+        self.assertIn("frame-ancestors 'self'", response.getheader('Content-Security-Policy'))
+        self.assertEqual(response.getheader('Cache-Control'), 'no-cache')
+        etag = response.getheader('ETag')
+        response, _ = self.request('GET', '/pane?pane=p2', headers={'If-None-Match': etag})
+        self.assertEqual(response.status, 304)
+        self.assertEqual(response.getheader('X-Frame-Options'), 'SAMEORIGIN')
+        for path in ('/', '/index.html', '/api/snapshot', '/workspace.js'):
+            response, _ = self.request('GET', path)
+            self.assertEqual(response.getheader('X-Frame-Options'), 'DENY', path)
+            self.assertIn("frame-ancestors 'none'", response.getheader('Content-Security-Policy'), path)
+
     def test_csp_allows_blob_images_only_in_img_src(self):
         res, _ = self.request("GET", "/")
         policy = dict(part.strip().split(" ", 1) for part in res.getheader("Content-Security-Policy").split(";"))
         self.assertEqual(policy["img-src"], "'self' data: blob:")
         self.assertEqual(policy["default-src"], "'self'")
         self.assertNotIn("blob:", policy["script-src"])
+
+    def test_snapshot_refresh_can_target_one_registered_host(self):
+        with patch.object(self.board, 'request_refresh') as refresh:
+            response, _ = self.request('GET', '/api/snapshot?refresh=1&host=remote',
+                                       headers={'Authorization': 'Bearer ' + TOKEN})
+        self.assertEqual(response.status, 200)
+        refresh.assert_called_once_with('remote')
 
     def test_json_is_gzip_compressed_when_accepted_and_large(self):
         import gzip
@@ -254,18 +277,18 @@ class ServerTest(unittest.TestCase):
                       "sessionTidied": body["sessionTidied"], "sessionRemoved": body["sessionRemoved"],
                       "sessionOpened": body["sessionOpened"], "sessionPinned": body["sessionPinned"], "bootId": self.httpd.boot_id,
                       "quickReplyPreferences": {"ok": True, "revision": 0, "quickReplies": None},
-                      "savedPrompts": {"ok": True, "revision": 0}}
+                      "savedPrompts": {"ok": True, "revision": 0}, "recoverySessions": []}
             self.assertEqual(body, served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})
                 self.assertIsNone(res.getheader("Content-Encoding"), header)
                 self.assertEqual(json.loads(data), served)
         # Small replies stay plain even for gzip clients.
-        res, data = self.request("GET", "/api/snapshot", headers={
+        res, data = self.request("GET", "/api/prompts", headers={
             "Authorization": "Bearer " + TOKEN, "Accept-Encoding": "gzip"})
         self.assertIsNone(res.getheader("Content-Encoding"))
         self.assertEqual(res.getheader("Vary"), "Accept-Encoding")
-        self.assertIn("version", json.loads(data))
+        self.assertIn("revision", json.loads(data))
 
 
 WEB_INDEX = ('<!doctype html><html><head><meta charset="utf-8">\n'
@@ -409,6 +432,30 @@ class StaticAssetTest(unittest.TestCase):
         self.assertEqual(res.getheader("Cache-Control"), "no-cache")
         for path in ("/notes.txt", "/missing.js", "/vendor/../app.js", "/%2e%2e/server.py"):
             self.assertEqual(self.get(path)[0].status, 404, path)
+
+    def test_bundled_fonts_are_versioned_and_served_with_the_correct_mime_only_at_reviewed_paths(self):
+        import html
+        import re
+        for face in ("regular", "bold"):
+            name = "vendor/d2coding-%s.woff2" % face
+            target = self.web / name
+            target.write_bytes(b"wOF2\x00\xff" + face.encode())
+            self.addCleanup(target.unlink, missing_ok=True)
+            raw = target.read_bytes()
+            version = self.sha(raw)[:8]
+            res, data = self.get("/" + name + "?v=" + version, **{"Accept-Encoding": "gzip"})
+            self.assertEqual((res.status, data), (200, raw))
+            self.assertEqual(res.getheader("Content-Type"), "font/woff2")
+            self.assertEqual(res.getheader("Cache-Control"), server.IMMUTABLE)
+            self.assertIsNone(res.getheader("Content-Encoding"))
+            res, data = self.get("/" + name + "?v=" + version, method="HEAD")
+            self.assertEqual((res.status, data), (200, b""))
+            page = self.get("/")[1].decode()
+            content = re.search(r'name="sessionholic-assets"\s+content="([^"]*)"', page).group(1)
+            self.assertEqual(json.loads(html.unescape(content))["/" + name], version)
+            self.assertEqual(self.get("/" + name + "?v=00000000")[0].getheader("Cache-Control"), "no-cache")
+        for route in ("/d2coding-regular.woff2", "/vendor/other.woff2", "/vendor/../d2coding-bold.woff2"):
+            self.assertEqual(self.get(route)[0].status, 404)
 
     def test_index_is_rendered_with_asset_versions(self):
         import html
@@ -1147,13 +1194,15 @@ class FakeWatcher:
                     self.owner.say({"type": "bye", "reason": "stdin-closed"})
                     self.owner.exit(0)
 
-    def __init__(self, leave_on_eof=True):
+    def __init__(self, leave_on_eof=True, hello=True):
         read, write = os.pipe()
         self.stdout, self.out = os.fdopen(read, "rb"), os.fdopen(write, "wb", buffering=0)
         self.stdin = self.Input(self)
         self.leave_on_eof = leave_on_eof
         self.lines, self.signals = [], []
         self.exited, self.returncode = threading.Event(), None
+        if hello:
+            self.say({'type': 'hello', 'proto': 1})
 
     def say(self, message):
         try:
@@ -1472,6 +1521,22 @@ class BoardLiveTest(unittest.TestCase):
         self.assertEqual(watcher.signals, [])
         self.assertEqual((len(watchers), self.calls, self.live(board)), (1, [], False))
 
+    def test_incompatible_or_missing_hello_ends_only_live_and_keeps_one_shot_fallback(self):
+        for hello in ({'type': 'hello', 'proto': 2}, {'type': 'hello', 'proto': True},
+                      {'type': 'hello', 'proto': '1'}, {'type': 'heartbeat'}):
+            with self.subTest(hello=hello):
+                self.calls = []
+                board, watchers = self.live_board(hello=False)
+                board.viewer_joined()
+                wait_for(lambda: len(watchers) == 1)
+                watchers[0].say(hello)
+                watchers[0].say({'type': 'snapshot', 'data': live_data('호환되지 않는 목록')})
+                wait_for(lambda: self.calls == [('remote', ['snapshot'])])
+                self.assertTrue(board.state['remote']['ok'])
+                self.assertFalse(board.state['remote']['live'])
+                self.assertNotEqual(board.state['remote']['data']['claude'][0].get('title'), '호환되지 않는 목록')
+                board.close_live()
+
     def test_a_failed_watcher_falls_back_once_and_restarts_after_its_own_backoff(self):
         board, watchers = self.live_board()
         board.STREAM_BACKOFF, board.STREAM_TRIP = (60, 60, 60, 60), 60
@@ -1690,7 +1755,7 @@ class BoardLiveTest(unittest.TestCase):
         preface = server.remote_program()
         self.assertTrue(preface.startswith(b"from __future__ import annotations\n"))
         data = board.state["remote"]["data"]
-        self.assertEqual(set(data), {"host", "collectedAt", "claude", "codex", "tmux", "errors"})
+        self.assertEqual(set(data), {"host", "collectedAt", "claude", "codex", "tmux", "errors", 'sourceStatus'})
         self.assertEqual(data["codex"], [])
         board.viewer_left()
         wait_for(lambda: board.live_manager is None and not board.streams, timeout=10)

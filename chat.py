@@ -12,6 +12,7 @@ import threading
 import time
 
 import instance
+from attachments import MAX_ATTACHMENTS
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -68,7 +69,6 @@ MENU_GAP = 12
 QUESTION_LINES = 12
 PROMPT_SETTLE = 0.6
 PROMPT_KEY_LIMIT = 40
-PROMPT_RESULTS = 256
 PROMPT_CHANGED = '질문이 바뀌었거나 웹에서 고를 수 없는 메뉴입니다. 다시 확인해 주세요.'
 PROMPT_NO_TERMINAL = ('이 세션에는 보드가 연결한 터미널이 없어 질문에 답할 수 없습니다. '
                       '실행 중인 터미널에서 직접 선택해 주세요.')
@@ -122,8 +122,9 @@ class SendTiming:
 class StateRead:
     """One conversation read in progress. Readers asking for a subset of its receipt ids
     share it instead of starting their own remote read."""
-    def __init__(self, ids, epoch, cwd):
+    def __init__(self, ids, epoch, cwd, session_id=None):
         self.ids, self.epoch, self.cwd = frozenset(ids), epoch, cwd
+        self.session_id = session_id
         self.done = threading.Event()
         self.response = self.error = None
         self.joined = 0
@@ -425,7 +426,8 @@ class Chat:
         # two warm-ups never both pass the room check and push out another connection.
         self.warming = set()
         self.warm_gate = threading.Lock()
-        self.prompt_results = {}
+        from prompt_receipts import PromptReceipts
+        self.prompt_receipts = PromptReceipts(state_dir)
         # state key -> {request id: monotonic expiry}, oldest first.
         self.waiting = {}
         # state key -> the newest remote read in progress (StateRead).
@@ -438,9 +440,16 @@ class Chat:
         return {k: source.get(k) for k in ('host', 'agent', 'home', 'id')}
 
     @classmethod
+    def watch_identity(cls, source):
+        identity = cls.identity(source)
+        if source.get('agent') == 'claude' and source.get('sessionId'):
+            identity['sessionId'] = source['sessionId']
+        return identity
+
+    @classmethod
     def state_key(cls, source):
         # The conversation cache key; event watchers use the same key (events.watch_key).
-        return json.dumps(cls.identity(source), sort_keys=True)
+        return json.dumps(cls.watch_identity(source), sort_keys=True)
 
     def resolve(self, ref):
         """The listed source a client reference names, whether or not its host is reachable."""
@@ -449,14 +458,16 @@ class Chat:
         # Ordinary messages stay on the selected source even after a transfer.
         # A fresh destination is accepted only from server-written nativeSource metadata.
         try:
-            source = self.board.source(ref)
+            resolver = getattr(self.workflow, 'resolve_source', self.board.source)
+            source = resolver(ref)
             # Found among the board's rows of exactly this agent.
             source.setdefault('agent', ref.get('agent'))
             return source
         except ValueError:
             for terminal in self.workflow.terminals.list():
                 native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
-                if isinstance(native, dict) and self.identity(native) == self.identity(ref or {}):
+                if (isinstance(native, dict) and self.identity(native) == self.identity(ref or {})
+                        and (not ref.get('sessionId') or native.get('sessionId') == ref['sessionId'])):
                     return {**native, 'title': terminal.get('title', '이어가는 작업')}
             raise
 
@@ -495,6 +506,8 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
+                **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
+                   and result.get('failureCode') == 'server_overloaded' else {}),
                 'attachments': Chat.attachment_history(result.get('attachments', [])),
                 # A Claude send that attached the session's board terminal names it: the screen
                 # reads its terminal list then (its marks show the terminal at once).
@@ -529,20 +542,22 @@ class Chat:
                 carried = list(dict.fromkeys(request_ids + self._waiting_ids(key, now)))
             cached = self.cache.get(key)
             fresh = WATCH_CACHE_SECONDS if watching else STATE_CACHE_SECONDS
-            if (cached and cached[3] == source.get('cwd') and now - cached[0] < fresh
+            if (cached and self.board.state[host['name']]['ok']
+                    and cached[3] == source.get('cwd') and cached[5] == source.get('sessionId') and now - cached[0] < fresh
                     and cached[4].issuperset(request_ids)):
                 return self._cached_view(cached[1], request_ids)
             shared = self.reads.get(key)
             # Shared only when it started after the latest send or terminal input (the same
             # epoch) and carries every id asked for here.
             if (shared is not None and shared.epoch == self.cache_epoch and shared.cwd == source.get('cwd')
+                    and shared.session_id == source.get('sessionId')
                     and shared.ids.issuperset(request_ids)):
                 shared.joined += 1
             else:
                 shared = None
                 self.read_sequence += 1
                 sequence, epoch = self.read_sequence, self.cache_epoch
-                read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'))
+                read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'), source.get('sessionId'))
         if shared is not None:
             return self._shared_view(shared, request_ids)
         if watching:
@@ -581,6 +596,8 @@ class Chat:
     def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
         read came in meanwhile."""
+        observations = getattr(self.board, 'runtime_observations', None)
+        observation_request = observations.begin() if observations else None
         if not self.board.state[host['name']]['ok']:
             stale = self._stale(key, source, request_ids)
             if stale is not None:
@@ -593,7 +610,9 @@ class Chat:
         try:
             result = self.rpc(host, 'read', source, **kwargs)
         except (RuntimeError, OSError, ValueError) as exc:
-            if source.get('agent') != 'codex' or source.get('phase') not in ('closed', 'notLoaded'):
+            saved_codex = (source.get('phase') in ('closed', 'notLoaded') or source.get('appServer') == 'off'
+                           or source.get('state') == 'notLoaded')
+            if source.get('agent') != 'codex' or not saved_codex:
                 from transfer import WorkerError
                 from transfer_native import DEADLINE_EXCEEDED
                 # Only a host that could not be reached, or did not answer in time (its helper's
@@ -608,13 +627,14 @@ class Chat:
                 raise
             # A disconnected daemon does not erase the saved conversation.
             try:
-                result = self.board.read(source['host'], 'codex', source['id'], source['home'])
+                result = self.board.read(source['host'], 'codex', source['id'], source['home'], fresh=True)
             except (RuntimeError, OSError, ValueError):
                 result = {'error': 'unavailable'}
             if result.get('error'):
                 result = {'messages': [], 'conversationUnavailable': True,
                           'reason': '앱 서버 연결이 없어 대화 기록을 불러오지 못했습니다. 세션을 다시 열어 확인해 주세요.'}
-            result = {**result, 'phase': 'closed', 'capabilities': {'canSend': False}, 'readOnly': True}
+            result = {**result, 'phase': result.get('phase', 'unknown') if host.get('platform') == 'windows' else 'closed',
+                      'runtimeKnown': False, 'capabilities': {'canSend': False}, 'readOnly': True}
         caps = result.get('capabilities', {})
         phase = result.get('phase', 'unavailable')
         if phase == 'notLoaded': phase = 'closed'
@@ -685,7 +705,7 @@ class Chat:
                     # Rows before these were left out (collector.recent_window, the read's range).
                     'olderOmitted': result.get('olderOmitted') is True,
                     'modelSettings': self.model_settings(result.get('modelSettings')),
-                    'receipts': receipts, 'maxAttachmentBytes': MAX_FILE,
+                    'receipts': receipts, 'maxAttachmentBytes': MAX_FILE, 'maxAttachments': MAX_ATTACHMENTS,
                     'requiresNativeTerminal': phase == 'needs_input' if claude else
                     result.get('requiresNativeTerminal', phase == 'needs_input'),
                     # A menu on the board terminal's screen; the web may answer it.
@@ -726,7 +746,40 @@ class Chat:
             if field in result:
                 response[field] = scrub_payload(result[field])
         if result.get('readOnly'):
-            response.update(readOnly=True, runtimeKnown=result.get('runtimeKnown') is True)
+            response['readOnly'] = True
+        if type(result.get('runtimeKnown')) is bool:
+            response['runtimeKnown'] = result['runtimeKnown']
+        reason = result.get('runtimeReason')
+        if isinstance(reason, str):
+            response['runtimeReason'] = scrub_payload(reason[:600])
+        reason_code = result.get('runtimeReasonCode')
+        if isinstance(reason_code, str) and re.fullmatch(r'[a-z_]{1,80}', reason_code):
+            response['runtimeReasonCode'] = reason_code
+        if observation_request is not None:
+            observed = {**result, 'phase': phase, 'runtimeReason': response.get('runtimeReason')}
+            if host.get('platform') != 'windows':
+                from runtime_observation import native_result
+                observed = native_result(observed, source['agent'])
+            annotation = (observations.current(source) if kwargs.get('liveRow') else None)
+            if annotation is None:
+                if kwargs.get('liveRow'):
+                    observed['runtimeKnown'] = False
+                annotation = observations.accept(source, observed, observation_request, 90)
+            response.update(annotation)
+            # A later-started poll/read already won: do not publish the older status.
+            accepted = annotation['runtimeObservation']
+            response.update(phase=accepted['phase'], runtimeKnown=accepted['known'])
+            if not accepted['known']:
+                response.update(prompt=None, promptOpenable=False, workingSince=None,
+                                capability={**response['capability'], 'supported': False,
+                                            'reason': response.get('runtimeReason') or response['capability'].get('reason') or
+                                            '현재 실행 상태를 확인하지 못했습니다. 터미널에서 확인해 주세요.'})
+            if not kwargs.get('liveRow') and accepted['requestSeq'] != observation_request:
+                response.update(readOnly=True, prompt=None, promptOpenable=False, recovery=None,
+                                stateReadSuperseded=True,
+                                workingSince=None, requiresNativeTerminal=False,
+                                capability={'supported': False, 'attachments': False,
+                                            'reason': '더 최근 상태가 도착했습니다. 상태를 다시 확인해 주세요.'})
         with self.lock:
             cached = self.cache.get(key)
             # The ids whose receipts this read carries are kept with it: a later read may
@@ -736,12 +789,14 @@ class Chat:
                 if key not in self.cache and len(self.cache) >= 64:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = (time.monotonic(), response, sequence, source.get('cwd'),
-                                   frozenset(request_ids))
+                                   frozenset(request_ids), source.get('sessionId'))
             # Newest read last: the least recently read conversation leaves first.
-            self.last_good.pop(key, None)
-            if len(self.last_good) >= 64:
-                self.last_good.pop(next(iter(self.last_good)))
-            self.last_good[key] = (time.time(), response, source.get('cwd'), source.get('sessionId'))
+            last = self.last_good.get(key)
+            if epoch == self.cache_epoch and (last is None or sequence > last[4]):
+                self.last_good.pop(key, None)
+                if len(self.last_good) >= 64:
+                    self.last_good.pop(next(iter(self.last_good)))
+                self.last_good[key] = (time.time(), response, source.get('cwd'), source.get('sessionId'), sequence)
         return response
 
     def _stale(self, key, source, request_ids, slow=False):
@@ -751,7 +806,7 @@ class Chat:
         then is unknown, so nothing of the last read's work or actions carries over."""
         with self.lock:
             entry = self.last_good.get(key)
-        if entry is None or entry[2:] != (source.get('cwd'), source.get('sessionId')):
+        if entry is None or entry[2:4] != (source.get('cwd'), source.get('sessionId')):
             return None
         at, last = entry[:2]
         known = {receipt['requestId']: receipt for receipt in last.get('receipts', [])}
@@ -763,8 +818,15 @@ class Chat:
         capability.update(supported=False, attachments=False,
                           reason='기기가 제때 답하지 않아 마지막으로 읽은 대화를 보여 줍니다. 곧 다시 읽습니다.' if slow
                           else '기기에 연결되지 않아 마지막으로 읽은 대화를 보여 줍니다. 연결되면 다시 읽습니다.')
-        return {**last, 'receipts': receipts, 'capability': capability, 'stale': True, 'staleSince': int(at),
+        observation = last.get('runtimeObservation')
+        annotation = {}
+        if isinstance(observation, dict):
+            annotation = {'runtimeObservation': {**observation, 'known': False, 'phase': 'unknown',
+                                                  'reasonCode': 'read_unavailable'},
+                          'lastKnown': observation if observation.get('known') else last.get('lastKnown')}
+        return {**last, **annotation, 'receipts': receipts, 'capability': capability, 'stale': True, 'staleSince': int(at),
                 'phase': 'unavailable', 'workingSince': None, 'recovery': None,
+                'runtimeKnown': False, 'runtimeReason': capability['reason'],
                 'readOnly': True, 'prompt': None, 'promptOpenable': False}
 
     @staticmethod
@@ -801,6 +863,11 @@ class Chat:
 
     def _forget_state(self, source):
         # Terminal input changes what the next read must show; drop the cached view.
+        if source.get('agent') == 'claude' and not source.get('sessionId'):
+            try:
+                source = self.resolve(source)
+            except (ValueError, RuntimeError, OSError):
+                pass
         with self.lock:
             self.cache_epoch += 1
             self.cache.pop(self.state_key(source), None)
@@ -812,6 +879,12 @@ class Chat:
                 or native.get('agent') != source.get('agent')):
             return False
         if source.get('agent') == 'claude':
+            if (native.get('home') or '.claude') != (source.get('home') or '.claude'):
+                return False
+            if native.get('cwd') != source.get('cwd'):
+                return False
+            if source.get('sessionId'):
+                return (native.get('sessionId') or native.get('id')) == source['sessionId']
             ids = {source.get('id'), source.get('sessionId')} - {None}
             return native.get('id') in ids or native.get('sessionId') in ids
         if source.get('agent') == 'codex':
@@ -872,14 +945,16 @@ class Chat:
 
     def prompt(self, data):
         action = data.get('action')
-        if action not in ('open', 'answer'):
+        if action not in ('open', 'answer', 'status'):
             raise ValueError('질문 요청 종류가 올바르지 않습니다.')
         request_id = data.get('requestId')
-        if (action == 'answer' or request_id is not None) and (
+        if (action in ('answer', 'status') or request_id is not None) and (
                 not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
             raise ValueError('질문 응답 요청 식별자가 필요합니다.')
-        source, host = self.source(data.get('source'))
+        source, host = self.source(data.get('source'), sending=action != 'status')
         self._direct_session(source)
+        if action == 'status':
+            return self._prompt_receipt_call('lookup', source, request_id)
         if action == 'open':
             return self._open_prompt(data.get('source'), source, request_id)
         fingerprint, number = data.get('fingerprint'), data.get('number')
@@ -887,6 +962,8 @@ class Chat:
             raise ValueError('질문 식별값이 올바르지 않습니다.')
         if isinstance(number, bool) or not isinstance(number, int):
             raise ValueError('선택지 번호가 올바르지 않습니다.')
+        if number <= 0:
+            raise PromptRejected('메뉴에 없는 선택지입니다. 질문을 다시 확인해 주세요.')
         return self._answer_prompt(source, request_id, fingerprint, number)
 
     def _claude_lock_for(self, source):
@@ -934,14 +1011,11 @@ class Chat:
 
     def _answer_prompt(self, source, request_id, fingerprint, number):
         """Move the menu cursor and press Enter, at most once per request id."""
-        key = json.dumps([self.identity(source), request_id], sort_keys=True)
-
         def saved():
-            with self.lock:
-                entry = self.prompt_results.get(key)
-            if entry and entry[0] != [fingerprint, number]:
-                raise ValueError('이미 사용한 질문 응답 요청입니다.')
-            return entry[1] if entry else None
+            receipt = self._prompt_receipt_call('lookup', source, request_id, fingerprint, number)
+            if receipt['status'] == 'not_found':
+                return None
+            return self._prompt_receipt_view(receipt)
 
         previous = saved()
         if previous:
@@ -964,18 +1038,19 @@ class Chat:
             reason = self._answer_refusal(menu, fingerprint, number)
             if reason:
                 raise PromptRejected(reason)
+            reservation = self._prompt_receipt_call('reserve', source, request_id, fingerprint, number, terminal)
+            if not reservation['reserved']:
+                return self._prompt_receipt_view(reservation)
             current = menu['current']
             keys = ['Down'] * (number - current) if number > current else ['Up'] * (current - number)
             from terminal import InputNotSent
             try:
                 self.workflow.terminals.send_keys(terminal['id'], keys + ['Enter'])
                 sent = True
-            except (InputNotSent, ValueError, KeyError) as exc:
-                # Refused before tmux delivered a key: the same request may be retried.
-                raise PromptRejected(str(exc) if isinstance(exc, InputNotSent) else
-                                     '터미널에 선택을 보내지 못했습니다. 다시 시도해 주세요.',
-                                     code='terminal_unavailable') from None
-            except (RuntimeError, OSError):
+            except InputNotSent as exc:
+                self._prompt_receipt_call('cancel_not_sent', source, request_id, fingerprint, number, terminal)
+                raise PromptRejected(str(exc), code='terminal_unavailable') from None
+            except (RuntimeError, OSError, ValueError, KeyError):
                 sent = False  # the keys may or may not have arrived; never press them again
             after = None
             if sent:
@@ -990,14 +1065,34 @@ class Chat:
                       'reason': None if answered else
                       '선택이 반영됐는지 화면에서 확인하지 못했습니다. 같은 선택을 다시 보내지 않으니 터미널을 확인해 주세요.',
                       'prompt': self._present(after, terminal, source) if after else None}
-            with self.lock:
-                if len(self.prompt_results) >= PROMPT_RESULTS:
-                    self.prompt_results.pop(next(iter(self.prompt_results)))
-                self.prompt_results[key] = ([fingerprint, number], result)
+            from prompt_receipts import PromptReceiptError
+            try:
+                receipt = self.prompt_receipts.finish(source, request_id, fingerprint, number, terminal,
+                    status=result['status'], reason_code='screen_changed' if answered else 'delivery_unconfirmed')
+                result['reasonCode'] = receipt['reasonCode']
+            except (PromptReceiptError, OSError):
+                # The durable reservation still guards this request. Never call a post-send
+                # storage failure "not sent" or encourage pressing the choice again.
+                result.update(status='unconfirmed', reasonCode='receipt_write_failed',
+                              reason='선택 전달 뒤 결과 저장을 확인하지 못했습니다. 전달 상태를 확인하거나 터미널을 확인해 주세요.')
             return result
         finally:
             turn.release()
             self._forget_state(source)
+
+    def _prompt_receipt_call(self, action, *args):
+        from prompt_receipts import PromptReceiptError
+        try:
+            return getattr(self.prompt_receipts, action)(*args)
+        except PromptReceiptError as exc:
+            raise PromptRejected(str(exc), exc.status, exc.code) from None
+
+    @staticmethod
+    def _prompt_receipt_view(receipt):
+        return {**{key: value for key, value in receipt.items() if key != 'reserved'},
+                'reason': None if receipt['status'] == 'answered' else
+                '선택이 반영됐는지 화면에서 확인하지 못했습니다. 같은 선택을 다시 보내지 않으니 터미널을 확인해 주세요.',
+                'prompt': None}
 
     def _open_claude_terminal(self, ref, source, request_id):
         """Attach the exact background session in a board terminal, never a new session.
@@ -1332,8 +1427,8 @@ class Chat:
         if not isinstance(text, str) or len(text.encode()) > 32768:
             raise ValueError('메시지는 32KiB까지 보낼 수 있습니다.')
         ids = data.get('attachments', [])
-        if not isinstance(ids, list) or len(ids) > 8 or len(set(str(i) for i in ids)) != len(ids):
-            raise ValueError('한 메시지에는 첨부 파일을 8개까지 보낼 수 있습니다.')
+        if not isinstance(ids, list) or len(ids) > MAX_ATTACHMENTS or len(set(str(i) for i in ids)) != len(ids):
+            raise ValueError(f'한 메시지에는 첨부 파일을 {MAX_ATTACHMENTS}개까지 보낼 수 있습니다.')
         if not text.strip() and not ids:
             raise ValueError('메시지나 첨부 파일을 추가해 주세요.')
         manifest = []

@@ -10,11 +10,16 @@
 // - The same assets without a version: network first (pages served before
 //   versioned URLs, or by a server that does not fill them in).
 // - Anything else (API, login, terminal, other queries) is never touched.
-const CACHE = "sessionholic-shell-v14";
+const CACHE = "sessionholic-shell-v15";
 const ASSETS = new Set([
   "/app.js",
+  "/workspace.js",
+  "/workspace.css",
   "/session_labels.js",
   "/session_history.js",
+  "/session_relations.js",
+  "/session_context.js",
+  "/session_delegation.js",
   "/push.js",
   "/theme-init.js",
   "/message-format.js",
@@ -27,11 +32,14 @@ const ASSETS = new Set([
   "/vendor/xterm.js",
   "/vendor/xterm.css",
   "/vendor/addon-fit.js",
+  "/vendor/d2coding-regular.woff2",
+  "/vendor/d2coding-bold.woff2",
 ]);
 const VERSIONED = /^\?v=[0-9a-f]{8}$/;
 // Precached from the page's asset list at install; the terminal library is
 // only cached once a terminal is actually opened.
-const PRECACHE_SKIP = new Set(["/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"]);
+const PRECACHE_SKIP = new Set(["/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js",
+  "/vendor/d2coding-regular.woff2", "/vendor/d2coding-bold.woff2"]);
 
 function cacheable(response) {
   return !!response && response.ok && response.type !== "opaqueredirect" && !response.redirected;
@@ -141,9 +149,8 @@ async function cacheFirst(event, request, url) {
 }
 
 // Phone notifications. The board sends an empty push; what to show is read from the
-// board itself, so no conversation text passes through a push service. Every push shows
-// a notification (`userVisibleOnly`): the queued ones, else the latest one shown again
-// quietly, else a generic one.
+// board itself, so no conversation text passes through a push service. Delayed wake-ups
+// with no current notices must never repeat an old completion or invent a new one.
 const PUSH_URL = /^\/(?:\?session=[A-Za-z0-9%._~-]{1,600})?$/;
 function pushUrl(value) {
   return typeof value === "string" && PUSH_URL.test(value) ? value : "/";
@@ -167,7 +174,8 @@ async function pendingNotifications() {
   const items = (Array.isArray(data?.notifications) ? data.notifications : [])
     .filter((item) => item && typeof item.title === "string" && typeof item.tag === "string")
     .slice(-20);
-  return { items, id, csrfToken: data.csrfToken };
+  return { items, id, csrfToken: data.csrfToken,
+    dismissTags: Array.isArray(data.dismissTags) ? data.dismissTags.filter((tag) => typeof tag === "string").slice(0, 500) : [] };
 }
 async function showPushed() {
   let pending = null;
@@ -177,6 +185,11 @@ async function showPushed() {
     pending = null;
   }
   const items = pending?.items ?? null;
+  if (pending) {
+    const shown = await self.registration.getNotifications().catch(() => []);
+    for (const old of shown) if (pending.dismissTags.includes(old.tag) || old.tag === "board-notice") old.close?.();
+    if (!items.length) return;
+  }
   if (items?.length) {
     const shown = await self.registration.getNotifications().catch(() => []);
     const results = await Promise.allSettled(items.map(async (item) => {
@@ -198,17 +211,8 @@ async function showPushed() {
     if (results.every((result) => result.status === "rejected")) throw results[0].reason;
     return;
   }
-  // Read, but nothing new (another wake-up already showed it): the latest notice again, quietly.
-  const shown = items ? await self.registration.getNotifications() : [];
-  const latest = shown[shown.length - 1];
-  if (latest) {
-    await self.registration.showNotification(latest.title, {
-      body: latest.body, tag: latest.tag, renotify: false, icon: "/icon-192.png", data: latest.data,
-    });
-    return;
-  }
-  await self.registration.showNotification("확인할 세션이 있어요", {
-    body: "눌러서 보드를 열어 주세요.", tag: "board-notice", renotify: true,
+  await self.registration.showNotification("알림 상태를 확인하지 못했어요", {
+    body: "연결 후 보드에서 최신 상태를 확인해 주세요.", tag: "board-notice", renotify: false, silent: true,
     icon: "/icon-192.png", data: { url: "/" },
   });
 }

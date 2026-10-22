@@ -281,6 +281,9 @@ class WindowsRoutingTest(unittest.TestCase):
                 self.assertEqual(self.flow.plan({'source': REF, 'target': target})['mode'], 'attach')
 
     def test_unused_codex_connections_close_only_when_their_session_is_idle_done_or_gone(self):
+        # This is the detached Mac cleanup contract. A PC's direct SSH TUI is
+        # retained until its native run lifetime can be proved independently.
+        self.board.hosts = [{**host, 'platform': 'macos'} for host in self.board.hosts]
         native = {'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex', 'cwd': ROW['cwd']}
         released = []
         self.terms.idle_codex_attaches = lambda: [{'id': 'a' * 32, 'host': HOST['name'], 'nativeSource': native}]
@@ -292,9 +295,9 @@ class WindowsRoutingTest(unittest.TestCase):
                 self.board.state[HOST['name']]['data']['codex'][0]['phase'] = phase
                 self.assertEqual(self.flow.close_idle_codex_attaches(), ['a' * 32] if closes else [], phase)
             self.assertEqual(end.call_count, 2)
-            # No longer listed (archived): closed. Its host's list not current: left alone.
+            # A bounded list's omission is not proof that a native session ended.
             self.board.state[HOST['name']]['data']['codex'] = []
-            self.assertEqual(self.flow.close_idle_codex_attaches(), ['a' * 32])
+            self.assertEqual(self.flow.close_idle_codex_attaches(), [])
             # A list the board stopped reading (nobody watching) is not current, though it read ok.
             for fetched in (int(time.time()) - self.flow.CODEX_RELEASE_LIST_AGE - 60, None):
                 self.board.state[HOST['name']]['fetchedAt'] = fetched
@@ -302,9 +305,10 @@ class WindowsRoutingTest(unittest.TestCase):
             self.board.state[HOST['name']]['fetchedAt'] = int(time.time())
             self.board.state[HOST['name']]['ok'] = False
             self.assertEqual(self.flow.close_idle_codex_attaches(), [])
-        self.assertEqual(len(released), 3)
+        self.assertEqual(len(released), 2)
 
     def test_unused_runs_close_only_resting_at_an_empty_prompt_on_two_sweeps_and_not_at_work(self):
+        self.board.hosts = [{**host, 'platform': 'macos'} for host in self.board.hosts]
         native = {'host': HOST['name'], 'agent': 'codex', 'id': SID, 'home': '.codex', 'cwd': ROW['cwd']}
         rest = '\x1b[0m› \x1b[2mImplement {feature}\x1b[0m\n'
         screens = {'a' * 32: rest, 'b' * 32: rest}
@@ -426,7 +430,7 @@ class WindowsRoutingTest(unittest.TestCase):
             self.assertEqual((first['mode'], first['allowed']), ('attach', True))
             self.assertIn('PC에 저장된 대화', first['summary'])
             # It now runs in that terminal, so the PC would refuse a second resume.
-            key = hashlib.sha256(json.dumps([self.flow.identity(self.board.source(CLAUDE_REF)), target],
+            key = hashlib.sha256(json.dumps([self.flow.route_identity(self.board.source(CLAUDE_REF)), target],
                                             sort_keys=True).encode()).hexdigest()
             self.terms.list = lambda: [{'alive': True, 'key': key + ':fixture'}]
             rpc.side_effect = ValueError('이 Claude 세션은 PC 터미널에서 실행 중입니다.')
@@ -683,7 +687,8 @@ class WindowsHTTPTest(unittest.TestCase):
             response, result = self.request('POST', '/api/session/action', {'source': REF, 'action': 'terminate',
                                             'requestId': 'fixture-control-0001', 'targetProof': 'aaa.' + 'a' * 64})
             self.assertEqual(response.status, 200)
-            self.assertEqual(result, receipt)
+            self.assertEqual({key: result[key] for key in receipt}, receipt)
+            self.assertTrue(result['cleanup']['complete'])
             self.assertEqual(rpc.call_count, 1)
             self.assertEqual(rpc.call_args.args[1], 'control_execute')
             response, result = self.request('POST', '/api/session/archive', {'source': REF, 'archived': True})

@@ -236,6 +236,21 @@ class WindowsRuntimeTest(unittest.TestCase):
             self.reader.thread = saved
         self.assertEqual(self.reader.send_calls, 0)
 
+    def test_live_read_explains_unsupported_and_conflicting_status_without_allowing_input(self):
+        for change, code in (({'turns': [{'id': 'future', 'status': 'new-status'}]}, 'turn_status_unsupported'),
+                             ({'turns': [{'id': 'active', 'status': 'inProgress'}]}, 'status_inconsistent'),
+                             ({'status': {'type': 'future-status'}}, 'status_unsupported')):
+            before = copy.deepcopy(self.reader.thread)
+            self.reader.thread.update(change)
+            result = self.runtime.chat({'action': 'read', 'source': self.source})
+            self.assertEqual((result['phase'], result['runtimeKnown'], result['runtimeReasonCode']), ('unknown', False, code))
+            self.assertTrue(result['runtimeReason'])
+            self.assertFalse(result['capabilities']['canSend'])
+            self.reader.thread = before
+        known = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((known['runtimeKnown'], known['runtimeReason'], known['runtimeEvidence']), (True, None, 'project_app_server'))
+        self.assertEqual(self.reader.send_calls, 0)
+
     def test_send_exact_once_receipt_and_no_message_in_ledger(self):
         first = self.send(text='sensitive-fixture-body')
         replay = self.send(text='sensitive-fixture-body')
@@ -283,6 +298,16 @@ class WindowsRuntimeTest(unittest.TestCase):
     def send_files(self, ids, request='request-1234', text='합성 입력', source=None):
         return self.runtime.chat({'action': 'send', 'source': source or self.source, 'requestId': request,
                                   'input': [{'type': 'text', 'text': text}] if text else [], 'attachmentIds': ids})
+
+    def test_32_files_are_sent_once_and_33_is_rejected_before_native_write(self):
+        files = [self.stored(f'file-{n}.txt', b'fixture') for n in range(33)]
+        result = self.send_files([file['id'] for file in files[:32]])
+        self.assertEqual(len(result['attachments']), 32)
+        mutation = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertEqual(len(mutation['input']), 33)
+        with self.assertRaises(ValueError):
+            self.send_files([file['id'] for file in files], request='request-too-many')
+        self.assertEqual(self.reader.send_calls, 1)
 
     def test_files_go_once_as_native_images_and_path_lines_with_their_names(self):
         image = self.stored('screen.png', b'\x89PNG\r\n\x1a\nfixture-image')
@@ -410,6 +435,20 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(result['status'], 'unconfirmed')
         self.assertFalse(result['confirmed'])
         self.assertTrue(result['applied'])
+
+    def test_cleanup_receipt_only_never_archives_or_observes_again(self):
+        first = self.execute(self.runtime.preview(self.source))
+        args = {'source': self.source, 'action': 'terminate', 'requestId': first['requestId'], 'receiptOnly': True}
+        with patch.object(self.runtime, '_observe') as observe, patch.object(self.runtime, '_apply') as apply:
+            result = self.runtime.execute(args)
+            self.assertTrue(result['replayed'])
+            self.assertTrue(result['confirmed'])
+            self.assertIsInstance(result['requestedAt'], int)
+            for change in ({'requestId': 'unknown-request'}, {'source': {**self.source, 'cwd': 'C:/other'}}):
+                with self.assertRaises(ValueError):
+                    self.runtime.execute({**args, **change})
+            observe.assert_not_called()
+            apply.assert_not_called()
 
     def test_archive_without_unloaded_readback_is_unconfirmed(self):
         self.reader.mutate_hook = lambda method: self.reader.loaded.append(self.source['id'])
@@ -699,6 +738,14 @@ class WindowsRuntimeTest(unittest.TestCase):
         result = self.execute(preview, source=source)
         self.assertTrue(result['confirmed'])
         self.assertEqual([item['pid'] for item in self.kills], [45])
+
+    def test_claude_shell_is_foreground_idle_and_other_registry_states_keep_their_meaning(self):
+        source, row, path = self.claude()
+        for status, phase in (('shell', 'idle'), ('busy', 'working'), ('waiting', 'needs_input'), ('future-state', 'unknown')):
+            path.write_text(json.dumps({**row, 'status': status}))
+            self.assertEqual(self.runtime.preview(source)['phase'], phase)
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual(self.kills, [])
 
     def test_claude_pid_reuse_is_stale(self):
         source, row, path = self.claude()

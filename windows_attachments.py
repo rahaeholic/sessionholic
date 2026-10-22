@@ -26,6 +26,7 @@ import uuid
 # transfer.windows_rpc sets it, as the PC reads no instance file of its own.
 DIRECTORY = '.sessionholic-attachments'
 MAX_FILE_BYTES = 20 * 1024 * 1024
+MAX_ATTACHMENTS = 32
 ID = re.compile(r'[a-f0-9]{32}\Z')
 _SHA = re.compile(r'[a-f0-9]{64}\Z')
 _METADATA = '.metadata.json'

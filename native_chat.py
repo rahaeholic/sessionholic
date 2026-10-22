@@ -260,6 +260,9 @@ def _receipt(identity, request_id, thread):
                 delivery = delivery if delivery in ("completed", "interrupted", "failed") else "accepted"
                 return {"source": identity, "requestId": request_id, "delivery": delivery,
                         "confirmed": True, "readbackConfirmed": True, "turnId": turn.get("id"),
+                        **({"failureCode": "server_overloaded"} if delivery == "failed"
+                           and isinstance(turn.get("error"), dict)
+                           and turn["error"].get("codexErrorInfo") == "serverOverloaded" else {}),
                         "canRetry": False}
     return {"source": identity, "requestId": request_id, "delivery": "unknown", "confirmed": False,
             "readbackConfirmed": False, "turnId": None, "canRetry": False,
@@ -336,7 +339,7 @@ def _messages(thread, identity=None, home=None):
 
 
 def _inputs(value):
-    if not isinstance(value, list) or not 1 <= len(value) <= 17:
+    if not isinstance(value, list) or not 1 <= len(value) <= attachments.MAX_ATTACHMENTS + 16:
         raise ValueError("메시지 입력이 올바르지 않습니다.")
     out, total = [], 0
     for item in value:
@@ -383,7 +386,7 @@ def _ledger_key(identity, request_id):
 
 def _manifest(value):
     """Accept only bounded, path-free metadata written by attachment resolution."""
-    if not isinstance(value, list) or len(value) > 8:
+    if not isinstance(value, list) or len(value) > attachments.MAX_ATTACHMENTS:
         return []
     out = []
     for item in value:
@@ -411,7 +414,7 @@ def _input_marker(block):
 
 def _proven_manifest(manifest, evidence, content):
     """A matching request proves reception, not preservation of each input."""
-    if not isinstance(evidence, list) or len(evidence) > 8 or not isinstance(content, list):
+    if not isinstance(evidence, list) or len(evidence) > attachments.MAX_ATTACHMENTS or not isinstance(content, list):
         return []
     proofs = {}
     for item in evidence:
@@ -419,7 +422,7 @@ def _proven_manifest(manifest, evidence, content):
                 or not isinstance(item.get("id"), str) or item["id"] in proofs
                 or not re.fullmatch(r"[a-f0-9]{32}", item["id"])
                 or item.get("kind") not in ("image", "file")
-                or type(item.get("occurrence")) is not int or not 1 <= item["occurrence"] <= 17
+                or type(item.get("occurrence")) is not int or not 1 <= item["occurrence"] <= attachments.MAX_ATTACHMENTS + 16
                 or not isinstance(item.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])):
             return []
         proofs[item["id"]] = item
@@ -513,7 +516,7 @@ def _send(client, identity, args, thread, home):
     raw_inputs = list(raw_inputs)
     ids = args.get("attachmentIds", [])
     manifest, evidence = [], []
-    if not isinstance(ids, list) or len(ids) > 8 or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
+    if not isinstance(ids, list) or len(ids) > attachments.MAX_ATTACHMENTS or any(not isinstance(i, str) for i in ids) or len(set(ids)) != len(ids):
         raise ValueError("첨부 식별자가 올바르지 않습니다.")
     if ids:
         cwd = thread.get("cwd")

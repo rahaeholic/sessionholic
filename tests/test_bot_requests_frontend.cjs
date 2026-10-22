@@ -128,8 +128,7 @@ function addSessions(c, rows) {
 }
 function botCalls(c) { return c.calls.filter((call) => call.url.startsWith("/api/bot-requests")); }
 
-// After the first authenticated read, only entering the category checks an expired cache.
-test("봇 진입은 GET 한 번이며 120초 캐시와 진행 중 요청을 공유하고 render·poll은 재조회하지 않는다", async () => {
+test("봇 목록은 120초 후 poll에서 자동 갱신하고 진행 중 요청을 공유한다", async () => {
   const pending = deferred();
   const c = client((url) => {
     if (url === "/api/bot-requests") return botCalls(c).length === 1 ? pending.promise : response(snapshot());
@@ -153,10 +152,37 @@ test("봇 진입은 GET 한 번이며 120초 캐시와 진행 중 요청을 공�
   c.render(); c.renderBotRequests(); await c.poll(false, { capabilities: false });
   assert.equal(c.calls.filter((call) => call.url === "/api/snapshot").length, 1);
   assert.equal(c.state.pollFailures, 0, "일반 poll 자체도 성공해야 한다");
-  assert.equal(botCalls(c).length, 1, "만료된 캐시도 일반 화면 갱신으로 읽지 않는다");
+  await c.state.botRequests.promise;
+  assert.equal(botCalls(c).length, 2, "켜둔 봇 목록도 만료 후 자동으로 다시 읽는다");
   c.setSessionCategory("general"); c.setSessionCategory("bot");
   await c.state.botRequests.promise;
   assert.deepEqual(botCalls(c).map((call) => call.method), ["GET", "GET"]);
+});
+
+test("자동 갱신은 꽉 찬 200개 목록에 최신 요청을 반영하며 열린 대화를 이동하지 않는다", async () => {
+  const fresh = request({ id: 'newest', updatedAt: 2000000100 });
+  const c = client(() => response(snapshot([fresh])));
+  cache(c, Array.from({ length: 200 }, (_, index) => request({ id: `old-${index}`, updatedAt: 1900000000 + index })));
+  const selected = session(); addSessions(c, [selected]);
+  c.state.selected = selected.key;
+  c.state.selectedBotRequest = 'keep-conversation';
+  c.advance(120000);
+  await c.loadBotRequests({ background: true });
+  assert.equal(c.state.botRequests.requests[0].id, 'newest');
+  assert.equal(c.state.selected, selected.key);
+  assert.equal(c.state.selectedBotRequest, 'keep-conversation');
+});
+
+test("CLI 상태의 다시 읽기는 설치 API 없이 결과를 표시하고 잠금 뒤 응답은 버린다", async () => {
+  const pending = deferred();
+  const c = client(() => pending.promise);
+  const load = vm.runInContext('loadCliStatus', c.context);
+  const result = load(true);
+  assert.equal(c.calls[0].url, '/api/cli-status/refresh');
+  c.beginAuthEpoch();
+  pending.resolve(response({ hosts: [{ label: 'PRIVATE' }], refreshing: false }));
+  await result;
+  assert.equal(textOf(c.get('cli-status')).includes('PRIVATE'), false);
 });
 
 test("첫 인증은 봇 GET을 한 번 시작하되 기다리지 않고 일반 목록의 중복을 제거하며 성공·실패 모두 주기 조회로 재시도하지 않는다", async () => {

@@ -261,7 +261,12 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(collector.claude_phase("working", "busy"), "working")
         self.assertEqual(collector.claude_phase("done", "busy"), "working")
         self.assertEqual(collector.claude_phase("done", "idle"), "done")
-        self.assertEqual(collector.claude_phase("something-new", None), "idle")
+        self.assertEqual(collector.claude_phase("idle", "idle"), "idle")
+        self.assertEqual(collector.claude_phase(None, "shell"), "idle")
+        self.assertEqual(collector.claude_phase("working", "shell"), "working")
+        self.assertEqual(collector.claude_phase("blocked", "shell"), "needs_input")
+        self.assertEqual(collector.claude_phase("something-new", None), "unknown")
+        self.assertEqual(collector.claude_phase(None, None), "unknown")
 
     def test_codex(self):
         self.assertEqual(collector.codex_phase({"type": "active", "activeFlags": ["waitingOnApproval"]}), "needs_input")
@@ -269,7 +274,9 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(collector.codex_phase({"type": "active", "activeFlags": []}), "working")
         self.assertEqual(collector.codex_phase({"type": "idle"}), "idle")
         self.assertEqual(collector.codex_phase({"type": "notLoaded"}), "closed")
-        self.assertEqual(collector.codex_phase(None), "closed")
+        for status in (None, 'active', {'type': 'future-status'}, {'type': 'future-status', 'activeFlags': ['approval']},
+                       {'type': 'active', 'activeFlags': 'unrecognized'}):
+            self.assertEqual(collector.codex_phase(status), 'unknown', status)
 
 
 class MessageTest(unittest.TestCase):
@@ -717,6 +724,66 @@ class SnapshotIsolationTest(unittest.TestCase):
         self.assertEqual((result["codex"], result["tmux"]), ([], []))
         self.assertEqual(len(result["errors"]), 2)
         self.assertNotIn("fixture", json.dumps(result["errors"]))
+        self.assertEqual(result['sourceStatus'], {'claude': {'ok': True}, 'codex': {'ok': False}, 'tmux': {'ok': False}})
+
+    def test_empty_adapter_success_and_swallowed_cli_failure_are_distinct(self):
+        with patch.object(collector, 'load_projects', return_value=[]), \
+                patch.object(collector, 'codex_threads', return_value=[]), \
+                patch.object(collector, 'tmux_sessions', return_value=[]), \
+                patch.object(collector, 'which', return_value='/fixture/claude'):
+            for raw, ok in (('[]', True), (None, False), ('{bad-json', False), ('{}', False)):
+                with self.subTest(raw=raw), patch.object(collector, 'run', return_value=raw):
+                    result = collector.snapshot()
+                    self.assertEqual(result['claude'], [])
+                    self.assertEqual(result['sourceStatus']['claude']['ok'], ok)
+                    self.assertEqual(result['sourceStatus']['codex'], {'ok': True})
+
+    def test_compatibility_warning_and_one_home_failure_have_different_source_status(self):
+        def collect(reply, errors):
+            rows, failures = collector.codex_home_rows('.codex', None, 'fixture', reply, [])
+            errors.extend(failures)
+            return rows
+        for reply, ok in ((({'data': [], '_sourceCoverage': 'interactive'}, set(), None), True),
+                          ((None, None, 'connect'), False), (({'wrong': []}, set(), None), False)):
+            with self.subTest(reply=reply):
+                status, errors = {}, []
+                collector.section(errors, 'Codex', collect, reply, errors, status=status)
+                self.assertEqual(status, {'ok': ok})
+                self.assertTrue(errors)
+
+    def test_tmux_absent_server_is_empty_but_permission_failure_is_not_success(self):
+        from types import SimpleNamespace
+        with patch.object(collector, 'which', return_value='/fixture/tmux'), \
+                patch.object(collector.settings, 'load', return_value={'tmux': {}}):
+            for stderr, ok in (('no server running on /fixture/default', True),
+                               ('error connecting to /fixture/default (No such file or directory)', True),
+                               ('error connecting to /fixture/default (Permission denied)', False)):
+                status, errors = {}, []
+                done = SimpleNamespace(returncode=1, stdout='', stderr=stderr)
+                with patch.object(collector.subprocess, 'run', return_value=done):
+                    self.assertEqual(collector.section(errors, 'tmux', collector.tmux_sessions, status=status), [])
+                self.assertEqual(status, {'ok': ok}, stderr)
+
+    def test_watch_composes_source_success_separately_from_an_empty_or_missing_part(self):
+        watch = collector.Watch(None, None)
+        watch.publish('claude', [], [], ok=True)
+        watch.publish('tmux', [], [], ok=True)
+        watch.order = ['.codex']
+        before = watch.compose()
+        self.assertEqual(before['sourceStatus'], {'claude': {'ok': True}, 'codex': {'ok': False}, 'tmux': {'ok': True}})
+        watch.publish(('codex', '.codex'), [], [], ok=True)
+        self.assertTrue(watch.compose()['sourceStatus']['codex']['ok'])
+        watch.publish(('codex', '.codex'), [], ['연결 실패'], ok=False)
+        self.assertFalse(watch.compose()['sourceStatus']['codex']['ok'])
+
+    def test_malformed_tmux_output_is_failure_instead_of_an_empty_success(self):
+        with patch.object(collector, 'which', return_value='/fixture/tmux'), \
+             patch.object(collector.settings, 'load', return_value={'tmux': {}}), \
+             patch.object(collector, 'run', return_value='unexpected format\n'):
+            status, errors = {}, []
+            self.assertEqual(collector.section(errors, 'tmux', collector.tmux_sessions, status=status), [])
+        self.assertFalse(status['ok'])
+        self.assertTrue(errors)
 
     def test_broken_claude_rows_and_transcript_races_are_isolated(self):
         good, unreadable, gone = ("a0000000-0000-4000-8000-00000000000" + str(i) for i in range(3))
@@ -1218,7 +1285,7 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(out.items[0]["type"], "hello")
         self.assertEqual((first["seq"], first["reason"]), (1, "initial"))
         self.assertEqual(self.codex(first), [("t1", "idle", "작업")])
-        self.assertEqual(set(first["data"]), {"host", "collectedAt", "claude", "codex", "tmux", "errors"})
+        self.assertEqual(set(first["data"]), {"host", "collectedAt", "claude", "codex", "tmux", "errors", 'sourceStatus'})
         caps = daemon.capabilities[0]
         self.assertTrue(caps["experimentalApi"])
         self.assertIn("account/rateLimits/updated", caps["optOutNotificationMethods"])
@@ -1691,6 +1758,35 @@ class SavedHistoryTest(unittest.TestCase):
         other = folder / 'private-other.jsonl'; other.write_text('private'); path.unlink(); path.symlink_to(other)
         with patch.object(collector, 'HOME', self.home), self.assertRaises(ValueError): collector.saved_history_source(source)
         with self.assertRaises(ValueError): self.windows.WindowsCollector(self.home).saved_history_source(source)
+
+class InitialTitleTest(unittest.TestCase):
+    def test_first_claude_request_survives_new_answers_and_generated_titles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'fixture.jsonl'
+            first = [{'type': 'user', 'isMeta': True, 'message': {'content': '펼친 지침'}},
+                     {'type': 'user', 'message': {'content': '첫 요청\n작업 목적'}},
+                     {'type': 'ai-title', 'aiTitle': '처음 자동 제목'}]
+            path.write_text('\n'.join(json.dumps(row) for row in first) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['initialTitle'], '첫 요청 작업 목적')
+            with path.open('a') as stream:
+                for unused in range(80):
+                    stream.write(json.dumps({'type': 'progress', 'data': 'x' * 1000}) + '\n')
+                stream.write(json.dumps({'type': 'ai-title', 'aiTitle': '마지막 응답으로 바뀐 제목'}) + '\n')
+                stream.write(json.dumps({'type': 'assistant', 'message': {'content': '전혀 다른 최종 답변'}}) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['initialTitle'], '첫 요청 작업 목적')
+            with path.open('a') as stream:
+                stream.write(json.dumps({'type': 'custom-title', 'customTitle': '직접 정한 제목'}) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['manualNativeTitle'], '직접 정한 제목')
+
+    def test_codex_first_request_is_not_replaced_by_the_native_name_or_harness(self):
+        thread = {'id': 'fixture', 'status': {'type': 'idle'}, 'preview': '첫 요청의 목적', 'name': '현재 자동 이름'}
+        first = collector.codex_row(thread, '.codex', None, '', set(), [])
+        later = collector.codex_row({**thread, 'name': '새 답변 제목'}, '.codex', None, '', set(), [])
+        self.assertEqual(first['initialTitle'], '첫 요청의 목적')
+        self.assertEqual(later['initialTitle'], first['initialTitle'])
+        harness = '# AGENTS.md instructions for /example\n<INSTRUCTIONS>rules</INSTRUCTIONS>\n<environment_context>env</environment_context>\n실제 첫 요청'
+        explicit = collector.codex_row({**thread, 'first_user_message': harness}, '.codex', None, '', set(), [])
+        self.assertEqual(explicit['initialTitle'], '실제 첫 요청')
 
 
 if __name__ == "__main__":

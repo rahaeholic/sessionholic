@@ -410,7 +410,10 @@ def _rpc(request):
         control = SessionControl()
         if op == 'control_preview':
             return control.preview(args['source'])
-        return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'))
+        if args.get('receiptOnly') is True:
+            return control.receipt(args['source'], args.get('action'), args.get('requestId'))
+        return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'),
+                               **({'cleanup_terminals': args['cleanupTerminals']} if 'cleanupTerminals' in args else {}))
     if op == 'profiles':
         from launch import new_session_status
         tmux = _tmux()
@@ -421,6 +424,9 @@ def _rpc(request):
     if op == 'resume_preview':
         from launch import resume_preview
         return resume_preview(args['source'])
+    if op == 'recover_session':
+        from launch import recover_saved_session
+        return recover_saved_session(args.get('source'))
     if op == 'launcher_programs':
         from launcher_programs import launcher_programs
         return launcher_programs(args)
@@ -703,10 +709,12 @@ def sweep_leftovers(listing=None, temp=None, sockets=None, now=None, kill=os.kil
 def hold_kill(name):
     name = _hold_name(name)
     tmux = _tmux()
-    if not tmux or not _hold_alive(tmux, name):
-        return {'killed': False}
+    if not tmux:
+        return {'killed': False, 'alive': None}
+    if not _hold_alive(tmux, name):
+        return {'killed': False, 'alive': False}
     done = _hold_run(tmux, 'kill-session', '-t', '=' + name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {'killed': done.returncode == 0}
+    return {'killed': done.returncode == 0, 'alive': _hold_alive(tmux, name)}
 
 
 def new_session_main(preset=None):

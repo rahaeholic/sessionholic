@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -75,6 +76,116 @@ class SessionControlsHTTPTest(unittest.TestCase):
     def action(self, **changes):
         return {'source': self.source, 'action': 'interrupt', 'targetProof': self.proof,
                 'requestId': 'fixture-control-1234', **changes}
+
+    def linked_terminals(self, rows):
+        closed = []
+        def close(tid):
+            closed.append(tid)
+            next(row for row in rows if row['id'] == tid)['closed'] = True
+        self.httpd.terminals = self.httpd.workflow.terminals = SimpleNamespace(
+            list=lambda: rows, close=lambda: None, close_terminal=close)
+        return closed
+
+    def terminal(self, name='a', **changes):
+        return {'id': name * 32, 'host': self.host['name'], 'mode': 'attach', 'createdAt': 100,
+                'alive': True, 'closed': False, 'nativeSource': {**self.source, 'cwd': self.row['cwd']}, **changes}
+
+    def test_termination_closes_all_exact_terminals_then_removes_in_one_request(self):
+        rows = [self.terminal(), self.terminal('b', mode='resume')]
+        closed = self.linked_terminals(rows)
+        receipt = {'confirmed': True, 'requestedAt': int(time.time()), 'cleanupTerminals': ['a' * 32, 'b' * 32]}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=receipt), patch.object(self.board, 'request_refresh'):
+            response, result = self.request('/api/session/action', self.action(action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertEqual(closed, ['a' * 32, 'b' * 32])
+        self.assertTrue(result['cleanup']['complete'])
+        self.assertIsInstance(result['cleanup']['removedAt'], int)
+        self.assertEqual(self.httpd.workflow.recoveries.get(self.source)['provenance']['closure'], 'explicit_termination')
+
+    def test_unknown_termination_leaves_connections_and_list_untouched(self):
+        closed = self.linked_terminals([self.terminal()])
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': False, 'status': 'unconfirmed'}):
+            response, result = self.request('/api/session/action', self.action(action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertEqual(closed, [])
+        snapshot = self.httpd.session_removed.decorate(self.board.snapshot())
+        self.assertIsNone(snapshot['hosts'][0]['data']['codex'][0]['removedAt'])
+
+    def test_estimated_changed_identity_and_newer_terminals_are_not_closed(self):
+        wrong = [{**self.source, **change, 'cwd': change.get('cwd', self.row['cwd'])} for change in (
+            {'home': '.codex-other'}, {'host': 'other'}, {'id': str(uuid.uuid4())}, {'cwd': '/other'})]
+        rows = [self.terminal(), self.terminal('b', linkConfidence='estimated')]
+        rows += [self.terminal(chr(100 + index), nativeSource=source) for index, source in enumerate(wrong)]
+        closed = self.linked_terminals(rows)
+        def rpc(host, operation, args, **kwargs):
+            rows.append(self.terminal('c'))  # created while native termination was in flight
+            return {'confirmed': True, 'cleanupTerminals': args['cleanupTerminals']}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), \
+                patch.object(self.board, 'request_refresh'):
+            response, result = self.request('/api/session/action', self.action(action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertEqual(closed, ['a' * 32])
+        self.assertTrue(result['cleanup']['complete'])
+        self.assertEqual(result['cleanup']['list'], 'done')
+        self.assertEqual(result['cleanup']['unverified'], ['b' * 32, 'c' * 32])
+
+    def test_partial_cleanup_retry_reads_existing_receipt_after_row_disappears(self):
+        rows = [self.terminal()]
+        self.linked_terminals(rows)
+        close = self.httpd.terminals.close_terminal
+        self.httpd.terminals.close_terminal = lambda tid: (_ for _ in ()).throw(OSError('synthetic close failure'))
+        calls = []
+        def rpc(host, operation, args, **kwargs):
+            calls.append(args)
+            return {'confirmed': True, 'cleanupTerminals': ['a' * 32], 'replayed': args.get('receiptOnly', False)}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), patch.object(self.board, 'request_refresh'):
+            response, first = self.request('/api/session/action', self.action(action='terminate'))
+            self.assertEqual(response.status, 200, first)
+            self.assertFalse(first['cleanup']['complete'])
+            self.assertIsNone(first['cleanup'].get('removedAt'))
+            self.board.state[self.host['name']]['data']['codex'] = []
+            self.httpd.terminals.close_terminal = close
+            response, second = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(response.status, 200, second)
+        self.assertTrue(second['cleanup']['complete'])
+        self.assertEqual([args.get('receiptOnly', False) for args in calls], [False, True])
+        self.assertNotIn('targetProof', calls[1])
+
+    def test_remote_hold_failure_is_partial_and_retry_only_reads_receipt_and_kills_hold(self):
+        self.host['local'] = False
+        rows = [self.terminal(holdName='sh-000000000000000a')]
+        closed = self.linked_terminals(rows)
+        fail = True
+        operations = []
+        def rpc(host, operation, args, **kwargs):
+            operations.append((operation, args))
+            if operation == 'hold_kill':
+                if fail:
+                    raise OSError('synthetic remote failure')
+                return {'alive': False}
+            return {'confirmed': True, 'cleanupTerminals': ['a' * 32]}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), patch.object(self.board, 'request_refresh'):
+            response, first = self.request('/api/session/action', self.action(action='terminate'))
+            self.assertEqual(response.status, 200, first)
+            self.assertFalse(first['cleanup']['complete'])
+            self.assertEqual(first['cleanup']['remotePending'], ['a' * 32])
+            fail = False
+            response, second = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(response.status, 200, second)
+        self.assertTrue(second['cleanup']['complete'])
+        self.assertEqual([op for op, args in operations], ['control_execute', 'hold_kill', 'control_execute', 'hold_kill'])
+        self.assertTrue(operations[2][1]['receiptOnly'])
+
+    def test_removed_write_failure_keeps_card_visible_until_cleanup_retry(self):
+        self.linked_terminals([])
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': True, 'cleanupTerminals': []}), \
+                patch.object(self.board, 'request_refresh'), \
+                patch.object(self.httpd.session_removed, 'mark', side_effect=OSError('synthetic full disk')):
+            response, result = self.request('/api/session/action', self.action(action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertFalse(result['cleanup']['complete'])
+        snapshot = self.httpd.session_tidied.decorate(self.board.snapshot())
+        self.assertIsNone(snapshot['hosts'][0]['data']['codex'][0]['tidiedAt'])
 
     def test_all_controls_require_login_csrf_and_same_origin(self):
         with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:

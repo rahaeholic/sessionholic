@@ -634,8 +634,9 @@ class WorkerHoldTest(unittest.TestCase):
         with self.remote(ran=Ran(alive=True, listed=listed)) as (ran, _), patch.object(transfer_worker.time, 'time', return_value=now):
             self.assertEqual(transfer_worker._rpc({'op': 'hold_list', 'args': {}}),
                              {'holds': [{'name': HOLD, 'age': 300}, {'name': 'sh-fedcba9876543210', 'age': 5}]})
-            self.assertEqual(transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': HOLD}}), {'killed': True})
-            self.assertEqual(ran.calls[-1][5:], ['kill-session', '-t', '=' + HOLD])
+            self.assertEqual(transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': HOLD}}), {'killed': True, 'alive': True})
+            self.assertEqual(ran.calls[-2][5:], ['kill-session', '-t', '=' + HOLD])
+            self.assertEqual(ran.calls[-1][5:], ['has-session', '-t', '=' + HOLD])
             # An envelope never run is removed once old; a fresh one stays.
             folder = transfer_worker.private_dir(self.holds())
             old, fresh = folder / 'sh-0000000000000001.json', folder / 'sh-0000000000000002.json'
@@ -649,7 +650,7 @@ class WorkerHoldTest(unittest.TestCase):
                 transfer_worker._rpc({'op': 'hold_kill', 'args': {'name': 'other'}})
         with self.remote(tmux=None):
             self.assertEqual(transfer_worker.hold_list(), {'holds': []})
-            self.assertEqual(transfer_worker.hold_kill(HOLD), {'killed': False})
+            self.assertEqual(transfer_worker.hold_kill(HOLD), {'killed': False, 'alive': None})
 
     def test_profiles_say_whether_and_with_which_tmux_this_host_holds_runs(self):
         for tmux, expected in ((HOLD_TMUX, True), (None, False)):

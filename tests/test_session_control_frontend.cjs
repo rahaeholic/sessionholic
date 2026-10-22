@@ -20,7 +20,7 @@ const source = (extra = {}) => ({ host: 'workstation', hostLabel: '합성 기기
 const preview = (extra = {}) => ({ targetProof: 'synthetic-proof', capabilities: { interrupt: { supported: true }, terminate: { supported: true } }, ...extra });
 const response = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
-function client(fetchImpl) {
+function client(fetchImpl, storage = new Map()) {
   const nodes = new Map(), calls = [], counts = { refresh: 0, poll: 0, capabilities: 0, login: 0 };
   let request = 0, methods;
   function el(tag, className = '', textContent = '') {
@@ -35,8 +35,9 @@ function client(fetchImpl) {
     Object.defineProperty(value, 'id', { get() { return this._id; }, set(id) { this._id = id; nodes.set(id, this); } });
     return value;
   }
-  const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false };
-  const context = vm.createContext({ console, state, el, $: (id) => nodes.get(id),
+  const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false, runtimeObservations: new Map() };
+  const context = vm.createContext({ console, state, el, clearTimeout() {}, $: (id) => nodes.get(id),
+    sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     document: { body: el('body') }, window: { SessionholicGoals: { async refresh() { counts.refresh++; } } },
     button(text, className, callback) { const value = el('button', className, text); value.events.click = callback; return value; },
     cardTitle: (s) => s.title, sourceOf: undefined, botRequestForNative: () => null,
@@ -75,10 +76,10 @@ test('실행 확인 전에는 제어하지 않고 중복 클릭·완료 후 재�
   assert.equal(c.calls[1].body.source.home, '.codex-isolated'); assert.equal(c.calls[1].body.source.id, 'synthetic-one');
   assert.equal(c.calls[1].body.targetProof, 'synthetic-proof');
   assert.equal(c.get('session-control-close').disabled, true);
-  pending.resolve(response({ confirmed: true })); await first;
+  pending.resolve(response({ confirmed: true, cleanup: { complete: true } })); await first;
   await confirm.events.click();
   assert.equal(c.calls.length, 2); assert.equal(c.get('session-control-terminate').disabled, true);
-  assert.match(c.get('session-control-status').textContent, /실행 종료를 확인/);
+  assert.match(c.get('session-control-status').textContent, /실행을 끝내고 터미널과 목록을 정리/);
   assert.equal(c.counts.refresh, 1); assert.equal(c.counts.poll, 1);
 });
 
@@ -138,6 +139,49 @@ test('보관과 되돌리기는 작업 보관 API만 호출하며 실행 중단�
   assert.deepEqual(c.calls.map((call) => call.url), ['/api/session/preview', '/api/session/archive', '/api/session/archive']);
   assert.deepEqual(c.calls.slice(1).map((call) => call.body.archived), [true, false]);
   assert.equal(c.counts.refresh, 2); assert.equal(c.counts.poll, 0);
+});
+
+test('부분 정리는 같은 요청의 영수증만 조회하며 탭 재시작 뒤에도 원본 종료를 반복하지 않는다', async () => {
+  const storage = new Map();
+  const s = source({ cwd: '/synthetic/project' });
+  const first = client(async ({ url }) => response(url.endsWith('/preview') ? preview() : {
+    confirmed: true, cleanup: { complete: false, failed: ['synthetic-terminal'] }
+  }), storage);
+  await first.manageSession(s);
+  first.get('session-control-terminate').events.click();
+  await first.get('session-control-confirm').events.click();
+  const request = first.calls[1].body;
+  assert.equal(first.get('session-control-terminate').disabled, false);
+  assert.match(first.get('session-control-status').textContent, /정리가 남아 있습니다/);
+  assert.equal(storage.size, 1);
+  const restarted = client(async () => response({ confirmed: true, cleanup: { complete: true, closed: [], version: 3 } }), storage);
+  await restarted.manageSession(source({ cwd: '/synthetic/project' }));
+  assert.equal(restarted.calls.length, 0, 'reopening does not dispatch anything');
+  restarted.get('session-control-terminate').events.click();
+  await restarted.get('session-control-confirm').events.click();
+  assert.equal(restarted.calls.length, 1);
+  assert.equal(restarted.calls[0].body.cleanupOnly, true);
+  assert.equal(restarted.calls[0].body.requestId, request.requestId);
+  assert.equal(restarted.calls[0].body.targetProof, undefined);
+  assert.equal(storage.size, 0);
+  assert.match(restarted.get('session-control-status').textContent, /터미널과 목록을 정리했습니다/);
+});
+
+test('종료 응답 유실 뒤 명시적 재시도도 원본 제어 대신 같은 결과만 확인한다', async () => {
+  let fail = true;
+  const c = client(async ({ url }) => {
+    if (url.endsWith('/preview')) return response(preview());
+    if (fail) throw Error('synthetic lost response');
+    return response({ confirmed: false, status: 'unconfirmed', reason: '원본 종료 결과 미확인' });
+  });
+  await c.manageSession(source());
+  c.get('session-control-terminate').events.click(); await c.get('session-control-confirm').events.click();
+  assert.equal(c.calls.length, 2);
+  fail = false;
+  c.get('session-control-terminate').events.click(); await c.get('session-control-confirm').events.click();
+  assert.equal(c.calls[2].body.cleanupOnly, true);
+  assert.equal(c.calls[2].body.requestId, c.calls[1].body.requestId);
+  assert.equal(c.calls.filter((call) => call.url.endsWith('/action') && !call.body.cleanupOnly).length, 1);
 });
 
 

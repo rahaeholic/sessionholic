@@ -1097,6 +1097,27 @@ class TmuxFixtureTest(unittest.TestCase):
         self.managers.append(replacement)
         self.assertEqual(next(row for row in replacement.list() if row["id"] == created["id"])["nativeSource"], native)
 
+    def test_exact_evidence_confirms_only_the_same_estimated_native_and_survives_restart(self):
+        created = self.create()
+        native = {"host": "local", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
+                  "home": ".codex", "cwd": "/tmp/work"}
+        self.assertTrue(self.manager.link_native(created["id"], native, confidence="estimated"))
+        for changed in ({"home": ".codex-other"}, {"cwd": "/other"},
+                        {"id": "019a0000-0000-7000-8000-000000000002"}):
+            self.assertFalse(self.manager.link_native(created["id"], {**native, **changed}))
+        with patch.object(self.manager, "_save", side_effect=OSError("fixture save failure")):
+            with self.assertRaises(OSError):
+                self.manager.link_native(created["id"], native)
+        self.assertEqual(self.manager.terminals[created["id"]].record["metadata"]["linkConfidence"], "estimated")
+        self.assertTrue(self.manager.link_native(created["id"], native))
+        self.assertFalse(self.manager.link_native(created["id"], native, confidence="estimated"))
+        self.manager.close()
+        replacement = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(replacement)
+        saved = next(row for row in replacement.list() if row["id"] == created["id"])
+        self.assertEqual(saved["nativeSource"], native)
+        self.assertEqual(saved["linkConfidence"], "exact")
+
     def test_windows_native_cwd_survives_terminal_creation_and_restart(self):
         native = {"host": "windows-fixture", "agent": "codex", "id": "019a0000-0000-7000-8000-000000000001",
                   "home": ".codex", "cwd": r"\\?\C:\Users\example\Work"}
@@ -1164,6 +1185,46 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertNotIn("env", saved[0])
         self.assertEqual((Path(self.directory.name) / "sessions.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual(list(Path(self.directory.name).glob("*.launch.json")), [])
+
+    def test_fresh_view_redraws_at_server_geometry_and_unchanged_resize_does_not_signal(self):
+        import fcntl
+        import struct
+        import termios
+        created = self.create()
+        tid = created["id"]
+        self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        stream = self.manager.terminals[tid]
+        self.assertEqual(self.tmux_size(tid), (120, 30))
+        self.manager.resize(tid, 90, 28)
+        # Returning focus at the same size must not signal or resize again.
+        with patch.object(terminal.fcntl, "ioctl", wraps=fcntl.ioctl) as ioctl, patch.object(terminal.os, "killpg") as signal:
+            self.manager.resize(tid, 90, 28)
+            self.assertEqual([call.args[1] for call in ioctl.call_args_list], [termios.TIOCGWINSZ])
+            signal.assert_not_called()
+        deadline = time.monotonic() + 2
+        while self.tmux_size(tid) != (90, 28) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.tmux_size(tid), (90, 28))
+        old_offset = stream.offset
+        fresh = self.manager.read(tid, 0, 1, fresh=True)
+        self.assertTrue(fresh["reset"])
+        self.assertEqual((fresh["cols"], fresh["rows"]), (90, 28))
+        self.assertGreater(fresh["after"], old_offset)
+        self.assertIn(b"FIXTURE_READY", base64.b64decode(fresh["data"]))
+        current = self.manager.read(tid, fresh["after"], 0, fresh["epoch"])
+        self.assertFalse(current["reset"])
+        # A stale cursor also starts with a complete screen instead of a cut ANSI suffix.
+        reset = self.manager.read(tid, fresh["after"], 1, "0" * 32)
+        self.assertTrue(reset["reset"])
+        self.assertIn(b"FIXTURE_READY", base64.b64decode(reset["data"]))
+        self.assertEqual(self.launch_count.read_text(), "start\n")
+        self.assertEqual(struct.unpack("HHHH", fcntl.ioctl(stream.fd, termios.TIOCGWINSZ, b"\0" * 8))[:2], (28, 90))
+
+    def tmux_size(self, tid):
+        done = subprocess.run([self.manager.tmux, "-L", self.socket, "display-message", "-p", "-t", "sb-" + tid,
+                               "#{pane_width} #{pane_height}"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(done.returncode, 0)
+        return tuple(map(int, done.stdout.split()))
 
     def test_workflow_native_binding_launches_real_echo_and_survives_restart(self):
         import server
@@ -1253,6 +1314,8 @@ class TmuxFixtureTest(unittest.TestCase):
         rows = {row["id"]: row for row in self.manager.list()}
         self.assertFalse(rows[first["id"]]["alive"])
         self.assertTrue(rows[first["id"]]["closed"])
+        self.assertNotEqual(rows[first["id"]]["metadata"].get("closeEffect"), "run",
+                            "killing a board tmux never proves its native daemon stopped")
         self.assertTrue(all(rows[tid]["alive"] for tid in other_ids))
         self.assertFalse(self.manager.read(first["id"], wait=0)["alive"])
         with self.assertRaises(RuntimeError):

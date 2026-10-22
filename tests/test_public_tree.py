@@ -71,6 +71,22 @@ class PublicTreeTest(unittest.TestCase):
         self.assertIn({"file": "README.md", "category": "symlink"}, result["findings"])
         self.assertIn({"file": "LICENSE", "category": "owner-license-selection-required"}, result["findings"])
 
+    def test_only_the_two_reviewed_font_binaries_pass_and_tampering_is_rejected(self):
+        names = list(public.FONT_ASSETS)
+        self.allow(*names, "web/vendor/other.woff2")
+        for name in names:
+            target = self.root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((public.ROOT / name).read_bytes())
+        other = self.root / "web/vendor/other.woff2"
+        other.write_bytes(b"wOF2\xff\x00")
+        self.assertEqual(public.audit(self.root)["findings"],
+                         [{"file": "web/vendor/other.woff2", "category": "unexpected-binary"}])
+        target = self.root / names[0]
+        original = target.read_bytes()
+        target.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        self.assertIn({"file": names[0], "category": "invalid-vendored-font"}, public.audit(self.root)["findings"])
+
 
 if __name__ == "__main__":
     unittest.main()

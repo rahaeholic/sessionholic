@@ -5,6 +5,7 @@ This guard supplements review; it cannot prove that arbitrary text contains no
 private information. Release archives must be built from the reviewed Git commit.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -27,6 +28,10 @@ HOME_PATH = re.compile(r"/Users/([A-Za-z0-9._-]+)/")
 # the first space. A Windows user name never holds , ; = + [ ], so prose stops there.
 WINDOWS_HOME_PATH = re.compile(r"\b[A-Za-z]:(?:\\{1,2}|/)[Uu][Ss][Ee][Rr][Ss](?:\\{1,2}|/)([^\\/:*?\"<>|\r\n'`,;=+\[\]]+)(\\|/|[\"'`])?")
 EXAMPLE_USERS = {"example", "test", "user", "u", "sample", "demo", "runner", "local", "source", "other", "fixture"}
+FONT_ASSETS = {
+    "web/vendor/d2coding-regular.woff2": "e7c2e03ecafb3a322d9eddf037c1f5e7514e64354f2e855d2975340b0320f820",
+    "web/vendor/d2coding-bold.woff2": "2fc2e589603e35c06a511b8f947094b07559b94235e24fc4e5e29501ccd2169a",
+}
 TAILNET_URL = re.compile(r"https?://[a-zA-Z0-9.-]+\.ts\.net(?=[:/\s\"'`]|$)")
 # A host name on a tailnet without its scheme: the label before `.ts.net` names the tailnet.
 TAILNET_NAME = re.compile(r"\b[a-zA-Z0-9-]+\.([a-zA-Z0-9-]+)\.ts\.net\b")
@@ -65,6 +70,10 @@ def audit(root=ROOT, release=False):
             findings.append({"file": name, "category": "unexpected-large-file"})
             continue
         data = path.read_bytes()
+        if name in FONT_ASSETS:
+            if not data.startswith(b"wOF2") or hashlib.sha256(data).hexdigest() != FONT_ASSETS[name]:
+                findings.append({"file": name, "category": "invalid-vendored-font"})
+            continue
         if path.suffix in (".png", ".jpg", ".jpeg"):
             if not (data.startswith(b"\x89PNG\r\n\x1a\n") if path.suffix == ".png" else data.startswith(b"\xff\xd8\xff")):
                 findings.append({"file": name, "category": "invalid-image"})
