@@ -127,6 +127,7 @@ function fixture(saved = null) {
       canClose: () => !info.busy, prepareClose: () => calls.push(["close-view", id]),
       visibility: (value) => calls.push(["visibility", id, value]), refresh: (kind) => calls.push(["refresh", id, kind]),
       locked: () => { info.authenticated = false; calls.push(["locked", id]); }, newSession: () => calls.push(["new", id]), unsaved: () => !!info.unsaved,
+      browseSessions: () => calls.push(["browse", id]),
       sessionKeyForTerminal: (terminal) => terminal.key || null, openTerminal: (terminal) => calls.push(["open-existing-terminal", id, terminal.id]) };
   }
   vm.runInNewContext(source, { window, URLSearchParams, console, Set, Map, Date, Promise });
@@ -185,6 +186,31 @@ test("selection and new sessions target the active pane, duplicate sessions and 
   assert.equal(f.workspace.claimTerminal({ id: "a".repeat(32) }), false);
   assert.equal(f.calls.at(-2)?.[0] === "focus" || f.calls.some(([name, id]) => name === "focus" && id === "p2"), true);
   assert.equal(f.workspace.claim("p2", {}, "a".repeat(32)), false);
+});
+
+test("empty panes restore without starting sessions and browsing keeps the target pane with strict frame ownership", () => {
+  const f = fixture();
+  f.workspace.add(null);
+  assert.equal(f.workspace.routeNew(), true);
+  assert.equal(f.calls.filter(([name]) => name === "new").length, 0, "a loading pane never starts in the parent");
+  const saved = f.preferences.get("workspace");
+  assert.equal(saved.panes.p2, null);
+  const restored = fixture(saved), second = restored.attach("p2"), editor = restored.infos.get("p1").editor;
+  second.info.title = ""; restored.workspace.changed();
+  assert.equal(second.row.children[0].children[0].children[0].textContent, "2 · 빈 창");
+  assert.equal(restored.calls.some(([name, id]) => name === "new" || name === "api" || name === "restore" && id === "p2"), false);
+  restored.workspace.focus("p1", false);
+  assert.equal(restored.workspace.browseSessions("p2", {}), false, "foreign windows cannot choose a target");
+  assert.equal(restored.workspace.browseSessions("p2", second.frame.contentWindow), true);
+  assert.equal(restored.preferences.get("workspace").active, "p2");
+  assert.equal(restored.document.body.classList.contains("workspace-list-open"), true);
+  assert.ok(restored.calls.some(([name, id]) => name === "browse" && id === "p1"));
+  assert.equal(restored.workspace.routeSession("session-c"), true);
+  assert.deepEqual(second.info.ref, { key: "session-c", mode: "chat" });
+  assert.equal(second.frame.appendCount, 1); assert.equal(restored.infos.get("p1").editor, editor);
+  restored.infos.get("p1").authenticated = false;
+  assert.equal(restored.workspace.browseSessions("p2", second.frame.contentWindow), false);
+  assert.equal(restored.calls.some(([name]) => name === "new" || name === "api"), false);
 });
 
 test("IME blocks pane changes and ongoing voice remains bound to its original pane", () => {

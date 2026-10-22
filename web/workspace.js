@@ -393,7 +393,7 @@
   }
   function labelPane(row, index) {
     const value = row.hooks?.describe();
-    const title = value?.title || (row.ref ? "저장한 세션 확인 중" : "목록에서 세션을 선택하세요");
+    const title = value?.title || (row.ref ? "저장한 세션 확인 중" : "빈 창");
     row.label.textContent = `${index >= 0 ? index + 1 : ""} · ${title}`;
     row.meta.textContent = value?.route || "";
     row.meta.hidden = !value?.route;
@@ -432,7 +432,20 @@
   }
   function routeNew() {
     if (embedded || internal || !enabled || active === "p1") return false;
-    panes.get(active)?.hooks?.newSession(); return true;
+    const row = panes.get(active);
+    if (!row?.hooks) { notify("빈 창을 준비하고 있습니다. 잠시 후 다시 열어 주세요."); return true; }
+    row.hooks.newSession(); return true;
+  }
+  function browseSessions(id = ownId, win = root) {
+    if (embedded) return frameReady ? parent.browseSessions(ownId, root) : false;
+    if (!enabled || !hooks?.describe().authenticated || !ids(tree).includes(id) ||
+        id !== "p1" && panes.get(id)?.frame?.contentWindow !== win) return false;
+    // The list lives in the parent. Its next selection still belongs to this
+    // pane, even while the search field has keyboard focus in the parent.
+    if (!focus(id, false)) return true;
+    doc.body.classList.add("workspace-list-open");
+    hooks.browseSessions?.();
+    return true;
   }
   function routeTerminal(terminal) {
     if (embedded || internal || !enabled) return false;
@@ -657,5 +670,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, closePane, layout, activeSessionKey, readingActive, isActive };
+    add, closePane, layout, activeSessionKey, readingActive, isActive, browseSessions };
 })(typeof window !== "undefined" ? window : null);

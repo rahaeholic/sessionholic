@@ -1848,6 +1848,10 @@ button.host:focus-visible {
   line-height: 1.55;
   white-space: pre-line;
 }
+.empty-pane { width: min(100%, 380px); padding: 24px; }
+.empty-pane-actions { display: flex; flex-direction: column; gap: 10px; margin-top: 24px; }
+.empty-pane-actions > button { width: 100%; min-height: var(--tap); padding: 10px 16px; border-radius: var(--radius); }
+.empty-pane .empty-pane-note { margin: 14px 0 0; font-size: var(--fs-cap); }
 .detail-head {
   display: flex;
   align-items: flex-start;

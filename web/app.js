@@ -1488,6 +1488,40 @@ function renderSessionList(sessions, now) {
   renderGroups(shown, now);
   $("session-count").textContent = `${shown.length}개`;
 }
+function renderEmptyPane() {
+  if (!state.authenticated || state.selected || state.selectedBotRequest || state.sessionCategory === "bot" ||
+      state.terminalVisible || state.launcherWorkspace) return;
+  const detail = $("detail");
+  let empty = detail.children[0];
+  if (empty?.id !== "empty-pane") {
+    empty = el("section", "welcome empty-pane"); empty.id = "empty-pane";
+    empty.append(appMark(), el("h2", null, "빈 창"),
+      el("p", null, "새 세션을 시작하거나 기존 세션을 이 창에서 여세요."));
+    const actions = el("div", "empty-pane-actions");
+    const current = () => state.authenticated && !state.selected && !state.selectedBotRequest &&
+      !state.terminalVisible && !state.launcherWorkspace && detail.children[0] === empty;
+    const start = button("＋ 새 세션", "primary", () => { if (current() && !start.disabled) openNewSession(); });
+    start.id = "empty-pane-new"; start.setAttribute("aria-haspopup", "dialog");
+    const browse = button("기존 세션 열기", "secondary", () => {
+      if (!current()) return;
+      if (window.SessionholicWorkspace?.browseSessions()) return;
+      backToList(); $("search")?.focus?.({ preventScroll: true });
+    });
+    browse.id = "empty-pane-browse";
+    actions.append(start, browse);
+    const note = el("p", "empty-pane-note"); note.id = "empty-pane-note";
+    note.setAttribute("role", "status");
+    start.setAttribute("aria-describedby", note.id);
+    empty.append(actions, note);
+    empty.startButton = start; empty.statusNote = note;
+    detail.replaceChildren(empty);
+  }
+  const ready = !networkOffline() && newSessionHosts().some((host) => host.newSession.available && host.online !== false);
+  empty.startButton.disabled = !ready || !!state.newSessionBusy;
+  empty.statusNote.textContent = !state.capabilities ? "기기 정보를 확인하고 있습니다…" :
+    !ready ? "지금 새 세션을 열 수 있는 기기가 없습니다. 기기 연결과 실행 설정을 확인해 주세요." : "";
+  empty.statusNote.hidden = !empty.statusNote.textContent;
+}
 function render() {
   if (!state.snapshot) return;
   if (state.inlineTerminal && !inlineTerminalCurrent(state.inlineTerminal)) leaveInlineTerminal({ loadChat: false });
@@ -1505,19 +1539,7 @@ function render() {
   if (!embedded) { renderSessionList(sessions, now); renderHistorySearch(); }
   if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
   const selected = sessions.find((s) => s.key === state.selected);
-  if (!state.selected && !$("detail").children.length) {
-    const welcome = el("div", "welcome");
-    welcome.append(
-      appMark(),
-      el("h2", null, "맥락부터 확인하세요."),
-      el(
-        "p",
-        null,
-        "작업을 고르면 최근 대화를 볼 수 있습니다.\n이어서 사용할 에이전트와 계정도 여기서 선택하세요.",
-      ),
-    );
-    $("detail").append(welcome);
-  }
+  if (!state.selected) renderEmptyPane();
   window.SessionholicGoals?.update?.(sessions);
   // Its conversation listed now: it takes its place beside the docked terminal.
   if (!selected && state.docked && state.terminal && !state.dockBeside && dockedSessionFor(state.terminal)) {
@@ -12642,6 +12664,7 @@ function renderNewSession() {
   if (!chip) return;
   chip.hidden = !newSessionHosts().some((host) => host.newSession.available);
   if (chip.hidden && $("new-session-dialog")?.open) closeNewSession();
+  renderEmptyPane();
 }
 function newSessionHostMeta(host) {
   const status = host.newSession;
@@ -13815,6 +13838,7 @@ function workspaceHooks() {
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    browseSessions: () => $("search")?.focus?.({ preventScroll: true }),
     answerSession: (key) => {
       const target = selectedSession();
       if (target?.key === key) { answerOnOpen(target); loadChatState(target, true); }

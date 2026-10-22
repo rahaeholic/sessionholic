@@ -10035,6 +10035,45 @@ const NEW_SESSION_HOSTS = [
   { name: 'old', label: 'Old', online: false, newSession: { available: true, label: 'launcher' } },
 ];
 
+test('빈 창은 기기 로딩 중에도 유지되고 새 세션 버튼은 실행 없이 해당 문서의 기기 선택을 연다', () => {
+  const calls = [], c = client(async (url) => { calls.push(url); throw new Error('unexpected request'); }, noChatTimers);
+  c.state.authenticated = true;
+  const show = () => vm.runInContext('renderEmptyPane()', c.context);
+  show();
+  const empty = c.get('detail').children[0], start = c.get('empty-pane-new');
+  assert.equal(start.disabled, true); assert.match(c.get('empty-pane-note').textContent, /기기 정보를 확인/);
+  start.events.click(); assert.equal(!!c.get('new-session-dialog').open, false);
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS }; c.renderNewSession();
+  assert.equal(c.get('detail').children[0], empty); assert.equal(c.get('empty-pane-new'), start);
+  assert.equal(start.disabled, false); assert.equal(c.get('empty-pane-note').hidden, true);
+  start.events.click();
+  assert.equal(c.get('new-session-dialog').open, true);
+  assert.deepEqual(c.get('new-session-hosts').children.map((row) => row.disabled), [false, true, true]);
+  assert.deepEqual(calls, [], 'opening a blank pane or choosing new does not create a terminal');
+  c.context.navigator = { onLine: false }; show(); assert.equal(start.disabled, true);
+  c.context.navigator.onLine = true;
+  c.state.capabilities = { hosts: NEW_SESSION_HOSTS.slice(1) }; show(); assert.equal(start.disabled, true);
+});
+
+test('빈 창의 기존 세션 열기는 원래 창을 지정하고 오래된 버튼은 다른 대화에서 동작하지 않는다', () => {
+  const c = client(undefined, noChatTimers); c.state.authenticated = true; c.state.capabilities = { hosts: NEW_SESSION_HOSTS };
+  let browsed = 0;
+  c.context.window.SessionholicWorkspace = { embedded: true, browseSessions: () => { browsed++; return true; } };
+  const show = () => vm.runInContext('renderEmptyPane()', c.context);
+  show();
+  const empty = c.get('detail').children[0], browse = c.get('empty-pane-browse'), start = c.get('empty-pane-new');
+  browse.events.click(); assert.equal(browsed, 1);
+  c.state.selected = 'another-session'; show();
+  browse.events.click(); start.events.click();
+  assert.equal(browsed, 1); assert.equal(!!c.get('new-session-dialog').open, false);
+  assert.equal(c.get('detail').children[0], empty, 'blank rendering never replaces an active conversation');
+  c.state.selected = null; c.state.terminalVisible = true;
+  const terminalView = node(); c.get('detail').replaceChildren(terminalView); show();
+  assert.equal(c.get('detail').children[0], terminalView);
+  c.state.terminalVisible = false; c.state.launcherWorkspace = { terminalId: 'a'.repeat(32) }; show();
+  assert.equal(c.get('detail').children[0], terminalView);
+});
+
 test('the new session chip shows only when a host can open one; the sheet says why others cannot', () => {
   const c = client();
   c.state.capabilities = { hosts: NEW_SESSION_HOSTS.slice(1, 2) };
