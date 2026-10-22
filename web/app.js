@@ -3083,7 +3083,7 @@ function cardActions(s) {
     { label: sessionPinned(s) ? "★ 상단 고정 해제" : "☆ 상단 고정 (즐겨찾기)", run: () => pinSession(s) },
     { label: "세션 관리", run: () => manageSession(s) },
   ];
-  if (window.SessionholicWorkspace && !window.SessionholicWorkspace.embedded)
+  if (window.SessionholicWorkspace)
     actions.splice(1, 0, { label: "다른 창에서 보기", run: () => window.SessionholicWorkspace.add({ key: s.key, mode: "chat" }) });
   if (window.SessionholicLabels?.eligible?.(s)) actions.push({ label: "제목 수정", run: () => window.SessionholicLabels.open(s, document.activeElement) });
   if (!sessionOneShot(s)) actions.push({ label: terminal ? "터미널로 돌아가기" : "터미널 열기", run: () => openSessionTerminal(s), disabled: state.launchBusy });
@@ -3142,10 +3142,12 @@ function keepRestoredSession(s) {
   }
 }
 function openCardMenu(row, at = null) {
-  const s = sessionForRow(row);
+  openSessionMenu(sessionForRow(row), { at, trigger: row?.card });
+}
+function openSessionMenu(s, { at = null, trigger = null } = {}) {
   if (!s || !state.authenticated) return;
   closeSwipe();
-  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), actions: cardActions(s), at, trigger: row.card });
+  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), actions: cardActions(s), at, trigger });
 }
 function bindCardGestures(root) {
   let drag = null;
@@ -3825,6 +3827,18 @@ function drawDetail(s) {
   focusToggle.addEventListener("pointerdown", (event) => event.preventDefault());
   focusToggle.setAttribute("aria-pressed", "false");
   headActions.append(focusToggle);
+  const sessionMenu = button("⋯", "detail-session-menu icon-button", () => {
+    const current = selectedSession();
+    if (!current || current.key !== s.key || conversationIdentity(current) !== conversationIdentity(s)) return;
+    const rect = sessionMenu.getBoundingClientRect?.();
+    openSessionMenu(current, { trigger: sessionMenu, at: rect ? { x: rect.right - 260, y: rect.bottom + 6 } : null });
+  });
+  sessionMenu.id = "detail-session-menu";
+  sessionMenu.title = "세션 메뉴";
+  sessionMenu.setAttribute("aria-label", "세션 메뉴");
+  sessionMenu.setAttribute("aria-haspopup", "dialog");
+  for (const type of ["pointerdown", "mousedown"]) sessionMenu.addEventListener(type, (event) => event.preventDefault());
+  headActions.append(sessionMenu);
   head.append(headActions);
   window.SessionholicGoals?.attachSessionDetail?.(s, head);
   pane.append(head, buildDetailModeTabs(s));

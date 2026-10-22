@@ -8729,6 +8729,45 @@ test('refresh in the conversation header shares the same unsaved-draft protectio
   assert.equal(reload.disabled, true); assert.equal(c.get('quick-reload').disabled, true);
 });
 
+test('대화 상단 세션 메뉴는 목록과 같은 동작을 제공하고 분할 문서의 세션과 작성 중 초안을 유지한다', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  s.title = '열린 대화'; c.drawDetail(s);
+  const input = c.get('chat-input'), menu = c.get('detail-session-menu'), opened = [];
+  c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true, add: (ref) => opened.push(ref) };
+  c.context.window.SessionholicLabels = { eligible: () => true, open() {} };
+  input.value = entry.text = '보존할 초안'; entry.composing = true;
+  assert.equal(menu.attributes['aria-label'], '세션 메뉴');
+  assert.equal(menu.attributes['aria-haspopup'], 'dialog');
+  assert.ok(byClass(c.get('detail'), 'detail-head-actions')[0].children.includes(menu));
+  c.openCardMenu({ dataset: { sessionKey: s.key }, card: node() });
+  const labels = c.get('action-list').children.map((item) => item.textContent);
+  assert.ok(labels.includes('제목 수정') && labels.includes('실행 종료하고 정리') && labels.includes('다른 창에서 보기'));
+  c.closeActionSheet();
+  menu.getBoundingClientRect = () => ({ right: 680, bottom: 60 });
+  c.context.window.innerWidth = 1200; c.context.window.innerHeight = 800;
+  for (const type of ['pointerdown', 'mousedown']) {
+    let prevented = false; menu.events[type]({ preventDefault() { prevented = true; } });
+    assert.equal(prevented, true);
+  }
+  menu.events.click();
+  assert.deepEqual(c.get('action-list').children.map((item) => item.textContent), labels);
+  assert.equal(c.get('action-sheet').style.left, '420px');
+  assert.equal(c.state.actionTrigger, menu);
+  assert.equal(c.get('chat-input'), input); assert.equal(input.value, '보존할 초안'); assert.equal(entry.composing, true);
+  c.get('action-list').children.find((item) => item.textContent === '다른 창에서 보기').events.click({ detail: 0 });
+  assert.equal(opened.length, 1); assert.equal(opened[0].key, s.key); assert.equal(opened[0].mode, 'chat');
+  menu.events.click(); c.closeActionSheet(); assert.equal(menu.focusCount, 1, 'cancel returns focus to the same menu button');
+});
+
+test('대화 세션 메뉴는 최신 제목으로 열리고 다른 세션으로 이동하거나 로그아웃한 옛 버튼은 무시한다', () => {
+  const c = client(undefined, noChatTimers), { s } = selectChat(c); c.drawDetail(s);
+  const menu = c.get('detail-session-menu');
+  c.state.snapshot.hosts[0].data.codex[0] = { ...s, title: '갱신된 제목' };
+  menu.events.click(); assert.equal(c.get('action-title').textContent, '갱신된 제목'); c.closeActionSheet();
+  c.state.selected = 'different-session'; menu.events.click(); assert.equal(c.get('action-sheet').open, false);
+  c.state.selected = s.key; c.state.authenticated = false; menu.events.click(); assert.equal(c.get('action-sheet').open, false);
+});
+
 test('a conversation header replaced during cache clearing is released when the refresh wait ends', async () => {
   const timers = []; let resume;
   const c = client(undefined, { setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });

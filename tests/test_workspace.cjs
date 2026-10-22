@@ -513,6 +513,28 @@ test('embedded textarea and xterm Option number keys are captured at the window 
   assert.equal(single.workspace.handleKey(singleKey), false); assert.equal(singleKey.prevented, undefined);
 });
 
+test('an embedded session menu delegates new views to its own pane and rejects foreign callers without executing sessions', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  const childWindow = second.frame.contentWindow;
+  Object.assign(childWindow, { addEventListener() {}, document: { body: { classList: { add() {} } }, addEventListener() {} },
+    location: { pathname: '/pane', search: '?pane=p2', origin: f.window.location.origin }, parent: f.window });
+  vm.runInNewContext(source, { window: childWindow, URLSearchParams, console, Set, Map, Date, Promise });
+  childWindow.SessionholicWorkspace.init(second.child);
+  assert.equal(f.workspace.addFromPane('p1', undefined, { key: 'session-c' }), false);
+  assert.equal(f.workspace.addFromPane('p2', {}, { key: 'session-c' }), false);
+  assert.equal(f.workspace.addFromPane('p2', childWindow, { key: 'session-c' }, 'foreign'), false);
+  assert.equal(childWindow.SessionholicWorkspace.add({ key: 'session-c', mode: 'chat' }), true);
+  const saved = f.preferences.get('workspace');
+  assert.deepEqual(saved.tree.children[1].children, [{ pane: 'p2' }, { pane: 'p3' }]);
+  assert.deepEqual(saved.panes.p3, { key: 'session-c', mode: 'chat' });
+  assert.equal(f.frames.length, 2); assert.equal(second.frame.appendCount, 1);
+  childWindow.SessionholicWorkspace.add({ key: 'session-c', mode: 'chat' });
+  assert.equal(f.frames.length, 2, 'existing session views are focused without duplicating them');
+  f.infos.get('p1').authenticated = false;
+  assert.equal(childWindow.SessionholicWorkspace.add({ key: 'session-a' }), false);
+  assert.equal(f.calls.some(([name]) => name === 'api' || name === 'new'), false);
+});
+
 test('Option plus physical pane numbers selects the matching visible pane in any saved configuration', () => {
   for (const saved of [undefined, 'ctrl-meta', 'ctrl-alt-meta']) {
     for (let number = 1; number <= 4; number++) {

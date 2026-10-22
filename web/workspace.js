@@ -332,6 +332,7 @@
     return null;
   }
   function add(ref, target = active, edge = "right") {
+    if (embedded) return frameReady ? parent.addFromPane(ownId, root, ref, edge) : false;
     if (!hooks?.describe().authenticated) return false;
     ref = validRef(ref);
     const existing = findRef(ref);
@@ -345,6 +346,12 @@
     active = id; layout();
     if (row.hooks) applyRef(row);
     return true;
+  }
+  function addFromPane(id, win, ref, edge = "right") {
+    const row = panes.get(id);
+    if (embedded || !row?.frame || row.frame.contentWindow !== win || !ids(tree).includes(id) ||
+        !["left", "right", "top", "bottom"].includes(edge)) return false;
+    return add(ref, id, edge);
   }
   function closePane(id) {
     if (ids(tree).length < 2) { notify("마지막 창은 유지합니다."); return; }
@@ -670,5 +677,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, closePane, layout, activeSessionKey, readingActive, isActive, browseSessions };
+    add, addFromPane, closePane, layout, activeSessionKey, readingActive, isActive, browseSessions };
 })(typeof window !== "undefined" ? window : null);
