@@ -187,6 +187,7 @@ const state = {
   detailUpdatedAt: null,
   detailRevision: null,
   detailRun: 0,
+  detailModes: new Map(),
   route: null,
   plan: null,
   planInline: null,
@@ -801,7 +802,9 @@ function openRequestedSession() {
 // Opened from the 답 필요 group or its notification: the question is loaded once,
 // as "질문 불러오기" would, so the choices are there without another tap.
 function answerOnOpen(s) {
+  if (!sessionRecordOnly(s)) state.detailModes.set(conversationIdentity(s), "terminal");
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
+  if (state.selected === s.key) { renderDetailMode(); syncSessionTerminal(s); }
 }
 // 상단 / 설정 › 캐시 지우고 새로고침: this board's shell caches go, and a worker that receives no
 // notifications is unregistered (one that does keeps its subscription and only updates).
@@ -2945,6 +2948,7 @@ function renderTerminalMarks() {
       if (row.card?.cardParts) markCardTerminal(row.card, sessions.get(row.dataset?.sessionKey));
   const selected = sessions.get(state.selected);
   if (selected) renderDetailTerminal(selected);
+  if (selected && state.detailFor === selected.key && !state.terminalVisible) syncSessionTerminal(selected);
 }
 function renderDetailTerminal(s) {
   if (!s || $("detail").dataset?.key !== s.key) return;
@@ -3509,7 +3513,7 @@ function restoreConversationView(list) {
   setMessagesScroll(list, view.pinned ? list.scrollHeight : box ? box.top - view.offset : view.top);
 }
 function select(key) {
-  if (window.SessionholicWorkspace?.routeSession(key)) return;
+  if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key })) return;
   if (state.launchBusy) return;
   if (state.inlineTerminal && (state.inlineTerminal.key !== key || !inlineTerminalCurrent(state.inlineTerminal))) leaveInlineTerminal({ loadChat: false });
   state.launcherWorkspace = null;
@@ -3549,6 +3553,7 @@ function select(key) {
     setDetailShown(true, { direction: entering ? "push" : null, focus: mobile });
     const session = reopening && selectedSession();
     if (session && chatVisible()) loadChatState(session, true);
+    if (session) syncSessionTerminal(session);
     return;
   }
   haptic("select");
@@ -3788,6 +3793,14 @@ function drawDetail(s) {
   const terminalHost = el("div", "detail-terminal-host"); terminalHost.id = "detail-terminal-host";
   terminalHost.setAttribute("role", "tabpanel"); terminalHost.setAttribute("aria-labelledby", "detail-mode-terminal");
   terminalHost.hidden = true; pane.append(terminalHost);
+  const connection = el("div", "session-terminal-empty"); connection.id = "session-terminal-empty";
+  const connectionText = el("p"); connectionText.id = "session-terminal-empty-text";
+  const connect = button("터미널 열기", "primary", () => {
+    const selected = selectedSession();
+    if (selected?.key === s.key && conversationIdentity(selected) === conversationIdentity(s)) openChatTerminal(selected);
+  });
+  connect.id = "session-terminal-connect";
+  connection.append(connectionText, connect); terminalHost.append(connection);
   const relations = el("details", "session-relations"); relations.id = "session-relations"; relations.hidden = true;
   pane.append(relations);
   renderDetailTerminal(s);
@@ -3862,6 +3875,10 @@ function drawDetail(s) {
     ...(bot ? [botWatchNotice(s)] : [buildChatComposer(s), buildContinuePanel(s)]));
   setChromeVisible(state.chromeVisible);
   renderSessionRelations(s);
+  renderDetailMode();
+  // Reuse an already running, proven connection only. Selecting or reading a
+  // conversation must never create/resume a native CLI as a side effect.
+  queueMicrotask(() => syncSessionTerminal(s));
   if (!state.chromeVisible && touchDevice()) showTapHint();
 }
 function renderSessionRelations(s, sessions = allSessions()) {
@@ -4030,6 +4047,9 @@ function promptRequestCopy(request) {
 function renderPrompt(s, data, selected = selectedSession() || null) {
   const card = $("chat-prompt");
   if (!card || !currentChat(chatEntry(s), selected)) return;
+  if ($("detail").dataset.key === s.key && sessionDetailMode(selected) === "chat") {
+    card.hidden = true; card.chooseNumber = null; return;
+  }
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
   const receipt = entry.promptRequest;
@@ -4826,7 +4846,8 @@ function persistAllDrafts() {
   return saved && ![...state.chats.values(), ...terminalAttachmentDrafts.values()].some((entry) => entry.uploads || entry.uploadQueue?.length);
 }
 function chatVisible() {
-  return window.SessionholicWorkspace?.visible() !== false && !document.hidden && !boardCovered() && !state.inlineTerminal && (!phoneLayout() || state.detailShown);
+  return window.SessionholicWorkspace?.visible() !== false && !document.hidden && !boardCovered() &&
+    (!state.inlineTerminal || !!state.inlineTerminal.key && state.inlineTerminal.key === state.selected) && (!phoneLayout() || state.detailShown);
 }
 function chatHostOffline(entry, session = selectedSession() || null) {
   return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
@@ -6679,15 +6700,14 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-terminal-gate").hidden = !gateOn;
   $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
   $("chat-open-terminal").disabled = offline || state.launchBusy;
-  // A send in flight (or unconfirmed) locks the text but not the field: a
-  // disabled field would drop the focus, and with it the keyboard and the
-  // next ⌘↩. sendChat itself refuses a second send meanwhile.
+  // Reads and pending sends never lock drafting or dictation. The request and
+  // its receipt retain an immutable copy; sendChat refuses a second send.
   const input = $("chat-input");
   input.placeholder = chatPlaceholder(oneShot);
   // Drafting belongs to this conversation, not to a transient send capability.
   // A refresh/offline read must never blur IME or interrupt speech recognition.
   input.disabled = !state.authenticated || oneShot || !!botRequestForNative(entry.source);
-  input.readOnly = !input.disabled && (entry.sending || !!entry.pending || !!entry.commandBusy);
+  input.readOnly = false;
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
@@ -6704,6 +6724,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-check").disabled = offline || entry.checking;
   $("chat-terminal").disabled = state.launchBusy || oneShot;
   $("chat-terminal").hidden = oneShot;
+  if (sessionComposerTerminal(selected)) $("chat-terminal").hidden = true;
   const continuation = $("detail").querySelector?.(".continue-disclosure");
   if (continuation) continuation.hidden = oneShot;
   const native = terminalInfo(state.terminal).nativeSource;
@@ -6922,6 +6943,13 @@ function applyChatReceipt(entry, receipt, selected) {
       resizeChatInput(entry, selected);
     }
   }
+  // The user can already be writing the next message while the receipt is on
+  // its way. Keep those words, and remove only the files in the accepted send.
+  if (!entry.pending.preserveDraft && (receipt.status !== "failed" || receipt.confirmed === true)) {
+    const sentIds = new Set(entry.pending.attachments || []);
+    entry.attachments = entry.attachments.filter((file) => !sentIds.has(file.id));
+    pruneThumbs(entry);
+  }
   entry.pending = null;
   persistChatDraft(entry);
 }
@@ -7085,6 +7113,10 @@ function openDelegation(s, entry) {
 }
 async function sendChat(entry, message = null) {
   if (networkOffline()) { updateChatComposer(entry); return; }
+  const selected = selectedSession();
+  if (selected && $("detail").dataset.key === selected.key && sessionDetailMode(selected) === "chat") {
+    toast("작업 보기에서 메시지를 보내 주세요."); return;
+  }
   // What a finished dictation said gives way to what the send says.
   if (!message && !dictationListening($("chat-input"))) entry.dictationNotice = "";
   const text = message ? String(message.text || "") : entry.text;
@@ -7105,7 +7137,8 @@ async function sendChat(entry, message = null) {
   // Keep the exact source and idempotency key even if selection changes during transport.
   const authEpoch = state.authEpoch;
   const pending = { requestId: requestId(), revision: entry.revision, source: entry.source,
-    ...(message?.preserveDraft === true ? { preserveDraft: true } : {}),
+    ...(message && (message.preserveDraft === true || entry.text !== text || entry.attachments.length !== attachments.length ||
+      !entry.attachments.every((file, index) => file.id === attachments[index]?.id)) ? { preserveDraft: true } : {}),
     text, attachments: attachments.map((item) => item.id),
     attachmentDetails: attachmentMetadata(attachments) };
   entry.pending = pending;
@@ -7398,6 +7431,8 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
 // refusal still leaves it to edit.
 function retryOutbox(entry, item) {
   if (!currentChat(entry) || entry.sending || entry.pending || entry.uploads || entry.composing) return;
+  const s = selectedSession();
+  if (s && sessionDetailMode(s) === "chat" && !sessionRecordOnly(s)) chooseDetailMode("terminal");
   const message = { text: String(item.text || ""), attachments: (item.attachmentObjects || []).slice() };
   if (!message.text.trim() && !message.attachments.length) {
     entry.outbox = (entry.outbox || []).filter((value) => value !== item);
@@ -8145,6 +8180,8 @@ function openChatTerminal(s) {
   const bot = botRequestForNative(sourceOf(s));
   if (bot) { selectBotRequest(botGroupKey(bot)); return; }
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
+  state.detailModes.set(conversationIdentity(s), "terminal");
+  renderDetailMode();
   if (state.terminalAlive && terminalMatchesDetail(state.terminal, s)) {
     openTerminal(state.terminal, { inline: inlineTerminalRef(s) });
     return;
@@ -10467,6 +10504,12 @@ async function uploadTerminalFiles(files = []) {
 function pasteTerminalFiles(event) {
   const files = clipboardFiles(event.clipboardData);
   if (!files.length) return; // Keep native text paste and its IME/selection behavior.
+  const s = selectedSession();
+  if (sessionComposerTerminal(s)) {
+    event.stopPropagation?.();
+    pasteChat(chatEntry(s), event, $("chat-input"));
+    return;
+  }
   event.preventDefault(); event.stopPropagation?.();
   if (!state.authenticated || !state.terminal || !state.terminalVisible) return;
   const input = $("terminal-draft"), text = event.clipboardData?.getData?.("text/plain") || "";
@@ -10542,7 +10585,8 @@ function fitTerminal() {
   const terminal = state.terminal, openRun = state.terminalOpenRun;
   const current = () => state.terminal === terminal && state.terminalOpenRun === openRun && state.terminalVisible;
   state.resizeTimer = setTimeout(async () => {
-    if (!current() || !state.connected || !terminal || !state.term) return;
+    if (!current() || !state.connected || !terminal || !state.term || state.terminalSizingId !== terminal.id ||
+        document.hasFocus?.() === false || window.SessionholicWorkspace?.readingActive() === false) return;
     const size = `${state.term.cols}x${state.term.rows}`;
     if (size === state.lastSize) return;
     try {
@@ -10560,6 +10604,13 @@ function fitTerminal() {
         terminalError("터미널 크기를 맞추지 못했습니다. 다시 연결해 주세요.");
     }
   }, 180);
+}
+function activateTerminalSizing() {
+  if (!state.terminalVisible || !state.terminal) return;
+  state.terminalSizingId = state.terminal.id;
+  // A different device may have changed this shared PTY since our last focus.
+  state.lastSize = "";
+  fitTerminal();
 }
 function showTerminalScreen(visible) {
   if ($("board-status")) $("board-status").open = false;
@@ -10586,18 +10637,62 @@ function terminalMatchesDetail(terminal, s) {
   return !!source && sameRecoverySource(source, s) &&
     (s.agent !== "claude" || !s.sessionId || source.sessionId === s.sessionId);
 }
+function sessionRecordOnly(s) {
+  return !s || sessionOneShot(s) || !!botRequestForNative(sourceOf(s));
+}
+function terminalHasRawDraft(terminal) {
+  if (!terminal) return false;
+  const files = terminalAttachmentDrafts.get(terminal.id);
+  return !!(state.drafts.get(draftKey(terminal)) || state.terminal?.id === terminal.id && $("terminal-draft").value ||
+    files?.attachments.length || files?.uploads || files?.uploadQueue.length);
+}
+function sessionDetailMode(s = selectedSession()) {
+  if (sessionRecordOnly(s)) return "chat";
+  return state.detailModes.get(conversationIdentity(s)) || (s.readOnly === true ||
+    sessionRemoved(s) && !["working", "needs_input"].includes(s.phase) ? "chat" : "terminal");
+}
+function sessionComposerTerminal(s = selectedSession()) {
+  return s && !sessionRecordOnly(s) && state.terminalVisible && state.inlineTerminal?.key === s.key &&
+    state.inlineTerminal.identity === conversationIdentity(s) && state.terminalRawComposerId !== state.terminal?.id &&
+    terminalMatchesDetail(state.terminal, s) ? state.terminal : null;
+}
+function syncSessionTerminal(s = selectedSession()) {
+  if (!s || !state.authenticated || state.selected !== s.key ||
+      conversationIdentity(selectedSession()) !== conversationIdentity(s) || sessionDetailMode(s) !== "terminal" || !state.detailShown ||
+      window.SessionholicWorkspace?.visible() === false) return;
+  if (state.terminalVisible && state.inlineTerminal?.key === s.key &&
+      state.inlineTerminal.identity === conversationIdentity(s) && terminalMatchesDetail(state.terminal, s)) {
+    renderDetailMode(); return;
+  }
+  const terminal = terminalForSession(s);
+  if (terminal && terminalMatchesDetail(terminal, s))
+    return openTerminal(terminal, { inline: inlineTerminalRef(s), recordHistory: false, passive: true });
+  renderDetailMode();
+}
+function chooseDetailMode(mode) {
+  const s = selectedSession();
+  if (!s || !["terminal", "chat"].includes(mode) || mode === "terminal" && sessionRecordOnly(s)) return;
+  state.detailModes.set(conversationIdentity(s), mode);
+  if (mode === "chat") {
+    state.answerOnOpen = null;
+    stopDictation({ field: $("chat-input") });
+    if (state.inlineTerminal) leaveInlineTerminal();
+    renderDetailMode();
+  } else syncSessionTerminal(s);
+  window.SessionholicWorkspace?.changed(); syncEvents();
+}
 function buildModeTabs(choose, chatControls = "messages") {
   const tabs = el("div", "detail-mode-tabs"); tabs.id = "detail-mode-tabs";
   tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "작업 보기 방식");
-  for (const [mode, label, controls] of [["chat", "채팅", chatControls], ["terminal", "터미널", "detail-terminal-host"]]) {
+  for (const [mode, label, controls] of [["terminal", "작업", "detail-terminal-host"], ["chat", "기록", chatControls]]) {
     const tab = button(label, "detail-mode-tab", () => choose(mode));
     tab.id = `detail-mode-${mode}`; tab.setAttribute("role", "tab");
-    tab.setAttribute("aria-controls", controls); tab.setAttribute("aria-selected", String(mode === "chat"));
-    tab.tabIndex = mode === "chat" ? 0 : -1;
+    tab.setAttribute("aria-controls", controls); tab.setAttribute("aria-selected", String(mode === "terminal"));
+    tab.tabIndex = mode === "terminal" ? 0 : -1;
     tab.addEventListener("keydown", (event) => {
       if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
-      $(`detail-mode-${event.key === "Home" ? "chat" : event.key === "End" ? "terminal" : mode === "chat" ? "terminal" : "chat"}`)?.focus();
+      $(`detail-mode-${event.key === "Home" ? "terminal" : event.key === "End" ? "chat" : mode === "chat" ? "terminal" : "chat"}`)?.focus();
     });
     tabs.append(tab);
   }
@@ -10607,8 +10702,7 @@ function buildDetailModeTabs(s) {
   const identity = conversationIdentity(s), authEpoch = state.authEpoch;
   return buildModeTabs((mode) => {
     if (!state.authenticated || authEpoch !== state.authEpoch || state.selected !== s.key || conversationIdentity(selectedSession()) !== identity) return;
-    if (mode === "chat") leaveInlineTerminal();
-    else openChatTerminal(selectedSession());
+    chooseDetailMode(mode);
   });
 }
 function launcherWorkspaceCurrent(terminalId) {
@@ -10627,11 +10721,14 @@ function showLauncherChat(terminalId) {
   if (!launcherWorkspaceCurrent(terminalId)) return;
   const terminal = launcherWorkspaceTerminal();
   if (!terminal) return;
+  state.launcherWorkspace.mode = "chat";
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (launcherConversation(terminal)) {
     state.launcherWorkspace = null;
     openNativeChat(terminal);
+    chooseDetailMode("chat");
   }
+  renderDetailMode();
 }
 function syncLauncherWorkspace() {
   const id = state.launcherWorkspace?.terminalId;
@@ -10639,6 +10736,67 @@ function syncLauncherWorkspace() {
   // Never redraw underneath terminal input or infer the conversation from its title/time.
   if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.detailShown &&
       launcherConversation(launcherWorkspaceTerminal())) showLauncherChat(id);
+  else if (launcherWorkspaceCurrent(id) && state.inlineTerminal && launcherConversation(launcherWorkspaceTerminal())) {
+    renderSessionComposerLink();
+  }
+}
+function renderSessionComposerLink() {
+  const target = $("terminal-compose");
+  if (!target) return;
+  target.hidden = !state.terminalVisible || !!sessionComposerTerminal() && !terminalHasRawDraft(state.terminal) || !launcherConversation(state.terminal);
+  target.textContent = sessionComposerTerminal() ? "터미널 초안 가져오기" : "통합 입력 사용";
+  target.disabled = !!state.composing || !!state.draftPaste;
+}
+function useSessionComposer({ mergeDrafts = false, expectedIdentity = null } = {}) {
+  const terminal = state.terminal, source = launcherConversation(terminal);
+  if (!state.authenticated || !terminal || !source || !state.terminalVisible || state.composing || state.draftPaste) return;
+  if (expectedIdentity && expectedIdentity !== `${terminal.id}:${conversationIdentity(source)}`) return;
+  const files = terminalAttachmentDrafts.get(terminal.id);
+  if (files?.uploads || files?.uploadQueue.length) { toast("첨부 업로드를 마친 뒤 통합 입력으로 이동해 주세요."); return; }
+  if (files?.attachments.length && (!terminalAttachmentMatches(files, terminal) ||
+      files.attachments.some((file) => !validTerminalAttachment(file) || file.terminalSourceKey !== chatKey(source)) ||
+      files.source?.cwd !== source.cwd || source.agent === "claude" && files.source?.sessionId !== source.sessionId)) {
+    toast("첨부를 올린 세션의 연결이 바뀌었습니다. 원래 터미널에서 첨부를 확인해 주세요."); return;
+  }
+  const entry = chatEntry(source), text = $("terminal-draft").value;
+  if (entry.pending || entry.sending || entry.uploads) {
+    toast("전송과 업로드를 마친 뒤 통합 입력으로 이동해 주세요. 초안은 유지됩니다."); return;
+  }
+  const identity = `${terminal.id}:${conversationIdentity(source)}`;
+  if (!mergeDrafts && (entry.text && text || entry.attachments.length && files?.attachments.length)) {
+    openActionSheet({ title: "두 초안을 어떻게 볼까요?", preview: "같은 세션에 메시지 초안과 터미널 초안이 남아 있습니다. 합쳐도 자동 전송하지 않습니다.",
+      actions: [{ label: "초안 합쳐서 이동", run: () => useSessionComposer({ mergeDrafts: true, expectedIdentity: identity }) },
+        { label: "메시지 초안 보기", run: () => {
+          if (`${state.terminal?.id}:${conversationIdentity(launcherConversation(state.terminal))}` !== identity) return;
+          const current = selectedSession();
+          if (!current || !terminalMatchesDetail(terminal, current)) openNativeChat(terminal);
+          const selected = selectedSession();
+          if (selected && terminalMatchesDetail(terminal, selected))
+            openTerminal(terminal, { inline: inlineTerminalRef(selected), recordHistory: false });
+          state.terminalRawComposerId = null; renderDetailMode();
+        } }, { label: "터미널 초안 보기", run: () => {
+          if (`${state.terminal?.id}:${conversationIdentity(launcherConversation(state.terminal))}` !== identity) return;
+          state.terminalRawComposerId = terminal.id; renderDetailMode();
+        } }], trigger: $("terminal-compose") }); return;
+  }
+  const merged = [...new Map([...entry.attachments, ...(files?.attachments || [])].map((file) => [file.id, file])).values()];
+  if (merged.length > MAX_ATTACHMENTS) { toast(`두 초안의 첨부가 ${MAX_ATTACHMENTS}개를 넘습니다. 파일을 줄인 뒤 옮겨 주세요.`); return; }
+  stopDictation({ abort: true, field: $("terminal-draft") });
+  if (text) { entry.text = [entry.text, text].filter(Boolean).join("\n\n"); entry.revision++; $("terminal-draft").value = ""; state.drafts.delete(draftKey(terminal)); }
+  if (files?.attachments.length) {
+    entry.attachments = merged.map(({ terminalSourceKey, ...file }) => file);
+    for (const [key, url] of files.thumbs) entry.thumbs.set(key, url);
+    files.thumbs.clear(); files.attachments = [];
+    entry.revision++;
+  }
+  state.terminalRawComposerId = null;
+  saveDraft(); persistChatDraft(entry);
+  openNativeChat(terminal);
+  const s = selectedSession();
+  if (s && terminalMatchesDetail(terminal, s)) {
+    state.detailModes.set(conversationIdentity(s), "terminal");
+    openTerminal(terminal, { inline: inlineTerminalRef(s), recordHistory: false });
+  }
 }
 async function openNewSessionTerminal(terminal, { recordHistory = true, restoreChat = false } = {}) {
   if (window.SessionholicWorkspace?.routeTerminal(terminal)) return;
@@ -10684,14 +10842,25 @@ async function openNewSessionTerminal(terminal, { recordHistory = true, restoreC
 }
 function renderDetailMode() {
   const active = !!state.inlineTerminal && state.terminalVisible && inlineTerminalCurrent(state.inlineTerminal);
-  setClass($("detail"), "is-terminal-mode", active);
-  if ($("detail-terminal-host")) $("detail-terminal-host").hidden = !active;
+  const s = selectedSession(), work = active || (s ? sessionDetailMode(s) === "terminal" : !!state.launcherWorkspace && state.launcherWorkspace.mode !== "chat");
+  setClass($("detail"), "is-terminal-mode", work);
+  setClass($("detail"), "is-record-mode", !work);
+  setClass($("terminal-screen"), "has-session-composer", !!sessionComposerTerminal(s));
+  if ($("detail-terminal-host")) $("detail-terminal-host").hidden = !work;
+  if ($("chat-composer")) $("chat-composer").hidden = !work || !!state.inlineTerminal?.key && state.terminalRawComposerId === state.terminal?.id;
+  if ($("session-terminal-empty")) $("session-terminal-empty").hidden = active;
+  if ($("session-terminal-empty-text")) $("session-terminal-empty-text").textContent =
+    "터미널을 열면 이곳에 작업 화면이 표시됩니다. 아래 작성창은 원본 세션의 전송 상태를 확인하며 사용할 수 있습니다.";
+  if ($("session-terminal-connect")) $("session-terminal-connect").disabled = networkOffline() || state.launchBusy;
+  if ($("detail-mode-terminal")) $("detail-mode-terminal").disabled = !!s && sessionRecordOnly(s);
   for (const mode of ["chat", "terminal"]) {
     const tab = $(`detail-mode-${mode}`);
     if (!tab) continue;
-    const selected = mode === "terminal" ? active : !active;
+    const selected = mode === "terminal" ? work : !work;
     tab.setAttribute("aria-selected", String(selected)); tab.tabIndex = selected ? 0 : -1;
   }
+  if (s && $("chat-composer")?.dataset.source === chatKey(sourceOf(s))) updateChatComposer(chatEntry(s), s);
+  renderSessionComposerLink();
   window.SessionholicWorkspace?.changed();
 }
 function restoreTerminalHome() {
@@ -10963,11 +11132,11 @@ function loadXterm() {
   });
   return xtermLoading;
 }
-async function openTerminal(terminal, { recordHistory = true, inline = null } = {}) {
-  if (window.SessionholicWorkspace?.routeTerminal(terminal)) return;
-  if (window.SessionholicWorkspace?.claimTerminal(terminal) === false) return;
+async function openTerminal(terminal, { recordHistory = true, inline = null, passive = false } = {}) {
+  if (!passive && window.SessionholicWorkspace?.routeTerminal(terminal)) return;
+  if (window.SessionholicWorkspace?.claimTerminal(terminal, { passive }) === false) return;
   if (!inline && terminalInfo(terminal).mode === "new-session") return openNewSessionTerminal(terminal, { recordHistory });
-  if (!inline && window.SessionholicWorkspace?.managed()) {
+  if (!inline) {
     const exact = allSessions().find((s) => terminalMatchesDetail(terminal, s));
     if (exact) {
       select(exact.key);
@@ -10980,6 +11149,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
       : !terminalMatchesDetail(terminal, selectedSession())))) {
     toast("선택한 대화와 터미널의 연결을 확인하지 못했습니다. 열린 터미널 목록에서 확인해 주세요."); return;
   }
+  if (inline?.key) state.detailModes.set(inline.identity, "terminal");
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (inline) {
     rememberConversationView(); state.inlineTerminal = inline;
@@ -11007,6 +11177,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
   }
   stopTerminalReader();
   if (changing) resetTerminalScroll();
+  if (changing) state.terminalSizingId = null;
   renderTerminalMods();
   state.inputEpoch++;
   state.inputQueue = Promise.resolve();
@@ -11022,7 +11193,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
   // screen presents it over the board.
   const shown = presenting && !docking && !inline
     ? navTransition(phoneLayout() ? "push" : "present", () => showTerminalScreen(true)) : (showTerminalScreen(true), null);
-  releaseBoardFocus();
+  if (!inline || document.activeElement?.id !== "chat-input") releaseBoardFocus();
   updateThemeColor();
   if (boardCovered()) closeEvents();
   $("terminal-title").textContent = terminalTitle(terminal, "진행 중인 작업");
@@ -11039,6 +11210,8 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
   renderTerminalPermission(terminal);
   restoreTerminalDraft(terminal);
   $("terminal-draft").value = state.drafts.get(draftKey(terminal)) || "";
+  state.terminalRawComposerId = inline?.key && terminalHasRawDraft(terminal) ? terminal.id : null;
+  renderDetailMode();
   state.composing = false;
   state.draftRevision++;
   $("draft-note").textContent = "";
@@ -11047,6 +11220,11 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
   $("terminal-reopen").hidden = true;
   state.dockBeside = null;
   syncBeside();
+  if (sessionComposerTerminal()) {
+    const selected = selectedSession();
+    loadChatState(selected, true);
+    syncEvents();
+  }
   if (!state.terminalAlive) {
     showTerminalEnded();
     return;
@@ -11124,6 +11302,8 @@ async function openTerminal(terminal, { recordHistory = true, inline = null } = 
     });
   }
   requestAnimationFrame(fitTerminal);
+  if (document.activeElement?.id === "chat-input" && sessionComposerTerminal() ||
+      document.activeElement?.closest?.("#terminal-screen")) activateTerminalSizing();
   renderTerminalReturn();
   terminalStatus("터미널에 연결하고 있습니다…");
   startTerminalReader();
@@ -11290,7 +11470,11 @@ function sendInput(text) {
   return send;
 }
 function returnToBoard({ selectLaunchedSource = true, animate = true, loadChat = true } = {}) {
-  if (state.inlineTerminal) { leaveInlineTerminal({ loadChat }); return; }
+  if (state.inlineTerminal) {
+    const s = selectedSession();
+    if (s) state.detailModes.set(conversationIdentity(s), "chat");
+    leaveInlineTerminal({ loadChat }); return;
+  }
   saveDraft();
   stopTerminalReader();
   state.inputEpoch++;
@@ -11731,7 +11915,7 @@ function draftBeforeInput(event) {
 // A focused control keeps its keys, and Tab moves the focus as on any page.
 function terminalDocumentKey(event) {
   if (!state.terminalVisible || (state.docked && state.dockSide !== "terminal") || event.defaultPrevented ||
-      editingText() || dictationListening($("terminal-draft"))) return false;
+      editingText() || dictationListening($("terminal-draft")) || sessionComposerTerminal() && dictationListening($("chat-input"))) return false;
   const active = document.activeElement;
   if ((active && active !== document.body && active !== document.documentElement) || event.key === "Tab") {
     // Not for the CLI: a held bar modifier must not wait for a later key either.
@@ -12497,6 +12681,7 @@ function finishTerminalClose(closing) {
     const wasVisible = state.terminalVisible;
     const wasDocked = state.docked;
     const wasInline = !!state.inlineTerminal;
+    if (wasInline && state.inlineTerminal.key) state.detailModes.set(state.inlineTerminal.identity, "chat");
     if (wasInline) leaveInlineTerminal({ loadChat: false });
     saveDraft();
     stopTerminalReader();
@@ -13043,6 +13228,7 @@ function showLogin() {
   window.SessionholicWorkspace?.locked();
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   state.launcherWorkspace = null;
+  state.detailModes.clear();
   if (state.historySearch.mode && $("search")) $("search").value = state.search;
   cancelHistorySearch();
   state.historySearch.mode = false; state.historySearch.query = ""; state.historySearch.hits.clear();
@@ -13444,7 +13630,7 @@ function workspaceHooks() {
   });
   const describe = () => {
     const s = selectedSession();
-    const ref = s ? { key: s.key, mode: state.terminalVisible ? "terminal" : "chat",
+    const ref = s ? { key: s.key, mode: sessionDetailMode(s),
       ...(state.terminalVisible && state.terminal ? { terminalId: state.terminal.id } : {}) }
       : state.launcherWorkspace?.terminalId ? { terminalId: state.launcherWorkspace.terminalId, mode: state.terminalVisible ? "terminal" : "chat" }
       : state.terminalVisible && state.terminal ? { terminalId: state.terminal.id, mode: "terminal" } : null;
@@ -13458,6 +13644,10 @@ function workspaceHooks() {
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    answerSession: (key) => {
+      const target = selectedSession();
+      if (target?.key === key) { answerOnOpen(target); loadChatState(target, true); }
+    },
     commitComposition: async () => {
       if (!workspaceComposing()) return true;
       const field = document.activeElement;
@@ -13483,7 +13673,9 @@ function workspaceHooks() {
     sessionExists: (key) => allSessions().some((s) => s.key === key),
     focus: () => {
       const previous = lastField?.isConnected && !lastField.disabled && lastField;
-      const field = state.terminalVisible
+      const s = selectedSession();
+      const field = s && sessionDetailMode(s) === "chat" ? $("messages") :
+        sessionComposerTerminal(s) && (!previous || previous !== state.term?.textarea) ? $("chat-input") : state.terminalVisible
         ? previous?.closest?.("#terminal-screen") ? previous : directTerminalInput() ? state.term?.textarea : $("terminal-draft")
         : previous?.closest?.("#detail") ? previous : $("chat-input");
       (field || $("messages") || $("detail"))?.focus?.({ preventScroll: true });
@@ -13493,8 +13685,12 @@ function workspaceHooks() {
       if (!state.authenticated || !state.snapshot) return false;
       const s = ref.key && allSessions().find((s) => s.key === ref.key);
       if (ref.key && !s) return false;
+      if (s) state.detailModes.set(conversationIdentity(s), ref.mode === "terminal" ? "terminal" : "chat");
       if (s && state.selected !== s.key) select(s.key);
-      if (ref.mode !== "terminal" && !(!s && ref.terminalId)) return true;
+      if (ref.mode !== "terminal" && !(!s && ref.terminalId)) {
+        if (s) chooseDetailMode("chat");
+        return true;
+      }
       const terminal = ref.terminalId ? state.terminals.find((t) => t.id === ref.terminalId) : s && terminalForSession(s);
       if (!terminal) return !ref.terminalId;
       if (state.terminalVisible && state.terminal?.id === terminal.id) return true;
@@ -13529,7 +13725,8 @@ function workspaceHooks() {
       if (!shown) { stopTerminalReader(); stopChatPolling(); state.inputEpoch++; syncEvents(); schedule(); }
       else if (state.authenticated) {
         if (state.terminalVisible) startTerminalReader();
-        else { const s = selectedSession(); if (s) loadChatState(s, true); }
+        const s = selectedSession(); if (s && chatVisible()) loadChatState(s, true);
+        if (s) syncSessionTerminal(s);
         updateViewport();
       }
     },
@@ -13582,6 +13779,17 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("settings").addEventListener("click", openSettings);
+  $("terminal-compose")?.addEventListener("click", useSessionComposer);
+  document.addEventListener("focusin", (event) => {
+    if (state.terminalVisible && (event.target?.closest?.("#terminal-screen") || event.target?.id === "chat-input" && sessionComposerTerminal()))
+      activateTerminalSizing();
+  });
+  $("terminal-viewport").addEventListener("pointerdown", activateTerminalSizing);
+  window.addEventListener("blur", () => { state.terminalSizingId = null; });
+  window.addEventListener("focus", () => {
+    if (document.activeElement?.id === "chat-input" && sessionComposerTerminal() ||
+        document.activeElement?.closest?.("#terminal-screen")) activateTerminalSizing();
+  });
   $("settings-close").addEventListener("click", closeSettings);
   $("hard-reload")?.addEventListener("click", hardReload);
   $("quick-reload")?.addEventListener("click", hardReload);

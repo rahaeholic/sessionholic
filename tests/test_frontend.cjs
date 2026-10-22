@@ -3066,8 +3066,8 @@ test('HTTP status without a not_started guarantee remains unknown and never auto
     const { entry } = selectChat(c); entry.text = '전송 결과를 모르는 초안';
     await c.sendChat(entry); await new Promise((resolve) => setImmediate(resolve)); await c.sendChat(entry);
     assert.equal(sends, 1); assert.equal(!!entry.pending, true); assert.equal(entry.receipt.status, 'unknown');
-    assert.equal(c.get('chat-input').readOnly, true); assert.equal(c.get('chat-input').disabled, false);
-    assert.equal(c.get('chat-input').attributes['aria-disabled'], 'true'); assert.equal(entry.text, '전송 결과를 모르는 초안');
+    assert.equal(c.get('chat-input').readOnly, false); assert.equal(c.get('chat-input').disabled, false);
+    assert.equal(c.get('chat-input').attributes['aria-disabled'], 'false'); assert.equal(entry.text, '전송 결과를 모르는 초안');
   }
 });
 
@@ -5106,7 +5106,7 @@ test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구
   // A send whose result is not known yet locks the input (read-only).
   entry.pending = { requestId: 'request-0001', revision: entry.revision };
   c.updateChatComposer(entry);
-  assert.equal(findId(composer, 'chat-input').readOnly, true);
+  assert.equal(findId(composer, 'chat-input').readOnly, false);
   assert.equal(quick.disabled, true);
 });
 
@@ -9069,7 +9069,7 @@ test('a menu item runs only for a press that started on it after the menu opened
   assert.equal(dialog.open, false, 'the keyboard still runs items');
 });
 
-test('sending locks the draft read-only instead of disabling the field, so the focus and the next ⌘↩ stay', async () => {
+test('sending preserves the editor and next draft while duplicate submits remain blocked', async () => {
   let release = null;
   const sends = [];
   const c = client(async (url, options) => {
@@ -9092,19 +9092,20 @@ test('sending locks the draft read-only instead of disabling the field, so the f
   input.events.keydown(key);
   assert.equal(entry.sending, true);
   assert.equal(input.disabled, false, 'a disabled field would drop the focus (and the keyboard)');
-  assert.equal(input.readOnly, true, 'the text being sent cannot change');
-  assert.equal(input.attributes['aria-disabled'], 'true');
+  assert.equal(input.readOnly, false, 'the next draft stays editable while the send is pending');
+  assert.equal(input.attributes['aria-disabled'], 'false');
   input.events.keydown(key);
   input.events.paste({ clipboardData: { files: [{ name: 'a.png', size: 1, type: 'image/png' }], items: [], getData: () => '끼어든 글' },
     preventDefault() {} });
-  assert.equal(entry.text, '첫 메시지', 'a paste cannot slip into the locked draft');
+  assert.equal(entry.text, '첫 메시지끼어든 글', 'mixed paste keeps next-draft text while files wait for the receipt');
+  assert.equal(entry.attachments.length, 0);
   await settle();
   assert.equal(sends.length, 1, 'a second ⌘↩ meanwhile sends nothing');
   release(); await settle();
   assert.equal(entry.pending, null);
   assert.equal(input.readOnly, false);
   assert.equal(input.attributes['aria-disabled'], 'false');
-  assert.equal(input.value, '', 'the sent draft is cleared');
+  assert.equal(input.value, '첫 메시지끼어든 글', 'editing after dispatch preserves the next draft');
   // The next message goes out with the same key, without touching the field again.
   input.value = '두 번째 메시지'; input.events.input();
   input.events.keydown(key);
@@ -11146,7 +11147,7 @@ test('a listening mic can always end it, and says it is finishing', async () => 
   // A send whose result is not known yet locks the input (read-only).
   entry.pending = { requestId: 'request-0001', revision: entry.revision };
   c.updateChatComposer(entry);
-  assert.equal(input.readOnly, true);
+  assert.equal(input.readOnly, false);
   assert.equal(mic.disabled, false, 'locked input, mic still ends the listening');
   mic.events.click();
   assert.equal(rec.stopped, 1);
@@ -11155,7 +11156,7 @@ test('a listening mic can always end it, and says it is finishing', async () => 
   await settle();
   assert.equal(c.state.dictation, null);
   c.updateChatComposer(entry);
-  assert.equal(mic.disabled, true, 'not listening: a locked input keeps its mic off');
+  assert.equal(mic.disabled, false, 'dictation can start for the next draft while delivery is pending');
 });
 
 test('an iPad app back from the background takes its full height again, with no resize to wait for', async () => {
@@ -11697,57 +11698,27 @@ test("docked, a key typed with nothing focused goes to the side last touched", a
   assert.equal(c.terminalDocumentKey(key()), true);
 });
 
-test("docked, another conversation shows without the terminal; opening a terminal shows its own conversation", async () => {
-  const { c } = dockClient(1180);
-  const { s } = selectChat(c);
-  const other = { host: "workstation", agent: "codex", home: ".codex-example", id: "other-session",
-    key: ["workstation", "codex", ".codex-example", "other-session"].join("|") };
+test("a proven terminal opens in its own session area and switching sessions preserves the other draft", async () => {
+  const { c, s, terminal } = inlineDetailClient();
+  const other = { ...s, id: 'other-session', key: s.key.replace(s.id, 'other-session') };
   c.state.snapshot.hosts[0].data.codex.push(other);
-  const own = { id: "own", mode: "attach", nativeSource: c.sourceOf(s) };
-  await c.openTerminal(own);
-  assert.equal(c.state.docked, true);
-  c.select(s.key);
-  assert.equal(c.state.terminalVisible, true);
-  c.select(other.key);
-  assert.equal(c.state.selected, other.key);
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.state.docked, false);
-  assert.equal(c.get("app").hidden, false);
-  await c.openTerminal(own);
-  assert.equal(c.state.docked, true);
-  assert.equal(c.state.selected, s.key);
+  await c.openTerminal(terminal);
+  assert.equal(c.state.docked, false); assert.equal(c.state.inlineTerminal.key, s.key);
+  c.select(other.key); await settle();
+  assert.equal(c.state.selected, other.key); assert.equal(c.state.terminalVisible, false);
+  await c.openTerminal(terminal);
+  assert.equal(c.state.selected, s.key); assert.equal(c.state.inlineTerminal.key, s.key);
 });
 
-test("with the list stepped aside for a docked terminal, back and ⌘K bring the list and keep the conversation", async () => {
-  const { c, classes } = dockClient(1180);
-  const { s } = selectChat(c);
-  await c.openTerminal({ id: "solo", mode: "attach", nativeSource: c.sourceOf(s) });
-  assert.equal(c.state.dockSolo, true);
-  // Back hides the pane directly, replacing its entry without needing older history.
-  const backs = c.context.window.history.backCount;
-  c.backToList();
-  assert.equal(c.context.window.history.backCount, backs);
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.context.window.history.state.view, 'list');
-  assert.equal(classes.has("dock-solo"), false);
-  assert.equal(c.state.selected, s.key);
-  await c.openTerminal({ id: "solo", mode: "attach", nativeSource: c.sourceOf(s) });
-  c.noteDockSide("board");
-  c.context.document.activeElement = c.context.document.body;
-  const search = c.get("search");
-  const before = search.focusCount || 0;
-  c.documentKeydown({ key: "k", ctrlKey: true, preventDefault() {}, target: c.context.document.body });
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(search.focusCount, before + 1);
-  // Wide enough for the list too: back is the board's own again.
-  c.context.window.innerWidth = 1600;
-  await c.openTerminal({ id: "solo", mode: "attach", nativeSource: c.sourceOf(s) });
-  assert.equal(c.state.dockSolo, false);
-  const before2 = c.context.window.history.backCount;
-  c.backToList();
-  assert.equal(c.state.terminalVisible, true);
-  assert.equal(c.state.docked, true);
-  assert.equal(c.context.window.history.backCount, before2);
+test("the unified terminal keeps the list on desktop and list navigation never terminates the run", async () => {
+  const { c, s, terminal } = inlineDetailClient();
+  await c.openTerminal(terminal);
+  assert.equal(c.state.dockSolo, false); assert.equal(c.state.docked, false);
+  c.setDetailShown(false);
+  assert.equal(c.state.terminalVisible, false); assert.equal(c.state.terminalAlive, true);
+  assert.equal(c.state.selected, s.key); assert.equal(terminal.closed, undefined);
+  c.select(s.key); await settle();
+  assert.equal(c.state.inlineTerminal.key, s.key); assert.equal(c.state.terminal.id, terminal.id);
 });
 
 test("docked, the board's focus is let go, a phone held sideways never docks, and a pinch decides once", async () => {
@@ -11789,62 +11760,21 @@ test("docked, the board's focus is let go, a phone held sideways never docks, an
   assert.equal(c.dockWidth({ preferred: true }), 0);
 });
 
-test("docked, closing the terminal keeps the conversation, and another session gives the terminal's history entry way", async () => {
-  const chatReads = [];
-  const { c } = dockClient(1180, async (url, options) => {
-    if (url.endsWith("/api/chat/state")) chatReads.push(JSON.parse(options.body).source?.id || JSON.parse(options.body).id);
-    return { ok: true, status: 200, json: async () => ({ terminals: [] }) };
-  });
-  const { s } = selectChat(c);
-  const other = { host: "workstation", agent: "codex", home: ".codex-example", id: "other-session",
-    key: ["workstation", "codex", ".codex-example", "other-session"].join("|") };
-  c.state.snapshot.hosts[0].data.codex.push(other);
-  const own = { id: "own", mode: "attach", nativeSource: c.sourceOf(s) };
-  await c.openTerminal(own);
-  assert.equal(c.context.window.history.state.view, "terminal");
-  // Another conversation: the terminal steps aside, its entry is replaced, the old one is not read again.
-  chatReads.length = 0;
-  c.select(other.key);
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.context.window.history.state.view, "list");
-  assert.equal(chatReads.includes("native-session"), false);
-  // A notification for another session while docked: back returns to the terminal.
-  c.select(s.key);
-  await c.openTerminal(own);
-  c.state.authenticated = true;
-  const pushed = [];
-  const push = c.context.window.history.pushState;
-  c.context.window.history.pushState = function (value) { pushed.push(value.view); return push.call(this, value); };
-  c.requestSessionOpen("/?session=" + encodeURIComponent(other.key));
-  c.openRequestedSession();
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.state.selected, other.key);
-  assert.deepEqual(pushed, ["detail"]);
-  // One for the terminal's own session leaves it beside.
-  c.select(s.key);
-  await c.openTerminal(own);
-  c.requestSessionOpen("/?session=" + encodeURIComponent(s.key));
-  c.openRequestedSession();
-  assert.equal(c.state.docked, true);
-  // Closing a docked terminal leaves the conversation shown and reading.
-  c.state.detailShown = true;
-  c.state.chatPollRun = 7;
-  c.finishTerminalClose({ id: "own", copy: { done: "닫았습니다." } });
-  assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.state.detailShown, true);
-  assert.equal(c.state.chatPollRun, 7);
+test("closing a unified connection keeps its conversation record without reopening the connection", async () => {
+  const { c, s, terminal, entry } = inlineDetailClient();
+  entry.text = '보존할 초안'; c.get('chat-input').value = entry.text;
+  await c.openTerminal(terminal); c.finishTerminalClose({ id: terminal.id, copy: { done: '연결 닫음' } });
+  await settle();
+  assert.equal(c.state.terminalVisible, false); assert.equal(c.state.detailShown, true);
+  assert.equal(c.state.selected, s.key); assert.equal(entry.text, '보존할 초안');
+  assert.equal(c.get('detail-mode-chat').attributes['aria-selected'], 'true');
 });
 
-test("docked with the list aside, Esc on the board side brings the list", async () => {
-  const { c } = dockClient(1180);
-  const { s } = selectChat(c);
-  await c.openTerminal({ id: "esc", mode: "attach", nativeSource: c.sourceOf(s) });
-  c.get("session-layout").hidden = false;
-  c.noteDockSide("board");
-  const backs = c.context.window.history.backCount;
-  assert.equal(c.listNavigationKeydown({ key: "Escape", preventDefault() {}, target: c.context.document.body }), true);
-  assert.equal(c.context.window.history.backCount, backs);
-  assert.equal(c.state.terminalVisible, false);
+test("record navigation leaves a unified terminal execution alive", async () => {
+  const { c, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
+  c.get('detail-mode-chat').events.click();
+  assert.equal(c.state.inlineTerminal, null); assert.equal(c.state.terminalAlive, true);
+  assert.equal(terminal.closed, undefined); assert.equal(c.get('chat-composer').hidden, true);
 });
 
 test("typing with an iPad's on-screen keyboard folds the top bar; beside a docked terminal the terminal keeps its height", async () => {
@@ -12296,37 +12226,15 @@ test('새 세션은 분할 없이 탭으로 열리고 정확한 대화가 연결
   assert.equal(c.state.selected, null);
 });
 
-test('docked, the conversation beside follows the terminal on docking and for a handoff, and pressing it keeps the terminal', async () => {
-  const { c } = dockClient(1180);
-  const { s } = selectChat(c);
-  const other = { host: 'workstation', agent: 'codex', home: '.codex-example', id: 'other-session',
-    key: ['workstation', 'codex', '.codex-example', 'other-session'].join('|') };
-  c.state.snapshot.hosts[0].data.codex.push(other);
-  // 크게: a terminal of s covers the board; back on the board, another conversation is picked.
-  c.state.terminalDock = false;
-  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
-  assert.equal(c.state.docked, false);
-  c.returnToBoard({ selectLaunchedSource: false, animate: false });
-  c.select(other.key);
-  await c.openTerminal({ id: 'own', mode: 'attach', nativeSource: c.sourceOf(s) });
-  // 나란히: the terminal's own conversation comes beside it, not the one picked before.
-  c.toggleDock();
-  assert.equal(c.state.docked, true);
-  assert.equal(c.state.selected, s.key);
-  // Pressing the conversation shown beside it does not hide the terminal.
-  c.select(s.key);
-  assert.equal(c.state.terminalVisible, true);
-  // A handoff's new run: its source is not shown beside it while the new run is not listed.
-  c.returnToBoard({ selectLaunchedSource: false, animate: false });
-  const target = { host: 'workstation', agent: 'codex', home: '.codex-other', id: 'handoff-target',
-    key: ['workstation', 'codex', '.codex-other', 'handoff-target'].join('|') };
-  await c.openTerminal({ id: 'handoff', mode: 'handoff', sourceKey: JSON.stringify(c.sourceOf(s)), nativeSource: c.sourceOf(target) });
-  assert.equal(c.state.selected, null);
-  assert.match(textOf(c.get('detail')), /아직 목록에 없습니다/);
+test('a terminal whose native target is listed opens the destination rather than its handoff source', async () => {
+  const { c, s } = inlineDetailClient();
+  const target = { ...s, id: 'handoff-target', key: s.key.replace(s.id, 'handoff-target') };
   c.state.snapshot.hosts[0].data.codex.push(target);
-  c.render();
-  assert.equal(c.state.selected, target.key);
-  assert.equal(c.state.terminalVisible, true);
+  const term = { id: 'handoff', mode: 'handoff', sourceKey: JSON.stringify(c.sourceOf(s)), nativeSource: c.sourceOf(target) };
+  c.state.terminal = term;
+  await c.openTerminal(term); await settle();
+  assert.equal(c.state.selected, target.key); assert.equal(c.state.inlineTerminal.key, target.key);
+  assert.equal(c.state.docked, false); assert.equal(c.state.terminal.id, 'handoff');
 });
 
 test('봇 요청 탭은 봇이 연 세션도 보여 주고, 누르면 그 대화를 보기 전용으로 따라간다', () => {
@@ -12551,10 +12459,10 @@ test('late terminal resize success and failure belong to the terminal they were 
       return Promise.resolve({ ok: true, status: 200, json: async () => ({}) });
     }, { setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; }, clearTimeout() {} });
     c.state.authenticated = true; c.state.terminalVisible = true; c.state.connected = true; c.state.terminalAlive = true;
-    c.state.terminal = { id: 'first' }; c.state.term = { cols: 101, rows: 31 }; c.state.fit = { fit() {} };
+    c.state.terminal = { id: 'first' }; c.state.terminalSizingId = 'first'; c.state.term = { cols: 101, rows: 31 }; c.state.fit = { fit() {} };
     vm.runInContext('fitTerminal()', c.context);
     const old = timers.find((item) => item.ms === 180).callback();
-    c.state.terminal = { id: 'second' }; c.state.lastSize = '';
+    c.state.terminal = { id: 'second' }; c.state.terminalSizingId = 'second'; c.state.lastSize = '';
     vm.runInContext('fitTerminal()', c.context);
     complete(); await old;
     assert.equal(c.state.lastSize, ''); assert.equal(c.get('terminal-error').textContent, '');
@@ -12758,7 +12666,7 @@ test('touch quick replies keep the input focus, send once on selection, and neve
   assert.equal(entry.text, c.quickReplies()[0]); assert.equal(focused, 0); assert.equal(composer.children.length, 0);
   assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
   assert.equal(requests.find((r) => r.url === '/api/chat/send').body.text, c.quickReplies()[0]);
-  assert.equal(c.get('chat-input').readOnly, true);
+  assert.equal(c.get('chat-input').readOnly, false);
   await sending;
   assert.equal(entry.text, '');
   c.openQuickReplies(entry, input, trigger); c.state.quickRepliesOpen.panel.children.at(-1).events.click();
@@ -13239,7 +13147,7 @@ test('recovered unknown sends keep the original receipt id and cannot send a dup
   const requests = []; const second = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
   second.context.localStorage = storage; const restored = selectChat(second).entry;
   assert.equal(restored.pending.requestId, entry.pending.requestId); assert.equal(restored.receipt.status, 'unknown');
-  second.updateChatComposer(restored); assert.equal(second.get('chat-input').readOnly, true);
+  second.updateChatComposer(restored); assert.equal(second.get('chat-input').readOnly, false);
   await second.sendChat(restored); assert.equal(requests.length, 0);
   second.applyChatReceipt(restored, { requestId: restored.pending.requestId, status: 'accepted' });
   assert.equal(restored.text, ''); assert.equal(storage.store.size, 0);
@@ -13942,6 +13850,7 @@ function inlineDetailClient({ agent = 'codex', home = '.codex-example', sessionI
   const { s, entry } = selectChat(c, { agent, home });
   if (sessionId) s.sessionId = sessionId;
   c.state.detailShown = true;
+  c.state.detailModes.set(c.conversationIdentity(s), 'chat');
   c.drawDetail(s); wireTree(c, c.get('detail'));
   const page = node(), marker = c.get('terminal-home'), screen = c.get('terminal-screen');
   page.children = [marker, screen]; marker.parentNode = page; screen.parentNode = page;
@@ -13973,7 +13882,7 @@ test('채팅의 터미널 버튼은 같은 상세영역의 탭을 바꾸며 대�
   c.openChatTerminal(s); await settle();
   assert.equal(c.get('terminal-screen').parentNode, host);
   assert.equal(c.state.inlineTerminal.key, s.key); assert.equal(c.state.docked, false);
-  assert.equal(c.get('app').hidden, false); assert.equal(c.boardCovered(), false); assert.equal(c.chatVisible(), false);
+  assert.equal(c.get('app').hidden, false); assert.equal(c.boardCovered(), false); assert.equal(c.chatVisible(), true);
   assert.equal(c.get('detail-mode-terminal').attributes['aria-selected'], 'true');
   assert.equal(c.get('terminal-dock').hidden, true); assert.equal(entries.length, 1); assert.equal(entries[0].view, 'detail');
   assert.equal(c.get('chat-input'), input); assert.equal(c.get('messages'), messages);
@@ -13981,7 +13890,7 @@ test('채팅의 터미널 버튼은 같은 상세영역의 탭을 바꾸며 대�
   assert.equal(c.state.inlineTerminal, null); assert.equal(c.get('terminal-screen').parentNode, page);
   assert.equal(c.get('terminal-screen').hidden, true); assert.equal(c.get('detail-mode-chat').attributes['aria-selected'], 'true');
   assert.equal(c.chatVisible(), true); assert.equal(entry.text, '보내지 않은 초안'); assert.equal(input.value, entry.text);
-  assert.equal(messages.scrollTop, 350); assert.equal(term.disposed, 0); assert.equal(reads(), 1);
+  assert.equal(messages.scrollTop, 350); assert.equal(term.disposed, 0); assert.equal(reads(), 2);
   c.get('detail-mode-terminal').events.click(); await settle();
   assert.equal(c.get('terminal-screen').parentNode, host); assert.equal(term.disposed, 0);
 });
@@ -14019,10 +13928,10 @@ test('다른 대화 선택·목록 복귀·잠금은 이동한 터미널 DOM을 
     assert.equal(c.state.inlineTerminal, null, action); assert.equal(c.get('terminal-screen').parentNode, page, action);
     assert.equal(c.get('terminal-screen').hidden, true, action);
   }
-  const { c, terminal, page } = inlineDetailClient();
+  const { c, terminal, host } = inlineDetailClient();
   await c.openTerminal(terminal);
-  assert.equal(c.state.inlineTerminal, null); assert.equal(c.get('terminal-screen').parentNode, page);
-  assert.equal(c.state.docked, true); assert.equal(c.chatVisible(), true);
+  assert.equal(c.state.inlineTerminal.key, c.state.selected); assert.equal(c.get('terminal-screen').parentNode, host);
+  assert.equal(c.state.docked, false); assert.equal(c.chatVisible(), true);
 });
 
 test('동일 worker의 Claude 대화가 바뀌거나 목록에서 사라지면 이전 inline 터미널을 새 대화에 붙이지 않는다', async () => {
@@ -14669,4 +14578,276 @@ test('터미널 첨부 업로드 실패는 재시도할 선택을 보관하고 �
   c.beginAuthEpoch(); c.state.authenticated = false; c.terminalAttachmentDrafts.clear();
   done(fileReply()); await pending;
   assert.equal(c.terminalAttachmentDrafts.size, 0);
+});
+
+test('기본 작업 보기는 기존 exact 터미널만 재사용하며 입력 DOM과 한글 조합을 유지한다', async () => {
+  const { c, s, entry, terminal } = inlineDetailClient();
+  const input = c.get('chat-input'); let blurred = 0;
+  input.blur = () => { blurred++; };
+  c.context.document.activeElement = input;
+  input.value = entry.text = '조합 중인 다음 문장'; entry.composing = true;
+  c.state.detailModes.delete(c.conversationIdentity(s));
+  await vm.runInContext('syncSessionTerminal()', c.context);
+  assert.equal(c.state.terminal.id, terminal.id); assert.equal(c.state.inlineTerminal.key, s.key);
+  assert.equal(c.get('chat-input'), input); assert.equal(input.value, entry.text);
+  assert.equal(blurred, 0); assert.equal(entry.composing, true);
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.chatVisible(), true);
+  assert.equal(c.get('detail-mode-terminal').textContent, '작업');
+  assert.equal(c.get('detail-mode-chat').textContent, '기록');
+});
+
+test('기록 선택과 복원은 실행을 시작하지 않고 작성·승인 UI를 감춘다', async () => {
+  const { c, s, entry, terminal } = inlineDetailClient(), calls = [];
+  c.context.fetch = async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; };
+  await c.openTerminal(terminal); c.get('detail-mode-chat').events.click();
+  c.renderPrompt(s, { prompt: { fingerprint: 'approval', agent: 'codex', current: 1, options: [{ number: 1, label: '승인' }] } });
+  entry.text = '기록에서는 전송하지 않음'; await c.sendChat(entry);
+  const hooks = vm.runInContext('workspaceHooks()', c.context);
+  assert.equal(hooks.restore({ key: s.key, mode: 'chat' }), true);
+  await settle();
+  assert.equal(hooks.describe().ref.mode, 'chat'); assert.equal(c.state.terminalVisible, false);
+  assert.equal(c.get('chat-composer').hidden, true); assert.equal(c.get('chat-prompt').hidden, true);
+  assert.equal(entry.text, '기록에서는 전송하지 않음');
+  assert.equal(calls.some((url) => /launch|new-session|\/send|\/input|\/prompt/.test(url)), false);
+});
+
+test('터미널이 없거나 추정 연결뿐인 작업을 읽어도 실행을 만들지 않는다', async () => {
+  for (const estimated of [false, true]) {
+    const { c, s, terminal } = inlineDetailClient(), opens = [];
+    c.state.detailModes.delete(c.conversationIdentity(s));
+    c.state.terminals = estimated ? [{ ...terminal, linkConfidence: 'estimated' }] : [];
+    c.context.openTerminal = async (value) => { opens.push(value); };
+    await vm.runInContext('syncSessionTerminal()', c.context); await settle();
+    assert.equal(opens.length, 0); assert.equal(c.get('detail-terminal-host').hidden, false);
+    assert.equal(c.get('session-terminal-empty').hidden, false);
+    assert.equal(c.get('chat-input').disabled, false);
+    const hooks = vm.runInContext('workspaceHooks()', c.context);
+    assert.equal(hooks.describe().ref.mode, 'terminal', '연결 전 작업 보기도 작업으로 복원한다');
+  }
+});
+
+test('일회성·읽기 전용·지운 대화는 기록으로 열려 터미널 자리를 소비하지 않는다', async () => {
+  for (const change of [{ executionMode: 'one-shot' }, { readOnly: true }, { removed: true }]) {
+    const { c, s } = inlineDetailClient();
+    Object.assign(s, change);
+    if (change.removed) c.context.sessionRemoved = () => true;
+    c.state.detailModes.delete(c.conversationIdentity(s)); c.context.__session = s;
+    const opens = []; c.context.openTerminal = async (value) => { opens.push(value); };
+    c.context.renderDetailMode(); await settle();
+    assert.equal(vm.runInContext('sessionDetailMode(__session)', c.context), 'chat');
+    assert.equal(opens.length, 0); assert.equal(c.get('chat-composer').hidden, true);
+    assert.equal(c.get('detail-mode-terminal').disabled, change.executionMode === 'one-shot');
+  }
+});
+
+test('통합 작성창은 raw 키 입력 대신 기존 메시지 API와 영수증을 사용한다', async () => {
+  const { c, s, entry, terminal } = inlineDetailClient(), calls = [];
+  await c.openTerminal(terminal);
+  c.context.fetch = async (url, options) => {
+    const body = options?.body ? JSON.parse(options.body) : null; calls.push({ url, body });
+    return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } }) };
+  };
+  entry.text = c.get('chat-input').value = '이 터미널의 실제 세션으로'; entry.revision++;
+  await c.sendChat(entry);
+  const sent = calls.filter((item) => item.url === '/api/chat/send');
+  assert.equal(sent.length, 1); assert.equal(sent[0].body.source.id, s.id);
+  assert.equal(sent[0].body.text, '이 터미널의 실제 세션으로');
+  assert.equal(calls.some((item) => /\/terminal\/.+\/input/.test(item.url)), false);
+  assert.equal(entry.receipt.status, 'accepted'); assert.equal(entry.pending, null);
+  assert.equal(c.get('chat-input').value, '');
+});
+
+test('전송 중 작성한 다음 문장은 남고 이미 보낸 첨부만 다음 초안에서 빠진다', async () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const file = { id: 'sent-file', name: 'before.png', type: 'image/png', size: 8 };
+  entry.text = c.get('chat-input').value = '보낸 내용'; entry.attachments = [file];
+  entry.pending = { requestId: 'request-following-draft', revision: entry.revision, text: entry.text,
+    attachments: [file.id], attachmentDetails: [file], source: entry.source };
+  entry.sending = true; c.updateChatComposer(entry);
+  const input = c.get('chat-input'); input.value = '다음 내용'; input.events.input();
+  c.applyChatReceipt(entry, { requestId: 'request-following-draft', status: 'accepted', confirmed: true });
+  assert.equal(entry.text, '다음 내용'); assert.equal(input.value, '다음 내용');
+  assert.equal(entry.attachments.length, 0); assert.equal(entry.pending, null);
+  assert.equal(input.readOnly, false);
+});
+
+test('터미널 화면의 파일 붙여넣기도 통합 작성창의 첨부 경로로 들어간다', async () => {
+  const { c, entry, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
+  let uploaded, raw = 0;
+  c.context.uploadChatFiles = (target, files) => { uploaded = { target, files }; };
+  c.context.uploadTerminalFiles = () => { raw++; };
+  const event = { clipboardData: { files: [{ name: 'paste.png', size: 9 }], getData: () => '첨부 설명' },
+    preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; } };
+  c.context.__paste = event; vm.runInContext('pasteTerminalFiles(__paste)', c.context);
+  assert.equal(uploaded.target, entry); assert.equal(uploaded.files[0].name, 'paste.png');
+  assert.equal(entry.text, '첨부 설명'); assert.equal(c.get('terminal-draft').value, '');
+  assert.equal(event.prevented, true); assert.equal(event.stopped, true); assert.equal(raw, 0);
+});
+
+test('분할 창의 작업·기록 복원과 포커스는 같은 입력 DOM을 유지한다', async () => {
+  const { c, s, terminal, entry } = inlineDetailClient();
+  const hooks = vm.runInContext('workspaceHooks()', c.context), input = c.get('chat-input');
+  entry.text = input.value = '분할 창의 초안';
+  hooks.restore({ key: s.key, mode: 'terminal', terminalId: terminal.id }); await settle();
+  assert.equal(hooks.describe().ref.mode, 'terminal'); hooks.focus();
+  assert.equal(input.focusCount, 1); assert.equal(c.get('chat-input'), input);
+  hooks.restore({ key: s.key, mode: 'chat' }); await settle();
+  assert.equal(hooks.describe().ref.mode, 'chat'); assert.equal(entry.text, input.value);
+  assert.equal(c.get('chat-composer').hidden, true);
+});
+
+test('터미널 크기는 포커스를 받은 창만 보내고 재포커스 때 같은 크기도 다시 보낸다', async () => {
+  const timers = [], calls = [], c = client(async (url) => {
+    calls.push(url); return { ok: true, status: 200, json: async () => ({}) };
+  }, { setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  c.state.authenticated = true; c.state.terminalVisible = true; c.state.connected = true;
+  c.state.terminal = { id: 'shared' }; c.state.term = { cols: 90, rows: 30 }; c.state.fit = { fit() {} };
+  vm.runInContext('fitTerminal()', c.context); await timers.at(-1).fn(); assert.equal(calls.length, 0);
+  vm.runInContext('activateTerminalSizing()', c.context); await timers.at(-1).fn(); assert.equal(calls.length, 1);
+  vm.runInContext('activateTerminalSizing()', c.context); await timers.at(-1).fn(); assert.equal(calls.length, 2);
+  c.context.window.SessionholicWorkspace = { visible: () => true, readingActive: () => false };
+  vm.runInContext('fitTerminal()', c.context); await timers.at(-1).fn(); assert.equal(calls.length, 2);
+});
+
+test('통합 터미널의 작성창·승인 영역은 보이고 raw 작성창은 숨기는 스타일이다', () => {
+  const css = styleSheet();
+  assert.match(css, /is-terminal-mode > :not\(\.detail-head\).*:not\(\.chat-composer\):not\(\.chat-prompt\)/);
+  assert.match(css, /has-session-composer \.draft-panel \{ display: none;/);
+  assert.match(css, /is-record-mode > \.chat-composer/);
+});
+
+test('새 터미널의 통합 입력 전환은 확인된 같은 세션에 초안과 첨부를 옮긴다', async () => {
+  const { c, s } = newSessionWorkspaceClient(1440);
+  const terminal = { id: c.state.terminal.id, mode: 'new-session', host: s.host, alive: true };
+  await vm.runInContext('openNewSessionTerminal(state.terminal = ' + JSON.stringify(terminal) + ')', c.context);
+  c.get('terminal-draft').value = '새 세션에서 쓴 초안';
+  const fresh = { ...s, id: 'new-native', key: s.key.replace(s.id, 'new-native'), cwd: '/fixture/project' };
+  c.state.snapshot.hosts[0].data.codex.push(fresh);
+  c.state.terminal = { ...terminal, nativeSource: { ...c.sourceOf(fresh), cwd: fresh.cwd }, linkConfidence: 'exact' };
+  const file = { id: 'a'.repeat(32), name: 'screen.png', path: '/fixture/project/screen.png', type: 'image/png', size: 8,
+    terminalSourceKey: c.chatKey(c.sourceOf(fresh)) };
+  c.context.__file = file;
+  vm.runInContext('terminalAttachmentEntry().attachments = [__file]', c.context);
+  vm.runInContext('useSessionComposer()', c.context); await settle();
+  assert.equal(c.state.selected, fresh.key); assert.equal(c.state.inlineTerminal.key, fresh.key);
+  const entry = c.chatEntry(fresh);
+  assert.equal(entry.text, '새 세션에서 쓴 초안'); assert.equal(entry.attachments[0].id, file.id);
+  assert.equal(c.get('terminal-draft').value, ''); assert.equal(c.get('chat-input').value, entry.text);
+  assert.equal(vm.runInContext('terminalAttachmentEntry().attachments.length', c.context), 0);
+});
+
+test('새 세션의 전환 버튼은 추정 연결·조합 중·다른 세션 첨부를 이동하지 않는다', async () => {
+  for (const scenario of ['estimated', 'ime', 'changed-file-source']) {
+    const { c, s } = newSessionWorkspaceClient(1440);
+    const terminal = { id: c.state.terminal.id, mode: 'new-session', host: s.host, alive: true };
+    c.context.__terminal = terminal;
+    await vm.runInContext('openNewSessionTerminal(__terminal)', c.context);
+    const fresh = { ...s, id: 'new-native', key: s.key.replace(s.id, 'new-native'), cwd: '/fixture/project' };
+    c.state.snapshot.hosts[0].data.codex.push(fresh);
+    c.state.terminal = { ...terminal, nativeSource: c.sourceOf(fresh), linkConfidence: scenario === 'estimated' ? 'estimated' : 'exact' };
+    c.get('terminal-draft').value = '옮기기 전 초안'; c.state.composing = scenario === 'ime';
+    if (scenario === 'changed-file-source') {
+      c.context.__source = c.sourceOf(fresh);
+      vm.runInContext('terminalAttachmentEntry().attachments = [{ id: "a".repeat(32), path: "/fixture/project/a.png", terminalSourceKey: "different" }]', c.context);
+    }
+    vm.runInContext('useSessionComposer()', c.context); await settle();
+    assert.equal(c.state.selected, null, scenario); assert.equal(c.get('terminal-draft').value, '옮기기 전 초안');
+  }
+});
+
+test('통합 입력 중 일시적인 readOnly 관측이 와도 보기·초안·음성 입력을 바꾸지 않는다', async () => {
+  const { c, s, entry, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
+  const input = c.get('chat-input'); input.value = entry.text = '계속 쓸 내용';
+  s.readOnly = true; c.context.renderDetailMode();
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(c.get('chat-input'), input); assert.equal(c.get('chat-composer').hidden, false);
+  assert.equal(input.disabled, false); assert.equal(entry.text, '계속 쓸 내용');
+});
+
+test('통합 작성창에서 받아쓰는 동안 포커스 없는 키를 raw 터미널로 보내지 않는다', async () => {
+  const { c, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
+  c.context.dictationListening = (field) => field === c.get('chat-input');
+  c.context.document.activeElement = c.context.document.body;
+  const key = { key: 'a', target: c.context.document.body, preventDefault() { throw Error('must not enter PTY'); } };
+  assert.equal(c.terminalDocumentKey(key), false);
+});
+
+test('목록에서 지운 세션이 다시 답을 기다리면 작업과 승인 UI를 사용할 수 있다', async () => {
+  const { c, s } = inlineDetailClient(); s.phase = 'needs_input'; c.context.sessionRemoved = () => true;
+  c.state.detailModes.delete(c.conversationIdentity(s)); c.context.renderDetailMode();
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(c.get('detail-mode-terminal').disabled, false); assert.equal(c.get('chat-composer').hidden, false);
+  c.renderPrompt(s, { prompt: { fingerprint: 'waiting-again', current: 1, agent: 'codex', options: [{ number: 1, label: '계속' }] } });
+  assert.equal(c.get('chat-prompt').hidden, false);
+});
+
+test('기록으로 보던 세션도 답 필요 알림 의도는 작업 보기로 연다', async () => {
+  const { c, s } = inlineDetailClient();
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+  c.answerOnOpen(s); await settle();
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.state.inlineTerminal.key, s.key);
+});
+
+test('자동 터미널 동기화는 다른 분할 창의 포커스를 빼앗는 경로를 호출하지 않는다', async () => {
+  const { c, s, entry } = inlineDetailClient(), claims = [];
+  c.state.detailModes.delete(c.conversationIdentity(s)); entry.text = '이 창에서 작성 중';
+  c.context.window.SessionholicWorkspace = { visible: () => true, readingActive: () => true, changed() {},
+    routeTerminal() { throw Error('passive synchronization must not route focus'); },
+    claimTerminal(terminal, options) { claims.push(options.passive); return false; } };
+  const field = c.get('chat-input'); c.context.document.activeElement = field;
+  for (let index = 0; index < 3; index++) await vm.runInContext('syncSessionTerminal()', c.context);
+  assert.ok(claims.length >= 3 && claims.every((passive) => passive === true)); assert.equal(c.context.document.activeElement, field);
+  assert.equal(entry.text, '이 창에서 작성 중'); assert.equal(c.state.terminalVisible, false);
+});
+
+test('기존 터미널 raw 초안이 남았으면 숨기지 않고 명시적으로 통합 입력으로 옮긴다', async () => {
+  const { c, s, entry, terminal } = inlineDetailClient();
+  c.state.drafts.set(c.draftKey(terminal), '터미널에 남은 초안'); c.get('terminal-draft').value = '터미널에 남은 초안';
+  await c.openTerminal(terminal);
+  assert.equal(c.get('chat-composer').hidden, true); assert.equal(c.get('terminal-compose').hidden, false);
+  assert.equal(c.get('terminal-draft').value, '터미널에 남은 초안');
+  vm.runInContext('useSessionComposer()', c.context); await settle();
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.state.selected, s.key);
+  assert.equal(entry.text, '터미널에 남은 초안'); assert.equal(c.get('terminal-draft').value, '');
+});
+
+test('양쪽 초안 충돌은 각각 보기나 명시적인 합치기로 해결하며 어느 초안도 잃지 않는다', async () => {
+  const { c, entry, terminal } = inlineDetailClient(); let actions;
+  entry.text = '메시지 초안'; c.get('chat-input').value = entry.text;
+  c.state.drafts.set(c.draftKey(terminal), '터미널 초안'); c.get('terminal-draft').value = '터미널 초안'; await c.openTerminal(terminal);
+  c.context.openActionSheet = (value) => { actions = value.actions; };
+  vm.runInContext('useSessionComposer()', c.context);
+  assert.equal(entry.text, '메시지 초안'); assert.equal(c.get('terminal-draft').value, '터미널 초안');
+  actions.find((action) => action.label === '메시지 초안 보기').run(); await settle();
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.get('terminal-compose').hidden, false);
+  assert.equal(c.get('terminal-draft').value, '터미널 초안');
+  vm.runInContext('useSessionComposer()', c.context);
+  actions.find((action) => action.label === '초안 합쳐서 이동').run(); await settle();
+  assert.equal(entry.text, '메시지 초안\n\n터미널 초안'); assert.equal(c.get('terminal-draft').value, '');
+  assert.equal(c.get('chat-composer').hidden, false);
+});
+
+test('기록의 실패 메시지 재시도는 작업 보기로 전환하고 별도 다음 초안을 보존한다', async () => {
+  const { c, entry } = inlineDetailClient(), sends = [];
+  entry.text = c.get('chat-input').value = '다음에 보낼 내용';
+  c.context.fetch = async (url, options) => {
+    const body = JSON.parse(options.body); sends.push({ url, body });
+    return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } }) };
+  };
+  c.retryOutbox(entry, { text: '이전에 실패한 내용', attachmentObjects: [] }); await settle();
+  assert.equal(sends.filter((item) => item.url === '/api/chat/send').length, 1);
+  assert.equal(sends.find((item) => item.url === '/api/chat/send').body.text, '이전에 실패한 내용');
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(entry.text, '다음에 보낼 내용'); assert.equal(c.get('chat-composer').hidden, false);
+});
+
+test('raw 초안의 자동 동기화도 같은 터미널을 다시 열거나 IME 포커스를 해제하지 않는다', async () => {
+  const { c, terminal } = inlineDetailClient(); c.get('terminal-draft').value = '한글 조합';
+  await c.openTerminal(terminal);
+  let blurred = 0; const field = c.get('terminal-draft'); field.blur = () => { blurred++; };
+  c.context.document.activeElement = field; c.state.composing = true;
+  await vm.runInContext('syncSessionTerminal()', c.context);
+  assert.equal(blurred, 0); assert.equal(c.state.composing, true); assert.equal(field.value, '한글 조합');
 });

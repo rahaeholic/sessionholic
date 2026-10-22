@@ -309,7 +309,7 @@ test("dropping another session at an occupied pane center previews and creates a
   assert.equal(f.frames.length, 1);
   assert.deepEqual(f.infos.get("p1").ref, { key: "session-a", mode: "chat" });
   const second = f.attach("p2");
-  assert.deepEqual(second.info.ref, { key: "session-b", mode: "chat" });
+  assert.deepEqual(second.info.ref, { key: "session-b", mode: "terminal" });
   assert.equal(f.nodes.get("workspace-primary").style.width, "50%");
   assert.equal(second.row.style.width, "50%");
 });
@@ -323,8 +323,8 @@ test("a center drop into a loading empty pane is retained until its document is 
   assert.equal(f.nodes.get("workspace-drop-cue").textContent, "빈 창에서 열기");
   f.document.fire("drop", { clientX: 990, clientY: 400, dataTransfer: transfer, preventDefault() {} });
   assert.equal(f.frames.length, 1, "the empty pane is filled rather than split again");
-  assert.deepEqual(f.preferences.get("workspace").panes.p2, { key: "session-b", mode: "chat" });
-  assert.deepEqual(f.attach("p2").info.ref, { key: "session-b", mode: "chat" });
+  assert.deepEqual(f.preferences.get("workspace").panes.p2, { key: "session-b", mode: "terminal" });
+  assert.deepEqual(f.attach("p2").info.ref, { key: "session-b", mode: "terminal" });
   assert.equal(f.calls.filter(([name]) => name === "api").length, 0);
 });
 
@@ -386,4 +386,36 @@ test("compact and maximized views preserve documents, passive panes remain unrea
   const event = combo("unused"); f.document.fire("window:beforeunload", event);
   assert.equal(event.prevented, true);
   assert.equal(event.returnValue, "");
+});
+
+test('passive terminal claims never move focus or notify when another pane owns the terminal', () => {
+  const f = fixture(); f.workspace.add({ terminalId: 'a'.repeat(32), mode: 'terminal' });
+  const second = f.attach('p2', { terminalId: 'a'.repeat(32), mode: 'terminal' });
+  second.info.terminalId = 'a'.repeat(32); second.info.terminalVisible = true;
+  f.workspace.focus('p1'); const before = f.calls.length;
+  for (let index = 0; index < 3; index++) assert.equal(f.workspace.claimTerminal({ id: 'a'.repeat(32) }, { passive: true }), false);
+  assert.equal(f.workspace.readingActive(), true); assert.equal(f.calls.length, before);
+  assert.equal(f.workspace.claimTerminal({ id: 'a'.repeat(32) }), false);
+  assert.equal(f.workspace.readingActive(), false); assert.ok(f.calls.some((call) => call[0] === 'toast'));
+});
+
+test('answer intent reaches an already mounted record pane without creating a new execution', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b', mode: 'chat' });
+  const second = f.attach('p2', { key: 'session-b', mode: 'chat' }), answers = [];
+  second.child.answerSession = (key) => answers.push(key);
+  f.workspace.focus('p1'); assert.equal(f.workspace.routeSession('session-b', { answer: true }), true);
+  assert.deepEqual(answers, ['session-b']); assert.equal(f.workspace.readingActive(), false);
+  assert.equal(f.calls.some((call) => call[0] === 'api' && /launch|new-session/.test(call[1])), false);
+});
+
+test('a loading pane retains answer intent until restore completes and opens in work mode', () => {
+  const f = fixture(); f.workspace.add(null);
+  assert.equal(f.workspace.routeSession('session-b', { answer: true }), true);
+  assert.deepEqual(f.preferences.get('workspace').panes.p2, { key: 'session-b', mode: 'terminal' });
+  const row = f.nodes.get('session-workspace').children.find((node) => node.dataset.paneId === 'p2');
+  const frame = row.children.find((node) => node.tagName === 'IFRAME'), child = f.app('p2'), answers = [];
+  child.answerSession = (key) => answers.push(key);
+  assert.equal(f.workspace.attach('p2', frame.contentWindow, child), true);
+  assert.deepEqual(answers, ['session-b']); assert.equal(f.infos.get('p2').ref.mode, 'terminal');
+  f.workspace.changed(); assert.equal(answers.length, 1, 'answer intent is consumed only once');
 });

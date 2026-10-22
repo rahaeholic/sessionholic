@@ -262,7 +262,7 @@
             </div>
             <p class="sr-only" role="status">세션을 확인하고 있습니다…</p>
           </div>
-          <p class="list-footnote">메시지는 여기서, 자세한 작업은 터미널에서.</p>
+          <p class="list-footnote">터미널에서 작업하고, 아래 작성창에서 메시지를 보내세요.</p>
           <!-- Shown where a hardware keyboard is (or was seen); opens the shortcuts. -->
           <button id="keyboard-hint" class="keyboard-hint" type="button" hidden aria-haspopup="dialog"
             aria-label="키보드 단축키 보기">↑↓ 이동 · → 열기 · ← 목록 · ⌫ 종료 · ? 단축키</button>
@@ -330,6 +330,7 @@
         <span id="terminal-status" role="status"></span
         ><button id="terminal-reconnect" type="button" hidden>다시 연결</button
         ><button id="terminal-reopen" type="button" hidden>이 세션 다시 열기</button
+        ><button id="terminal-compose" type="button" hidden>통합 입력 사용</button
         ><button
           id="terminal-copy"
           type="button"
@@ -408,6 +409,7 @@
           </div>
           <input id="terminal-files" type="file" multiple hidden>
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
+          <p class="draft-mode-note">터미널에 직접 입력 · Enter로 실행</p>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
@@ -415,7 +417,7 @@
               aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
-              placeholder="입력 후 보내기"
+              placeholder="터미널에 직접 입력할 내용"
               autocapitalize="off"
               spellcheck="false"
             ></textarea

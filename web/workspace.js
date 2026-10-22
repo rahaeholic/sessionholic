@@ -347,7 +347,10 @@
   function applyRef(row) {
     if (!row.hooks || !row.ref || row.restoring) return;
     row.restoring = true;
-    try { if (local(() => row.hooks.restore(copy(row.ref)))) row.ref = null; }
+    try { if (local(() => row.hooks.restore(copy(row.ref)))) {
+      row.ref = null;
+      if (row.pendingAnswer) { row.hooks.answerSession?.(row.pendingAnswer); row.pendingAnswer = null; }
+    } }
     finally { row.restoring = false; }
   }
   function changed() {
@@ -390,15 +393,23 @@
     if (panes.get(id)?.frame?.contentWindow !== win) return;
     changed();
   }
-  function routeSession(key) {
+  function routeSession(key, { answer = false } = {}) {
     if (embedded || internal || !enabled) return false;
     doc.body.classList.remove("workspace-list-open");
     const existing = findRef({ key });
-    if (existing) { focus(existing); return true; }
+    if (existing) {
+      focus(existing);
+      if (answer) {
+        const row = panes.get(existing);
+        if (row.hooks) row.hooks.answerSession?.(key);
+        else { row.pendingAnswer = key; if (row.ref) row.ref.mode = "terminal"; changed(); }
+      }
+      return true;
+    }
     if (active === "p1") return false;
     const row = panes.get(active);
-    if (!row?.hooks) { row.ref = { key, mode: "chat" }; return true; }
-    row.ref = null; row.hooks.select(key); row.hooks.focus(); changed();
+    if (!row?.hooks) { row.ref = { key, mode: "terminal" }; if (answer) row.pendingAnswer = key; changed(); return true; }
+    row.ref = null; row.hooks.select(key); if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed();
     return true;
   }
   function routeNew() {
@@ -439,17 +450,18 @@
   }
   function readingActive() { return embedded ? frameReady && parent.isActive(ownId, root) : !enabled || active === "p1"; }
   function isActive(id, win) { return active === id && panes.get(id)?.frame?.contentWindow === win; }
-  function claimTerminal(terminal) {
-    if (embedded) return frameReady && parent.claim(ownId, root, terminal.id);
-    return claim("p1", root, terminal.id);
+  function claimTerminal(terminal, { passive = false } = {}) {
+    if (embedded) return frameReady && parent.claim(ownId, root, terminal.id, { passive });
+    return claim("p1", root, terminal.id, { passive });
   }
-  function claim(id, win, terminalId) {
+  function claim(id, win, terminalId, { passive = false } = {}) {
     if (id !== "p1" && panes.get(id)?.frame?.contentWindow !== win) return false;
     for (const other of ids(tree)) {
       if (other === id) continue;
       const descriptor = panes.get(other)?.hooks?.describe();
       if (descriptor?.terminalId === terminalId && descriptor.terminalVisible) {
-        focus(other); notify("이 터미널이 열린 창으로 이동했습니다."); return false;
+        if (!passive) { focus(other); notify("이 터미널이 열린 창으로 이동했습니다."); }
+        return false;
       }
     }
     return true;
@@ -563,8 +575,8 @@
       tree = move(tree, target.from, target.id, target.edge); active = target.from; maximized = false; layout(); focus(active);
     } else if (target.edge === "center") {
       const row = panes.get(target.id);
-      focus(target.id, false); row.ref = { key: data.key, mode: "chat" }; applyRef(row); changed();
-    } else add({ key: data.key, mode: "chat" }, target.id, target.edge);
+      focus(target.id, false); row.ref = { key: data.key, mode: "terminal" }; applyRef(row); changed();
+    } else add({ key: data.key, mode: "terminal" }, target.id, target.edge);
   }
   function init(appHooks) {
     hooks = appHooks;
