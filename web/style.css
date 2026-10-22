@@ -7533,7 +7533,6 @@ input.switch:focus-visible {
 .detail-pane.is-typing .work-context, .detail-pane.is-typing .session-relations { display: none; }
 .detail-terminal-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .detail-pane.is-terminal-mode > :not(.detail-head):not(.detail-mode-tabs):not(.detail-terminal-host):not(.chat-composer):not(.chat-prompt):not(.continue-disclosure) { display: none !important; }
-.detail-pane.is-record-mode > .chat-composer, .detail-pane.is-record-mode > .chat-prompt { display: none !important; }
 .session-terminal-empty { height: 100%; min-height: 140px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; text-align: center; color: var(--label-2); background: var(--t-bg); }
 .session-terminal-empty p { max-width: 420px; line-height: 1.6; margin: 0; color: var(--t-label-2); }
 body.terminal-inline #terminal-screen.has-session-composer .draft-panel { display: none; }
@@ -7541,7 +7540,6 @@ body.terminal-inline #terminal-screen.has-session-composer .terminal-header .ter
 .detail-pane.is-terminal-mode > .chat-composer { flex: none; }
 .detail-pane.is-terminal-mode > .chat-prompt { flex: none; max-height: 32vh; overflow-y: auto; }
 .detail-pane.is-terminal-mode .detail-terminal { display: none; }
-.detail-pane.is-record-mode .chat-model-controls { display: none; }
 .draft-mode-note { margin: 0 0 6px; color: var(--t-label-2); font-size: var(--fs-cap); }
 body.terminal-inline #terminal-screen { position: relative; inset: auto; z-index: auto; width: 100%; height: 100%; min-height: 0; padding: 0; }
 body.terminal-inline .terminal-header { min-height: 44px; }

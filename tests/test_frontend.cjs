@@ -11784,7 +11784,7 @@ test("record navigation leaves a unified terminal execution alive", async () => 
   const { c, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
   c.get('detail-mode-chat').events.click();
   assert.equal(c.state.inlineTerminal, null); assert.equal(c.state.terminalAlive, true);
-  assert.equal(terminal.closed, undefined); assert.equal(c.get('chat-composer').hidden, true);
+  assert.equal(terminal.closed, undefined); assert.equal(c.get('chat-composer').hidden, false);
 });
 
 test("typing with an iPad's on-screen keyboard folds the top bar; beside a docked terminal the terminal keeps its height", async () => {
@@ -14607,18 +14607,18 @@ test('기본 작업 보기는 기존 exact 터미널만 재사용하며 입력 D
   assert.equal(c.get('detail-mode-chat').textContent, '기록');
 });
 
-test('기록 선택과 복원은 실행을 시작하지 않고 작성·승인 UI를 감춘다', async () => {
+test('기록 선택과 복원은 실행을 시작하지 않고 공통 작성·승인 UI를 유지한다', async () => {
   const { c, s, entry, terminal } = inlineDetailClient(), calls = [];
   c.context.fetch = async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; };
   await c.openTerminal(terminal); c.get('detail-mode-chat').events.click();
   c.renderPrompt(s, { prompt: { fingerprint: 'approval', agent: 'codex', current: 1, options: [{ number: 1, label: '승인' }] } });
-  entry.text = '기록에서는 전송하지 않음'; await c.sendChat(entry);
+  entry.text = '아직 보내지 않은 기록 초안';
   const hooks = vm.runInContext('workspaceHooks()', c.context);
   assert.equal(hooks.restore({ key: s.key, mode: 'chat' }), true);
   await settle();
   assert.equal(hooks.describe().ref.mode, 'chat'); assert.equal(c.state.terminalVisible, false);
-  assert.equal(c.get('chat-composer').hidden, true); assert.equal(c.get('chat-prompt').hidden, true);
-  assert.equal(entry.text, '기록에서는 전송하지 않음');
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.get('chat-prompt').hidden, false);
+  assert.equal(entry.text, '아직 보내지 않은 기록 초안');
   assert.equal(calls.some((url) => /launch|new-session|\/send|\/input|\/prompt/.test(url)), false);
 });
 
@@ -14646,7 +14646,7 @@ test('일회성·읽기 전용·지운 대화는 기록으로 열려 터미널 �
     const opens = []; c.context.openTerminal = async (value) => { opens.push(value); };
     c.context.renderDetailMode(); await settle();
     assert.equal(vm.runInContext('sessionDetailMode(__session)', c.context), 'chat');
-    assert.equal(opens.length, 0); assert.equal(c.get('chat-composer').hidden, true);
+    assert.equal(opens.length, 0); assert.equal(c.get('chat-composer').hidden, change.executionMode === 'one-shot');
     assert.equal(c.get('detail-mode-terminal').disabled, change.executionMode === 'one-shot');
   }
 });
@@ -14705,7 +14705,7 @@ test('분할 창의 작업·기록 복원과 포커스는 같은 입력 DOM을 �
   assert.equal(input.focusCount, 1); assert.equal(c.get('chat-input'), input);
   hooks.restore({ key: s.key, mode: 'chat' }); await settle();
   assert.equal(hooks.describe().ref.mode, 'chat'); assert.equal(entry.text, input.value);
-  assert.equal(c.get('chat-composer').hidden, true);
+  assert.equal(c.get('chat-composer').hidden, false); hooks.focus(); assert.equal(input.focusCount, 2);
 });
 
 test('터미널 크기는 포커스를 받은 창만 보내고 재포커스 때 같은 크기도 다시 보낸다', async () => {
@@ -14725,7 +14725,7 @@ test('통합 터미널의 작성창·승인 영역은 보이고 raw 작성창은
   const css = styleSheet();
   assert.match(css, /is-terminal-mode > :not\(\.detail-head\).*:not\(\.chat-composer\):not\(\.chat-prompt\)/);
   assert.match(css, /has-session-composer \.draft-panel \{ display: none;/);
-  assert.match(css, /is-record-mode > \.chat-composer/);
+  assert.doesNotMatch(css, /is-record-mode > \.chat-composer[^}]*display:\s*none/);
 });
 
 test('새 터미널의 통합 입력 전환은 확인된 같은 세션에 초안과 첨부를 옮긴다', async () => {
@@ -14793,12 +14793,12 @@ test('목록에서 지운 세션이 다시 답을 기다리면 작업과 승인 
   assert.equal(c.get('chat-prompt').hidden, false);
 });
 
-test('기록으로 보던 세션도 답 필요 알림 의도는 작업 보기로 연다', async () => {
+test('기록으로 보던 세션의 답 필요 알림도 공통 입력을 유지하고 보기 선택을 바꾸지 않는다', async () => {
   const { c, s } = inlineDetailClient();
   assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
   c.answerOnOpen(s); await settle();
-  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
-  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.state.inlineTerminal.key, s.key);
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.state.inlineTerminal, null);
 });
 
 test('자동 터미널 동기화는 다른 분할 창의 포커스를 빼앗는 경로를 호출하지 않는다', async () => {
@@ -14840,7 +14840,7 @@ test('양쪽 초안 충돌은 각각 보기나 명시적인 합치기로 해결�
   assert.equal(c.get('chat-composer').hidden, false);
 });
 
-test('기록의 실패 메시지 재시도는 작업 보기로 전환하고 별도 다음 초안을 보존한다', async () => {
+test('기록의 실패 메시지 재시도는 기록 보기와 별도 다음 초안을 보존한다', async () => {
   const { c, entry } = inlineDetailClient(), sends = [];
   entry.text = c.get('chat-input').value = '다음에 보낼 내용';
   c.context.fetch = async (url, options) => {
@@ -14850,7 +14850,7 @@ test('기록의 실패 메시지 재시도는 작업 보기로 전환하고 별�
   c.retryOutbox(entry, { text: '이전에 실패한 내용', attachmentObjects: [] }); await settle();
   assert.equal(sends.filter((item) => item.url === '/api/chat/send').length, 1);
   assert.equal(sends.find((item) => item.url === '/api/chat/send').body.text, '이전에 실패한 내용');
-  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
   assert.equal(entry.text, '다음에 보낼 내용'); assert.equal(c.get('chat-composer').hidden, false);
 });
 
@@ -15194,4 +15194,60 @@ test('a healthy terminal stays incremental after its fresh frame and read errors
   assert.match(requests[0], /fresh=1/); assert.doesNotMatch(requests[1], /fresh=1/);
   assert.match(requests[2], /fresh=1/); assert.doesNotMatch(requests[3], /fresh=1/);
   assert.equal(c.state.terminalAfter, 4);
+});
+
+test('기록 탭의 명시적 보내기는 같은 native 메시지·첨부 API를 쓰고 터미널을 만들지 않는다', async () => {
+  for (const agent of ['codex', 'claude']) {
+    const { c, s, entry } = inlineDetailClient({ agent }), calls = [];
+    c.context.fetch = async (url, options) => {
+      const body = options?.body ? JSON.parse(options.body) : null; calls.push({ url, body });
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } }) };
+    };
+    entry.text = c.get('chat-input').value = '기록을 읽으면서 같은 대화에 보냄'; entry.revision++;
+    entry.attachments = [{ id: 'a'.repeat(32), name: 'memo.txt', type: 'text/plain', path: '/fixture/memo.txt', size: 8 }];
+    await c.sendChat(entry);
+    const sent = calls.filter((row) => row.url === '/api/chat/send');
+    assert.equal(sent.length, 1); assert.deepEqual(sent[0].body.source, { ...c.sourceOf(s) });
+    assert.deepEqual(sent[0].body.attachments, ['a'.repeat(32)]);
+    assert.equal(entry.receipt.status, 'accepted'); assert.equal(entry.pending, null);
+    assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat'); assert.equal(c.state.terminalVisible, false);
+    assert.equal(calls.some((row) => /launch|new-session|\/terminal\/.+\/input/.test(row.url)), false);
+  }
+});
+
+test('작업·기록 탭 전환은 동일한 입력 DOM·한글 조합·첨부와 받아쓰기 객체를 유지한다', async () => {
+  const { c, entry, terminal } = inlineDetailClient(); await c.openTerminal(terminal);
+  const input = c.get('chat-input'), file = { id: 'pending-file', name: 'draft.txt' };
+  input.value = entry.text = '한글 조합 중'; entry.composing = true; entry.attachments = [file];
+  const mic = c.state.dictation = { field: input, fixture: true };
+  let stopped = 0, blurred = 0; c.context.stopDictation = () => { stopped++; c.state.dictation = null; };
+  input.blur = () => { blurred++; }; c.context.document.activeElement = input;
+  c.get('detail-mode-chat').events.click(); await settle();
+  assert.equal(c.get('chat-input'), input); assert.equal(c.get('chat-composer').hidden, false);
+  assert.equal(entry.text, '한글 조합 중'); assert.equal(entry.composing, true); assert.equal(entry.attachments[0], file);
+  assert.equal(c.state.dictation, mic); assert.equal(stopped, 0); assert.equal(blurred, 0);
+  c.get('detail-mode-terminal').events.click(); await settle();
+  assert.equal(c.get('chat-input'), input); assert.equal(c.state.dictation, mic); assert.equal(entry.composing, true);
+});
+
+test('기록 탭에서도 전송 결과 불명은 중복 전송을 잠그며 다음 초안은 계속 작성할 수 있다', async () => {
+  const { c, entry } = inlineDetailClient(); let sends = 0;
+  c.context.fetch = async (url) => { assert.equal(url, '/api/chat/send'); sends++; throw Error('lost receipt'); };
+  entry.text = c.get('chat-input').value = '한 번만 전달할 내용'; entry.revision++;
+  await c.sendChat(entry); assert.equal(sends, 1); assert.equal(entry.receipt.status, 'unknown');
+  assert.ok(entry.pending); assert.equal(c.get('chat-input').disabled, false);
+  entry.text = c.get('chat-input').value = '전송하지 않은 다음 초안'; entry.revision++;
+  await c.sendChat(entry); assert.equal(sends, 1); assert.equal(entry.text, '전송하지 않은 다음 초안');
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+});
+
+test('기록에서 원본 capability를 잃어도 작성창은 유지하고 일회성 기록은 입력을 허용하지 않는다', async () => {
+  const { c, s, entry } = inlineDetailClient(); let calls = 0;
+  c.context.fetch = async () => { calls++; throw Error('no dispatch without capability'); };
+  entry.data.capability = { supported: false, reason: '원본 연결 확인 중' };
+  entry.text = c.get('chat-input').value = '연결을 기다리며 쓰는 초안'; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.get('chat-input').disabled, false);
+  assert.equal(c.get('chat-send').disabled, true); await c.sendChat(entry); assert.equal(calls, 0);
+  s.executionMode = 'one-shot'; c.context.renderDetailMode();
+  assert.equal(c.get('chat-composer').hidden, true); await c.sendChat(entry); assert.equal(calls, 0);
 });

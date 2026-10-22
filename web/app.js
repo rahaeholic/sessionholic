@@ -809,7 +809,8 @@ function openRequestedSession() {
 // Opened from the 답 필요 group or its notification: the question is loaded once,
 // as "질문 불러오기" would, so the choices are there without another tap.
 function answerOnOpen(s) {
-  if (!sessionRecordOnly(s)) state.detailModes.set(conversationIdentity(s), "terminal");
+  if (!sessionRecordOnly(s) && !state.detailModes.has(conversationIdentity(s)))
+    state.detailModes.set(conversationIdentity(s), "terminal");
   state.answerOnOpen = { key: s.key, until: Date.now() + 30000 };
   if (state.selected === s.key) { renderDetailMode(); syncSessionTerminal(s); }
 }
@@ -4062,7 +4063,7 @@ function promptRequestCopy(request) {
 function renderPrompt(s, data, selected = selectedSession() || null) {
   const card = $("chat-prompt");
   if (!card || !currentChat(chatEntry(s), selected)) return;
-  if ($("detail").dataset.key === s.key && sessionDetailMode(selected) === "chat") {
+  if (sessionRecordOnly(s)) {
     card.hidden = true; card.chooseNumber = null; return;
   }
   const entry = chatEntry(s);
@@ -7156,10 +7157,6 @@ function openDelegation(s, entry) {
 }
 async function sendChat(entry, message = null) {
   if (networkOffline()) { updateChatComposer(entry); return; }
-  const selected = selectedSession();
-  if (selected && $("detail").dataset.key === selected.key && sessionDetailMode(selected) === "chat") {
-    toast("작업 보기에서 메시지를 보내 주세요."); return;
-  }
   // What a finished dictation said gives way to what the send says.
   if (!message && !dictationListening($("chat-input"))) entry.dictationNotice = "";
   const text = message ? String(message.text || "") : entry.text;
@@ -7474,8 +7471,6 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
 // refusal still leaves it to edit.
 function retryOutbox(entry, item) {
   if (!currentChat(entry) || entry.sending || entry.pending || entry.uploads || entry.composing) return;
-  const s = selectedSession();
-  if (s && sessionDetailMode(s) === "chat" && !sessionRecordOnly(s)) chooseDetailMode("terminal");
   const message = { text: String(item.text || ""), attachments: (item.attachmentObjects || []).slice() };
   if (!message.text.trim() && !message.attachments.length) {
     entry.outbox = (entry.outbox || []).filter((value) => value !== item);
@@ -10773,7 +10768,6 @@ function chooseDetailMode(mode) {
   state.detailModes.set(conversationIdentity(s), mode);
   if (mode === "chat") {
     state.answerOnOpen = null;
-    stopDictation({ field: $("chat-input") });
     if (state.inlineTerminal) leaveInlineTerminal();
     renderDetailMode();
   } else syncSessionTerminal(s);
@@ -10945,7 +10939,8 @@ function renderDetailMode() {
   setClass($("detail"), "is-record-mode", !work);
   setClass($("terminal-screen"), "has-session-composer", !!sessionComposerTerminal(s));
   if ($("detail-terminal-host")) $("detail-terminal-host").hidden = !work;
-  if ($("chat-composer")) $("chat-composer").hidden = !work || !!state.inlineTerminal?.key && state.terminalRawComposerId === state.terminal?.id;
+  if ($("chat-composer")) $("chat-composer").hidden = sessionRecordOnly(s) ||
+    work && !!state.inlineTerminal?.key && state.terminalRawComposerId === state.terminal?.id;
   if ($("session-terminal-empty")) $("session-terminal-empty").hidden = active;
   if ($("session-terminal-empty-text")) $("session-terminal-empty-text").textContent =
     "터미널을 열면 이곳에 작업 화면이 표시됩니다. 아래 작성창은 원본 세션의 전송 상태를 확인하며 사용할 수 있습니다.";
@@ -13828,7 +13823,7 @@ function workspaceHooks() {
     focus: () => {
       const previous = lastField?.isConnected && !lastField.disabled && lastField;
       const s = selectedSession();
-      const field = s && sessionDetailMode(s) === "chat" ? $("messages") :
+      const field = s && sessionDetailMode(s) === "chat" ? !sessionRecordOnly(s) && !$("chat-input")?.disabled ? $("chat-input") : $("messages") :
         sessionComposerTerminal(s) && (!previous || previous !== state.term?.textarea) ? $("chat-input") : state.terminalVisible
         ? previous?.closest?.("#terminal-screen") ? previous : directTerminalInput() ? state.term?.textarea : $("terminal-draft")
         : previous?.closest?.("#detail") ? previous : $("chat-input");
