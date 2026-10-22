@@ -558,6 +558,50 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertFalse(result['confirmed'])
         self.assertTrue(result['applied'])
 
+    def test_delayed_archive_receipt_recovers_without_second_mutation(self):
+        self.reader.mutate_hook = lambda method: self.reader.row.update(archived=0)
+        first = self.execute(self.runtime.preview(self.source))
+        self.assertFalse(first['confirmed'])
+        self.reader.row['archived'] = 1
+        with patch.object(self.runtime, '_observe') as observe, patch.object(self.runtime, '_apply') as apply:
+            result = self.runtime.execute({'source': self.source, 'action': 'terminate', 'requestId': first['requestId'],
+                                           'receiptOnly': True, 'verifyCleanup': True})
+        self.assertTrue(result['confirmed']); self.assertTrue(result['cleanupEligible'])
+        self.assertFalse(result['descendantsConfirmed'])
+        observe.assert_not_called(); apply.assert_not_called()
+        self.assertEqual(sum(method == 'thread/archive' for method, _ in self.reader.calls), 1)
+
+    def test_later_completed_turn_also_prevents_old_receipt_cleanup(self):
+        first = self.execute(self.runtime.preview(self.source))
+        self.reader.thread['turns'] = [{'id': 'new-completed-turn', 'status': 'completed'}]
+        result = self.runtime.execute({'source': self.source, 'action': 'terminate', 'requestId': first['requestId'],
+                                       'receiptOnly': True, 'verifyCleanup': True})
+        self.assertEqual(result['reconcileCode'], 'execution_changed')
+        self.assertFalse(result['cleanupEligible'])
+
+    def test_receipt_missing_tombstone_prevents_late_original_dispatch(self):
+        preview = self.runtime.preview(self.source)
+        with patch.object(self.runtime, '_apply') as apply:
+            result = self.runtime.execute({'source': self.source, 'action': 'terminate', 'requestId': 'request-1234',
+                                           'receiptOnly': True, 'sealMissing': True})
+            late = self.execute(preview)
+        self.assertEqual(result['dispatchState'], 'not_started')
+        self.assertEqual(late['dispatchState'], 'not_started')
+        apply.assert_not_called()
+
+    def test_confirmed_receipt_cannot_clean_new_endpoint_or_reloaded_thread(self):
+        first = self.execute(self.runtime.preview(self.source))
+        args = {'source': self.source, 'action': 'terminate', 'requestId': first['requestId'], 'receiptOnly': True, 'verifyCleanup': True}
+        self.reader.loaded = [self.source['id']]
+        result = self.runtime.execute(args)
+        self.assertTrue(result['confirmed'], 'retain historical execution success')
+        self.assertFalse(result['cleanupEligible'])
+        self.assertEqual(result['reconcileCode'], 'execution_changed')
+        self.reader.processes[12]['start'] += '-new'
+        result = self.runtime.execute(args)
+        self.assertFalse(result['cleanupEligible'])
+        self.assertEqual(result['reconcileCode'], 'execution_changed')
+
     def test_cleanup_receipt_only_never_archives_or_observes_again(self):
         first = self.execute(self.runtime.preview(self.source))
         args = {'source': self.source, 'action': 'terminate', 'requestId': first['requestId'], 'receiptOnly': True}

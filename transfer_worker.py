@@ -411,7 +411,9 @@ def _rpc(request):
         if op == 'control_preview':
             return control.preview(args['source'])
         if args.get('receiptOnly') is True:
-            return control.receipt(args['source'], args.get('action'), args.get('requestId'))
+            return control.receipt(args['source'], args.get('action'), args.get('requestId'),
+                                   **({'seal_missing': True} if args.get('sealMissing') is True else {}),
+                                   **({'verify_cleanup': True} if args.get('verifyCleanup') is True else {}))
         return control.execute(args['source'], args['action'], args.get('targetProof'), args.get('requestId'),
                                **({'cleanup_terminals': args['cleanupTerminals']} if 'cleanupTerminals' in args else {}))
     if op == 'profiles':

@@ -37,6 +37,7 @@ import uuid
 from urllib.parse import parse_qs, urlparse, unquote
 import instance
 import settings
+from termination_jobs import Jobs as TerminationJobs, terminal_stamp
 from goals import GoalError, Goals
 from work_service import WorkService
 from session_labels import BoardPreferences, SavedPrompts, SessionLabels, SessionOpened, SessionPinned, SessionRemoved, SessionSeen, SessionTidied, reference as label_reference
@@ -3312,17 +3313,27 @@ class Handler(BaseHTTPRequestHandler):
             self.server.work.health = {"state": "limited", "message": "작업 요약의 최신 내용을 저장하지 못했습니다."}
 
     def session_control(self, path, data):
+        self.control_dispatched = False
         ref = data.get("source")
         cleanup_only = data.get("cleanupOnly", False)
         if type(cleanup_only) is not bool or (cleanup_only and (path != "/api/session/action" or data.get("action") != "terminate")):
             raise ValueError("종료 후 정리 요청을 확인해 주세요.")
+        if cleanup_only and (not isinstance(data.get("requestId"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", data["requestId"])):
+            raise ValueError("종료 요청 식별자를 확인해 주세요.")
         if cleanup_only:
             # An archived native row may already have left the bounded list. Only
             # a server-kept locator and its native receipt authorize later cleanup.
             record = self.server.workflow.recoveries.get(ref)
-            if record is None:
-                raise ValueError("기존 종료 대상의 기록을 찾지 못했습니다. 추가 종료를 요청하지 않았습니다.")
-            source = dict(record["source"])
+            job = self.server.termination_jobs.get(data.get("requestId"))
+            if job:
+                if any(ref.get(k) is not None and job["source"].get(k) != ref[k]
+                       for k in ("host", "agent", "id", "home", "cwd", "sessionId")):
+                    raise ValueError("기존 종료 요청의 대상과 다릅니다.")
+                source = dict(job["source"])
+            elif record:
+                source = dict(record["source"])
+            else:
+                source = self.server.board.source(ref)
             source["online"] = self.server.board.state.get(source["host"], {}).get("ok") is True
         else:
             source = self.server.board.source(ref)
@@ -3334,7 +3345,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("보관 여부를 확인해 주세요.")
             return self.server.work.archive_session(source, archived)
         self.server.workflow.ensure_direct_session(source)
-        if not source.get("online"):
+        if path == "/api/session/preview":
+            pending = self.server.termination_jobs.pending(source)
+            if pending:
+                return {"termination": self.server.termination_jobs.view(pending), "capabilities": {}}
+        if not source.get("online") and not cleanup_only:
             raise RuntimeError("기기에 연결할 수 없습니다. 마지막 실행 상태를 유지합니다.")
         host = next(h for h in self.server.board.hosts if h["name"] == source["host"])
         selector = {key: source.get(key) for key in ("agent", "id", "home", "cwd", "kind", "sessionId", "phase")}
@@ -3366,7 +3381,19 @@ class Handler(BaseHTTPRequestHandler):
                                 (not info.get("closed") or info.get("holdName")) and
                                 self.server.workflow.same_native(info.get("nativeSource"), source)):
                             args["cleanupTerminals"].append(info["id"])
+        if action and data["action"] == "terminate":
+            stamps = {}
+            if not cleanup_only:
+                for row in self.server.terminals.list():
+                    info = {**(row.get("metadata") or {}), **row}
+                    if info["id"] in args.get("cleanupTerminals", []):
+                        stamps[info["id"]] = terminal_stamp(info)
+            stored_source = {key: source.get(key) for key in ("host", "agent", "home", "id", "cwd", "kind", "sessionId", "phase")}
+            self.control_dispatched = True  # From the durable claim onward an error is uncertain.
+            return self.server.termination_jobs.submit(stored_source, data["requestId"], stamps,
+                                                       initial=None if cleanup_only else args)
         try:
+            self.control_dispatched = action
             result = self.server.workflow.transfers.rpc(host, "control_execute" if action else "control_preview",
                                                        args, timeout=12 if action else 8)
         except (RuntimeError, OSError):
@@ -3375,87 +3402,8 @@ class Handler(BaseHTTPRequestHandler):
             raise RuntimeError("세션 제어 결과를 확인하지 못했습니다. 요청은 자동으로 다시 보내지 않습니다.")
         if action and result.get("confirmed"):
             self.server.chat._forget_state(source)
-            if data.get("action") == "terminate":
-                result = {**result, "cleanup": self.cleanup_terminated_session(source, result)}
-                try:
-                    native = self.server.workflow.native_of(source)
-                    if source["agent"] == "codex":
-                        native.pop("kind", None)
-                    self.server.workflow.recoveries.remember({**native, "explicitTermination": True})
-                except (ValueError, RuntimeError, OSError):
-                    pass
             self.server.board.request_refresh(host["name"], force=False)
         return result
-
-    def cleanup_terminated_session(self, source, receipt):
-        """Only a confirmed native termination reaches here. Failures remain visible;
-        a retry reads the same receipt and repeats only these idempotent steps."""
-        outcome = {"closed": [], "failed": [], "unverified": [], "remotePending": [],
-                   "list": "pending", "complete": False}
-        workflow = self.server.workflow
-        try:
-            rows = self.server.terminals.list()
-        except (ValueError, RuntimeError, OSError):
-            return {**outcome, "terminalScanPending": True}
-        targets = receipt.get("cleanupTerminals", [])
-        if not isinstance(targets, list) or len(targets) > 64:
-            return {**outcome, "terminalScanPending": True}
-        deadline = time.monotonic() + 12
-        for row in rows:
-            info = {**(row.get("metadata") or {}), **row}
-            if info["id"] in targets and (info.get("host") != source["host"] or
-                    not workflow.same_native(info.get("nativeSource"), source)):
-                outcome["unverified"].append(info["id"])
-                continue
-            if not workflow.same_native(info.get("nativeSource"), source):
-                continue
-            if info.get("host") != source["host"]:
-                continue
-            if info["id"] not in targets:
-                if not info.get("closed"):
-                    outcome["unverified"].append(info["id"])
-                continue
-            if info.get("linkConfidence") == "estimated":
-                if not info.get("closed"):
-                    outcome["unverified"].append(info["id"])
-                continue
-            # IDs were captured by the board BEFORE native dispatch and persisted
-            # in its receipt. Remote/local clock skew cannot select a later TUI.
-            try:
-                workflow.ensure_direct_terminal(info["id"])
-                self.server.terminals.close_terminal(info["id"])
-                outcome["closed"].append(info["id"])
-            except (ValueError, KeyError, RuntimeError, OSError):
-                outcome["failed"].append(info["id"])
-                continue
-            remaining = deadline - time.monotonic()
-            if (remaining <= 0 and info.get("holdName")) or workflow.end_hold(info, wait=True, timeout=max(.1, remaining)):
-                outcome["remotePending"].append(info["id"])
-            try:
-                self.server.terminal_inputs.prune_closed(info["id"], self.server.terminals.list())
-            except (ValueError, RuntimeError, OSError):
-                outcome["inputCleanupPending"] = True
-        # An estimated/changed/new terminal is outside the confirmed termination
-        # target. Keep it open for review, but do not trap a finished session in
-        # an endlessly retryable cleanup: another read cannot prove that link.
-        if outcome["failed"] or outcome["remotePending"]:
-            return outcome
-        try:
-            # Use the already verified source, even after archive removed its row.
-            stamp = int(time.time())
-            removed, changed = self.server.session_removed.mark(source, stamp)
-            # Optional legacy tidy follows the required durable removed write.
-            try:
-                _tidy, tidy_changed = self.server.session_tidied.mark(source, stamp)
-                changed = changed or tidy_changed
-            except (GoalError, ValueError, RuntimeError, OSError):
-                pass
-            if changed:
-                self.server.board.changed(force=True)
-            outcome.update(list="done", complete=True, removedAt=removed["seenAt"], version=self.server.board.version)
-        except (GoalError, ValueError, RuntimeError, OSError):
-            pass
-        return outcome
 
     def session_seen(self, data):
         """A listed session was looked at as of its update time: every device then shows it read."""
@@ -4032,7 +3980,7 @@ class Handler(BaseHTTPRequestHandler):
     def route_post(self):
         from chat import PromptRejected, SendRejected
         path = urlparse(self.path).path
-        not_started = {"dispatchState": "not_started"} if path == "/api/chat/send" else {}
+        not_started = {"dispatchState": "not_started"} if path in ("/api/chat/send", "/api/session/action") else {}
         if not host_allowed(self.headers.get("Host")):
             if not_started:
                 return self.send_json(421, {"error": "접속 주소를 확인해 주세요.", **not_started})
@@ -4243,9 +4191,11 @@ class Handler(BaseHTTPRequestHandler):
         except LaunchFailure as exc:
             return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:
-            return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요."})
+            safe = {"dispatchState": "not_started"} if path == "/api/session/action" and not getattr(self, "control_dispatched", False) else {}
+            return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요.", **safe})
         except RuntimeError as exc:
-            return self.send_json(409, {"error": str(exc)})
+            safe = {"dispatchState": "not_started"} if path == "/api/session/action" and not getattr(self, "control_dispatched", False) else {}
+            return self.send_json(409, {"error": str(exc), **safe})
         except (OSError, ImportError) as exc:
             return self.send_json(503, {"error": unavailable_message(exc, "실행 연결을 준비하지 못했어요. 원래 작업은 유지됩니다.")})
         return self.send_json(404, {"error": "없는 경로입니다."})
@@ -4295,6 +4245,120 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(200, packed or entry["body"], TYPES[Path(name).suffix], extra)
 
 
+def cleanup_terminated_session(server, source, receipt):
+    """Only a confirmed native termination reaches here. Failures remain visible;
+    a retry reads the same receipt and repeats only these idempotent steps."""
+    outcome = {"closed": [], "failed": [], "unverified": [], "remotePending": [],
+               "list": "pending", "complete": False}
+    workflow = server.workflow
+    try:
+        rows = server.terminals.list()
+    except (ValueError, RuntimeError, OSError):
+        return {**outcome, "terminalScanPending": True}
+    targets = receipt.get("cleanupTerminals", [])
+    stamps = receipt.get("terminalStamps", {})
+    if not isinstance(targets, list) or len(targets) > 64:
+        return {**outcome, "terminalScanPending": True}
+    # A newer connection must not be closed or hidden by an old termination.
+    for row in rows:
+        info = {**(row.get("metadata") or {}), **row}
+        if (info.get("host") == source["host"] and not info.get("closed")
+                and workflow.same_native(info.get("nativeSource"), source)
+                and info.get("linkConfidence") != "estimated"
+                and (info["id"] not in targets or info["id"] in stamps and stamps[info["id"]] != terminal_stamp(info))):
+            return {**outcome, "superseded": True, "unverified": [info["id"]]}
+    deadline = time.monotonic() + 12
+    for row in rows:
+        info = {**(row.get("metadata") or {}), **row}
+        if info["id"] in targets and (info.get("host") != source["host"] or
+                not workflow.same_native(info.get("nativeSource"), source)):
+            outcome["unverified"].append(info["id"])
+            continue
+        if not workflow.same_native(info.get("nativeSource"), source):
+            continue
+        if info.get("host") != source["host"]:
+            continue
+        if info["id"] not in targets:
+            if not info.get("closed"):
+                outcome["unverified"].append(info["id"])
+            continue
+        if info.get("linkConfidence") == "estimated":
+            if not info.get("closed"):
+                outcome["unverified"].append(info["id"])
+            continue
+        # IDs were captured by the board BEFORE native dispatch and persisted
+        # in its receipt. Remote/local clock skew cannot select a later TUI.
+        try:
+            workflow.ensure_direct_terminal(info["id"])
+            server.terminals.close_terminal(info["id"])
+            outcome["closed"].append(info["id"])
+        except (ValueError, KeyError, RuntimeError, OSError):
+            outcome["failed"].append(info["id"])
+            continue
+        remaining = deadline - time.monotonic()
+        if (remaining <= 0 and info.get("holdName")) or workflow.end_hold(info, wait=True, timeout=max(.1, remaining)):
+            outcome["remotePending"].append(info["id"])
+        try:
+            server.terminal_inputs.prune_closed(info["id"], server.terminals.list())
+        except (ValueError, RuntimeError, OSError):
+            outcome["inputCleanupPending"] = True
+    # An estimated/changed/new terminal is outside the confirmed termination
+    # target. Keep it open for review, but do not trap a finished session in
+    # an endlessly retryable cleanup: another read cannot prove that link.
+    if outcome["failed"] or outcome["remotePending"]:
+        return outcome
+    try:
+        # Use the already verified source, even after archive removed its row.
+        stamp = int(time.time())
+        removed, changed = server.session_removed.mark(source, stamp)
+        # Optional legacy tidy follows the required durable removed write.
+        try:
+            _tidy, tidy_changed = server.session_tidied.mark(source, stamp)
+            changed = changed or tidy_changed
+        except (GoalError, ValueError, RuntimeError, OSError):
+            pass
+        if changed:
+            server.board.changed(force=True)
+        outcome.update(list="done", complete=True, removedAt=removed["seenAt"], version=server.board.version)
+    except (GoalError, ValueError, RuntimeError, OSError):
+        pass
+    return outcome
+
+
+def run_termination_job(server, job, initial):
+    source = job["source"]
+    server.workflow.ensure_direct_session(source)
+    host = next((h for h in server.board.hosts if h["name"] == source["host"]), None)
+    if host is None:
+        raise ValueError("등록된 기기를 찾지 못했습니다.")
+    if server.board.state.get(source["host"], {}).get("ok") is not True:
+        server.board.request_refresh(host["name"], force=False)
+        raise RuntimeError("기기 연결 확인 중")
+    args = initial or {"source": {k: source.get(k) for k in ("agent", "id", "home", "cwd", "kind", "sessionId", "phase")},
+                       "action": "terminate", "requestId": job["requestId"], "receiptOnly": True,
+                       "sealMissing": True, "verifyCleanup": True}
+    result = server.workflow.transfers.rpc(host, "control_execute", args, timeout=20)
+    if not isinstance(result, dict):
+        raise ValueError("종료 응답 형식을 확인하지 못했습니다.")
+    if result.get("requestId") and result["requestId"] != job["requestId"]:
+        return {"confirmed": False, "applied": False, "reconcileCode": "superseded",
+                "reason": "이미 처리한 확인 정보입니다. 현재 상태를 다시 확인한 뒤 요청해 주세요."}
+    if result.get("confirmed") and result.get("cleanupEligible") is not False:
+        server.chat._forget_state(source)
+        result = {**result, "cleanup": cleanup_terminated_session(server, source,
+                    {**result, "terminalStamps": job["terminals"]})}
+        if result["cleanup"].get("complete"):
+            try:
+                native = server.workflow.native_of(source)
+                if source["agent"] == "codex":
+                    native.pop("kind", None)
+                server.workflow.recoveries.remember({**native, "explicitTermination": True})
+            except (ValueError, RuntimeError, OSError):
+                result["cleanup"]["recoveryNotePending"] = True
+        server.board.request_refresh(host["name"], force=False)
+    return result
+
+
 class BoardHTTPServer(ThreadingHTTPServer):
     # A page asks for its styles, scripts and first reads at once, and Tailscale Serve opens an
     # upstream connection for each: socketserver's backlog of 5 reset the rest (a 502, and a
@@ -4302,6 +4366,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
     request_queue_size = 128
 
     def server_close(self):
+        jobs = getattr(self, "termination_jobs", None)
+        if jobs is not None:
+            jobs.close()
         history = getattr(self, "session_history", None)
         if history is not None:
             history.stop.set()
@@ -4325,7 +4392,7 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True, cli_monitor=None):
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True, cli_monitor=None, termination_worker=False):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404.
     `work_list` False answers GET /api/work as retired (the screen no longer has the tab)."""
     if bind not in ("127.0.0.1", "::1"):
@@ -4388,6 +4455,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.workflow.bot_requests = server.bot_requests
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
+    server.termination_jobs = TerminationJobs(state_dir, lambda job, initial: run_termination_job(server, job, initial))
     from events import EventHub
     # Also announces the terminal list: what the board's terminals report, and while
     # anyone follows the stream, terminals that ended on their own.
@@ -4412,6 +4480,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         server.push.start()
     if automatic_work:
         server.work.start()
+    if termination_worker:
+        server.termination_jobs.start()
     return server
 
 
@@ -4438,6 +4508,7 @@ def main(argv=None):
     # The automatic work tab is retired: its off-screen conversation reads are opt-in.
     parser.add_argument("--auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 켬(기본 꺼짐)")
     parser.add_argument("--no-auto-work", action="store_true", help="화면 밖 자동 작업 관찰을 끔(기본값, 이전 설정 호환)")
+    parser.add_argument("--no-termination-worker", action="store_true", help="종료 결과 자동 재확인을 끔(검수용)")
     parser.add_argument("--no-history-retention", action="store_true", help="대화 자동 보존·정리 실행을 끔(검수용 서버 등)")
     parser.add_argument("--no-push", action="store_true", help="폰 알림을 끔(구독이 있어도 화면 밖 수집과 발송을 하지 않음)")
     parser.add_argument("--tailscale-user-file", type=Path,
@@ -4480,7 +4551,7 @@ def main(argv=None):
     cli_monitor = CliMonitor(hosts, lambda host: run_cli_status(host, args.state_dir))
     httpd = make_server(args.bind, args.port, board, token, state_dir=args.state_dir,
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
-                        cli_monitor=cli_monitor,
+                        cli_monitor=cli_monitor, termination_worker=not args.no_termination_worker,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push,
                         work_list=args.auto_work and not args.no_auto_work)
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."

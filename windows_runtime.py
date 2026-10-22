@@ -1071,7 +1071,8 @@ class WindowsRuntime:
                     'terminate': {'supported': can_end, 'method': 'codex-thread-archive', 'reason': None if can_end else 'PC 실행 상태를 확인하지 못했습니다.',
                                   'effect': ARCHIVE_EFFECT, 'scope': 'session-and-descendants', 'scopeReadback': 'selected-session'}}
                 target = {'identity': identity, 'path': observed['path'], 'cwd': wc._norm(observed['cwd']),
-                          'server': observed['server'], 'turnId': state['activeTurnId'], 'phase': state['phase']}
+                          'server': observed['server'], 'turnId': state['activeTurnId'], 'phase': state['phase'],
+                          'lastTurnId': (observed['thread'].get('turns') or [{}])[-1].get('id')}
                 return {**observed, 'target': target, 'phase': state['phase'], 'capabilities': capabilities}
             observed = self._claude(source)
             row = observed['row']
@@ -1098,6 +1099,66 @@ class WindowsRuntime:
         with self.store.lock():
             return self._view(observed)
 
+    def _reconcile_control(self, source, record, name, verify_cleanup=False):
+        result = record['result']
+        if result.get('action') != 'terminate' or result.get('applied') is False:
+            return result
+        if result.get('confirmed') and not verify_cleanup:
+            return result
+        evidence = record.get('termination') or {}
+        target, method = evidence.get('target') or {}, evidence.get('method')
+        details, code = None, 'insufficient_evidence'
+        try:
+            if method == 'codex-thread-archive' and target.get('server') and target.get('path'):
+                current = self.reader.process_reader(target['server']['pid'])
+                key = {'pid': current['pid'], 'start': current['start'], 'exe': wc._norm(current['exe'])} if current else None
+                if key != target['server']:
+                    return {**result, 'cleanupEligible': False, 'reconcileCode': 'execution_changed',
+                            'reason': '원본 서버 실행이 바뀌었습니다. 이전 요청으로 새 실행을 정리하지 않습니다.'}
+                self._verify_endpoint({'path': target['path'], 'server': target['server']})
+                before = self.reader.database_rows(source['id'])
+                with self.proxy_factory(self.reader.binary, target['path'], time.monotonic() + 8) as client:
+                    loaded, complete = _loaded(client)
+                    if 'lastTurnId' in target:
+                        response = client.call('thread/read', {'threadId': source['id'], 'includeTurns': True})
+                        thread = response.get('thread') if isinstance(response, dict) else None
+                        if (not isinstance(thread, dict) or thread.get('id') != source['id']
+                                or wc._norm(thread.get('cwd')) != target['cwd'] or not isinstance(thread.get('turns'), list)):
+                            raise ValueError('종료한 대화의 실행 이력을 확인하지 못했습니다.')
+                        turns = thread['turns']
+                        last = turns[-1].get('id') if turns else None
+                        if last != target['lastTurnId']:
+                            return {**result, 'cleanupEligible': False, 'reconcileCode': 'execution_changed',
+                                    'reason': '새 대화 실행이 확인됐습니다. 이전 요청으로 정리하지 않습니다.'}
+                after = self.reader.database_rows(source['id'])
+                if (before == after and len(after) == 1 and complete and source['id'] not in loaded
+                        and after[0].get('archived') == 1 and wc._norm(after[0].get('cwd')) == target['cwd']):
+                    details = {'archived': True, 'scopeReadback': 'selected-session', 'descendantsConfirmed': False}
+                else:
+                    code = ('execution_changed' if result.get('confirmed') else 'execution_present') if source['id'] in loaded else 'readback_pending'
+            elif method == 'claude-cli-process' and target.get('process'):
+                expected = target['process']
+                current = self.reader.process_reader(expected['pid'])
+                # PID disappearance/reuse only proves this saved process ended. A
+                # replacement registry for the same session must not be cleaned up.
+                if current is None or current != expected:
+                    running = self._claude_running(source['id'])
+                    if not running:
+                        details = {'scopeReadback': 'selected-process', 'descendantsConfirmed': False}
+                    else:
+                        code = 'execution_changed'
+                else:
+                    code = 'execution_present'
+        except (OSError, ValueError, TimeoutError):
+            code = 'readback_unavailable'
+        if details is None:
+            return {**result, 'cleanupEligible': False, 'reconcileCode': code,
+                    'reason': '종료 대상의 현재 상태를 다시 확인하고 있습니다. 종료 명령은 반복하지 않습니다.'}
+        result = {**result, **details, 'confirmed': True, 'cleanupEligible': True,
+                  'reconcileCode': 'verified', 'status': 'terminated', 'reconciled': True, 'reason': None}
+        self.store.save(name, {**record, 'result': result})
+        return result
+
     def execute(self, args):
         source, action, request_id, proof = args.get('source'), args.get('action'), args.get('requestId'), args.get('targetProof')
         identity = _identity(source)
@@ -1116,15 +1177,25 @@ class WindowsRuntime:
         with self.store.lock():
             prior = self.store.read(name)
             if receipt_only:
+                if not prior and action == 'terminate' and args.get('sealMissing') is True:
+                    # Fence a delayed original request: it will find this tombstone
+                    # before it can dispatch, even if it arrives after this read.
+                    result = {'source': identity, 'action': action, 'requestId': request_id,
+                              'confirmed': False, 'applied': False, 'status': 'not_started',
+                              'dispatchState': 'not_started', 'reason': '종료 명령이 실행되지 않았습니다. 상태를 확인한 뒤 다시 요청할 수 있습니다.'}
+                    prior = {'binding': binding, 'cancelled': True, 'result': result}
+                    self.store.save(name, prior)
                 if (action != 'terminate' or not prior or prior.get('binding') != binding
                         or prior.get('result', {}).get('source') != identity
                         or prior['result'].get('action') != action or prior['result'].get('requestId') != request_id):
                     raise ValueError('기존 종료 결과의 대상을 확인하지 못했습니다. 종료를 다시 요청하지 않았습니다.')
-                return {**prior['result'], 'replayed': True}
+                return {**self._reconcile_control(source, prior, name, args.get('verifyCleanup') is True), 'replayed': True}
             if prior:
+                if prior.get('cancelled') and prior.get('binding') == binding:
+                    return {**prior['result'], 'replayed': True}
                 if prior.get('digest') != digest:
                     raise ValueError('같은 요청 ID로 다른 세션을 제어할 수 없습니다.')
-                return {**prior['result'], 'replayed': True}
+                return {**self._reconcile_control(source, prior, name), 'replayed': True}
             data, signature = proof.split('.')
             if not hmac.compare_digest(signature, hmac.new(self.store.secret(), data.encode(), hashlib.sha256).hexdigest()):
                 raise ValueError('PC 세션 확인 정보가 변경되었습니다.')
@@ -1147,14 +1218,17 @@ class WindowsRuntime:
             if not cap['supported']:
                 return {**result, 'reason': cap['reason']}
             pending = {**result, 'applied': None, 'status': 'unconfirmed', 'reason': 'PC 실행 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다.'}
-            self.store.save(name, {'digest': digest, 'binding': binding, 'result': pending})
+            record = {'digest': digest, 'binding': binding, 'result': pending}
+            if action == 'terminate':
+                record['termination'] = {'method': cap['method'], 'target': observed['target']}
+            self.store.save(name, record)
             self.store.save(proof_name, {'result': pending})
             try:
                 details = self._apply(observed, action)
                 result.update(details)
             except (OSError, ValueError, TimeoutError):
                 result = pending
-            self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+            self.store.save(name, {**record, 'result': result})
             self.store.save(proof_name, {'result': result})
             return result
 

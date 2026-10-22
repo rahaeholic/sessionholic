@@ -412,7 +412,7 @@ class SessionControl:
                 process_terminate = process is not None and (interrupt or stable)
                 terminate = process_terminate or archive or finished
                 method = "codex-cli-process" if process_terminate else "codex-thread-finished" if finished else "codex-thread-archive"
-                target = {"identity": identity, "turnId": state.get("activeTurnId"), "phase": state["phase"],
+                target = {"identity": identity, "turnId": state.get("activeTurnId"), "lastTurnId": state.get("lastTurnId"), "phase": state["phase"],
                           "process": _process_key(process), "canInterrupt": interrupt, "safe": stable,
                           "record": record, "terminationMethod": method if terminate else None,
                           "archiveRevision": state.get("revision") if archive and not process_terminate else None}
@@ -477,7 +477,7 @@ class SessionControl:
         with self._lock() as folder:
             return self._view(observed, folder)
 
-    def receipt(self, source, action, request_id):
+    def receipt(self, source, action, request_id, *, seal_missing=False, verify_cleanup=False):
         """Recheck an uncertain outcome read-only; never repeat a native mutation."""
         if action != "terminate" or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise ValueError("종료 요청 식별자를 확인해 주세요.")
@@ -485,12 +485,30 @@ class SessionControl:
             try:
                 record = json.loads(_private_read(folder / (request_id + ".json"), private=True))
             except FileNotFoundError:
-                raise ValueError("기존 종료 결과가 없습니다. 원본 종료를 다시 요청하지 않았습니다.") from None
+                if not seal_missing:
+                    raise ValueError("기존 종료 결과가 없습니다. 원본 종료를 다시 요청하지 않았습니다.") from None
+                marker = folder / ('closed-' + _digest(native._identity(source)) + '.json')
+                if marker.exists():
+                    saved = json.loads(_private_read(marker, private=True))
+                    if saved.get('requestId') == request_id:
+                        return {'confirmed': False, 'applied': None, 'status': 'unconfirmed',
+                                'requestId': request_id, 'reconcileCode': 'insufficient_evidence',
+                                'reason': '종료 표시는 있으나 실행 근거 기록이 없습니다. 원본 상태 확인이 필요합니다.'}
+                result = {'source': native._identity(source), 'action': action, 'requestId': request_id,
+                          'confirmed': False, 'applied': False, 'status': 'not_started', 'dispatchState': 'not_started',
+                          'reason': '종료 명령이 실행되지 않았습니다. 상태를 확인한 뒤 다시 요청할 수 있습니다.'}
+                if marker.exists():
+                    # A newer marker cannot prove the older request never ran.
+                    result = {**result, 'applied': None, 'status': 'superseded', 'dispatchState': 'unknown',
+                              'reconcileCode': 'superseded', 'cleanupEligible': False,
+                              'reason': '더 새로운 종료 요청이 있습니다. 이전 요청으로 추가 정리하지 않습니다.'}
+                record = {'binding': self._binding(source), 'cancelled': True, 'result': result}
+                _save(folder / (request_id + '.json'), record)
             result = record.get("result", {})
             if (record.get("binding") != self._binding(source) or result.get("source") != native._identity(source)
                     or result.get("action") != action or result.get("requestId") != request_id):
                 raise ValueError("기존 종료 요청의 대상과 다릅니다. 추가 정리를 하지 않았습니다.")
-            record = self._reconcile(source, record, folder)
+            record = self._reconcile(source, record, folder, verify_cleanup=verify_cleanup)
             return {**record["result"], "replayed": True}
 
     @staticmethod
@@ -512,16 +530,19 @@ class SessionControl:
             seen.add(cursor)
         return None
 
-    def _reconcile(self, source, record, folder):
+    def _reconcile(self, source, record, folder, verify_cleanup=False):
         result = record["result"]
-        if result.get("action") != "terminate" or result.get("confirmed") or result.get("applied") is False:
+        if (result.get("action") != "terminate" or result.get("applied") is False
+                or result.get("confirmed") and not verify_cleanup):
             return record
+        def unresolved(code, reason):
+            return {**record, 'result': {**result, 'cleanupEligible': False, 'reconcileCode': code, 'reason': reason}}
         identity, deadline = native._identity(source), time.monotonic() + 8
         marker_path = folder / ("closed-" + _digest(identity) + ".json")
         try:
             marker = json.loads(_private_read(marker_path, private=True))
             if marker.get("source") != identity or marker.get("requestId") != result["requestId"]:
-                return record  # A newer board termination owns this source now.
+                return unresolved('superseded', '더 새로운 종료 요청이 있습니다. 이 요청으로 추가 종료나 정리를 하지 않습니다.')
             evidence = record.get("termination", {})
             method = evidence.get("method") or marker.get("method")
             details = None
@@ -531,13 +552,18 @@ class SessionControl:
                     state = native._codex_state(client, identity)
                     loaded = self._loaded_codex(client, identity)
                 after = launch.saved_codex_thread(source, self.home)
+                target = evidence.get("target") or {}
+                if ((result.get("confirmed") and loaded is True) or
+                        "lastTurnId" in target and "lastTurnId" in state and target["lastTurnId"] != state["lastTurnId"] or
+                        state.get("activeTurnId") and state.get("activeTurnId") != target.get("turnId")):
+                    return unresolved('execution_changed', '새 실행이 확인됐습니다. 이전 요청으로 정리하지 않습니다.')
                 # Archiving and ending an execution are separate. The original
                 # archive RPC may fail after unloading the thread. A completed,
                 # unloaded exact thread needs no second archive/interrupt.
                 if (before == after and loaded is False and state.get("phase") == "closed"
                         and state.get("safeToTransfer") is True):
                     details = {"archived": after["archived"], "alreadyEnded": True,
-                               "scope": "selected-session", "scopeReadback": "selected-session"}
+                               "scope": "selected-session", "scopeReadback": "selected-session", "descendantsConfirmed": False}
             elif method == "claude-background-stop":
                 target = evidence.get("target", {})
                 binary = native._claude_binary(self.home)
@@ -556,17 +582,20 @@ class SessionControl:
                     fresh = self._observe(source, deadline)
                     # A reused source can now own a new execution. Its terminal
                     # must not be cleaned up on the older process's receipt.
-                    if not fresh.get("process") and fresh.get("phase") not in ("working", "needs_input"):
-                        details = {"alreadyEnded": True}
+                    if fresh.get("process") or fresh.get("phase") in ("working", "needs_input"):
+                        return unresolved('execution_changed', '새 실행이 확인됐습니다. 이전 요청으로 정리하지 않습니다.')
+                    details = {"alreadyEnded": True}
             if details is None:
-                return record
+                return unresolved('readback_pending' if method else 'insufficient_evidence',
+                                  '원본 상태를 다시 확인하고 있습니다. 종료 명령은 반복하지 않습니다.')
             updated = {**record, "result": {**result, **details, "confirmed": True,
-                        "status": "terminated", "reason": None, "reconciled": True}}
+                        "status": "terminated", "reason": None, "reconciled": True,
+                        'cleanupEligible': True, 'reconcileCode': 'verified'}}
             _save(folder / (result["requestId"] + ".json"), updated)
             _save(marker_path, {**marker, "status": "terminated"})
             return updated
         except (OSError, ValueError, sqlite3.Error, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
-            return record
+            return unresolved('readback_unavailable', '기기의 종료 상태를 다시 읽지 못했습니다. 연결이 복구되면 확인합니다.')
 
     @staticmethod
     def _binding(source):
@@ -589,6 +618,8 @@ class SessionControl:
             except FileNotFoundError:
                 previous = None
             if previous is not None:
+                if previous.get('cancelled') and previous.get('binding') == self._binding(source):
+                    return {**previous['result'], 'replayed': True}
                 if previous.get("digest") != digest or (previous.get("binding") is not None and previous["binding"] != self._binding(source)):
                     raise ValueError("같은 요청 식별자를 다른 세션 제어에 사용할 수 없습니다.")
                 return {**self._reconcile(source, previous, folder)["result"], "replayed": True}

@@ -163,6 +163,41 @@ class SessionControlTest(unittest.TestCase):
         self.assertFalse(any(method in ('thread/archive', 'turn/interrupt') for client in clients for method, args in client.calls))
         kill.assert_not_called()
 
+    def test_missing_receipt_is_fenced_before_late_original_dispatch(self):
+        with patch.object(self.api, '_observe') as observe, patch.object(self.api, '_apply') as apply:
+            result = self.api.receipt(self.codex, 'terminate', 'request-delayed', seal_missing=True)
+            late = self.api.execute(self.codex, 'terminate', 'synthetic.' + 'a' * 64, 'request-delayed')
+        self.assertEqual(result['dispatchState'], 'not_started')
+        self.assertEqual(late['dispatchState'], 'not_started')
+        observe.assert_not_called(); apply.assert_not_called()
+
+    def test_replaced_marker_retires_old_pending_without_native_calls(self):
+        self.pending_archive()
+        path = next(self.api.directory.glob('closed-*.json'))
+        marker = json.loads(path.read_text()); marker['requestId'] = 'request-newer'
+        control._save(path, marker)
+        with patch.object(native, '_client') as client:
+            result = self.api.receipt(self.codex, 'terminate', 'request-archive', verify_cleanup=True)
+        self.assertEqual(result['reconcileCode'], 'superseded')
+        self.assertFalse(result['cleanupEligible'])
+        client.assert_not_called()
+
+    def test_missing_old_receipt_with_newer_marker_is_superseded_and_fenced(self):
+        self.pending_archive()
+        result = self.api.receipt(self.codex, 'terminate', 'request-older', seal_missing=True)
+        self.assertEqual(result['reconcileCode'], 'superseded')
+        self.assertNotEqual(result.get('dispatchState'), 'not_started')
+        with patch.object(self.api, '_apply') as apply:
+            late = self.api.execute(self.codex, 'terminate', 'synthetic.' + 'a' * 64, 'request-older')
+        self.assertEqual(late['reconcileCode'], 'superseded'); apply.assert_not_called()
+
+    def test_missing_receipt_with_same_marker_cannot_claim_not_started(self):
+        self.pending_archive()
+        (self.api.directory / 'request-archive.json').unlink()
+        result = self.api.receipt(self.codex, 'terminate', 'request-archive', seal_missing=True)
+        self.assertEqual(result['reconcileCode'], 'insufficient_evidence')
+        self.assertIsNone(result['applied'])
+
     def test_pending_archive_rechecks_closed_execution_without_resending_or_requiring_archive(self):
         self.pending_archive()
         restarted = control.SessionControl(self.home, self.home / 'control')

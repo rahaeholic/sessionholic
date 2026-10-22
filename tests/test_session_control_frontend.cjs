@@ -36,7 +36,7 @@ function client(fetchImpl, storage = new Map()) {
     return value;
   }
   const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false, runtimeObservations: new Map() };
-  const context = vm.createContext({ console, state, el, AbortController, AbortSignal, clearTimeout() {}, $: (id) => nodes.get(id),
+  const context = vm.createContext({ console, state, el, AbortController, AbortSignal, setTimeout() {}, clearTimeout() {}, $: (id) => nodes.get(id),
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     document: { body: el('body') }, window: { SessionholicGoals: { async refresh() { counts.refresh++; } } },
     button(text, className, callback) { const value = el('button', className, text); value.events.click = callback; return value; },
@@ -193,4 +193,55 @@ test('세션과 하위 에이전트 종료 범위를 설명과 최종 확인 양
   c.get('session-control-terminate').events.click();
   assert.ok(c.get('session-control-confirmation').children[0].textContent.includes(effect));
   assert.equal(c.calls.length, 1, '범위를 확인하는 동안 실행 요청은 보내지 않는다');
+});
+
+
+test('종료 CSRF 미전달은 보류를 해제하고 새 증명을 읽되 종료 명령은 자동 반복하지 않는다', async () => {
+  const storage = new Map();
+  const c = client(async ({ url }, calls) => url.endsWith('/preview')
+    ? response(preview({ targetProof: `proof-${calls.length}` }))
+    : response({ code: 'csrf_expired', dispatchState: 'not_started', error: 'expired' }, 403), storage);
+  await c.manageSession(source());
+  c.get('session-control-terminate').events.click(); await c.get('session-control-confirm').events.click();
+  assert.equal(storage.size, 0);
+  assert.equal(c.current().used, false);
+  assert.equal(c.current().preview.targetProof, 'proof-3');
+  assert.equal(c.get('session-control-terminate').disabled, false);
+  assert.equal(c.calls.filter(call => call.url.endsWith('/action')).length, 1);
+  assert.equal(c.counts.capabilities, 1);
+});
+
+test('다른 기기의 보류 요청을 미리보기에서 찾아 같은 ID의 결과만 확인한다', async () => {
+  const c = client(async ({ url }) => url.endsWith('/preview')
+    ? response({ termination: { requestId: 'other-device-request', confirmed: false, reason: '확인 중' } })
+    : response({ confirmed: true, cleanup: { complete: true }, requestId: 'other-device-request' }));
+  await c.manageSession(source());
+  c.get('session-control-terminate').events.click(); await c.get('session-control-confirm').events.click();
+  assert.equal(c.calls[1].body.requestId, 'other-device-request');
+  assert.equal(c.calls[1].body.cleanupOnly, true);
+  assert.equal(c.calls[1].body.targetProof, undefined);
+});
+
+test('종료 인증 거절도 미전달 근거가 있으면 브라우저 보류를 지운다', async () => {
+  const storage = new Map();
+  const c = client(async ({ url }) => url.endsWith('/preview') ? response(preview())
+    : response({ dispatchState: 'not_started' }, 401), storage);
+  await c.manageSession(source()); c.get('session-control-terminate').events.click();
+  await c.get('session-control-confirm').events.click();
+  assert.equal(storage.size, 0); assert.equal(c.current(), null);
+});
+
+
+test('결과 조회의 CSRF 거절은 원래 종료 요청의 미전달을 뜻하지 않으므로 보류를 유지한다', async () => {
+  const storage = new Map(); let stage = 0;
+  const c = client(async ({ url }) => url.endsWith('/preview') ? response(preview()) :
+    ++stage === 1 ? response({ confirmed: false, applied: null }) : response({ code: 'csrf_expired', dispatchState: 'not_started' }, 403), storage);
+  await c.manageSession(source()); c.get('session-control-terminate').events.click();
+  await c.get('session-control-confirm').events.click();
+  const saved = [...storage.values()][0];
+  c.get('session-control-terminate').events.click(); await c.get('session-control-confirm').events.click();
+  assert.equal([...storage.values()][0], saved);
+  assert.equal(c.calls.at(-1).body.cleanupOnly, true);
+  assert.equal(c.counts.capabilities, 1);
+  assert.equal(c.current().used, true);
 });

@@ -1071,13 +1071,14 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
       });
     } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
     assertAuthEpoch(authEpoch);
+    data = await response.json().catch(() => ({}));
     if (response.status === 401) {
       showLogin();
       const err = new Error("로그인이 필요합니다.");
       err.unauthorized = true;
+      err.dispatchState = data.dispatchState;
       throw err;
     }
-    data = await response.json().catch(() => ({}));
   } finally {
     release();
   }
@@ -3314,11 +3315,16 @@ function terminationRecord(s, value) {
   return null;
 }
 function terminationCopy(result) {
+  if (result.historical && result.cleanup?.complete) return "이전 종료 요청은 정리까지 완료됐습니다. 이후 다시 시작한 실행에는 영향을 주지 않았습니다.";
+  if (result.job?.state === "superseded" || result.reconcileCode === "superseded" || result.cleanup?.superseded)
+    return "새 실행 또는 더 새로운 요청이 확인됐습니다. 이전 요청으로 터미널이나 목록을 정리하지 않았습니다.";
+  if (result.cleanupEligible === false) return result.reason || "원본 종료는 기록돼 있지만 현재 실행을 다시 확인 중입니다.";
   if (result.confirmed !== true) return result.reason || "실행 종료 결과를 확인하지 못했습니다. 기존 결과 확인만 다시 시도할 수 있습니다.";
   const cleanup = result.cleanup;
   if (cleanup?.complete && cleanup.unverified?.length)
     return `실행을 종료하고 목록에서 정리했습니다. 연결을 확인하지 못한 터미널 ${cleanup.unverified.length}개는 열어 두었습니다. 열린 터미널 목록에서 확인할 수 있습니다.`;
-  if (cleanup?.complete) return result.alreadyEnded ? "끝난 세션의 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다." : "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.";
+  if (cleanup?.complete) return (result.alreadyEnded ? "끝난 세션의 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다." : "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.") +
+    (result.descendantsConfirmed === false ? " 하위 에이전트의 종료는 별도로 확인되지 않았습니다." : "");
   if (cleanup?.unverified?.length) return "실행 종료는 확인했습니다. 연결을 확인하지 못한 터미널은 열어 두었습니다. 터미널 또는 목록 정리가 남아 있습니다.";
   if (cleanup?.remotePending?.length) return "실행 종료는 확인했습니다. 실행 기기의 터미널 정리가 남았습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
   return "실행 종료는 확인했습니다. 터미널 또는 목록 정리가 남아 있습니다. 남은 정리만 다시 시도할 수 있습니다.";
@@ -3328,27 +3334,74 @@ async function terminateAndCleanup(context) {
   const source = { ...context.source, ...(context.s.cwd ? { cwd: context.s.cwd } : {}) };
   const record = pending || { requestId: requestId(), source };
   if (!pending) terminationRecord(context.s, record);
-  const result = await api("/api/session/action", { method: "POST", body: { source: record.source, action: "terminate",
-    requestId: record.requestId, ...(pending ? { cleanupOnly: true } : { targetProof: context.preview.targetProof }) },
-    authEpoch: context.authEpoch, csrfRetry: false });
-  if (result.cleanup?.complete || result.applied === false) terminationRecord(context.s, null);
+  let result;
+  try {
+    result = await api("/api/session/action", { method: "POST", body: { source: record.source, action: "terminate",
+      requestId: record.requestId, ...(pending ? { cleanupOnly: true } : { targetProof: context.preview.targetProof }) },
+      authEpoch: context.authEpoch, csrfRetry: false });
+  } catch (err) {
+    err.terminationPending = !!pending;
+    if (err.dispatchState === "not_started" && !pending) {
+      terminationRecord(context.s, null);
+      context.used = false; context.preview = null;
+      if (!err.unauthorized && !err.staleAuth) await refreshTerminationPreview(context, err.code === "csrf_expired");
+    } else if (pending && err.code === "csrf_expired" && terminationContextCurrent(context)) {
+      try { await loadCapabilities(context.authEpoch, { refreshView: false }); } catch { /* Keep the original request. */ }
+    }
+    throw err;
+  }
+  if (result.cleanup?.complete || result.applied === false || result.job?.state === "superseded") {
+    terminationRecord(context.s, null);
+    if (!result.cleanup?.complete) { context.used = false; await refreshTerminationPreview(context); }
+  } else {
+    terminationRecord(context.s, { requestId: result.requestId || record.requestId, source: record.source });
+  }
   if (result.confirmed === true) {
     for (const id of result.cleanup?.closed || []) {
       clearTerminalAttachmentDraft(id);
       const terminal = state.terminals?.find((row) => row.id === id);
       if (terminal) { terminal.alive = false; terminal.closed = true; terminal.closedReason = "user"; }
     }
-    if (result.cleanup?.complete) {
+    if (result.cleanup?.complete && !result.historical) {
       (state.removedLocal ||= new Map()).set(context.s.key, { removed: true, after: state.snapshot,
         version: result.cleanup.version });
     }
   }
   return result;
 }
+function terminationContextCurrent(context) {
+  return context.authEpoch === state.authEpoch && (sessionControl === context ||
+    typeof endSession !== "undefined" && endSession === context);
+}
+async function refreshTerminationPreview(context, refreshAuth = false) {
+  if (!terminationContextCurrent(context)) return;
+  try {
+    if (refreshAuth) await loadCapabilities(context.authEpoch, { refreshView: false });
+    const preview = await api("/api/session/preview", { method: "POST", body: { source: context.source }, authEpoch: context.authEpoch });
+    if (!terminationContextCurrent(context)) return;
+    context.preview = preview;
+    if (preview.termination) adoptTermination(context, preview.termination);
+  } catch { /* A fresh sheet can retry this read; never reuse the old proof. */ }
+}
+function adoptTermination(context, result) {
+  terminationRecord(context.s, { requestId: result.requestId, source: { ...context.source, ...(context.s.cwd ? { cwd: context.s.cwd } : {}) } });
+  context.pendingCleanup = true;
+  scheduleTerminationRead(context);
+}
+function scheduleTerminationRead(context) {
+  clearTimeout(context.terminationTimer);
+  if (!terminationRecord(context.s) || !terminationContextCurrent(context)) return;
+  context.terminationTimer = setTimeout(() => {
+    if (!terminationContextCurrent(context) || context.busy || !terminationRecord(context.s)) return;
+    if (sessionControl === context) executeSessionAction(context, "terminate");
+    else endSessionRun(context);
+  }, 5000);
+}
 let sessionControl = null;
 function closeSessionControl(force = false) {
   if (!force && sessionControl?.busy) return;
   const previous = sessionControl;
+  clearTimeout(previous?.terminationTimer);
   sessionControl = null;
   const dialog = $("session-control-dialog");
   if (dialog?.open) dialog.close();
@@ -3408,12 +3461,19 @@ async function manageSession(s, trigger = null) {
     context.pendingCleanup = true;
     status.textContent = "이전 종료 요청이 있습니다. 기존 결과를 확인하고 남은 정리만 다시 시도합니다.";
     const retry = $("session-control-terminate"); retry.disabled = false; retry.textContent = "종료 결과 확인 · 남은 정리";
+    scheduleTerminationRead(context);
     return;
   }
   try {
     const result = await api("/api/session/preview", { method: "POST", body: { source: context.source }, authEpoch: context.authEpoch });
     if (sessionControl !== context) return;
     context.preview = result;
+    if (result.termination) {
+      adoptTermination(context, result.termination);
+      status.textContent = terminationCopy(result.termination);
+      const retry = $("session-control-terminate"); retry.disabled = false; retry.textContent = "종료 결과 확인 · 남은 정리";
+      return;
+    }
     status.textContent = "이 세션에서 사용할 동작을 선택하세요.";
     for (const action of ["interrupt", "terminate"]) {
       const capability = result.capabilities?.[action];
@@ -3463,13 +3523,16 @@ async function executeSessionAction(context, action) {
     }
   } catch (err) {
     if (sessionControl === context && !err.staleAuth && !err.unauthorized)
-      $("session-control-status").textContent = "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
+      $("session-control-status").textContent = err.dispatchState === "not_started" && !err.terminationPending
+        ? "종료 요청이 전달되지 않았습니다. 상태를 갱신했습니다. 다시 종료할 수 있습니다."
+        : "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
   } finally {
     if (sessionControl === context) {
       $("session-control-confirmation").hidden = true;
       context.pendingCleanup = !!terminationRecord(context.s);
       if (context.pendingCleanup) $("session-control-terminate").textContent = "종료 결과 확인 · 남은 정리";
       sessionControlBusy(context, false);
+      if (action === "terminate") scheduleTerminationRead(context);
     }
   }
 }
@@ -6564,6 +6627,7 @@ let endSession = null;
 function closeEndSession(force = false) {
   if (!force && endSession?.busy) return;
   const previous = endSession;
+  clearTimeout(previous?.terminationTimer);
   endSession = null;
   const dialog = $("end-session-dialog");
   if (dialog?.open) dialog.close();
@@ -6609,12 +6673,19 @@ async function confirmEndSession(s, trigger = null) {
   if (terminationRecord(s)) {
     status.textContent = "이전 종료 요청이 있습니다. 기존 결과를 확인하고 남은 정리만 다시 시도합니다.";
     terminate.textContent = "종료 결과 확인 · 남은 정리"; terminate.disabled = false; terminate.focus?.();
+    scheduleTerminationRead(context);
     return;
   }
   try {
     const result = await api("/api/session/preview", { method: "POST", body: { source }, authEpoch: context.authEpoch });
     if (endSession !== context) return;
     context.preview = result;
+    if (result.termination) {
+      adoptTermination(context, result.termination);
+      status.textContent = terminationCopy(result.termination);
+      terminate.textContent = "종료 결과 확인 · 남은 정리"; terminate.disabled = false;
+      return;
+    }
     const end = result.capabilities?.terminate, stop = result.capabilities?.interrupt;
     terminate.disabled = !end?.supported;
     if (end?.alreadyEnded) terminate.textContent = "끝난 세션 정리";
@@ -6671,9 +6742,11 @@ async function endSessionRun(context) {
     poll(false);
   } catch (err) {
     if (endSession === context && !err.staleAuth && !err.unauthorized)
-      $("end-session-status").textContent = "실행 종료 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
+      $("end-session-status").textContent = err.dispatchState === "not_started" && !err.terminationPending
+        ? "종료 요청이 전달되지 않았습니다. 상태를 갱신했습니다. 다시 종료할 수 있습니다."
+        : "종료 결과를 확인 중입니다. 창을 닫아도 서버에서 확인을 이어갑니다.";
   } finally {
-    if (endSession === context) endSessionBusy(context, false);
+    if (endSession === context) { endSessionBusy(context, false); scheduleTerminationRead(context); }
   }
 }
 async function endSessionRemove(context) {
