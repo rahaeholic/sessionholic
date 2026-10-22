@@ -57,6 +57,13 @@
     }
     return out;
   }
+  function tiled(list, short = false) {
+    if (list.length === 1) return leaf(list[0]);
+    const middle = Math.ceil(list.length / 2);
+    const branch = (part) => part.length === 1 ? leaf(part[0]) :
+      { axis: short ? "x" : "y", ratio: 0.5, children: part.map(leaf) };
+    return { axis: "x", ratio: 0.5, children: [branch(list.slice(0, middle)), branch(list.slice(middle))] };
+  }
   function ratioAt(tree, path, ratio) {
     if (tree.pane || !/^[01]*$/.test(path)) return tree;
     if (!path) return { ...tree, ratio: Math.max(0.15, Math.min(0.85, ratio)) };
@@ -79,9 +86,11 @@
   }
   function shortcut(event, modifiers = "ctrl-meta") {
     if (event.shiftKey) return null;
+    const composing = event.isComposing || event.keyCode === 229;
+    if (!event.ctrlKey && !event.metaKey && event.altKey &&
+        (event.code === "Digit0" || event.key === "0" && !composing)) return { view: true };
     const physicalDigit = /^Digit([1-4])$/.exec(event.code || "")?.[1];
     const digit = physicalDigit || (/^[1-4]$/.test(event.key) ? event.key : null);
-    const composing = event.isComposing || event.keyCode === 229;
     // A physical Option+number is an explicit pane selection, even while an
     // IME owns its last word. focus() commits that editor before moving it.
     if (!event.ctrlKey && !event.metaKey && event.altKey && digit && (!composing || physicalDigit))
@@ -117,7 +126,7 @@
     return { version: 1, tree: copy(value.tree), active: ids(value.tree).includes(value.active) ? value.active : ids(value.tree)[0], panes,
       ...(value.single === true ? { single: true } : {}) };
   }
-  const model = { MAX_PANES, ids, leaf, validTree, remove, split, move, geometry, ratioAt, neighbor, shortcut, validRef, restoreLayout };
+  const model = { MAX_PANES, ids, leaf, validTree, remove, split, move, geometry, tiled, ratioAt, neighbor, shortcut, validRef, restoreLayout };
   if (typeof module !== "undefined" && module.exports) { module.exports = model; return; }
   if (!root?.document) return;
 
@@ -214,9 +223,18 @@
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
-    const rects = geometry(tree).panes;
     const bounds = rootNode.getBoundingClientRect();
-    const compact = root.innerWidth <= 700 || list.length > 1 && Object.values(rects).some((r) => r.w * bounds.width < 280 || r.h * bounds.height < 170);
+    const tooSmall = (rects) => Object.values(rects).some((r) => r.w * bounds.width < 240 || r.h * bounds.height < 170);
+    let rects = geometry(tree).panes;
+    // Repeatedly splitting the active right pane produces 1/2, 1/4, 1/8,
+    // 1/8 widths. That is a layout problem, not a mobile-sized workspace.
+    // Retile coordinates only; keep every document, editor and CLI mounted.
+    if (!maximized && list.length > 1 && root.innerWidth > 700 && bounds.width > 0 && bounds.height > 0 && tooSmall(rects)) {
+      const candidate = tiled(list, bounds.height < 340);
+      const next = geometry(candidate).panes;
+      if (!tooSmall(next)) { tree = candidate; rects = next; }
+    }
+    const compact = root.innerWidth <= 700 || list.length > 1 && bounds.width > 0 && bounds.height > 0 && tooSmall(rects);
     doc.body.classList.toggle("workspace-compact", compact && enabled);
     for (const [id, row] of panes) {
       const included = list.includes(id), shown = included && (!(maximized || compact) || active === id);
@@ -275,9 +293,11 @@
       $("workspace-dividers").append(node);
     }
     const switcher = $("workspace-switcher"); switcher.hidden = !enabled || !compact;
+    const arrange = $("workspace-arrange");
+    if (arrange) { arrange.hidden = !enabled || root.innerWidth <= 700; arrange.textContent = maximized ? "분할로 돌아가기" : "분할 정렬"; }
     switcher.replaceChildren();
     list.forEach((id, index) => {
-      const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `⌥${index + 1}`, () => focus(id));
+      const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `창 ${index + 1}`, () => focus(id));
       tab.setAttribute("aria-keyshortcuts", `Alt+${index + 1}`);
       tab.setAttribute("aria-pressed", String(id === active)); switcher.append(tab);
     });
@@ -310,13 +330,21 @@
     return true;
   }
   function maximize() { maximized = !maximized; layout(); }
+  function arrange() {
+    const list = ids(tree);
+    if (list.length < 2) return;
+    const bounds = $("session-workspace").getBoundingClientRect();
+    tree = tiled(list, bounds.height > 0 && bounds.height < 340); maximized = false; layout();
+  }
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));
     if (!action || !ids(tree).includes(id) || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
-    if (!event.ctrlKey && !event.metaKey && event.altKey && ids(tree).length < 2) return false;
+    if (action.view && !panes.get(id)?.hooks?.describe().canToggleView) return false;
+    if (!action.view && !event.ctrlKey && !event.metaKey && event.altKey && ids(tree).length < 2) return false;
     if (event.repeat && action.maximize) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
     event.preventDefault(); event.stopImmediatePropagation();
-    if (action.maximize) { if (ids(tree).length > 1) maximize(); }
+    if (action.view) { if (!event.repeat) panes.get(id).hooks.toggleView(); }
+    else if (action.maximize) { if (ids(tree).length > 1) maximize(); }
     else {
       const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, id, action.direction);
       if (target) focus(target);
@@ -635,6 +663,7 @@
     keys.value = hooks.prefs.get("workspaceKeys", "ctrl-meta");
     keys.addEventListener("change", () => hooks.prefs.set("workspaceKeys", keys.value === "ctrl-alt-meta" ? keys.value : "ctrl-meta"));
     $("workspace-split-open").addEventListener("click", () => add(null));
+    $("workspace-arrange")?.addEventListener("click", arrange);
     $("home").addEventListener("click", (event) => {
       if (!enabled) return;
       event.preventDefault(); event.stopImmediatePropagation();
@@ -677,5 +706,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, addFromPane, closePane, layout, activeSessionKey, readingActive, isActive, browseSessions };
+    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions };
 })(typeof window !== "undefined" ? window : null);

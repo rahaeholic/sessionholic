@@ -3948,12 +3948,12 @@ test('changing list filters removes hidden cards without changing the selected s
 test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
+  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'ctrl-up', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
     assert.match(html, new RegExp(`data-key="${key}"`));
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
-  assert.match(css, /"ctrl k1 k2 k3 k4 meta up\s+word\s+enter"/);
-  assert.match(css, /"alt\s+k5 k6 k7 k8 left down right enter"/);
+  assert.match(css, /"ctrl k1 k2 k3 k4 meta cup up\s+word\s+enter"/);
+  assert.match(css, /"alt\s+k5 k6 k7 k8 \.\s+left down right enter"/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
@@ -4044,6 +4044,9 @@ test('held bar modifiers combine with the next key from the bar, the input bar o
   const settle = () => new Promise((resolve) => setImmediate(resolve));
   c.state.connected = true;
   c.state.terminal = { id: 'term-1' };
+  c.pressTerminalKey('ctrl-up');
+  await settle();
+  assert.deepEqual(calls.splice(0), ['\x1b[1;5A'], 'the dedicated Codex key sends exactly one Ctrl+Up sequence');
   c.pressTerminalKey('alt-left');
   await settle();
   assert.deepEqual(calls.splice(0), ['\x1bb']);
@@ -4082,6 +4085,8 @@ test('held bar modifiers combine with the next key from the bar, the input bar o
   assert.equal(calls.length, before, 'plain typing stays in the draft');
   // xterm: its own keys pass through; ⌘← and a held modifier are ours, and its keypress is swallowed.
   assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'a', code: 'KeyA' }), true);
+  assert.equal(c.xtermKeyEvent({ type: 'keypress', key: 'ㅏ', isComposing: true }), false, 'IME keypress is not a second raw character');
+  assert.equal(c.xtermKeyEvent({ type: 'keypress', key: 'Process', keyCode: 229 }), false);
   assert.equal(c.xtermKeyEvent({ type: 'keydown', key: 'ArrowLeft', metaKey: true, preventDefault() {} }), false);
   assert.equal(c.xtermKeyEvent({ type: 'keypress', key: 'ArrowLeft', metaKey: true }), false);
   await settle();
@@ -13981,6 +13986,36 @@ test('채팅의 터미널 버튼은 같은 상세영역의 탭을 바꾸며 대�
   assert.equal(c.get('terminal-screen').parentNode, host); assert.equal(term.disposed, 0);
 });
 
+test('보기 전환 키 경로는 같은 편집기·초안·첨부를 유지하며 기존 터미널과 채팅을 왕복한다', async () => {
+  const { c, s, entry, terminal, term } = inlineDetailClient();
+  const input = c.get('chat-input'), attachments = entry.attachments;
+  input.value = entry.text = '보존할 한글 초안';
+  const toggle = () => vm.runInContext('toggleConversationView()', c.context);
+  await toggle(); assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(c.state.inlineTerminal.key, s.key);
+  await toggle(); assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+  assert.equal(c.get('chat-input'), input); assert.equal(input.value, entry.text);
+  assert.equal(entry.attachments, attachments); assert.equal(term.disposed, 0);
+  assert.equal(c.get('detail-mode-tabs').attributes['aria-keyshortcuts'], 'Alt+0');
+  s.executionMode = 'one-shot'; await toggle(); assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+});
+
+test('보기 전환은 Mac raw 한글 조합이 끝난 뒤 확정 범위를 먼저 처리하고 다른 대화로 바뀌면 취소한다', async () => {
+  const { c, terminal, term } = inlineDetailClient(); await c.openTerminal(terminal);
+  let composing = true; const sequence = [], field = node(); term.textarea = field;
+  c.context.window.SessionholicTerminalIme = { composing: () => composing, flush: () => sequence.push('flush') };
+  c.context.document.activeElement = field;
+  field.blur = () => { sequence.push('blur'); composing = false; c.context.document.activeElement = null; };
+  const pending = vm.runInContext('toggleConversationView()', c.context);
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  c.flushFrames(); await pending;
+  assert.deepEqual(sequence, ['blur', 'flush']); assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+  composing = true; c.context.document.activeElement = field;
+  const stale = vm.runInContext('toggleConversationView()', c.context);
+  c.state.selected = 'different-conversation'; c.flushFrames(); await stale;
+  assert.deepEqual(sequence, ['blur', 'flush', 'blur'], 'the old action does not flush/send into a newly selected conversation');
+});
+
 test('PC 상태 읽기가 실패해도 살아 있는 정확한 터미널로는 같은 상세영역에서 돌아간다', async () => {
   const { c, s, entry, host } = inlineDetailClient();
   entry.data = { route: c.sourceOf(s), phase: 'unknown', runtimeKnown: false, readOnly: true,
@@ -15012,6 +15047,27 @@ test('a terminal abandoned during font loading cannot replace the newly selected
   assert.equal(created[0].fontWeightBold, '400');
   assert.match(created[0].fontFamily, /^"Sessionholic Terminal"/);
   c.setTerminalFontSize(18); assert.equal(c.state.fontSize, 18);
+});
+
+test('폐기한 raw 터미널의 늦은 한글 확정 콜백은 새 터미널로 전달하지 않는다', async () => {
+  const { c, faces } = terminalFontFixture(), appended = [], created = [], calls = [];
+  c.context.fetch = async (url, options) => { if (url.endsWith('/input')) calls.push({ url, body: JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => ({ ok: true, terminals: [] }) }; };
+  class Terminal {
+    constructor(options) { this.options = options; created.push(this); }
+    loadAddon() {} open() {} onData(fn) { this.data = fn; } onBinary() {} dispose() {}
+  }
+  c.context.Terminal = c.context.window.Terminal = Terminal;
+  c.context.FitAddon = c.context.window.FitAddon = { FitAddon: class { fit() {} } };
+  c.context.document.head = { appendChild(item) { appended.push(item); } };
+  c.context.startTerminalReader = () => {};
+  const pending = c.openTerminal({ id: 'old', mode: 'attach', alive: true });
+  for (const item of appended) item.onload(); await settle();
+  for (const face of faces) face.finish(); await pending;
+  await c.openTerminal({ id: 'new', mode: 'attach', alive: true }); c.state.connected = true;
+  created[0].data('오래된 조합'); await settle(); assert.equal(calls.length, 0);
+  created[1].data('현재 조합'); await settle();
+  assert.equal(calls.length, 1); assert.equal(calls[0].url, '/api/terminal/new/input'); assert.equal(calls[0].body.text, '현재 조합');
 });
 
 test('server screen geometry is applied before output, while a passive viewer never locally rewraps its ANSI stream', async () => {

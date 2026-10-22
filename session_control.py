@@ -408,9 +408,10 @@ class SessionControl:
                 except (OSError, ValueError, sqlite3.Error):
                     pass
                 archive = bool(record and not record["archived"] and (interrupt or stable))
+                finished = bool(record and stable and state["phase"] == "closed")
                 process_terminate = process is not None and (interrupt or stable)
-                terminate = process_terminate or archive
-                method = "codex-cli-process" if process_terminate else "codex-thread-archive"
+                terminate = process_terminate or archive or finished
+                method = "codex-cli-process" if process_terminate else "codex-thread-finished" if finished else "codex-thread-archive"
                 target = {"identity": identity, "turnId": state.get("activeTurnId"), "phase": state["phase"],
                           "process": _process_key(process), "canInterrupt": interrupt, "safe": stable,
                           "record": record, "terminationMethod": method if terminate else None,
@@ -420,8 +421,10 @@ class SessionControl:
                             "interrupt": _capability(interrupt, "codex-turn-interrupt", None if interrupt else state.get("reason") or "진행 중인 응답이 없습니다."),
                             "terminate": _capability(terminate, method, None if terminate else
                                 "원본 실행과 저장된 세션을 정확히 확인하지 못했습니다.",
-                                effect="선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다." if archive and not process_terminate else "원본 CLI 실행을 종료합니다.",
-                                scope="thread_and_descendants" if archive and not process_terminate else "exact_process")}}
+                                effect="원본 실행은 이미 끝났습니다. 연결된 터미널과 목록만 정리합니다." if finished and not process_terminate else
+                                    "선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다." if archive and not process_terminate else "원본 CLI 실행을 종료합니다.",
+                                scope="selected-session" if finished and not process_terminate else "thread_and_descendants" if archive and not process_terminate else "exact_process",
+                                **({"alreadyEnded": True} if finished and not process_terminate else {}))}}
             binary = native._claude_binary(self.home)
             rows = json.loads(native._claude_run(binary, ["agents", "--json", "--all"], deadline))
             if not isinstance(rows, list):
@@ -475,7 +478,7 @@ class SessionControl:
             return self._view(observed, folder)
 
     def receipt(self, source, action, request_id):
-        """Read an existing outcome; never observe or apply a native operation."""
+        """Recheck an uncertain outcome read-only; never repeat a native mutation."""
         if action != "terminate" or not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise ValueError("종료 요청 식별자를 확인해 주세요.")
         with self._lock() as folder:
@@ -487,7 +490,83 @@ class SessionControl:
             if (record.get("binding") != self._binding(source) or result.get("source") != native._identity(source)
                     or result.get("action") != action or result.get("requestId") != request_id):
                 raise ValueError("기존 종료 요청의 대상과 다릅니다. 추가 정리를 하지 않았습니다.")
-            return {**result, "replayed": True}
+            record = self._reconcile(source, record, folder)
+            return {**record["result"], "replayed": True}
+
+    @staticmethod
+    def _loaded_codex(client, identity):
+        cursor, seen = None, set()
+        for unused in range(32):
+            page = client.call("thread/loaded/list", {"limit": 100, **({"cursor": cursor} if cursor else {})})
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                return None
+            if any(not isinstance(sid, str) for sid in page["data"]):
+                return None
+            if identity["id"] in page["data"]:
+                return True
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                return False
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                return None
+            seen.add(cursor)
+        return None
+
+    def _reconcile(self, source, record, folder):
+        result = record["result"]
+        if result.get("action") != "terminate" or result.get("confirmed") or result.get("applied") is False:
+            return record
+        identity, deadline = native._identity(source), time.monotonic() + 8
+        marker_path = folder / ("closed-" + _digest(identity) + ".json")
+        try:
+            marker = json.loads(_private_read(marker_path, private=True))
+            if marker.get("source") != identity or marker.get("requestId") != result["requestId"]:
+                return record  # A newer board termination owns this source now.
+            evidence = record.get("termination", {})
+            method = evidence.get("method") or marker.get("method")
+            details = None
+            if method in ("codex-thread-archive", "codex-thread-finished"):
+                before = launch.saved_codex_thread(source, self.home)
+                with native._client(identity, self.home, deadline) as client:
+                    state = native._codex_state(client, identity)
+                    loaded = self._loaded_codex(client, identity)
+                after = launch.saved_codex_thread(source, self.home)
+                # Archiving and ending an execution are separate. The original
+                # archive RPC may fail after unloading the thread. A completed,
+                # unloaded exact thread needs no second archive/interrupt.
+                if (before == after and loaded is False and state.get("phase") == "closed"
+                        and state.get("safeToTransfer") is True):
+                    details = {"archived": after["archived"], "alreadyEnded": True,
+                               "scope": "selected-session", "scopeReadback": "selected-session"}
+            elif method == "claude-background-stop":
+                target = evidence.get("target", {})
+                binary = native._claude_binary(self.home)
+                rows = json.loads(native._claude_run(binary, ["agents", "--json", "--all"], deadline))
+                matches = [row for row in rows if isinstance(row, dict) and row.get("id") == target.get("nativeId")] if isinstance(rows, list) else []
+                if (len(matches) == 1 and target.get("sessionId") and target.get("startedAt") is not None
+                        and all(matches[0].get(k) == target.get(k) for k in ("sessionId", "startedAt", "kind"))
+                        and matches[0].get("cwd") == source.get("cwd")
+                        and matches[0].get("state") in ("stopped", "done", "failed")):
+                    details = {"alreadyEnded": True}
+            elif method in ("codex-cli-process", "claude-cli-process"):
+                processes = evidence.get("signalProcesses")
+                if (isinstance(processes, list) and 0 < len(processes) <= 65
+                        and all(_process_ended(row, _process_info(row["pid"], deadline, start_label=False), deadline)
+                                for row in processes)):
+                    fresh = self._observe(source, deadline)
+                    # A reused source can now own a new execution. Its terminal
+                    # must not be cleaned up on the older process's receipt.
+                    if not fresh.get("process") and fresh.get("phase") not in ("working", "needs_input"):
+                        details = {"alreadyEnded": True}
+            if details is None:
+                return record
+            updated = {**record, "result": {**result, **details, "confirmed": True,
+                        "status": "terminated", "reason": None, "reconciled": True}}
+            _save(folder / (result["requestId"] + ".json"), updated)
+            _save(marker_path, {**marker, "status": "terminated"})
+            return updated
+        except (OSError, ValueError, sqlite3.Error, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
+            return record
 
     @staticmethod
     def _binding(source):
@@ -512,7 +591,7 @@ class SessionControl:
             if previous is not None:
                 if previous.get("digest") != digest or (previous.get("binding") is not None and previous["binding"] != self._binding(source)):
                     raise ValueError("같은 요청 식별자를 다른 세션 제어에 사용할 수 없습니다.")
-                return {**previous["result"], "replayed": True}
+                return {**self._reconcile(source, previous, folder)["result"], "replayed": True}
             proof = self._verify(target_proof, self._secret(folder))
             if proof.get("source") != identity:
                 raise ValueError("세션 제어 대상이 변경되었습니다.")
@@ -536,7 +615,10 @@ class SessionControl:
             if not capability["supported"]:
                 return {**result, "reason": capability["reason"]}
             pending = {**result, "applied": None, "status": "unconfirmed", "reason": "실행 요청 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다."}
-            _save(receipt_path, {"digest": digest, "binding": self._binding(source), "result": pending})
+            record = {"digest": digest, "binding": self._binding(source), "result": pending}
+            if action == "terminate":
+                record["termination"] = {"method": capability["method"], "target": observed["target"]}
+            _save(receipt_path, record)
             _save(proof_path, {"result": pending})
             marker_path = folder / ("closed-" + _digest(identity) + ".json")
             prior_marker = None
@@ -548,11 +630,14 @@ class SessionControl:
                 _save(marker_path, {"source": identity, "status": "pending", "requestId": request_id,
                                     "requestedAt": int(time.time()), "method": capability["method"]})
             try:
-                details = self._apply(source, action, observed, deadline)
+                def before_signal(processes):
+                    record["termination"]["signalProcesses"] = [_process_key(row) for row in processes]
+                    _save(receipt_path, record)
+                details = self._apply(source, action, observed, deadline, before_signal) if action == "terminate" else self._apply(source, action, observed, deadline)
                 result.update(details)
             except (OSError, ValueError, sqlite3.Error, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
                 result = pending
-            _save(receipt_path, {"digest": digest, "binding": self._binding(source), "result": result})
+            _save(receipt_path, {**record, "result": result})
             _save(proof_path, {"result": result})
             if action == "terminate":
                 if result.get("applied") is False:
@@ -581,7 +666,7 @@ class SessionControl:
             return {"applied": True, "confirmed": confirmed, "status": "interrupted" if confirmed else "unconfirmed",
                     "reason": None if confirmed else "중단 요청을 보냈지만 원본 응답의 종료는 아직 확인되지 않았습니다."}
 
-    def _terminate_process(self, observed, deadline):
+    def _terminate_process(self, observed, deadline, before_signal=None):
         expected = observed["process"]
         children = _descendants(expected, deadline)
         # The kernel's own start time and executable, read right before the signal with no `ps`
@@ -591,6 +676,8 @@ class SessionControl:
             return {"applied": False, "confirmed": False, "status": "stale", "reason": "원본 프로세스가 변경되어 종료하지 않았습니다."}
         # Never kill a process group: it could contain a user's shell or another
         # session. SIGTERM allows the native CLI to clean up its own resources.
+        if before_signal is not None:
+            before_signal([current, *children])
         os.kill(current["pid"], signal.SIGTERM)
         for unused in range(15):
             after = _process_info(current["pid"], deadline)
@@ -606,8 +693,19 @@ class SessionControl:
         return {"applied": True, "confirmed": False, "status": "unconfirmed",
                 "reason": "종료 신호를 보냈지만 원본 프로세스가 아직 남아 있습니다. 강제 종료는 하지 않았습니다."}
 
-    def _apply(self, source, action, observed, deadline):
+    def _apply(self, source, action, observed, deadline, before_signal=None):
         method = observed["capabilities"][action]["method"]
+        if method == "codex-thread-finished":
+            identity = observed["source"]
+            record = launch.saved_codex_thread(source, self.home)
+            with native._client(identity, self.home, deadline) as client:
+                state = native._codex_state(client, identity)
+                loaded = self._loaded_codex(client, identity)
+            if (record != observed["target"]["record"] or record != launch.saved_codex_thread(source, self.home)
+                    or loaded is not False or state.get("phase") != "closed" or not state.get("safeToTransfer")):
+                return {"applied": False, "confirmed": False, "status": "stale", "reason": "원본 세션이 변경되어 정리하지 않았습니다. 상태를 다시 확인해 주세요."}
+            return {"applied": True, "confirmed": True, "status": "terminated", "alreadyEnded": True,
+                    "archived": record["archived"], "scope": "selected-session", "reason": None}
         if method == "claude-background-finished":
             fresh = self._observe(source, deadline)
             if (fresh["target"] != observed["target"]
@@ -672,4 +770,4 @@ class SessionControl:
                 or _process_key(fresh.get("process")) != _process_key(observed["process"])
                 or method == "codex-cli-process" and not fresh.get("native", {}).get("safeToTransfer")):
             return {"applied": False, "confirmed": False, "status": "stale", "reason": "원본 실행이 변경되어 프로세스를 종료하지 않았습니다."}
-        return self._terminate_process(fresh, deadline)
+        return self._terminate_process(fresh, deadline, before_signal)

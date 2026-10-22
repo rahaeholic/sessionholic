@@ -179,5 +179,8 @@
   "docs/plan/2026-10-22-pane-number-navigation.md",
   "docs/plan/2026-10-22-composer-and-pane-hierarchy.md",
   "docs/plan/2026-10-22-empty-pane-start.md",
-  "docs/plan/2026-10-22-conversation-session-menu.md"
+  "docs/plan/2026-10-22-conversation-session-menu.md",
+  "docs/plan/2026-10-22-mac-terminal-ime-and-view-key.md",
+  "web/terminal-ime.js",
+  "tests/test_terminal_ime.cjs"
 ]

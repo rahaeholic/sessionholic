@@ -10819,9 +10819,35 @@ function chooseDetailMode(mode) {
   } else syncSessionTerminal(s);
   window.SessionholicWorkspace?.changed(); syncEvents();
 }
+function canToggleConversationView() {
+  const s = selectedSession();
+  return !!state.authenticated && (!!s && !sessionRecordOnly(s) || launcherWorkspaceCurrent(state.launcherWorkspace?.terminalId));
+}
+async function toggleConversationView() {
+  if (!canToggleConversationView()) return;
+  const s = selectedSession(), identity = s ? conversationIdentity(s) : state.launcherWorkspace?.terminalId;
+  const epoch = state.authEpoch, field = document.activeElement;
+  if (workspaceComposing()) {
+    field?.blur?.();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (workspaceComposing() || window.SessionholicTerminalIme?.composing(state.term)) {
+      toast("입력 조합을 마친 뒤 보기를 전환해 주세요."); return;
+    }
+  }
+  if (epoch !== state.authEpoch || !canToggleConversationView() ||
+      identity !== (selectedSession() ? conversationIdentity(selectedSession()) : state.launcherWorkspace?.terminalId)) return;
+  window.SessionholicTerminalIme?.flush(state.term);
+  if (s) chooseDetailMode(sessionDetailMode() === "terminal" ? "chat" : "terminal");
+  else if (state.inlineTerminal) showLauncherChat(identity);
+  else {
+    const terminal = launcherWorkspaceTerminal();
+    if (terminal) openNewSessionTerminal(terminal, { recordHistory: false });
+  }
+}
 function buildModeTabs(choose, chatControls = "messages") {
   const tabs = el("div", "detail-mode-tabs"); tabs.id = "detail-mode-tabs";
   tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "터미널과 채팅 보기");
+  tabs.setAttribute("aria-keyshortcuts", "Alt+0"); tabs.title = "Option+0으로 터미널/채팅 전환";
   for (const [mode, label, controls] of [["terminal", "터미널", "detail-terminal-host"], ["chat", "채팅", chatControls]]) {
     const tab = button(label, "detail-mode-tab", () => choose(mode));
     tab.id = `detail-mode-${mode}`; tab.setAttribute("role", "tab");
@@ -11435,8 +11461,9 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
       queueTerminalScroll(event.deltaY / terminalLineHeight());
       return false;
     });
+    const sender = state.term, terminalId = state.terminal.id;
     state.term.onData((text) => {
-      if (!state.connected) return;
+      if (!state.connected || state.term !== sender || state.terminal?.id !== terminalId) return;
       state.terminalScrollLines = 0;
       renderTerminalScroll();
       sendInput(text).catch(() => {});
@@ -11703,6 +11730,7 @@ function configureTerminalKeyboard() {
   // which reaches the CLI as repeated text. Touch devices type in the input bar.
   const field = state.term?.textarea;
   if (!field?.setAttribute) return;
+  window.SessionholicTerminalIme?.install(state.term);
   if (directTerminalInput()) field.removeAttribute("inputmode");
   else field.setAttribute("inputmode", "none");
 }
@@ -11916,7 +11944,7 @@ const TERMINAL_ALWAYS_KEYS = /^(F([1-9]|1[0-2])|PageUp|PageDown|Insert)$/;
 const TERMINAL_BAR_KEYS = {
   escape: ["Escape"], tab: ["Tab"], backtab: ["Tab", { shift: true }], interrupt: ["c", { ctrl: true }],
   "ctrl-j": ["j", { ctrl: true }], "ctrl-u": ["u", { ctrl: true }], "ctrl-x": ["x", { ctrl: true }],
-  "ctrl-l": ["l", { ctrl: true }], up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
+  "ctrl-l": ["l", { ctrl: true }], "ctrl-up": ["ArrowUp", { ctrl: true }], up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
   right: ["ArrowRight"], enter: ["Enter"],
 };
 const TERMINAL_BAR_BYTES = {
@@ -11932,6 +11960,7 @@ const TERMINAL_BAR_BYTES = {
   "ctrl-u": "\x15",
   "ctrl-x": "\x18",
   "ctrl-l": "\x0c",
+  "ctrl-up": "\x1b[1;5A",
   enter: "\r",
 };
 function terminalKeyBytes(key, mods = {}, { windows = false } = {}) {
@@ -12129,6 +12158,7 @@ function terminalDocumentKey(event) {
 // xterm has the focus: it sends most keys itself; ⌘ edits, ⌥ word moves and held bar
 // modifiers are ours (the keypress that follows a handled keydown is swallowed too).
 function xtermKeyEvent(event) {
+  if (event.type === "keypress" && (event.isComposing || event.keyCode === 229)) return false;
   if (event.type !== "keydown") return !state.terminalKeyHandled;
   state.terminalKeyHandled = false;
   const ours = anyTerminalMod() || event.metaKey || (event.altKey && ["ArrowLeft", "ArrowRight", "Backspace"].includes(event.key));
@@ -13828,6 +13858,7 @@ function workspaceComposing() {
   // compositionOwner identifies late terminal events; it is not an active IME
   // flag. Samsung can also omit compositionend after a blur.
   if (state.composing && document.activeElement === $("terminal-draft")) return true;
+  if (document.activeElement === state.term?.textarea && window.SessionholicTerminalIme?.composing(state.term)) return true;
   const s = selectedSession();
   return !!s && !!chatEntry(s).composing && document.activeElement === $("chat-input");
 }
@@ -13846,12 +13877,14 @@ function workspaceHooks() {
       title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,
+      canToggleView: canToggleConversationView(),
       composing: workspaceComposing(),
       dictation: !!state.dictation || !!state.dictationParked,
       dialog: !!document.querySelector?.("dialog[open]") };
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    toggleView: toggleConversationView,
     browseSessions: () => $("search")?.focus?.({ preventScroll: true }),
     answerSession: (key) => {
       const target = selectedSession();

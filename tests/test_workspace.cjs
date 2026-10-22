@@ -104,7 +104,7 @@ function fixture(saved = null) {
       return { left, top, width, height, right: left + width, bottom: top + height };
     }
   }
-  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-split-open", "groups", "home", "workspace-keys"])
+  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-arrange", "workspace-split-open", "groups", "home", "workspace-keys"])
     nodes.set(id, new Node());
   nodes.get("workspace-primary").dataset.paneId = "p1";
   nodes.get("session-workspace").append(nodes.get("workspace-primary"), nodes.get("workspace-dividers"), nodes.get("workspace-drop-cue"));
@@ -117,7 +117,7 @@ function fixture(saved = null) {
   const infos = new Map();
   function app(id, ref = null) {
     const editor = { text: "초안 " + id, caret: 3, recognition: {}, terminal: {} };
-    const info = { authenticated: true, snapshot: { version: 1 }, ref, composing: false, title: id, dictation: false, editor };
+    const info = { authenticated: true, snapshot: { version: 1 }, ref, composing: false, title: id, dictation: false, editor, canToggleView: true };
     infos.set(id, info);
     return { prefs, describe: () => info, api: async (path) => { calls.push(["api", path]); return { path }; },
       toast: (message) => calls.push(["toast", message]), select: (key) => { info.ref = { key, mode: "chat" }; calls.push(["select", id, key]); },
@@ -128,6 +128,7 @@ function fixture(saved = null) {
       visibility: (value) => calls.push(["visibility", id, value]), refresh: (kind) => calls.push(["refresh", id, kind]),
       locked: () => { info.authenticated = false; calls.push(["locked", id]); }, newSession: () => calls.push(["new", id]), unsaved: () => !!info.unsaved,
       browseSessions: () => calls.push(["browse", id]),
+      toggleView: () => calls.push(["view", id]),
       sessionKeyForTerminal: (terminal) => terminal.key || null, openTerminal: (terminal) => calls.push(["open-existing-terminal", id, terminal.id]) };
   }
   vm.runInNewContext(source, { window, URLSearchParams, console, Set, Map, Date, Promise });
@@ -436,6 +437,45 @@ test("compact and maximized views preserve documents, passive panes remain unrea
   assert.equal(event.returnValue, "");
 });
 
+test('four repeated right splits retile into four visible panes before considering compact mode', () => {
+  const f = fixture(), editors = [f.infos.get('p1').editor], children = [];
+  for (const [id, key] of [['p2', 'session-b'], ['p3', 'session-c'], ['p4', null]]) {
+    f.workspace.add(key ? { key } : null);
+    const child = f.attach(id); children.push(child); editors.push(child.info.editor);
+  }
+  assert.equal(f.document.body.classList.contains('workspace-compact'), false);
+  const saved = f.preferences.get('workspace'), geometry = f.workspace.geometry(saved.tree).panes;
+  assert.equal(Object.keys(geometry).length, 4);
+  for (const box of Object.values(geometry)) { assert.equal(box.w, .5); assert.equal(box.h, .5); }
+  for (const child of children) {
+    assert.equal(child.row.classList.contains('workspace-pane-covered'), false);
+    assert.equal(child.frame.appendCount, 1);
+  }
+  assert.equal(f.nodes.get('workspace-arrange').hidden, false);
+  f.workspace.handleKey(combo('Enter'));
+  assert.equal(f.nodes.get('workspace-arrange').textContent, '분할로 돌아가기');
+  f.nodes.get('workspace-arrange').fire('click', {});
+  assert.equal(f.nodes.get('workspace-arrange').textContent, '분할 정렬');
+  for (const [index, child] of children.entries()) {
+    assert.equal(child.row.classList.contains('workspace-pane-covered'), false);
+    assert.equal(child.info.editor, editors[index + 1]);
+  }
+  assert.equal(f.calls.some(([name]) => name === 'api' || name === 'close-view'), false);
+});
+
+test('restored narrow desktop splits recover while genuine small screens keep reachable tabs', () => {
+  let tree = W.leaf('p1');
+  for (let number = 2; number <= 4; number++) tree = W.split(tree, 'p' + (number - 1), 'p' + number, 'right');
+  const f = fixture({ version: 1, tree, active: 'p4', panes: {} });
+  assert.equal(f.document.body.classList.contains('workspace-compact'), false);
+  f.window.innerWidth = 650; f.workspace.layout();
+  assert.equal(f.document.body.classList.contains('workspace-compact'), true);
+  assert.equal(f.nodes.get('workspace-switcher').hidden, false);
+  assert.equal(f.nodes.get('workspace-arrange').hidden, true);
+  f.window.innerWidth = 1440; f.workspace.layout();
+  assert.equal(f.document.body.classList.contains('workspace-compact'), false);
+});
+
 test('passive terminal claims never move focus or notify when another pane owns the terminal', () => {
   const f = fixture(); f.workspace.add({ terminalId: 'a'.repeat(32), mode: 'terminal' });
   const second = f.attach('p2', { terminalId: 'a'.repeat(32), mode: 'terminal' });
@@ -535,6 +575,24 @@ test('an embedded session menu delegates new views to its own pane and rejects f
   assert.equal(f.calls.some(([name]) => name === 'api' || name === 'new'), false);
 });
 
+test('Option zero switches only the eligible current pane in single and split layouts, even with an IME event', () => {
+  for (const extra of [{ key: '0' }, { key: 'º', code: 'Digit0' }, { key: 'Process', code: 'Digit0', isComposing: true, keyCode: 229 }]) {
+    const event = combo('0', { ctrlKey: false, metaKey: false, altKey: true, ...extra });
+    assert.deepEqual(W.shortcut(event), { view: true });
+  }
+  const f = fixture(), event = () => combo('º', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit0' });
+  assert.equal(f.workspace.handleKey(event()), true); assert.ok(f.calls.some(([name, id]) => name === 'view' && id === 'p1'));
+  f.workspace.add({ key: 'session-b' }); const second = f.attach('p2'); f.calls.length = 0;
+  f.document.fire('window:keydown', event());
+  assert.deepEqual(f.calls.filter(([name]) => name === 'view'), [['view', 'p2']]);
+  f.workspace.handleKey({ ...event(), repeat: true });
+  assert.equal(f.calls.filter(([name]) => name === 'view').length, 1, 'holding the key does not cycle views');
+  second.info.canToggleView = false; assert.equal(f.workspace.handleKey(event(), 'p2'), false);
+  second.info.canToggleView = true; second.info.dialog = true; assert.equal(f.workspace.handleKey(event(), 'p2'), false);
+  assert.equal(W.shortcut(combo('0', { ctrlKey: false, metaKey: false, altKey: true, keyCode: 229 })), null);
+  assert.equal(f.calls.some(([name]) => name === 'api' || name === 'new'), false);
+});
+
 test('Option plus physical pane numbers selects the matching visible pane in any saved configuration', () => {
   for (const saved of [undefined, 'ctrl-meta', 'ctrl-alt-meta']) {
     for (let number = 1; number <= 4; number++) {
@@ -565,7 +623,7 @@ test('a physical Option pane number commits Korean in the original pane before m
 test('the root window capture and visible Option number buttons select the same mounted editor', () => {
   const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
   const tabs = f.nodes.get('workspace-switcher').children;
-  assert.deepEqual(tabs.map(tab => tab.textContent), ['⌥1', '⌥2']);
+  assert.deepEqual(tabs.map(tab => tab.textContent), ['창 1', '창 2']);
   assert.deepEqual(tabs.map(tab => tab.attrs['aria-keyshortcuts']), ['Alt+1', 'Alt+2']);
   const editor = second.info.editor;
   f.workspace.focus('p1', false); f.calls.length = 0;

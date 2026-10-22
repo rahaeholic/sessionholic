@@ -1,6 +1,6 @@
 /* The original single-pane screen keeps its DOM and layout until split. */
 .session-workspace, .workspace-pane { display: contents; }
-.workspace-pane[hidden], .workspace-pane-bar[hidden], #workspace-switcher[hidden], #workspace-drop-cue[hidden] { display: none !important; }
+.workspace-pane[hidden], .workspace-pane-bar[hidden], #workspace-switcher[hidden], #workspace-arrange[hidden], #workspace-drop-cue[hidden] { display: none !important; }
 .workspace-split-open { white-space: nowrap; min-height: 36px; padding: 0 10px; color: var(--accent); }
 .workspace-keys { display: block; width: 100%; min-height: 40px; margin: 8px 0; padding: 8px; border: 1px solid var(--sep); border-radius: 8px; color: var(--label); background: var(--surface); }
 #workspace-switcher { display: flex; gap: 2px; margin-left: auto; }

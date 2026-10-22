@@ -2867,13 +2867,13 @@ li[data-task] {
    and a tall Enter, all within one thumb's reach. */
 .terminal-keys {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(4, minmax(0, 1fr)) repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.3fr);
   grid-template-rows: repeat(2, 42px);
   grid-template-areas:
-    "ctrl k1 k2 k3 k4 meta up   word  enter"
-    "alt  k5 k6 k7 k8 left down right enter";
+    "ctrl k1 k2 k3 k4 meta cup up   word  enter"
+    "alt  k5 k6 k7 k8 .    left down right enter";
   gap: 5px;
-  max-width: 620px;
+  max-width: 680px;
 }
 .terminal-keys button {
   min-width: 0;
@@ -2902,6 +2902,7 @@ li[data-task] {
 .terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
 .terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
 .terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
+.terminal-keys [data-key="ctrl-up"] { grid-area: cup; }
 .terminal-keys [data-key="alt-left"] { grid-area: word; }
 .terminal-keys [data-key="up"] { grid-area: up; }
 .terminal-keys [data-key="left"] { grid-area: left; }
@@ -7545,6 +7546,9 @@ input.switch:focus-visible {
 .work-context-item p, .work-context-scope { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .detail-pane.is-typing .work-context, .detail-pane.is-typing .session-relations { display: none; }
 .detail-terminal-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+/* Native choices and their uncertain delivery receipts stay in the chat view.
+   The visible terminal already owns that menu and its keyboard controls. */
+#detail.is-terminal-mode #chat-prompt { display: none; }
 .detail-pane.is-terminal-mode > :not(.detail-head):not(.detail-mode-tabs):not(.detail-terminal-host):not(.chat-composer):not(.chat-prompt):not(.continue-disclosure) { display: none !important; }
 .session-terminal-empty { height: 100%; min-height: 140px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; text-align: center; color: var(--label-2); background: var(--t-bg); }
 .session-terminal-empty p { max-width: 420px; line-height: 1.6; margin: 0; color: var(--t-label-2); }

@@ -111,6 +111,41 @@ class SessionControlsHTTPTest(unittest.TestCase):
         snapshot = self.httpd.session_removed.decorate(self.board.snapshot())
         self.assertIsNone(snapshot['hosts'][0]['data']['codex'][0]['removedAt'])
 
+    def test_pending_native_receipt_reconciles_then_closes_original_terminal_and_removes_card(self):
+        import session_control
+        import transfer_native
+        root = Path(self.temporary.name).resolve()
+        control = session_control.SessionControl(root, root / 'native-control')
+        selector = {key: self.row.get(key) for key in ('agent', 'id', 'home', 'cwd', 'kind', 'sessionId', 'phase')}
+        record = {'id': self.source['id'], 'home': self.source['home'], 'cwd': self.row['cwd'], 'archived': False}
+        observed = {'source': transfer_native._identity(selector), 'phase': 'closed', 'process': None,
+                    'target': {'record': record}, 'capabilities': {'terminate': {'supported': True, 'method': 'codex-thread-archive'}}}
+        with patch.object(control, '_observe', return_value=observed):
+            preview = control.preview(selector)
+        operations = []
+        def rpc(host, operation, args, **kwargs):
+            operations.append(args.get('receiptOnly', False))
+            if args.get('receiptOnly'):
+                return control.receipt(args['source'], args['action'], args['requestId'])
+            return control.execute(args['source'], args['action'], args['targetProof'], args['requestId'], cleanup_terminals=args['cleanupTerminals'])
+        closed = self.linked_terminals([self.terminal()])
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), patch.object(self.board, 'request_refresh'), \
+                patch.object(control, '_observe', return_value=observed), patch.object(control, '_apply', side_effect=TimeoutError()) as apply:
+            response, first = self.request('/api/session/action', self.action(action='terminate', targetProof=preview['targetProof']))
+            self.assertEqual(response.status, 200, first)
+            self.assertFalse(first['confirmed']); self.assertEqual(closed, [])
+            self.board.state[self.host['name']]['data']['codex'] = []
+            from unittest.mock import MagicMock
+            client = MagicMock(); client.__enter__.return_value = client; client.call.return_value = {'data': [], 'nextCursor': None}
+            with patch.object(session_control.launch, 'saved_codex_thread', return_value=record), \
+                    patch.object(transfer_native, '_client', return_value=client), \
+                    patch.object(transfer_native, '_codex_state', return_value={'phase': 'closed', 'safeToTransfer': True}):
+                response, second = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(response.status, 200, second)
+        self.assertTrue(second['confirmed']); self.assertTrue(second['cleanup']['complete'])
+        self.assertEqual(closed, ['a' * 32]); self.assertEqual(operations, [False, True])
+        self.assertEqual(apply.call_count, 1, 'rechecking never dispatches another termination')
+
     def test_estimated_changed_identity_and_newer_terminals_are_not_closed(self):
         wrong = [{**self.source, **change, 'cwd': change.get('cwd', self.row['cwd'])} for change in (
             {'home': '.codex-other'}, {'host': 'other'}, {'id': str(uuid.uuid4())}, {'cwd': '/other'})]
