@@ -419,3 +419,48 @@ test('a loading pane retains answer intent until restore completes and opens in 
   assert.deepEqual(answers, ['session-b']); assert.equal(f.infos.get('p2').ref.mode, 'terminal');
   f.workspace.changed(); assert.equal(answers.length, 1, 'answer intent is consumed only once');
 });
+
+test('Command+Option direction keys work with every saved modifier setting and keep editing, IME and send keys', () => {
+  for (const saved of [undefined, 'ctrl-meta', 'ctrl-alt-meta']) {
+    for (const [key, direction] of [['ArrowLeft', 'ArrowLeft'], ['ArrowRight', 'ArrowRight'], ['ArrowUp', 'ArrowUp'], ['ArrowDown', 'ArrowDown'],
+      ['UIKeyInputLeftArrow', 'ArrowLeft'], ['UIKeyInputRightArrow', 'ArrowRight'], ['UIKeyInputUpArrow', 'ArrowUp'], ['UIKeyInputDownArrow', 'ArrowDown']]) {
+      const event = combo(key, { ctrlKey: false, altKey: true });
+      assert.deepEqual(W.shortcut(event, saved), { direction });
+    }
+  }
+  for (const extra of [{ isComposing: true }, { keyCode: 229 }, { shiftKey: true }, { metaKey: false }])
+    assert.equal(W.shortcut(combo('ArrowLeft', { ctrlKey: false, altKey: true, ...extra })), null);
+  for (const key of ['Enter', '1', 'a']) assert.equal(W.shortcut(combo(key, { ctrlKey: false, altKey: true })), null);
+});
+
+test('pane movement starts from the document that received the key even before its focus event arrives', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); f.attach('p2');
+  f.workspace.focus('p1', false); f.calls.length = 0;
+  assert.equal(f.workspace.handleKey(combo('ArrowLeft'), 'p2'), true);
+  assert.ok(f.calls.some(([name, id]) => name === 'focus' && id === 'p1'));
+  assert.equal(f.workspace.handleKey(combo('ArrowRight'), 'removed-pane'), false);
+});
+
+test('embedded textarea and xterm Command+Option keys are captured before CLI input and use their own pane', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  const listeners = new Map(), childDocument = { body: { classList: { add() {} } },
+    addEventListener(name, fn, capture) { listeners.set(name, { fn, capture }); } };
+  const childWindow = second.frame.contentWindow;
+  Object.assign(childWindow, { document: childDocument, location: { pathname: '/pane', search: '?pane=p2', origin: f.window.location.origin }, parent: f.window });
+  vm.runInNewContext(source, { window: childWindow, URLSearchParams, console, Set, Map, Date, Promise });
+  childWindow.SessionholicWorkspace.init(second.child);
+  assert.equal(listeners.get('keydown').capture, true);
+  for (const target of [{ tagName: 'TEXTAREA', id: 'chat-input' }, { className: 'xterm-helper-textarea', id: 'xterm' }]) {
+    f.workspace.focus('p1', false); f.calls.length = 0;
+    const event = combo('ArrowLeft', { ctrlKey: false, altKey: true, target });
+    listeners.get('keydown').fn(event);
+    assert.ok(event.prevented && event.stopped);
+    assert.ok(f.calls.some(([name, id]) => name === 'focus' && id === 'p1'));
+    assert.equal(f.calls.some(([name]) => name === 'api'), false);
+  }
+  second.info.dialog = true;
+  const event = combo('ArrowLeft', { ctrlKey: false, altKey: true }); listeners.get('keydown').fn(event);
+  assert.equal(event.prevented, undefined);
+  const single = fixture(), singleKey = combo('ArrowLeft', { ctrlKey: false, altKey: true });
+  assert.equal(single.workspace.handleKey(singleKey), false); assert.equal(singleKey.prevented, undefined);
+});

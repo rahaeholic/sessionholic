@@ -10785,8 +10785,8 @@ function chooseDetailMode(mode) {
 }
 function buildModeTabs(choose, chatControls = "messages") {
   const tabs = el("div", "detail-mode-tabs"); tabs.id = "detail-mode-tabs";
-  tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "작업 보기 방식");
-  for (const [mode, label, controls] of [["terminal", "작업", "detail-terminal-host"], ["chat", "기록", chatControls]]) {
+  tabs.setAttribute("role", "tablist"); tabs.setAttribute("aria-label", "터미널과 채팅 보기");
+  for (const [mode, label, controls] of [["terminal", "터미널", "detail-terminal-host"], ["chat", "채팅", chatControls]]) {
     const tab = button(label, "detail-mode-tab", () => choose(mode));
     tab.id = `detail-mode-${mode}`; tab.setAttribute("role", "tab");
     tab.setAttribute("aria-controls", controls); tab.setAttribute("aria-selected", String(mode === "terminal"));

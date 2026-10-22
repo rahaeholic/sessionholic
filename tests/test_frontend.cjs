@@ -14606,8 +14606,8 @@ test('기본 작업 보기는 기존 exact 터미널만 재사용하며 입력 D
   assert.equal(c.get('chat-input'), input); assert.equal(input.value, entry.text);
   assert.equal(blurred, 0); assert.equal(entry.composing, true);
   assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.chatVisible(), true);
-  assert.equal(c.get('detail-mode-terminal').textContent, '작업');
-  assert.equal(c.get('detail-mode-chat').textContent, '기록');
+  assert.equal(c.get('detail-mode-terminal').textContent, '터미널');
+  assert.equal(c.get('detail-mode-chat').textContent, '채팅');
 });
 
 test('기록 선택과 복원은 실행을 시작하지 않고 공통 작성·승인 UI를 유지한다', async () => {

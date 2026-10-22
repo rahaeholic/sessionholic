@@ -78,8 +78,14 @@
       }).sort((a, b) => a.score - b.score)[0]?.id || null;
   }
   function shortcut(event, modifiers = "ctrl-meta") {
-    if (!event.ctrlKey || !event.metaKey || !!event.altKey !== (modifiers === "ctrl-alt-meta") || event.shiftKey || event.isComposing || event.keyCode === 229) return null;
-    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return { direction: event.key };
+    if (event.shiftKey || event.isComposing || event.keyCode === 229) return null;
+    const key = ({ UIKeyInputLeftArrow: "ArrowLeft", UIKeyInputRightArrow: "ArrowRight",
+      UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown" })[event.key] || event.key;
+    const direction = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key);
+    const commandOption = !event.ctrlKey && event.metaKey && event.altKey && direction;
+    const configured = event.ctrlKey && event.metaKey && !!event.altKey === (modifiers === "ctrl-alt-meta");
+    if (!commandOption && !configured) return null;
+    if (direction) return { direction: key };
     if (event.key === "Enter") return { maximize: true };
     const digit = /^Digit([1-4])$/.exec(event.code || "")?.[1] || (/^[1-4]$/.test(event.key) ? event.key : null);
     return digit ? { number: Number(digit) } : null;
@@ -300,12 +306,13 @@
   function maximize() { maximized = !maximized; layout(); }
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));
-    if (!action || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
+    if (!action || !ids(tree).includes(id) || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
+    if (!event.ctrlKey && event.metaKey && event.altKey && ids(tree).length < 2) return false;
     if (event.repeat && action.maximize) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
     event.preventDefault(); event.stopImmediatePropagation();
     if (action.maximize) { if (ids(tree).length > 1) maximize(); }
     else {
-      const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, active, action.direction);
+      const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, id, action.direction);
       if (target) focus(target);
     }
     return true;
