@@ -23,7 +23,7 @@ CODEX = {'schema_version': 1, 'accounts': [
     {'key': 'beta', 'status': 'login_required', 'windows': {}},
     {'key': 'gamma', 'status': 'skipped'}]}
 CLAUDE = {'schema_version': 1, 'status': 'ready', 'usage': {'windows': {
-    'five_hour': {'used_percentage': 14, 'resets_at': '2026-10-10T06:29:59Z'},
+    'five_hour': {'used_percentage': 30, 'resets_at': '2026-10-10T06:29:59Z'},
     'seven_day': {'used_percentage': 16, 'resets_at': '2026-10-14T22:59:59Z'}}}}
 
 
@@ -74,9 +74,18 @@ class UsageMeterTest(unittest.TestCase):
         self.assertEqual(codex['rows'][0]['windows'][0]['remaining'], None)
         self.assertEqual(codex['rows'][1]['note'], '로그인 필요')
         self.assertEqual(codex['rows'][1]['windows'], [])
+        # The summary follows the weekly window even when the 5-hour one has less left.
         self.assertEqual((claude['short'], claude['remaining']), ('CC', 84))
-        self.assertEqual([w['remaining'] for w in claude['rows'][0]['windows']], [86, 84])
+        self.assertEqual([(w['label'], w['remaining']) for w in claude['rows'][0]['windows']], [('7일', 84), ('5시간', 70)])
         self.assertIsNotNone(data['fetchedAt'])
+
+    def test_claude_summary_uses_the_5_hour_window_only_without_a_weekly_value(self):
+        five_only = {'schema_version': 1, 'status': 'ready', 'usage': {'windows': {
+            'five_hour': {'used_percentage': 30, 'resets_at': None}, 'seven_day': None}}}
+        meter, _, _, _ = self.meter([CODEX, five_only])
+        claude = meter.snapshot(refresh=True)['providers'][1]
+        self.assertEqual(claude['remaining'], 70)
+        self.assertEqual([w['remaining'] for w in claude['rows'][0]['windows']], [None, 70])
 
     def test_reads_are_spaced_and_failures_keep_marked_last_good_values(self):
         meter, calls, clock, _ = self.meter([CODEX, CLAUDE, None, {'schema_version': 1, 'status': 'unavailable'}])
