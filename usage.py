@@ -180,11 +180,12 @@ class UsageMeter:
                     "note": STATUS.get(data.get("status"), "조회 실패")}
         windows = ((data.get("usage") or {}).get("windows")) or {}
         entries = []
-        for field, label in (("five_hour", "5시간"), ("seven_day", "7일")):
+        # The weekly window leads; the 5-hour one stands in only when no weekly value is given.
+        for field, label in (("seven_day", "7일"), ("five_hour", "5시간")):
             window = windows.get(field)
             used = self.remaining((window or {}).get("used_percentage"))
             entries.append({"label": label, "remaining": None if used is None else 100 - used,
                             "resetsAt": self.reset((window or {}).get("resets_at"))})
         values = [entry["remaining"] for entry in entries if entry["remaining"] is not None]
-        return {**base, "remaining": min(values) if values else None, "status": "ready", "note": None,
+        return {**base, "remaining": values[0] if values else None, "status": "ready", "note": None,
                 "rows": [{"name": "Claude Code", "status": "ready", "note": None, "credits": None, "windows": entries}]}
