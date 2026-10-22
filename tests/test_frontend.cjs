@@ -117,6 +117,7 @@ function client(
     Uint8Array,
     TextEncoder,
     AbortController,
+    AbortSignal: new AbortController().signal.constructor,
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
@@ -1216,7 +1217,7 @@ test("terminal reconnect preserves epoch and handles reset output in one respons
     },
   };
   await c.startTerminalReader();
-  assert.match(calls[0], /after=42&wait=20&epoch=old-epoch/);
+  assert.match(calls[0], /after=42&wait=10&epoch=old-epoch&fresh=1/);
   assert.equal(reset, 1);
   assert.deepEqual(output, ["가나다"]);
   assert.equal(c.state.terminalAfter, 3);
@@ -1255,7 +1256,7 @@ test("stop and resume during an xterm write callback continue after queued outpu
   await first;
   const requests = calls.filter((url) => url.includes("/events"));
   assert.equal(requests.length, 2);
-  assert.match(requests[1], /after=3&wait=20&epoch=epoch-1/);
+  assert.match(requests[1], /after=3&wait=10&epoch=epoch-1&fresh=1/);
   assert.deepEqual(output, ["가", "나"]);
   assert.equal(c.state.terminalAfter, 6);
 });
@@ -15082,4 +15083,115 @@ test('device menu stays anchored to its button and clamps within the current pan
   vm.runInContext('positionBoardStatusPanel()', c.context);
   assert.equal(writes['--status-panel-shift'], '-232px'); assert.equal(panel.style.maxHeight, '270px');
   assert.equal(panel.focusCount, undefined);
+});
+
+test('terminal reads have a cancellable deadline even without AbortSignal.timeout', async () => {
+  const timers = [], aborted = [];
+  const c = client((url, options) => new Promise((resolve, reject) => {
+    options.signal?.addEventListener('abort', () => { aborted.push(url); reject(Object.assign(Error('aborted'), { name: 'AbortError' })); });
+  }), { setTimeout(fn, ms) { timers.push({ fn, ms, cleared: false }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  c.context.AbortSignal = undefined;
+  const pending = c.api('/api/terminal/fixture/events', { timeout: 15000 });
+  assert.equal(timers.length, 1, 'a legacy browser must not wait forever');
+  assert.equal(timers[0].ms, 15000); timers[0].fn();
+  await assert.rejects(pending, (err) => err.timeout === true);
+  assert.equal(aborted.length, 1); assert.equal(timers[0].cleared, true);
+  const caller = new AbortController();
+  const cancelled = c.api('/api/terminal/fixture/events', { timeout: 15000, signal: caller.signal });
+  caller.abort(); await assert.rejects(cancelled, (err) => err.name === 'AbortError' && !err.timeout);
+  assert.equal(timers[1].cleared, true);
+});
+
+test('a resumed terminal requests the current screen instead of replaying a valid old ANSI cursor', async () => {
+  const requests = [], limits = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200,
+    json: async () => ({ after: 101, epoch: 'same', alive: false }) }; }, noChatTimers);
+  c.context.AbortSignal = { timeout(ms) { limits.push(ms); return new AbortController().signal; } };
+  c.state.terminal = { id: 'resume-current' }; c.state.terminalVisible = true; c.state.term = {};
+  c.state.terminalAfter = 100; c.state.terminalEpoch = 'same';
+  await c.startTerminalReader();
+  assert.match(requests[0], /fresh=1/); assert.match(requests[0], /wait=10/);
+  assert.equal(limits[0], 15000);
+});
+
+test('an exhausted terminal read retries later without replacing drafts, composition or the microphone', async () => {
+  let reads = 0; const timers = [];
+  const c = client(async (url, options) => { if (++reads <= 7) throw Error('temporary read outage');
+    if (reads > 8) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => reject(Object.assign(Error('aborted'), { name: 'AbortError' }))));
+    return { ok: true, status: 200, json: async () => ({ after: 50, epoch: 'now', alive: true }) }; },
+    { setTimeout(fn, ms) { const id = timers.push({ fn, ms, cleared: false }); if (ms < 30000) queueMicrotask(fn); return id; },
+      clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  c.state.authenticated = true; c.state.terminal = { id: 'retry-later' }; c.state.terminalVisible = true; c.state.term = {};
+  const input = c.get('chat-input'); input.value = '한글 조합 중';
+  const mic = c.state.dictation = { fixture: true }; c.state.composing = true;
+  await c.startTerminalReader(); assert.equal(reads, 7);
+  const later = timers.find((timer) => timer.ms === 30000 && !timer.cleared);
+  assert.ok(later, 'read retry exhaustion must not permanently stop an open terminal');
+  const resumed = later.fn(); await settle(); assert.equal(reads, 9); assert.equal(c.state.connected, true);
+  assert.equal(c.state.terminalAfter, 50);
+  assert.equal(c.get('chat-input'), input); assert.equal(input.value, '한글 조합 중');
+  assert.equal(c.state.composing, true); assert.equal(c.state.dictation, mic);
+  c.stopTerminalReader(); await resumed;
+});
+
+test('automatic terminal recovery cannot clear an uncertain input lock or send another key', async () => {
+  const calls = []; const c = client(async (url) => { calls.push(url); return { ok: true, status: 200,
+    json: async () => ({ after: 1, epoch: 'still-same', alive: false }) }; }, noChatTimers);
+  c.state.authenticated = true; c.state.terminal = { id: 'uncertain-input' }; c.state.terminalVisible = true;
+  c.state.term = {}; c.state.inputFailed = true;
+  await c.startTerminalReader();
+  assert.equal(c.state.inputFailed, true); assert.deepEqual(calls, []);
+});
+
+test('late terminal recovery timers cannot read after hide, stop, session replacement or authentication change', async () => {
+  for (const change of ['stop', 'hidden', 'terminal', 'auth', 'input']) {
+    const timers = []; let reads = 0;
+    const c = client(async () => { reads++; throw Error('outage'); },
+      { setTimeout(fn, ms) { const id = timers.push({ fn, ms, cleared: false }); if (ms < 30000) queueMicrotask(fn); return id; },
+        clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+    c.state.authenticated = true; c.state.terminal = { id: 'before' }; c.state.terminalVisible = true; c.state.term = {};
+    await c.startTerminalReader(); const later = timers.find((timer) => timer.ms === 30000);
+    assert.ok(later);
+    if (change === 'stop') { c.stopTerminalReader(); assert.equal(later.cleared, true); }
+    if (change === 'hidden') c.context.document.hidden = true;
+    if (change === 'terminal') c.state.terminal = { id: 'after' };
+    if (change === 'auth') c.beginAuthEpoch();
+    if (change === 'input') c.state.inputFailed = true;
+    await later.fn(); await settle(); assert.equal(reads, 7, change);
+    c.stopTerminalReader();
+  }
+});
+
+test('foreground recovery aborts an overdue read once and immediately gets a fresh screen, while healthy reads are shared', async () => {
+  let now = 1000; const requests = []; let stopped = false;
+  const c = client((url, options) => {
+    requests.push(url);
+    if (requests.length === 1) return new Promise((resolve, reject) => options.signal.addEventListener('abort', () => {
+      stopped = true; reject(Object.assign(Error('old read'), { name: 'AbortError' }));
+    }));
+    return Promise.resolve({ ok: true, status: 200, json: async () => ({ after: 20, epoch: 'now', alive: false }) });
+  }, noChatTimers);
+  c.context.Date = class extends Date { static now() { return now; } };
+  c.state.authenticated = true; c.state.terminal = { id: 'foreground' }; c.state.terminalVisible = true; c.state.term = {};
+  c.state.terminalAfter = 5; c.state.terminalEpoch = 'old';
+  const old = c.startTerminalReader();
+  await vm.runInContext('resumeTerminalReader()', c.context); assert.equal(requests.length, 1);
+  now += 15000;
+  await vm.runInContext('resumeTerminalReader()', c.context); await old;
+  assert.equal(stopped, true); assert.match(requests[1], /fresh=1/); assert.equal(c.state.terminalAfter, 20);
+});
+
+test('a healthy terminal stays incremental after its fresh frame and read errors trigger a new current screen', async () => {
+  const requests = []; const c = client(async (url) => {
+    if (!url.includes('/events')) return { ok: true, status: 200, json: async () => ({ terminals: [] }) };
+    requests.push(url);
+    if (requests.length === 2) throw Error('one dropped read');
+    return { ok: true, status: 200, json: async () => ({ after: requests.length, epoch: 'screen', alive: requests.length < 4 }) };
+  }, { setTimeout(fn, ms) { if (ms < 30000) queueMicrotask(fn); return 1; }, clearTimeout() {} });
+  c.state.terminal = { id: 'increments' }; c.state.terminalVisible = true; c.state.term = {};
+  await c.startTerminalReader();
+  assert.match(requests[0], /fresh=1/); assert.doesNotMatch(requests[1], /fresh=1/);
+  assert.match(requests[2], /fresh=1/); assert.doesNotMatch(requests[3], /fresh=1/);
+  assert.equal(c.state.terminalAfter, 4);
 });

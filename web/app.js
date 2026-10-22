@@ -226,6 +226,8 @@ const state = {
   terminalScreenSize: null,
   terminalRun: 0,
   terminalAbort: null,
+  terminalReconnectTimer: null,
+  terminalReadStartedAt: 0,
   connected: false,
   terminalAlive: true,
   terminalManualReconnect: false,
@@ -1008,13 +1010,19 @@ function apiPathname(path) {
 function apiTimeout(path, method) {
   return API_PATH_TIMEOUT_MS[apiPathname(path)] ?? API_TIMEOUT_MS[method] ?? API_TIMEOUT_MS.POST;
 }
-// The caller's signal and the time limit, as one. A browser without
-// AbortSignal.timeout keeps the old behaviour (no limit).
+// The caller's signal and the time limit, as one, including older WebKit.
 function apiSignal(signal, timeout) {
-  const limit = timeout > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-    ? AbortSignal.timeout(timeout) : null;
+  let timer = null, limit = null;
+  if (timeout > 0) {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") limit = AbortSignal.timeout(timeout);
+    else {
+      const deadline = new AbortController();
+      limit = deadline.signal;
+      timer = setTimeout(() => deadline.abort(), timeout);
+    }
+  }
   if (!limit) return { signal, limit: null, release() {} };
-  if (!signal) return { signal: limit, limit, release() {} };
+  if (!signal) return { signal: limit, limit, release() { clearTimeout(timer); } };
   const controller = new AbortController();
   const abort = () => controller.abort();
   for (const source of [signal, limit]) {
@@ -1023,6 +1031,7 @@ function apiSignal(signal, timeout) {
   }
   // A caller's signal outlives many requests (a terminal reader's): each takes its listener back.
   const release = () => {
+    clearTimeout(timer);
     for (const source of [signal, limit]) source.removeEventListener?.("abort", abort);
   };
   return { signal: controller.signal, limit, release };
@@ -10347,6 +10356,9 @@ function stopTerminalReader() {
   state.terminalRun++;
   state.terminalAbort?.abort();
   state.terminalAbort = null;
+  clearTimeout(state.terminalReconnectTimer);
+  state.terminalReconnectTimer = null;
+  state.terminalReadStartedAt = 0;
   state.connected = false;
 }
 function saveDraft() {
@@ -11403,10 +11415,21 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
   startTerminalReader();
 }
 const TERMINAL_RETRIES = 6;
-async function startTerminalReader() {
+const TERMINAL_READ_TIMEOUT_MS = 15000;
+const TERMINAL_RECONNECT_MS = 30000;
+function resumeTerminalReader() {
+  if (!state.authenticated || document.hidden || !state.terminalVisible || !state.terminalAlive ||
+      state.terminal?.closed || state.inputFailed || networkOffline() || window.SessionholicWorkspace?.visible() === false) return;
+  if (!state.terminalAbort || state.terminalAbort.signal.aborted || state.terminalReconnectTimer !== null ||
+      !state.connected && state.terminalRetry > 0 ||
+      state.terminalReadStartedAt && Date.now() - state.terminalReadStartedAt >= TERMINAL_READ_TIMEOUT_MS)
+    return startTerminalReader();
+}
+async function startTerminalReader({ manual = false } = {}) {
   if (window.SessionholicWorkspace?.visible() === false) return;
   if (networkOffline()) return;
   if (!state.terminal || !state.terminalVisible || document.hidden) return;
+  if (state.inputFailed && !manual) return;
   if (!state.terminalAlive || state.terminal.closed) {
     showTerminalEnded();
     renderTerminalReturn();
@@ -11415,28 +11438,34 @@ async function startTerminalReader() {
   stopTerminalReader();
   const run = state.terminalRun;
   const id = state.terminal.id;
+  const authEpoch = state.authEpoch;
   const controller = new AbortController();
   state.terminalAbort = controller;
   state.inputFailed = false;
   state.inputEpoch++;
   terminalError();
   terminalStatus("터미널에 연결하고 있습니다…", false, { manualReconnect: false });
+  // A resumed page needs the current screen, not minutes of queued ANSI history.
+  let freshScreen = true;
   while (
     run === state.terminalRun &&
     state.terminalVisible &&
     !document.hidden
   ) {
     try {
-      // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever:
-      // the server answers within 20 seconds, so 35 without one is a lost connection.
+      // The server waits at most ten seconds. A lost connection is bounded even
+      // on browsers without the native timeout API.
+      state.terminalReadStartedAt = Date.now();
       const result = await api(
-        `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : "&fresh=1"}`,
-        { signal: controller.signal, timeout: 35000 },
+        `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=10${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : ""}${freshScreen || !state.terminalEpoch ? "&fresh=1" : ""}`,
+        { signal: controller.signal, timeout: TERMINAL_READ_TIMEOUT_MS },
       );
       if (run !== state.terminalRun) return;
+      state.terminalReadStartedAt = 0;
       // A malformed reply counts as a failed read, so it can never spin this loop.
       if (!result || !Number.isFinite(Number(result.after)))
         throw new Error("터미널 응답 형식이 올바르지 않습니다.");
+      freshScreen = false;
       state.terminalRetry = 0;
       const screen = state.term;
       if (Number.isInteger(result.cols) && result.cols >= 2 && result.cols <= 500 &&
@@ -11489,6 +11518,8 @@ async function startTerminalReader() {
         err.unauthorized || err.staleAuth
       )
         return;
+      state.terminalReadStartedAt = 0;
+      freshScreen = true;
       // Reading output is cursor based and safe to repeat; queued input is
       // still invalidated so an uncertain keystroke is never sent twice.
       state.inputEpoch++;
@@ -11498,8 +11529,17 @@ async function startTerminalReader() {
         state.terminalRetry = 0;
         terminalStatus("연결을 확인할 수 없습니다.", false, { manualReconnect: true });
         terminalError(
-          "새 입력은 보내지 않습니다. 실행 상태를 확인하려면 다시 연결해 주세요.",
+          "새 입력은 보내지 않습니다. 자동으로 다시 연결합니다. 초안은 유지됩니다.",
         );
+        if (!networkOffline()) {
+          const reconnect = setTimeout(() => {
+            if (run !== state.terminalRun || authEpoch !== state.authEpoch || state.terminal?.id !== id ||
+                state.terminalReconnectTimer !== reconnect) return;
+            state.terminalReconnectTimer = null;
+            if (state.authenticated) return startTerminalReader();
+          }, TERMINAL_RECONNECT_MS);
+          state.terminalReconnectTimer = reconnect;
+        }
         return;
       }
       terminalStatus(`연결이 끊겨 다시 연결하는 중… (${attempt}/${TERMINAL_RETRIES})`);
@@ -13634,7 +13674,7 @@ function recoverConnection() {
   if (document.hidden || state.loginBusy) return;
   if (!state.snapshot) $("login-error").textContent = "";
   if (state.terminalVisible) {
-    terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결하고 있습니다…");
+    if (!state.inputFailed) terminalStatus("네트워크 연결이 돌아왔습니다. 다시 연결하고 있습니다…");
     state.terminalRetry = 0;
     startTerminalReader();
     if (boardCovered()) return;
@@ -13901,6 +13941,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("terminal-viewport").addEventListener("pointerdown", activateTerminalSizing);
   window.addEventListener("blur", () => { state.terminalSizingId = null; });
   window.addEventListener("focus", () => {
+    resumeTerminalReader();
     if (document.activeElement?.id === "chat-input" && sessionComposerTerminal() ||
         document.activeElement?.closest?.("#terminal-screen")) activateTerminalSizing();
   });
@@ -14111,7 +14152,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("terminal-reopen").addEventListener("click", reopenEndedTerminal);
   $("terminal-reconnect").addEventListener("click", () => {
     state.lastSize = "";
-    startTerminalReader();
+    startTerminalReader({ manual: true });
   });
   $("terminal-bottom").addEventListener("click", terminalScrollEnd);
   $("terminal-live").addEventListener("click", terminalScrollEnd);

@@ -36,7 +36,7 @@ function client(fetchImpl, storage = new Map()) {
     return value;
   }
   const state = { authenticated: true, authEpoch: 1, csrf: 'synthetic-csrf', pollBusy: false, terminalsRefreshing: false, runtimeObservations: new Map() };
-  const context = vm.createContext({ console, state, el, clearTimeout() {}, $: (id) => nodes.get(id),
+  const context = vm.createContext({ console, state, el, AbortController, AbortSignal, clearTimeout() {}, $: (id) => nodes.get(id),
     sessionStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
     document: { body: el('body') }, window: { SessionholicGoals: { async refresh() { counts.refresh++; } } },
     button(text, className, callback) { const value = el('button', className, text); value.events.click = callback; return value; },
