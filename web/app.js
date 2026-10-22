@@ -104,6 +104,8 @@ const RECENT_SECONDS = 3 * 24 * 3600;
 // changes only this object (distances in CSS px, times in ms, speeds in px/ms).
 // Conversations open with their bars folded (집중 모드); 집중 모드 해제 or a tap brings them back.
 const CONVERSATION_OPENS_FOCUSED = true;
+const TERMINAL_DEFAULT_FONT_SIZE = 15;
+const TERMINAL_LINE_HEIGHT = 1.35;
 const GESTURE = Object.freeze({
   longPressMs: 450, // a press held this long opens the menu (cards, messages)
   pressSlopPx: 10, // drift allowed before a press becomes a drag (long press, swipe, pull)
@@ -221,6 +223,7 @@ const state = {
   fit: null,
   terminalAfter: 0,
   terminalEpoch: null,
+  terminalScreenSize: null,
   terminalRun: 0,
   terminalAbort: null,
   connected: false,
@@ -238,8 +241,9 @@ const state = {
   closingTerminal: null,
   terminalCloseBusy: false,
   resizeTimer: null,
+  resizePending: null,
   lastSize: "",
-  fontSize: prefs.get("fontSize", 14),
+  fontSize: clampFontSize(prefs.get("fontSize", TERMINAL_DEFAULT_FONT_SIZE)),
   // A wide screen shows the terminal beside the conversation ("나란히"); "크게" covers the board.
   terminalDock: prefs.get("terminalDock", true) !== false,
   inlineTerminal: null,
@@ -10543,12 +10547,46 @@ function bindDraftInput(node) {
   node.addEventListener("compositionend", endDraftComposition);
   node.addEventListener("paste", pasteTerminalFiles);
 }
-// Korean needs monospace fallbacks that keep two-cell glyphs aligned. Only
-// fonts already on the device are named; no web font is bundled.
-const TERMINAL_FONT = 'ui-monospace, SFMono-Regular, Menlo, Consolas, D2Coding, "D2Coding ligature", ' +
+// One bundled face keeps Hangul exactly two Latin cells on every device.
+// System fonts remain available when the bounded first-open load fails.
+const TERMINAL_FONT = '"Sessionholic Terminal", ui-monospace, SFMono-Regular, Menlo, Consolas, D2Coding, "D2Coding ligature", ' +
   '"Nanum Gothic Coding", NanumGothicCoding, "Noto Sans Mono CJK KR", "Source Han Mono K", "Sarasa Mono K", monospace';
+let terminalFontsLoading = null;
+let terminalFontsReady = false;
+function loadTerminalFonts() {
+  if (terminalFontsLoading) return terminalFontsLoading;
+  const Face = globalThis.FontFace, fonts = document.fonts;
+  if (typeof Face !== "function" || typeof fonts?.add !== "function") {
+    terminalFontsReady = true;
+    return Promise.resolve(false);
+  }
+  terminalFontsLoading = new Promise((resolve) => {
+    let settled = false;
+    const finish = (faces) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      // No font is installed after a timeout: a late change would invalidate
+      // xterm's measured cell widths while someone is typing.
+      try {
+        if (faces) for (const face of faces) fonts.add(face);
+      } catch {
+        for (const face of faces || []) fonts.delete?.(face);
+        faces = null;
+      }
+      terminalFontsReady = true;
+      resolve(!!faces);
+    };
+    const timer = setTimeout(() => finish(null), 5000);
+    try {
+      const faces = [["regular", "400"], ["bold", "700"]].map(([style, weight]) =>
+        new Face("Sessionholic Terminal", `url("${assetUrl(`/vendor/d2coding-${style}.woff2`)}") format("woff2")`, { weight, style: "normal" }));
+      Promise.all(faces.map((face) => face.load())).then(() => finish(faces), () => finish(null));
+    } catch { finish(null); }
+  });
+  return terminalFontsLoading;
+}
 function clampFontSize(size) {
-  return Math.max(GESTURE.pinchMinFont, Math.min(GESTURE.pinchMaxFont, Math.round(Number(size) || 14)));
+  return Math.max(GESTURE.pinchMinFont, Math.min(GESTURE.pinchMaxFont, Math.round(Number(size) || TERMINAL_DEFAULT_FONT_SIZE)));
 }
 // A−/A+ and the pinch share one range and one stored preference.
 function setTerminalFontSize(size, { persist = true } = {}) {
@@ -10576,25 +10614,39 @@ function fitTerminal() {
   if (window.SessionholicWorkspace?.visible() === false) return;
   measureTerminalTools();
   if (!state.term || !state.terminalVisible || !state.fit) return;
+  let dimensions;
   try {
-    state.fit.fit();
+    // Once the server reports its grid, keep rendering at that grid until it
+    // accepts a resize. Passive viewers must not independently rewrap ANSI.
+    if (state.terminalScreenSize && state.fit.proposeDimensions)
+      dimensions = state.fit.proposeDimensions();
+    else {
+      state.fit.fit();
+      dimensions = { cols: state.term.cols, rows: state.term.rows };
+    }
   } catch {
     return;
   }
-  clearTimeout(state.resizeTimer);
+  if (!dimensions) return;
+  const { cols, rows } = dimensions;
   const terminal = state.terminal, openRun = state.terminalOpenRun;
+  const size = `${cols}x${rows}`;
+  const previous = state.resizePending;
+  if (previous?.terminal === terminal && previous.openRun === openRun && previous.size === size) return;
+  clearTimeout(state.resizeTimer);
+  const pending = { terminal, openRun, size };
+  state.resizePending = pending;
   const current = () => state.terminal === terminal && state.terminalOpenRun === openRun && state.terminalVisible;
   state.resizeTimer = setTimeout(async () => {
-    if (!current() || !state.connected || !terminal || !state.term || state.terminalSizingId !== terminal.id ||
-        document.hasFocus?.() === false || window.SessionholicWorkspace?.readingActive() === false) return;
-    const size = `${state.term.cols}x${state.term.rows}`;
-    if (size === state.lastSize) return;
     try {
+      if (!current() || !state.connected || !terminal || !state.term || state.terminalSizingId !== terminal.id ||
+          document.hasFocus?.() === false || window.SessionholicWorkspace?.readingActive() === false) return;
+      if (size === state.lastSize) return;
       await api(
         `/api/terminal/${encodeURIComponent(terminal.id)}/resize`,
         {
           method: "POST",
-          body: { cols: state.term.cols, rows: state.term.rows },
+          body: { cols, rows },
         },
       );
       if (current()) state.lastSize = size;
@@ -10602,6 +10654,8 @@ function fitTerminal() {
       // An ended terminal has nothing to fit: its own end notice stays.
       if (current() && !err.unauthorized && !err.staleAuth && state.terminalAlive !== false)
         terminalError("터미널 크기를 맞추지 못했습니다. 다시 연결해 주세요.");
+    } finally {
+      if (state.resizePending === pending) state.resizePending = null;
     }
   }, 180);
 }
@@ -10890,7 +10944,7 @@ function leaveInlineTerminal({ loadChat = true } = {}) {
 // chrome: the viewport's padding, xterm's scrollbar and the dock's border.
 const DOCK = { cols: 80, minCols: 64, share: 0.45, minChat: 420, withList: 820, chrome: 34 };
 function terminalCellWidth() {
-  const size = state.fontSize || 14;
+  const size = state.fontSize || TERMINAL_DEFAULT_FONT_SIZE;
   try {
     state.cellCanvas ||= document.createElement("canvas");
     const context = state.cellCanvas.getContext?.("2d");
@@ -11095,8 +11149,8 @@ function xtermReady() {
   return !!(window.Terminal && window.FitAddon) && xtermLoaded.has("/vendor/xterm.css");
 }
 function loadXterm() {
-  if (xtermReady()) return Promise.resolve();
   if (xtermLoading) return xtermLoading;
+  if (xtermReady()) return loadTerminalFonts();
   const head = document.head;
   if (typeof head?.appendChild !== "function")
     return Promise.reject(new Error("터미널 화면 파일을 불러올 수 없습니다."));
@@ -11119,13 +11173,14 @@ function loadXterm() {
     ["/vendor/xterm.js", "script", { src: assetUrl("/vendor/xterm.js"), async: false }, () => !!window.Terminal],
     ["/vendor/addon-fit.js", "script", { src: assetUrl("/vendor/addon-fit.js"), async: false }, () => !!window.FitAddon],
   ];
-  xtermLoading = Promise.all(assets.filter(([path]) => !xtermLoaded.has(path)).map((asset) => add(...asset))).then(() => {
+  xtermLoading = Promise.all(assets.filter(([path]) => !xtermLoaded.has(path)).map((asset) => add(...asset))).then(async () => {
     if (!window.Terminal || !window.FitAddon) {
       xtermLoaded.delete("/vendor/xterm.js");
       xtermLoaded.delete("/vendor/addon-fit.js");
       throw new Error("터미널 화면 파일이 올바르지 않습니다.");
     }
     if (!xtermReady()) throw new Error("터미널 화면 파일을 받지 못했습니다.");
+    await loadTerminalFonts();
   }).catch((err) => {
     xtermLoading = null;
     throw err;
@@ -11229,7 +11284,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
     showTerminalEnded();
     return;
   }
-  if (!xtermReady()) {
+  if (!xtermReady() || !terminalFontsReady) {
     const viewport = $("terminal-viewport");
     viewport.classList?.add("is-loading");
     terminalStatus("터미널 화면을 불러오고 있습니다…");
@@ -11255,12 +11310,19 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
     state.term?.dispose();
     state.terminalAfter = 0;
     state.terminalEpoch = null;
+    state.terminalScreenSize = null;
     state.lastSize = "";
     $("terminal-viewport").replaceChildren();
     state.term = new Terminal({
+      cols: 120,
+      rows: 30,
       fontFamily: TERMINAL_FONT,
       fontSize: state.fontSize,
-      lineHeight: 1.2,
+      fontWeight: "400",
+      fontWeightBold: "700",
+      lineHeight: TERMINAL_LINE_HEIGHT,
+      letterSpacing: 0,
+      minimumContrastRatio: 4.5,
       cursorBlink: true,
       scrollback: 5000,
       screenReaderMode: state.screenReaderMode,
@@ -11336,7 +11398,7 @@ async function startTerminalReader() {
       // A silently dropped connection (Wi-Fi to LTE) must not hold the long poll forever:
       // the server answers within 20 seconds, so 35 without one is a lost connection.
       const result = await api(
-        `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : ""}`,
+        `/api/terminal/${encodeURIComponent(id)}/events?after=${state.terminalAfter}&wait=20${state.terminalEpoch ? `&epoch=${encodeURIComponent(state.terminalEpoch)}` : "&fresh=1"}`,
         { signal: controller.signal, timeout: 35000 },
       );
       if (run !== state.terminalRun) return;
@@ -11345,6 +11407,11 @@ async function startTerminalReader() {
         throw new Error("터미널 응답 형식이 올바르지 않습니다.");
       state.terminalRetry = 0;
       const screen = state.term;
+      if (Number.isInteger(result.cols) && result.cols >= 2 && result.cols <= 500 &&
+          Number.isInteger(result.rows) && result.rows >= 2 && result.rows <= 300 && screen.resize) {
+        screen.resize(result.cols, result.rows);
+        state.terminalScreenSize = { cols: result.cols, rows: result.rows };
+      }
       const commitCursor = () => {
         if (state.terminal?.id !== id || state.term !== screen) return;
         state.terminalAfter = Number.isFinite(Number(result.after))
@@ -11354,7 +11421,7 @@ async function startTerminalReader() {
       };
       if (result.reset) {
         screen.reset();
-        terminalError(
+        if (!result.redrawn) terminalError(
           "최근 출력부터 다시 연결했습니다. 이전 대화는 보드에서 확인할 수 있습니다.",
         );
       }
@@ -11524,7 +11591,7 @@ function configureTerminalKeyboard() {
   else field.setAttribute("inputmode", "none");
 }
 function terminalLineHeight() {
-  return Math.max(8, (state.fontSize || 14) * 1.2);
+  return Math.max(8, (state.fontSize || TERMINAL_DEFAULT_FONT_SIZE) * TERMINAL_LINE_HEIGHT);
 }
 function renderTerminalScroll() {
   const scrolled = state.terminalScrollLines > 0;

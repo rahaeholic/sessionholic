@@ -190,6 +190,7 @@ class _Terminal:
         self.io_lock = threading.Lock()
         self.process = None
         self.fd = None
+        self.tty = None
         self.generation = 0
         self.alive = not record.get("closed", False)
         # When this process saw it close (monotonic); a row loaded closed closed long ago.
@@ -542,6 +543,7 @@ class TerminalManager:
                 # in one command list on this board-only tmux socket.
                 done = self._run("set-option", "-g", "history-limit", str(HISTORY_LIMIT), ";",
                                  "new-session", "-d", "-s", record["name"], "-c", str(cwd),
+                                 "-x", "120", "-y", "30",
                                  sys.executable, "-I", str(Path(__file__).resolve()),
                                  "--launch", str(launch_path))
                 if done.returncode != 0:
@@ -585,6 +587,7 @@ class TerminalManager:
             # A copy-mode left behind by an earlier gateway would capture the keys.
             self._cancel_mode(terminal)
             master, slave = pty.openpty()
+            terminal.tty = os.ttyname(slave)
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
             attach_env = dict(os.environ)
             attach_env.pop("TMUX", None)
@@ -658,17 +661,44 @@ class TerminalManager:
                 except OSError:
                     pass
 
-    def read(self, terminal_id, after=0, wait=20, epoch=None):
+    def read(self, terminal_id, after=0, wait=20, epoch=None, fresh=False):
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("출력 위치가 올바르지 않습니다.")
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= 20:
             raise ValueError("대기 시간이 올바르지 않습니다.")
         if epoch is not None and (not isinstance(epoch, str) or not ID.fullmatch(epoch)):
             raise ValueError("출력 식별자가 올바르지 않습니다.")
+        if not isinstance(fresh, bool):
+            raise ValueError("화면 재연결 요청이 올바르지 않습니다.")
         with self.lock:
             terminal = self._use(terminal_id)
             self._attach(terminal)
-        return terminal.read(after, wait, epoch)
+        with terminal.condition:
+            stale = (epoch is not None and epoch != terminal.epoch
+                     or after < terminal.offset - len(terminal.output) or after > terminal.offset)
+        redraw = (fresh or stale) and terminal.alive
+        if redraw:
+            # ANSI history was drawn at past sizes. A new viewer starts with a
+            # full tmux repaint, never a truncated escape or a differently wrapped replay.
+            with terminal.io_lock:
+                with terminal.condition:
+                    after, epoch = terminal.offset, terminal.epoch
+                if terminal.fd is not None and terminal.tty:
+                    done = self._run("refresh-client", "-t", terminal.tty)
+                    if done.returncode != 0:
+                        raise RuntimeError("터미널 화면을 다시 그리지 못했습니다.")
+        result = terminal.read(after, wait, epoch)
+        with terminal.io_lock:
+            if terminal.fd is not None:
+                try:
+                    rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(terminal.fd, termios.TIOCGWINSZ, b"\0" * 8))
+                    result.update(cols=cols, rows=rows)
+                except OSError:
+                    pass
+        if redraw:
+            result["reset"] = True
+            result["redrawn"] = True
+        return result
 
     def write(self, terminal_id, text):
         if not isinstance(text, str):
@@ -866,7 +896,12 @@ class TerminalManager:
             if terminal.record.get("closed", False) or terminal.fd is None:
                 raise RuntimeError("터미널 연결이 종료되었습니다.")
             try:
-                fcntl.ioctl(terminal.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+                size = struct.pack("HHHH", rows, cols, 0, 0)
+                if fcntl.ioctl(terminal.fd, termios.TIOCGWINSZ, b"\0" * 8) == size:
+                    return {"ok": True}
+                fcntl.ioctl(terminal.fd, termios.TIOCSWINSZ, size)
+                # The detached attach client has no controlling terminal, so
+                # this PTY ioctl alone does not notify tmux on macOS.
                 os.killpg(terminal.process.pid, signal.SIGWINCH)
             except OSError:
                 raise RuntimeError("터미널 크기를 변경하지 못했습니다.") from None

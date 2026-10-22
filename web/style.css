@@ -2795,12 +2795,17 @@ li[data-task] {
   min-width: 0;
   padding: 6px 8px 0;
   overflow: hidden;
+  overflow-x: auto;
   background: var(--t-canvas);
   word-break: normal;
   overflow-wrap: normal;
 }
 .terminal-viewport .xterm {
   height: 100%;
+  -webkit-font-smoothing: auto;
+  font-kerning: none;
+  font-variant-ligatures: none;
+  text-rendering: auto;
 }
 /* Rows rarely fill the height exactly; the leftover strip matches the canvas
    instead of xterm.css's black. */

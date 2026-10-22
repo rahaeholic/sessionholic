@@ -433,6 +433,30 @@ class StaticAssetTest(unittest.TestCase):
         for path in ("/notes.txt", "/missing.js", "/vendor/../app.js", "/%2e%2e/server.py"):
             self.assertEqual(self.get(path)[0].status, 404, path)
 
+    def test_bundled_fonts_are_versioned_and_served_with_the_correct_mime_only_at_reviewed_paths(self):
+        import html
+        import re
+        for face in ("regular", "bold"):
+            name = "vendor/d2coding-%s.woff2" % face
+            target = self.web / name
+            target.write_bytes(b"wOF2\x00\xff" + face.encode())
+            self.addCleanup(target.unlink, missing_ok=True)
+            raw = target.read_bytes()
+            version = self.sha(raw)[:8]
+            res, data = self.get("/" + name + "?v=" + version, **{"Accept-Encoding": "gzip"})
+            self.assertEqual((res.status, data), (200, raw))
+            self.assertEqual(res.getheader("Content-Type"), "font/woff2")
+            self.assertEqual(res.getheader("Cache-Control"), server.IMMUTABLE)
+            self.assertIsNone(res.getheader("Content-Encoding"))
+            res, data = self.get("/" + name + "?v=" + version, method="HEAD")
+            self.assertEqual((res.status, data), (200, b""))
+            page = self.get("/")[1].decode()
+            content = re.search(r'name="sessionholic-assets"\s+content="([^"]*)"', page).group(1)
+            self.assertEqual(json.loads(html.unescape(content))["/" + name], version)
+            self.assertEqual(self.get("/" + name + "?v=00000000")[0].getheader("Cache-Control"), "no-cache")
+        for route in ("/d2coding-regular.woff2", "/vendor/other.woff2", "/vendor/../d2coding-bold.woff2"):
+            self.assertEqual(self.get(route)[0].status, 404)
+
     def test_index_is_rendered_with_asset_versions(self):
         import html
         import re

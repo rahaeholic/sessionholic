@@ -6488,7 +6488,8 @@ test('service worker keeps only responses the server marked immutable, so a mism
 
 test('service worker precache stores only immutable versioned assets and skips the terminal library', async () => {
   const versions = { '/app.js': 'aaaaaaaa', '/style.css': 'cccccccc', '/theme-init.js': 'eeeeeeee', '/vendor/xterm.js': 'dddddddd',
-    '/session_labels.js': 'abababab', '/api/snapshot': 'ffffffff' };
+    '/session_labels.js': 'abababab', '/api/snapshot': 'ffffffff',
+    '/vendor/d2coding-regular.woff2': '1234abcd', '/vendor/d2coding-bold.woff2': 'abcd1234' };
   const page = `<meta name="sessionholic-assets" content="${JSON.stringify(versions).replace(/"/g, '&quot;')}">`;
   const sw = serviceWorkerHarness(page);
   // The server already serves a different app.js than the page names.
@@ -6499,7 +6500,15 @@ test('service worker precache stores only immutable versioned assets and skips t
   assert.deepEqual([...sw.store.keys()].sort(), ['https://app.example/', 'https://app.example/session_labels.js?v=abababab', 'https://app.example/style.css?v=cccccccc',
     'https://app.example/theme-init.js?v=eeeeeeee']);
   assert.ok(sw.fetched.includes('/app.js?v=aaaaaaaa'), 'fetched, then refused by its header');
-  assert.ok(!sw.fetched.some((url) => url.includes('xterm') || url.includes('/api/')));
+  assert.ok(!sw.fetched.some((url) => url.includes('xterm') || url.includes('d2coding') || url.includes('/api/')));
+  for (const face of ['regular', 'bold']) {
+    const route = `/vendor/d2coding-${face}.woff2`, version = versions[route];
+    sw.current[route] = version;
+    await sw.run(`${route}?v=${version}`);
+    const before = sw.fetched.length;
+    await sw.run(`${route}?v=${version}`);
+    assert.equal(sw.fetched.length, before, 'a font is cached only after its first terminal use');
+  }
 });
 
 test('a list still being collected says how old it is, outside the cards, and the note clears when collection ends', () => {
@@ -7779,7 +7788,7 @@ test('the board text size is its own stored choice scaling the rem type scale, a
   c.setTextSize('huge');
   assert.equal(c.state.textSize, 'default'); assert.equal(root.attributes['data-text-size'], undefined);
   assert.deepEqual(writes, [['sessionholic:ui:textSize', '"large"'], ['sessionholic:ui:textSize', '"default"']]);
-  assert.equal(c.state.fontSize, 14, 'the terminal text size is untouched');
+  assert.equal(c.state.fontSize, 15, 'the terminal text size is untouched');
   c.context.navigator = { onLine: false };
   c.windowEvents.DOMContentLoaded();
   c.get('text-size-small').events.change({ target: { checked: true } });
@@ -13865,6 +13874,7 @@ function inlineDetailClient({ agent = 'codex', home = '.codex-example', sessionI
   c.context.loadChatState = async () => { reads++; };
   c.context.startTerminalReader = () => {};
   c.context.xtermReady = () => true; c.context.fitTerminal = () => {};
+  vm.runInContext('terminalFontsReady = true', c.context);
   const terminal = { id: 'inline-original', mode: 'attach', alive: true, nativeSource: c.sourceOf(s) };
   c.state.terminal = terminal; c.state.terminalAlive = true; c.state.terminals = [terminal];
   const term = { disposed: 0, dispose() { this.disposed++; } }; c.state.term = term;
@@ -14850,4 +14860,124 @@ test('raw 초안의 자동 동기화도 같은 터미널을 다시 열거나 IME
   c.context.document.activeElement = field; c.state.composing = true;
   await vm.runInContext('syncSessionTerminal()', c.context);
   assert.equal(blurred, 0); assert.equal(c.state.composing, true); assert.equal(field.value, '한글 조합');
+});
+
+function terminalFontFixture({ fail = false, installFails = false } = {}) {
+  const timers = [], faces = [], installed = [];
+  const c = client(undefined, { setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  c.state.assetVersions = { '/vendor/d2coding-regular.woff2': '1234abcd', '/vendor/d2coding-bold.woff2': 'abcd1234' };
+  c.context.document.fonts = { add(face) { if (installFails) throw Error('fixture font set failure'); installed.push(face); },
+    delete(face) { const index = installed.indexOf(face); if (index >= 0) installed.splice(index, 1); } };
+  c.context.FontFace = class FontFace {
+    constructor(family, url, options) { Object.assign(this, { family, url, options }); faces.push(this); }
+    load() { return new Promise((resolve, reject) => { this.finish = () => fail ? reject(Error('fixture network failure')) : resolve(this); }); }
+  };
+  return { c, timers, faces, installed, load: () => vm.runInContext('loadTerminalFonts()', c.context) };
+}
+
+test('terminal fonts are lazy, versioned and installed together before concurrent terminal loads finish', async () => {
+  const { c, faces, installed } = terminalFontFixture();
+  assert.equal(faces.length, 0, 'the board alone fetches no terminal font');
+  const appended = [];
+  c.context.document.head = { appendChild(item) { appended.push(item); } };
+  const first = c.loadXterm();
+  c.context.window.Terminal = function Terminal() {};
+  c.context.window.FitAddon = { FitAddon: function FitAddon() {} };
+  for (const item of appended) item.onload();
+  await settle();
+  let complete = false; first.then(() => { complete = true; });
+  assert.equal(c.loadXterm(), first, 'a second viewer cannot bypass fonts once xterm scripts are ready');
+  assert.deepEqual(faces.map((f) => f.options.weight), ['400', '700']);
+  assert.match(faces[0].url, /d2coding-regular\.woff2\?v=1234abcd/);
+  assert.match(faces[1].url, /d2coding-bold\.woff2\?v=abcd1234/);
+  faces[0].finish(); await settle();
+  assert.equal(installed.length, 0); assert.equal(complete, false);
+  faces[1].finish(); await first;
+  assert.equal(installed.length, 2); assert.equal(complete, true);
+  await c.loadXterm(); assert.equal(faces.length, 2);
+});
+
+test('font failure, unsupported loading or a five-second timeout keeps terminal opening usable without late font swaps', async () => {
+  for (const options of [{ fail: true }, { installFails: true }, {}]) {
+    const f = terminalFontFixture(options), pending = f.load();
+    assert.equal(f.timers.at(-1).ms, 5000);
+    if (!options.fail && !options.installFails) f.timers.at(-1).fn();
+    for (const face of f.faces) face.finish();
+    assert.equal(await pending, false); await settle();
+    assert.equal(f.installed.length, 0);
+    assert.equal(vm.runInContext('terminalFontsReady', f.c.context), true);
+    assert.equal(f.load(), pending, 'a late retry cannot change already measured cells');
+  }
+  const c = client(undefined, noChatTimers);
+  assert.equal(await vm.runInContext('loadTerminalFonts()', c.context), false);
+  assert.equal(vm.runInContext('terminalFontsReady', c.context), true);
+});
+
+test('a terminal abandoned during font loading cannot replace the newly selected terminal', async () => {
+  const { c, faces } = terminalFontFixture();
+  const created = [], appended = [];
+  class Terminal {
+    constructor(options) { this.options = options; created.push(options); }
+    loadAddon() {} open() {} onData() {} onBinary() {} dispose() {}
+  }
+  c.context.Terminal = c.context.window.Terminal = Terminal;
+  c.context.FitAddon = c.context.window.FitAddon = { FitAddon: class { fit() {} } };
+  c.context.document.head = { appendChild(item) { appended.push(item); } };
+  c.context.startTerminalReader = () => {};
+  const first = c.openTerminal({ id: 'old', mode: 'attach', alive: true });
+  for (const item of appended) item.onload();
+  await settle();
+  const second = c.openTerminal({ id: 'new', mode: 'attach', alive: true });
+  assert.equal(created.length, 0);
+  for (const face of faces) face.finish();
+  await Promise.all([first, second]);
+  assert.equal(c.state.terminal.id, 'new'); assert.equal(created.length, 1);
+  assert.equal(created[0].fontSize, 15); assert.equal(created[0].lineHeight, 1.35);
+  assert.equal(created[0].fontWeightBold, '700');
+  assert.match(created[0].fontFamily, /^"Sessionholic Terminal"/);
+  c.setTerminalFontSize(18); assert.equal(c.state.fontSize, 18);
+});
+
+test('server screen geometry is applied before output, while a passive viewer never locally rewraps its ANSI stream', async () => {
+  const order = [], timers = [], calls = [];
+  const c = client(async (url, request) => {
+    calls.push({ url, body: request?.body });
+    return { ok: true, status: 200, json: async () => url.includes('/events')
+      ? { after: 4, epoch: 'screen', reset: true, redrawn: true, cols: 120, rows: 30, data: Buffer.from('test').toString('base64'), alive: false }
+      : { terminals: [] } };
+  }, { setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  c.state.terminal = { id: 'grid' }; c.state.terminalVisible = true;
+  c.state.term = { cols: 80, rows: 24, resize(cols, rows) { order.push(['size', cols, rows]); this.cols = cols; this.rows = rows; },
+    reset() { order.push(['reset']); }, write(data, done) { order.push(['output', Buffer.from(data).toString()]); done(); } };
+  await c.startTerminalReader();
+  assert.match(calls[0].url, /fresh=1/);
+  assert.deepEqual(order, [['size', 120, 30], ['reset'], ['output', 'test']]);
+  assert.doesNotMatch(c.get('terminal-error').textContent, /최근 출력부터/, 'normal fresh screens are not errors');
+  c.state.fit = { fit() { throw Error('a passive viewer must retain the server grid'); }, proposeDimensions: () => ({ cols: 90, rows: 25 }) };
+  c.state.connected = true;
+  vm.runInContext('fitTerminal()', c.context); await timers.at(-1).fn();
+  assert.equal(c.state.term.cols, 120);
+  const count = calls.length;
+  vm.runInContext('activateTerminalSizing()', c.context); await timers.at(-1).fn();
+  assert.equal(calls.length, count + 1);
+  assert.deepEqual(JSON.parse(calls.at(-1).body), { cols: 90, rows: 25 });
+  assert.equal(c.state.term.cols, 120, 'only a subsequent server frame changes the grid');
+});
+
+test('continuous terminal output cannot postpone the same pending resize forever or duplicate its in-flight request', async () => {
+  const timers = [], posts = []; let finish;
+  const c = client(async (url) => { posts.push(url); await new Promise((r) => { finish = r; });
+    return { ok: true, status: 200, json: async () => ({}) }; },
+    { setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  c.state.terminal = { id: 'stream' }; c.state.terminalVisible = true; c.state.connected = true;
+  c.state.terminalSizingId = 'stream'; c.state.term = { cols: 120, rows: 30 };
+  c.state.terminalScreenSize = { cols: 120, rows: 30 };
+  c.state.fit = { proposeDimensions: () => ({ cols: 90, rows: 25 }) };
+  for (let i = 0; i < 20; i++) vm.runInContext('fitTerminal()', c.context);
+  assert.equal(timers.length, 1, 'output reuses the existing debounce instead of moving its deadline');
+  const pending = timers[0].fn(); await settle();
+  for (let i = 0; i < 20; i++) vm.runInContext('fitTerminal()', c.context);
+  assert.equal(posts.length, 1); assert.equal(timers.length, 1, 'no duplicate timer while the resize is in flight');
+  finish(); await pending;
+  assert.equal(c.state.lastSize, '90x25');
 });

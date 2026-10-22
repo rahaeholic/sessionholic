@@ -70,14 +70,14 @@ NAME = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
 PYTHON_PATH = re.compile(r"^/[A-Za-z0-9_./-]{1,120}$")
 SESSION_ID = re.compile(r"^[0-9A-Za-z-]{8,64}$")
 HOME_KEY = re.compile(r"^\.codex(-[A-Za-z0-9_-]{1,40})?$|^\.codex-router/[0-9a-f]{16}$")
-STATIC = re.compile(r"^(?:vendor/)?[a-z0-9_-]{1,40}\.(html|js|css|svg|png|webmanifest)$")
+STATIC = re.compile(r"^(?:(?:vendor/)?[a-z0-9_-]{1,40}\.(?:html|js|css|svg|png|webmanifest)|vendor/d2coding-(?:regular|bold)\.woff2)$")
 REMOTE_PATH = "/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 SOCKET_PATH_LIMIT = 104
 CONTROL_PREFIX = re.compile(r"^/[A-Za-z0-9_./+@-]+$")
 SSH_FALLBACK_ROOT = Path("/tmp")
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
-         ".webmanifest": "application/manifest+json"}
+         ".webmanifest": "application/manifest+json", ".woff2": "font/woff2"}
 # Static and JSON responses are gzip-compressed for clients that accept it, from this size.
 GZIP_MIN = 1024
 COMPRESSIBLE = frozenset((".html", ".js", ".css", ".svg", ".webmanifest", ".json"))
@@ -3704,7 +3704,10 @@ class Handler(BaseHTTPRequestHandler):
                     wait = min(max(float(query.get("wait", "20")), 0), 20)
                     if after < 0:
                         raise ValueError("출력 위치가 올바르지 않습니다.")
-                    result = self.server.terminals.read(match[1], after, wait, epoch=query.get("epoch"))
+                    fresh = query.get("fresh", "0")
+                    if fresh not in ("0", "1"):
+                        raise ValueError("화면 재연결 요청이 올바르지 않습니다.")
+                    result = self.server.terminals.read(match[1], after, wait, epoch=query.get("epoch"), fresh=fresh == "1")
                     return self.send_json(200, result)
             except GoalError as exc:
                 return self.send_json(exc.status, exc.payload)

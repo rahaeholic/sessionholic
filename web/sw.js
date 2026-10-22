@@ -32,11 +32,14 @@ const ASSETS = new Set([
   "/vendor/xterm.js",
   "/vendor/xterm.css",
   "/vendor/addon-fit.js",
+  "/vendor/d2coding-regular.woff2",
+  "/vendor/d2coding-bold.woff2",
 ]);
 const VERSIONED = /^\?v=[0-9a-f]{8}$/;
 // Precached from the page's asset list at install; the terminal library is
 // only cached once a terminal is actually opened.
-const PRECACHE_SKIP = new Set(["/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js"]);
+const PRECACHE_SKIP = new Set(["/vendor/xterm.js", "/vendor/xterm.css", "/vendor/addon-fit.js",
+  "/vendor/d2coding-regular.woff2", "/vendor/d2coding-bold.woff2"]);
 
 function cacheable(response) {
   return !!response && response.ok && response.type !== "opaqueredirect" && !response.redirected;
