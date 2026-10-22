@@ -77,7 +77,7 @@ test("Mac and iPad use the same Control+Command keys without taking IME, send, o
 
 // A small DOM fixture tests lifetime and cross-document boundaries. It does not
 // pretend to test Safari hardware keys or microphone capture.
-function fixture(saved = null) {
+function fixture(saved = null, { mobile = false } = {}) {
   const nodes = new Map(), calls = [], preferences = new Map(saved ? [["workspace", saved]] : []), frames = [];
   class Node {
     constructor(tag = "div") {
@@ -110,7 +110,7 @@ function fixture(saved = null) {
   nodes.get("session-workspace").append(nodes.get("workspace-primary"), nodes.get("workspace-dividers"), nodes.get("workspace-drop-cue"));
   const document = new Node(); document.body = new Node(); document.createElement = (tag) => new Node(tag);
   document.getElementById = (id) => nodes.get(id); document.querySelector = () => null;
-  const window = { document, location: { pathname: "/", search: "", origin: "https://board.example" }, innerWidth: 1440,
+  const window = { document, location: { pathname: "/", search: "", origin: "https://board.example" }, innerWidth: mobile ? 390 : 1440,
     addEventListener: (key, fn) => document.addEventListener("window:" + key, fn), requestAnimationFrame: () => {},
     setTimeout: () => 1 };
   const prefs = { get: (key, fallback) => preferences.get(key) ?? fallback, set: (key, value) => preferences.set(key, plain(value)) };
@@ -132,7 +132,8 @@ function fixture(saved = null) {
       sessionKeyForTerminal: (terminal) => terminal.key || null, openTerminal: (terminal) => calls.push(["open-existing-terminal", id, terminal.id]) };
   }
   vm.runInNewContext(source, { window, URLSearchParams, console, Set, Map, Date, Promise });
-  const workspace = window.SessionholicWorkspace, primary = app("p1", { key: "session-a", mode: "chat" });
+  const workspace = window.SessionholicWorkspace, primary = app("p1", mobile ? null : { key: "session-a", mode: "chat" });
+  primary.startOnList = () => mobile;
   workspace.init(primary); workspace.changed();
   function attach(id, ref = null) {
     const row = nodes.get("session-workspace").children.find((node) => node.dataset.paneId === id);
@@ -143,6 +144,37 @@ function fixture(saved = null) {
   }
   return { workspace, nodes, calls, preferences, frames, document, window, app, primary, infos, attach };
 }
+
+test('mobile cold starts ignore saved conversation and terminal panes while desktop restoration stays available', () => {
+  for (const saved of [
+    { version: 1, tree: W.leaf('p1'), active: 'p1', panes: { p1: { key: 'session-b', mode: 'chat' } } },
+    { version: 1, tree: W.split(W.leaf('p1'), 'p1', 'p2'), active: 'p2', panes: {
+      p1: { key: 'session-a', mode: 'chat' }, p2: { terminalId: 'a'.repeat(32), mode: 'terminal' } } },
+  ]) {
+    const f = fixture(saved, { mobile: true });
+    assert.equal(f.frames.length, 0);
+    assert.equal(f.calls.some(([name]) => name === 'restore' || name === 'api'), false);
+    assert.deepEqual(f.preferences.get('workspace').tree, { pane: 'p1' });
+    assert.equal(f.preferences.get('workspace').panes.p1, null);
+    const desktop = fixture(saved);
+    assert.ok(desktop.calls.some(([name]) => name === 'restore'));
+  }
+});
+
+test('showing the mobile launch list keeps existing split editors and live terminal frames mounted', () => {
+  const f = fixture(null, { mobile: true });
+  f.workspace.add({ key: 'session-b' }); const second = f.attach('p2', { key: 'session-b', mode: 'terminal' });
+  second.info.unsaved = true; second.info.terminalVisible = true;
+  const editor = second.info.editor, frame = second.frame;
+  assert.equal(f.workspace.showList(), true);
+  assert.equal(f.document.body.classList.contains('workspace-list-open'), true);
+  assert.equal(second.info.editor, editor); assert.equal(second.frame, frame); assert.ok(frame.parentNode);
+  assert.equal(f.calls.some(([name]) => name === 'close-view' || name === 'api'), false);
+  f.workspace.focus('p2');
+  assert.equal(f.document.body.classList.contains('workspace-list-open'), false);
+  f.workspace.showList(); f.workspace.showList(false);
+  assert.equal(f.document.body.classList.contains('workspace-list-open'), false);
+});
 
 test("split, focus, maximize and resize retain editor/recognition/frame identity and do not invoke execution APIs", () => {
   const f = fixture(), editor = f.infos.get("p1").editor;

@@ -317,6 +317,8 @@
     active = id;
     if (changed) layout();
     if (editor) {
+      doc.body.classList.remove("workspace-list-open");
+      hooks.paneOpened?.();
       const row = panes.get(id); row.frame?.contentWindow?.focus(); row.hooks?.focus();
     }
     return true;
@@ -364,6 +366,8 @@
     const row = record(id, ref); row.ref = ref;
     tree = split(tree, target, id, edge); maximized = false;
     active = id; layout();
+    doc.body.classList.remove("workspace-list-open");
+    hooks.paneOpened?.();
     if (row.hooks) applyRef(row);
     return true;
   }
@@ -401,7 +405,9 @@
     if (!info.authenticated) return;
     if (!restored) {
       restored = true;
-      const saved = restoreLayout(hooks.prefs.get("workspace", null));
+      // A new phone document starts at the list, including when a desktop
+      // layout or a terminal pane was saved by the previous document.
+      const saved = hooks.startOnList?.() ? null : restoreLayout(hooks.prefs.get("workspace", null));
       if (saved) {
         restoring = true; tree = saved.tree; active = saved.active; maximized = saved.single === true;
         for (const id of ids(tree)) record(id, saved.panes[id]);
@@ -472,6 +478,13 @@
     if (!focus(id, false)) return true;
     doc.body.classList.add("workspace-list-open");
     hooks.browseSessions?.();
+    return true;
+  }
+  function showList(shown = true) {
+    if (embedded || !hooks?.describe().authenticated) return false;
+    // Keep child documents mounted: their drafts, uploads and terminal readers
+    // still belong to the same pane when the user opens it again.
+    doc.body.classList.toggle("workspace-list-open", shown && enabled);
     return true;
   }
   function routeTerminal(terminal) {
@@ -698,5 +711,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions };
+    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList };
 })(typeof window !== "undefined" ? window : null);

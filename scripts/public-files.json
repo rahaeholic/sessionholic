@@ -184,5 +184,6 @@
   "web/terminal-ime.js",
   "tests/test_terminal_ime.cjs",
   "docs/plan/2026-10-22-terminal-session-lifecycle.md",
-  "docs/plan/2026-10-22-terminal-chat-recovery.md"
+  "docs/plan/2026-10-22-terminal-chat-recovery.md",
+  "docs/plan/2026-10-22-mobile-start-screen.md"
 ]

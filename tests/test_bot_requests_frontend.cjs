@@ -419,17 +419,19 @@ test("세 분류의 방향키·Home·End와 휴대폰 뒤로·앞으로가 봇 �
     assert.ok(c.get(`session-category-${category}`).focusCount > 0);
   }
   assert.equal(prevented, 6);
+  const listState = c.history.state;
   c.selectBotRequest(c.botRequestKey(row));
+  const detailState = c.history.state;
   assert.equal(c.history.state.view, "detail");
   assert.equal(c.state.detailShown, true);
   const detail = c.get("detail").children[1];
   c.backToList(); assert.equal(c.history.backCount, 1);
-  c.history.state = { sessionholic: true, view: "list" };
+  c.history.state = listState;
   c.windowEvents.popstate({ state: c.history.state });
   assert.equal(c.state.detailShown, false);
   assert.equal(c.state.selectedBotRequest, c.botRequestKey(row));
   assert.ok(byClass(c.get("groups"), "bot-request-card")[0].focusCount > 0);
-  c.history.state = { sessionholic: true, view: "detail" };
+  c.history.state = detailState;
   c.windowEvents.popstate({ state: c.history.state, hasUAVisualTransition: true });
   assert.equal(c.state.detailShown, true);
   assert.equal(c.get("detail").children[1], detail, "앞으로 이동은 저장된 메타 상세를 재사용한다");

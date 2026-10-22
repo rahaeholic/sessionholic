@@ -12521,6 +12521,102 @@ function navigationStack(c) {
   return entries;
 }
 
+test('mobile conversation navigation seeds the list and falls back locally for old entries without an app parent', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  const entries = navigationStack(c);
+  c.navigateView('detail');
+  assert.deepEqual(entries.map((entry) => entry.view), ['list', 'detail']);
+  assert.equal(entries[1].listDepth, 1);
+  selectChat(c); c.state.detailShown = true;
+  c.context.window.history.replaceState({ sessionholic: true, view: 'detail', listDepth: 0 });
+  c.backToList();
+  assert.equal(c.state.detailShown, false);
+  assert.equal(c.context.window.history.state.view, 'list');
+  assert.equal(entries.length, 2, 'an orphaned screen must not add a history entry or leave the app');
+});
+
+test('a mobile app icon launch shows the list, preserves drafts and live sessions, and ordinary visibility return keeps the selected session', async () => {
+  const requests = [], consumers = [];
+  const c = client(async (url, options) => { requests.push([url, options?.method || 'GET']);
+    return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.context.window.location = c.context.location = { origin: 'https://board.example', href: 'https://board.example/', search: '' };
+  c.context.window.launchQueue = { setConsumer: (consumer) => consumers.push(consumer) };
+  let lists = 0, startupHook;
+  c.context.window.SessionholicWorkspace = { init(hooks) { startupHook = hooks.startOnList; }, changed() {}, visible: () => true, managed: () => false, readingActive: () => true, routeSession: () => false, showList() { lists++; } };
+  c.context.navigator = { onLine: false };
+  const entries = navigationStack(c); c.windowEvents.DOMContentLoaded();
+  assert.equal(consumers.length, 1); assert.equal(startupHook(), true);
+  const { s, entry } = selectChat(c); entry.text = '돌아와서 이어 쓸 초안';
+  entry.attachments.push({ name: 'draft.png', path: '/fixture/draft.png' });
+  c.state.detailShown = true; c.navigateView('detail');
+  c.state.terminals = [{ id: 'existing-native-terminal', state: 'running' }];
+  const terminals = c.state.terminals;
+  c.context.document.hidden = true; c.documentEvents.visibilitychange();
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  assert.equal(c.state.selected, s.key); assert.equal(c.state.detailShown, true);
+  await consumers[0]({ targetURL: 'https://board.example/' });
+  assert.equal(c.state.selected, null); assert.equal(c.state.detailShown, false);
+  assert.equal(c.context.window.history.state.view, 'list');
+  assert.ok([...c.state.chats.values()].includes(entry));
+  assert.equal(entry.text, '돌아와서 이어 쓸 초안'); assert.equal(entry.attachments.length, 1);
+  assert.equal(c.state.terminals, terminals); assert.equal(lists, 1);
+  assert.equal(requests.some(([, method]) => method !== 'GET'), false);
+  const length = entries.length;
+  c.navigateView('detail'); c.backToList();
+  assert.equal(c.context.window.history.state.view, 'list');
+  assert.equal(entries.length, length + 1);
+});
+
+test('launch handling ignores foreign URLs, desktops and embedded panes but retains explicit session links', async () => {
+  for (const mode of ['desktop', 'pane', 'foreign', 'notification']) {
+    const c = client(undefined, noChatTimers);
+    c.context.window.matchMedia = (query) => ({ matches: mode !== 'desktop' && query === '(max-width: 700px)' });
+    c.context.window.location = c.context.location = { origin: 'https://board.example', href: 'https://board.example/', search: '' };
+    c.context.window.SessionholicWorkspace = { embedded: mode === 'pane', init() {}, changed() {}, visible: () => true, managed: () => false, readingActive: () => true, routeSession: () => false, showList() {} };
+    c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+    const { s } = selectChat(c); c.state.detailShown = true;
+    const targetURL = mode === 'foreign' ? 'https://foreign.example/' : mode === 'notification'
+      ? 'https://board.example/?session=' + encodeURIComponent(s.key) : 'https://board.example/';
+    await vm.runInContext('handleAppLaunch', c.context)({ targetURL });
+    assert.equal(c.state.selected, s.key); assert.equal(c.state.detailShown, true);
+  }
+});
+
+test('mobile relaunch commits IME before hiding a terminal and ignores stale prelaunch navigation', async () => {
+  const { c, s, entry, terminal, term, host } = inlineDetailClient();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.context.window.location = { origin: 'https://board.example' };
+  c.context.navigator = { onLine: false };
+  const entries = navigationStack(c); c.navigateView('list', true); c.navigateView('detail');
+  const stale = entries[1];
+  c.state.inlineTerminal = vm.runInContext('inlineTerminalRef(selectedSession())', c.context);
+  c.state.terminalVisible = true; host.append(c.get('terminal-screen'));
+  const field = c.get('chat-input'); field.value = entry.text = '한글 조합 중'; entry.composing = true;
+  c.context.document.activeElement = field;
+  field.blur = () => { entry.text = field.value = '한글 조합 완료'; entry.composing = false; c.context.document.activeElement = null; };
+  const pending = vm.runInContext('handleAppLaunch', c.context)({ targetURL: 'https://board.example/' });
+  assert.equal(c.state.selected, s.key, 'the pane stays visible until the final composition event');
+  c.flushFrames(); await pending;
+  assert.equal(entry.text, '한글 조합 완료'); assert.equal(c.state.selected, null);
+  assert.equal(c.state.terminal, terminal); assert.equal(term.disposed, 0);
+  assert.equal(c.state.terminalVisible, false); assert.equal(c.state.inlineTerminal, null);
+  c.state.selected = s.key;
+  vm.runInContext('showHistoryEntry', c.context)({ state: stale });
+  assert.equal(c.state.detailShown, false); assert.equal(c.context.window.history.state.view, 'list');
+});
+
+test('mobile routing to an existing child pane supplies a list parent for Android Back', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+  c.context.window.SessionholicWorkspace = { routeSession: () => true, visible: () => true, readingActive: () => false };
+  selectChat(c); const entries = navigationStack(c);
+  c.select(c.state.selected);
+  assert.deepEqual(entries.map((entry) => entry.view), ['list', 'detail']);
+  assert.equal(c.state.detailShown, true);
+});
+
 test('restoring old removed sessions keeps them visible from both the card and management sheet; failures keep filters', async () => {
   for (const manage of [false, true]) {
     const c = client(async () => ({ ok: true, status: 200, json: async () => ({ removedAt: null, version: 8 }) }), noChatTimers);

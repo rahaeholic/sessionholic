@@ -263,6 +263,7 @@ const state = {
   edgeClickUntil: 0,
   forwardEntries: [],
   historyCursor: null,
+  launchNavigationEntries: null,
   dockSide: "terminal",
   screenReaderMode: prefs.get("screenReaderMode", false) === true,
   directTerminalInput: prefs.get("directTerminalInput", null),
@@ -422,6 +423,9 @@ function prefersReducedMotion() {
 }
 function phoneLayout() {
   return !!window.matchMedia?.("(max-width: 700px)")?.matches;
+}
+function mobileStartOnList() {
+  return phoneLayout() && !window.SessionholicWorkspace?.embedded;
 }
 // A phone held sideways: as short as the board's other short-screen rules.
 function shortLayout() {
@@ -3554,7 +3558,12 @@ function restoreConversationView(list) {
   setMessagesScroll(list, view.pinned ? list.scrollHeight : box ? box.top - view.offset : view.top);
 }
 function select(key) {
-  if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key })) return;
+  if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key })) {
+    // The visible conversation may live in a child document. Its parent's
+    // Android Back still needs a list entry beneath it.
+    if (mobileStartOnList() && !state.detailShown) { navigateView("detail"); setDetailShown(true); }
+    return;
+  }
   if (state.launchBusy) return;
   if (state.inlineTerminal && (state.inlineTerminal.key !== key || !inlineTerminalCurrent(state.inlineTerminal))) leaveInlineTerminal({ loadChat: false });
   state.launcherWorkspace = null;
@@ -9350,7 +9359,13 @@ function updateReadNotice(data) {
 }
 
 function navigateView(view, replace = false, extra = {}) {
-  const current = window.history.state;
+  let current = window.history.state;
+  if (mobileStartOnList() && !replace && view !== "list" &&
+      (!current?.[INSTANCE.historyKey] || !Number.isInteger(current.listDepth) ||
+       current.view !== "list" && current.listDepth <= 0)) {
+    navigateView("list", true);
+    current = window.history.state;
+  }
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   // `notice` belongs to the one entry a notification opened.
   const { notice, ...kept } = current || {};
@@ -9365,6 +9380,7 @@ function navigateView(view, replace = false, extra = {}) {
   // A new entry drops the entries ahead of it, in the browser and for forward swipes.
   if (!replace) state.forwardEntries.length = 0;
   state.historyCursor = window.history.state;
+  state.launchNavigationEntries?.add(navigationId);
 }
 function backToList() {
   // The list stepped aside for a docked terminal: back brings it, the terminal steps aside.
@@ -9377,10 +9393,14 @@ function backToList() {
   stopChatPolling();
   if (
     window.history.state?.[INSTANCE.historyKey] &&
-    window.history.state.view === "detail"
+    window.history.state.view === "detail" &&
+    (!mobileStartOnList() || window.history.state.listDepth > 0)
   )
     window.history.back();
-  else setDetailShown(false, { direction: "pop", focus: true });
+  else {
+    setDetailShown(false, { direction: "pop", focus: true });
+    if (mobileStartOnList()) { navigateView("list", true); window.SessionholicWorkspace?.showList?.(); }
+  }
 }
 function backFromTerminal() {
   if (state.inlineTerminal) { leaveInlineTerminal(); return; }
@@ -9392,10 +9412,16 @@ function backFromTerminal() {
   }
   if (
     window.history.state?.[INSTANCE.historyKey] &&
-    window.history.state.view === "terminal"
+    window.history.state.view === "terminal" &&
+    (!mobileStartOnList() || window.history.state.listDepth > 0)
   )
     window.history.back();
-  else returnToBoard();
+  else {
+    returnToBoard({ selectLaunchedSource: !mobileStartOnList() });
+    if (mobileStartOnList()) {
+      setDetailShown(false); navigateView("list", true); window.SessionholicWorkspace?.showList?.();
+    }
+  }
 }
 // Forward swipes need the entries this page left by going back (the browser lists none):
 // one step back remembers the entry it left, one step forward to it forgets it, and
@@ -13925,10 +13951,50 @@ function warnDraftUnload(event) {
   event.returnValue = "";
 }
 
+// An app-icon launch is different from switching back from another app. Only
+// explicit launch intents reset the visible screen; visibility/pageshow keep it.
+async function openLaunchList() {
+  if (!mobileStartOnList()) return;
+  if (workspaceComposing()) {
+    const field = document.activeElement;
+    field?.blur?.();
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (document.activeElement === field && workspaceComposing()) return;
+  }
+  stopDictation({ abort: true }); dropParkedDictation("app-launch");
+  rememberConversationView(); persistAllDrafts();
+  if (state.terminalVisible) returnToBoard({ selectLaunchedSource: false, animate: false, loadChat: false });
+  stopChatPolling();
+  setDetailShown(false);
+  state.selected = null; state.selectedBotRequest = null;
+  state.answerOnOpen = null; state.openRequest = null; state.reopenOnReturn = null;
+  state.detailFor = null; state.detailRevision = null; state.detailRun++;
+  for (const dialog of document.querySelectorAll?.("dialog[open]") || []) dialog.close();
+  state.forwardEntries.length = 0;
+  state.launchNavigationEntries = new Set();
+  // Replace, rather than push, so relaunching does not build a stack of homes.
+  window.history.replaceState(null, "", "/");
+  navigateView("list", true);
+  window.SessionholicWorkspace?.showList?.();
+  render();
+}
+async function handleAppLaunch(params) {
+  if (window.SessionholicWorkspace?.embedded || !params?.targetURL) return;
+  let target;
+  try { target = new URL(params.targetURL, window.location.origin); } catch { return; }
+  if (target.origin !== window.location.origin || target.pathname !== "/") return;
+  if (requestSessionOpen(target.href)) {
+    window.history.replaceState(window.history.state, "", "/");
+    return;
+  }
+  await openLaunchList();
+}
+
 // Shows the screen a history entry names (popstate).
 function showHistoryEntry(event, swiped = false) {
   let view = event.state?.[INSTANCE.historyKey] ? event.state.view : "list";
-  if (state.closedTerminalNavigation || state.closedHistory?.has(event.state?.navigationId) || view === "terminal" && !state.terminal) {
+  if (state.closedTerminalNavigation || state.closedHistory?.has(event.state?.navigationId) || view === "terminal" && !state.terminal ||
+      mobileStartOnList() && state.launchNavigationEntries && !state.launchNavigationEntries.has(event.state?.navigationId)) {
     state.closedTerminalNavigation = false;
     view = "list";
     navigateView("list", true);
@@ -13955,14 +14021,16 @@ function showHistoryEntry(event, swiped = false) {
     if (target) openSessionTerminal(target);
   };
   // Forward again to a notification's conversation shows it, not the terminal's launch.
-  if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice });
+  if (fromTerminal) returnToBoard({ animate, selectLaunchedSource: !event.state?.notice && !(mobileStartOnList() && view === "list") });
   if (window.SessionholicGoals?.handleHistory?.(event)) {
     reopenSession();
     return;
   }
-  const detail = view === "detail" && !!(state.selected || state.selectedBotRequest);
+  const detail = view === "detail" && !!(state.selected || state.selectedBotRequest ||
+    mobileStartOnList() && window.SessionholicWorkspace?.managed());
   stopChatPolling();
   setDetailShown(detail, { direction: animate && !fromTerminal ? (detail ? "push" : "pop") : null, focus: true });
+  if (mobileStartOnList()) window.SessionholicWorkspace?.showList?.(!detail);
   const selected = selectedSession();
   if (selected && chatVisible()) loadChatState(selected, true);
   reopenSession();
@@ -14000,6 +14068,10 @@ function workspaceHooks() {
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    startOnList: mobileStartOnList,
+    paneOpened: () => {
+      if (mobileStartOnList() && !state.detailShown) { navigateView("detail"); setDetailShown(true); }
+    },
     toggleView: toggleConversationView,
     browseSessions: () => $("search")?.focus?.({ preventScroll: true }),
     answerSession: (key) => {
@@ -14101,6 +14173,7 @@ function workspaceHooks() {
 
 window.addEventListener("DOMContentLoaded", () => {
   window.SessionholicWorkspace?.init(workspaceHooks());
+  if (mobileStartOnList()) state.launchNavigationEntries = new Set();
   navigateView("list", true);
   window.SessionholicLabels?.init?.({ api, sourceOf, getAuthEpoch: () => state.authEpoch,
     canEdit: (session) => state.authenticated && !botRequestForNative(sourceOf(session)),
@@ -14498,6 +14571,8 @@ window.addEventListener("DOMContentLoaded", () => {
   // Opened from a notification: remember the session, then drop it from the address.
   if (globalThis.location?.search && requestSessionOpen(globalThis.location.href))
     window.history.replaceState(window.history.state, "", "/");
+  if (!window.SessionholicWorkspace?.embedded)
+    window.launchQueue?.setConsumer((params) => handleAppLaunch(params).catch(() => {}));
   if (networkOffline()) {
     showOfflineStart();
   } else {
