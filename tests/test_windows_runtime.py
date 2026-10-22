@@ -1090,8 +1090,24 @@ class WindowsRuntimeTest(unittest.TestCase):
     def test_readonly_collector_never_gains_mutation_permissions(self):
         self.assertNotIn('turn/start', wc.Proxy.ALLOWED)
         self.assertNotIn('thread/archive', wc.Proxy.ALLOWED)
+        self.assertNotIn('thread/compact/start', wc.Proxy.ALLOWED)
         self.assertIn('turn/start', wr.NativeProxy.ALLOWED)
         self.assertIn('thread/archive', wr.NativeProxy.ALLOWED)
+
+    def test_real_native_proxy_dispatches_model_catalog_and_compact_but_refuses_arbitrary_methods(self):
+        proxy = object.__new__(wr.NativeProxy)
+        proxy.sequence = 0
+        writes = []
+        proxy._send = writes.append
+        proxy._message = lambda: {'id': proxy.sequence, 'result': {'fixture': True}}
+        for method, params in [('model/list', {'limit': 100}),
+                               ('thread/compact/start', {'threadId': self.source['id']})]:
+            self.assertEqual(proxy.call(method, params), {'fixture': True})
+            self.assertEqual(writes[-1]['method'], method)
+            self.assertEqual(writes[-1]['params'], params)
+        with self.assertRaises(ValueError):
+            proxy.call('command/exec', {'command': 'must-not-run'})
+        self.assertEqual(len(writes), 2)
 
     def test_loaded_list_paginates_and_truncation_does_not_prove_absence(self):
         class Paged:

@@ -299,7 +299,7 @@ class Store:
 
 class NativeProxy(wc.Proxy):
     ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume',
-                                  'thread/settings/update'}
+                                  'thread/settings/update', 'model/list', 'thread/compact/start'}
 
     def notification(self, until):
         """The next server notification before `until` (monotonic), else None. Waiting stops

@@ -4,6 +4,8 @@
 
 원인: 공통 채팅 UI와 `Chat.command`는 모델 조회를 `action=command`로 전달하지만 `Transfers.windows_rpc`와 `WindowsRuntime.chat`의 허용 목록 모두에 command가 없다. Windows 전송에도 저장된 모델 선택 적용이 없다. 모바일 화면만 바꿔서는 해결되지 않는다.
 
+운영 읽기 검증에서 `NativeProxy.ALLOWED`에도 `model/list`, `thread/compact/start`가 빠진 것을 확인했다. 실제 NativeProxy.call을 사용하는 회귀 검사를 추가하고, native 제어 어댑터에만 해당 메서드를 허용한다. 일반 수집기의 읽기 전용 경계는 유지한다.
+
 수정 파일:
 - `windows_runtime.py`: command 라우팅, 실제 소유 서버의 모델 목록 조회, 세션별 모델·effort 저장, 동일 요청 중복 방지, read의 current/next 반환, idle `turn/start`에만 선택값 적용. 기존 Store와 endpoint 신원 확인을 재사용한다. 공용 config나 인증·권한을 변경하지 않는다.
 - `tests/test_windows_runtime.py`: 실제 production entrypoint에서 모델 목록/선택/effort/재시작/중복 요청/잘못된 선택/진행 중 작업/다른 세션 격리/오류를 검사한다. fake native transport만 사용한다.
