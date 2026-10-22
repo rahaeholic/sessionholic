@@ -4178,8 +4178,10 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   const entry = chatEntry(s);
   const prompt = data?.prompt && Array.isArray(data.prompt.options) && data.prompt.options.length ? data.prompt : null;
   const receipt = entry.promptRequest;
-  const unresolved = receipt && receipt.status !== "answered";
   const sameRequest = !!prompt && receipt?.fingerprint === prompt.fingerprint;
+  // A receipt guards that exact choice against resending; it is not evidence
+  // that the CLI is still waiting. Show it only with the matching live question.
+  const unresolved = sameRequest && receipt.status !== "answered";
   const openable = !prompt && data?.promptOpenable === true && data?.phase === "needs_input";
   const asked = state.answerOnOpen;
   if (asked?.key === s.key && (prompt || Date.now() > asked.until)) state.answerOnOpen = null;
@@ -4187,7 +4189,7 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
     state.answerOnOpen = null;
     Promise.resolve().then(() => promptAction(s, { action: "open" }));
   }
-  if (!prompt && !openable && !unresolved) {
+  if (!prompt && !openable) {
     card.hidden = true;
     card.chooseNumber = null;
     card.dataset.fingerprint = "";
@@ -4197,7 +4199,7 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
     entry.promptNote = "";
     return;
   }
-  const question = prompt ? prompt.fingerprint : openable ? "open" : `receipt:${receipt.requestId}`;
+  const question = prompt ? prompt.fingerprint : "open";
   if (card.dataset.question && card.dataset.question !== question) entry.promptNote = "";
   const revision = JSON.stringify([question, prompt?.current, entry.promptChoice?.number, !!entry.promptBusy, entry.promptNote,
     receipt?.requestId, receipt?.status, openable]);
@@ -4215,17 +4217,11 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   const focusNumber = entry.promptFocus ?? focusedNumber;
   entry.promptFocus = null;
   const head = el("div", "chat-prompt-head");
-  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : unresolved ? "선택 전달 상태 확인" : "답이 필요한 상태입니다"));
+  head.append(el("strong", null, prompt ? `${AGENT_NAMES[prompt.agent] || "에이전트"}가 답을 기다려요` : "답이 필요한 상태입니다"));
   const terminal = button("터미널", "chat-prompt-terminal", () => openChatTerminal(s));
   head.append(terminal);
   const nodes = [head];
-  if (unresolved) {
-    nodes.push(el("p", "chat-prompt-note", promptRequestCopy(receipt)));
-    if (!sameRequest) {
-      const check = button(entry.promptBusy ? "확인 중…" : "전달 상태 확인", "secondary", () => promptAction(s, { action: "status" }));
-      check.disabled = !!entry.promptBusy || networkOffline(); nodes.push(check);
-    }
-  }
+  if (unresolved) nodes.push(el("p", "chat-prompt-note", promptRequestCopy(receipt)));
   if (!prompt) {
     card.chooseNumber = null;
     if (openable) {
@@ -4316,7 +4312,7 @@ function renderPrompt(s, data, selected = selectedSession() || null) {
   } else {
     const choice = prompt.options.find((option) => option.number === entry.promptChoice?.number);
     const send = button(entry.promptBusy ? "확인 중…" : sameRequest ? receipt.status === "answered" ? "선택 전달됨" : "전달 상태 확인"
-      : choice ? `${choice.number}번 ${unresolved ? "새 응답 " : ""}보내기` : "선택지를 고르세요", "primary", () => {
+      : choice ? `${choice.number}번 보내기` : "선택지를 고르세요", "primary", () => {
       if (sameRequest) return promptAction(s, { action: "status" });
       if (!choice) return;
       promptAction(s, { action: "answer", fingerprint: prompt.fingerprint, number: choice.number });
@@ -4363,7 +4359,6 @@ async function promptAction(s, body) {
       persistChatDraft(entry);
     }
     entry.promptChoice = null;
-    if (action !== "open") entry.promptNote = descriptor.status === "answered" ? "" : promptRequestCopy(descriptor);
     if (action === "answer" && result.status === "answered" && currentChat(entry)) { toast("선택을 보냈습니다."); haptic("success"); }
     if (action !== "status" && (Object.hasOwn(result, "prompt") || result.status === "answered"))
       entry.data = { ...entry.data, prompt: result.prompt || null, promptOpenable: false };
@@ -4371,7 +4366,7 @@ async function promptAction(s, body) {
     if (action === "open" && currentChat(entry)) refreshTerminals();
   } catch (err) {
     if (belongs() && !err.unauthorized && !err.staleAuth) {
-      entry.promptNote = action === "open" ? err.message : promptRequestCopy(descriptor);
+      if (action === "open") entry.promptNote = err.message;
       if (currentChat(entry)) haptic("error");
     }
   } finally {
@@ -4915,7 +4910,6 @@ function restoreChatDraft(entry) {
   entry.revision = Number.isInteger(row.revision) && row.revision >= 0 ? row.revision : 0;
   if (row.promptRequest) {
     entry.promptRequest = { ...row.promptRequest };
-    if (entry.promptRequest.status !== "answered") entry.notice = "선택 전달 확인 기록을 복원했습니다. 같은 선택을 다시 보내지 않고 전달 상태를 확인해 주세요.";
   }
   if (row.commandRequest) {
     const command = row.commandRequest;
@@ -4934,7 +4928,7 @@ function restoreChatDraft(entry) {
       attachments: entry.pending.attachmentDetails, attachmentObjects: entry.attachments,
       state: "uncertain", status: "unknown", reason: "", at: row.at }];
     entry.notice = "전송 확인 중이던 메시지를 복원했습니다. 다시 보내지 않고 전송 상태를 확인합니다.";
-  } else if (!entry.notice) entry.notice = "이 기기에 보관한 초안을 복원했습니다.";
+  } else if (!entry.notice && (entry.text || entry.attachments.length)) entry.notice = "이 기기에 보관한 초안을 복원했습니다.";
   state.draftSavedShapes.set(key, savedDraftShape(chatDraftPayload(entry)));
 }
 function terminalDraftIdentity(terminal) { return JSON.stringify([terminal?.id, draftKey(terminal)]); }

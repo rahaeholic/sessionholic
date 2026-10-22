@@ -5561,13 +5561,74 @@ test('질문 pending descriptor만 초안에 보관하며 reload 후 같은 ID�
   assert.equal(selectChat(second.c, { home: '.codex-other' }).entry.promptRequest, null);
   assert.equal(selectChat(second.c, { id: 'other-session' }).entry.promptRequest, null);
 });
-test('질문이 화면에서 사라져도 미확인 선택의 상태 확인 UI와 descriptor를 유지한다', async () => {
+test('질문이 사라지면 전달 확인창을 숨기고 같은 질문의 중복 전송 방지는 유지한다', async () => {
   const f = pendingPromptFixture(async (body) => ({ ok: true, status: 200, json: async () => ({ requestId: body.requestId, status: 'unconfirmed' }) }));
   await f.c.promptAction(f.s, { action: 'answer', fingerprint: f.prompt.fingerprint, number: 1 });
+  const requestId = f.entry.promptRequest.requestId;
   f.entry.data = { ...f.entry.data, phase: 'working', prompt: null, promptOpenable: false };
   f.c.renderPrompt(f.s, f.entry.data);
-  assert.equal(f.c.get('chat-prompt').hidden, false); assert.match(textOf(f.c.get('chat-prompt')), /전달 상태 확인/);
-  assert.ok(f.entry.promptRequest);
+  assert.equal(f.c.get('chat-prompt').hidden, true);
+  assert.equal(f.entry.promptRequest.status, 'unconfirmed', '숨김을 전달 성공으로 바꾸지 않는다');
+  f.entry.data.prompt = f.prompt;
+  f.c.renderPrompt(f.s, f.entry.data);
+  assert.equal(f.c.get('chat-prompt').hidden, false);
+  await findClass(f.c.get('chat-prompt'), 'primary')[0].events.click();
+  await settle();
+  const calls = f.calls.filter((call) => call.url === '/api/chat/prompt');
+  assert.deepEqual(calls.map((call) => call.body.action), ['answer', 'status']);
+  assert.equal(calls[1].body.requestId, requestId);
+});
+test('not_found 선택 기록을 복원해도 끝난 대화에 확인창이나 복원 경고를 띄우지 않는다', async () => {
+  const f = pendingPromptFixture(async (body) => ({ ok: true, status: 200,
+    json: async () => ({ requestId: body.requestId, status: 'not_found' }) }));
+  await f.c.promptAction(f.s, { action: 'answer', fingerprint: f.prompt.fingerprint, number: 1 });
+  await settle();
+  const c = client(async (url, options) => {
+    assert.equal(url, '/api/chat/state', '복원만으로 선택을 다시 전송하거나 질문을 열지 않는다');
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body).source,
+      capability: { supported: true }, phase: 'idle', prompt: null, promptOpenable: false, messages: [] }) };
+  }, noChatTimers);
+  c.context.localStorage = f.storage;
+  const { s, entry } = selectChat(c); c.drawDetail(s);
+  await c.loadChatState(s, true);
+  assert.equal(entry.promptRequest.requestId, f.entry.promptRequest.requestId);
+  assert.equal(entry.promptRequest.status, 'not_found');
+  assert.equal(c.get('chat-prompt').hidden, true);
+  assert.equal(entry.notice, '', '선택 기록만 복원한 것을 초안·전달 확인 경고로 표시하지 않는다');
+  entry.text = '다음 요청'; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-input').disabled, false);
+  assert.equal(c.get('chat-send').disabled, false);
+});
+test('이전 선택의 경고는 새 질문을 가리거나 질문 불러오기를 막지 않는다', async () => {
+  const f = pendingPromptFixture(async (body) => ({ ok: true, status: 200,
+    json: async () => ({ requestId: body.requestId, status: 'unconfirmed' }) }));
+  await f.c.promptAction(f.s, { action: 'answer', fingerprint: f.prompt.fingerprint, number: 1 });
+  await settle();
+  f.entry.data = { ...f.entry.data, prompt: { ...f.prompt, fingerprint: 'b'.repeat(64) } };
+  f.c.renderPrompt(f.s, f.entry.data);
+  assert.doesNotMatch(textOf(f.c.get('chat-prompt')), /전달 결과|전달 상태 확인/);
+  assert.ok(findClass(f.c.get('chat-prompt'), 'chat-prompt-option').every((option) => !option.disabled));
+  f.entry.data = { ...f.entry.data, prompt: null, promptOpenable: true };
+  f.c.answerOnOpen(f.s); f.c.renderPrompt(f.s, f.entry.data);
+  await settle();
+  assert.equal(f.calls.filter((call) => call.body.action === 'open').length, 1);
+  assert.equal(f.calls.filter((call) => call.body.action === 'answer').length, 1);
+});
+test('늦게 도착한 선택 상태 응답이 사라진 확인창을 다시 열지 않는다', async () => {
+  let finish;
+  const f = pendingPromptFixture(async (body) => body.action === 'status'
+    ? new Promise((resolve) => { finish = resolve; })
+    : { ok: true, status: 200, json: async () => ({ requestId: body.requestId, status: 'unconfirmed' }) });
+  await f.c.promptAction(f.s, { action: 'answer', fingerprint: f.prompt.fingerprint, number: 1 });
+  await settle();
+  const checking = f.c.promptAction(f.s, { action: 'status' });
+  f.entry.data = { ...f.entry.data, phase: 'working', prompt: null, promptOpenable: false };
+  f.c.renderPrompt(f.s, f.entry.data);
+  finish({ ok: true, status: 200, json: async () => ({ requestId: f.entry.promptRequest.requestId, status: 'not_found' }) });
+  await checking;
+  assert.equal(f.c.get('chat-prompt').hidden, true);
+  assert.equal(f.entry.promptRequest.status, 'not_found');
+  assert.equal(f.entry.promptNote, '');
 });
 test('not_found는 재전송 허용으로 해석하지 않으며 status는 별도 대화 읽기나 질문 열기를 하지 않는다', async () => {
   const f = pendingPromptFixture(async (body) => ({ ok: true, status: 200, json: async () => ({ requestId: body.requestId, status: body.action === 'answer' ? 'unconfirmed' : 'not_found' }) }));
