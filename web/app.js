@@ -228,6 +228,7 @@ const state = {
   terminalAbort: null,
   connected: false,
   terminalAlive: true,
+  terminalManualReconnect: false,
   inputQueue: Promise.resolve(),
   inputEpoch: 0,
   inputFailed: false,
@@ -1102,8 +1103,9 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
 
 function labeledSession(session) {
   const value = window.SessionholicLabels?.decorate?.(session, state.snapshot?.sessionLabels) || session;
-  return { ...value, originalTitle: typeof value.originalTitle === "string" ? value.originalTitle : value.title,
-    title: typeof value.displayTitle === "string" && value.displayTitle ? value.displayTitle : value.title };
+  const initial = value.manualNativeTitle || value.initialTitle || value.title;
+  return { ...value, originalTitle: typeof value.originalTitle === "string" ? value.originalTitle : initial,
+    title: typeof value.displayTitle === "string" && value.displayTitle ? value.displayTitle : initial };
 }
 function normalizedRuntimeReason(value) {
   return typeof value === "string" && value.trim() ? value : null;
@@ -4891,6 +4893,32 @@ function chatRecovery(entry, selected = selectedSession() || null) {
   if (recovery?.supported !== true || recovery.closedByBoard === true) return null;
   return ["resume_session", "refresh_host"].includes(recovery.action) ? recovery : null;
 }
+const CONNECTION_NOTICE_DELAY_MS = 15000;
+function clearConnectionNotice(entry) {
+  clearTimeout(entry.connectionNotice?.timer);
+  entry.connectionNotice = null;
+}
+function chatRecoveryVisible(entry, recovery) {
+  if (recovery?.action !== "refresh_host") {
+    clearConnectionNotice(entry);
+    return !!recovery;
+  }
+  const source = chatKey(entry.source), authEpoch = state.authEpoch;
+  let notice = entry.connectionNotice;
+  if (!notice || notice.source !== source || notice.authEpoch !== authEpoch) {
+    clearConnectionNotice(entry);
+    notice = entry.connectionNotice = { source, authEpoch, since: Date.now(), timer: null };
+  }
+  const remaining = CONNECTION_NOTICE_DELAY_MS - Math.max(0, Date.now() - notice.since);
+  if (remaining <= 0) return true;
+  if (notice.timer === null) notice.timer = setTimeout(() => {
+    notice.timer = null;
+    if (entry.connectionNotice !== notice || !state.authenticated || authEpoch !== state.authEpoch ||
+        !currentChat(entry) || !chatVisible()) return;
+    updateChatComposer(entry);
+  }, remaining);
+  return false;
+}
 function chatSupported(entry, selected = selectedSession() || null) {
   return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !chatHostOffline(entry, selected) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
@@ -6696,7 +6724,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   // sent once the user opened the terminal from the gate.
   const recovery = chatRecovery(entry, selected);
   const gateOn = !supported && !recovery && terminalRequired(entry, selected);
-  $("chat-recovery").hidden = !recovery;
+  $("chat-recovery").hidden = !chatRecoveryVisible(entry, recovery);
   $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
   $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
   $("chat-recover").disabled = offline || !!entry.recovering || state.launchBusy;
@@ -6915,11 +6943,12 @@ function chatPollDelay(count) {
 function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected)) return;
   clearTimeout(state.chatPollTimer);
+  const reconnecting = chatRecovery(entry, selected)?.action === "refresh_host";
   // A bubble still waiting for its message keeps the conversation followed, so it
   // goes when the message (or an answer after it) shows, or when it times out.
   if (networkOffline() || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
-       !chatReadUnavailable(entry) &&
+       !chatReadUnavailable(entry) && !reconnecting &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
@@ -6927,7 +6956,7 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
     state.chatPollCount++;
     loadChatState(s, false);
-  }, chatPollDelay(state.chatPollCount));
+  }, reconnecting ? Math.min(5000, chatPollDelay(state.chatPollCount)) : chatPollDelay(state.chatPollCount));
 }
 function applyChatReceipt(entry, receipt, selected) {
   if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
@@ -7003,6 +7032,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
     if (epoch !== entry.stateEpoch || currentChat(entry, selected) && conversationIdentity(selected) !== identity) return;
     entry.data = data;
+    if (chatRecovery(entry, selected)?.action !== "refresh_host") clearConnectionNotice(entry);
     outcome = { status: "success", data };
     clearError();
     for (const receipt of data.receipts || []) {
@@ -10102,15 +10132,17 @@ async function launchPlan() {
   }
 }
 
-function terminalStatus(text, connected = false) {
+function terminalStatus(text, connected = false, { manualReconnect } = {}) {
   state.connected = connected;
+  if (connected) state.terminalManualReconnect = false;
+  else if (typeof manualReconnect === "boolean") state.terminalManualReconnect = manualReconnect;
   $("terminal-status").textContent = text;
   $("terminal-status").dataset.connected = String(connected);
   for (const node of $("terminal-keys").querySelectorAll("button"))
     node.disabled = !connected || !!state.draftPaste;
   $("draft-paste").disabled = !connected || !!state.draftPaste;
   $("draft-type").disabled = !connected || !!state.draftPaste;
-  $("terminal-reconnect").hidden = connected || !state.terminalAlive;
+  $("terminal-reconnect").hidden = connected || !state.terminalAlive || !state.terminalManualReconnect;
   renderTerminalAttachments();
 }
 function terminalInfo(terminal) {
@@ -11367,7 +11399,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
   if (document.activeElement?.id === "chat-input" && sessionComposerTerminal() ||
       document.activeElement?.closest?.("#terminal-screen")) activateTerminalSizing();
   renderTerminalReturn();
-  terminalStatus("터미널에 연결하고 있습니다…");
+  terminalStatus("터미널에 연결하고 있습니다…", false, { manualReconnect: false });
   startTerminalReader();
 }
 const TERMINAL_RETRIES = 6;
@@ -11388,7 +11420,7 @@ async function startTerminalReader() {
   state.inputFailed = false;
   state.inputEpoch++;
   terminalError();
-  terminalStatus("터미널에 연결하고 있습니다…");
+  terminalStatus("터미널에 연결하고 있습니다…", false, { manualReconnect: false });
   while (
     run === state.terminalRun &&
     state.terminalVisible &&
@@ -11464,7 +11496,7 @@ async function startTerminalReader() {
       state.terminalRetry = attempt;
       if (attempt > TERMINAL_RETRIES || networkOffline()) {
         state.terminalRetry = 0;
-        terminalStatus("연결을 확인할 수 없습니다.");
+        terminalStatus("연결을 확인할 수 없습니다.", false, { manualReconnect: true });
         terminalError(
           "새 입력은 보내지 않습니다. 실행 상태를 확인하려면 다시 연결해 주세요.",
         );
@@ -11525,7 +11557,7 @@ function sendInput(text) {
         state.inputFailed = true;
         state.inputEpoch++;
         stopTerminalReader();
-        terminalStatus("입력 전달을 확인하지 못했습니다.");
+        terminalStatus("입력 전달을 확인하지 못했습니다.", false, { manualReconnect: true });
         terminalError(
           "입력이 반영됐을 수도 있어 자동으로 다시 보내지 않습니다. 다시 연결한 뒤 터미널 내용을 확인해 주세요.",
         );
@@ -13436,6 +13468,21 @@ function updateViewport() {
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
+  positionBoardStatusPanel();
+}
+function positionBoardStatusPanel() {
+  if (!$("board-status")?.open) return;
+  const panel = $("board-status-panel");
+  if (!panel?.getBoundingClientRect || !panel.style?.setProperty) return;
+  panel.style.setProperty("--status-panel-shift", "0px");
+  const box = panel.getBoundingClientRect(), viewport = window.visualViewport;
+  const width = viewport?.width || window.innerWidth || document.documentElement.clientWidth;
+  const height = viewport?.height || window.innerHeight || document.documentElement.clientHeight;
+  if (!width || !height) return;
+  const left = (viewport?.offsetLeft || 0) + 12, right = left + width - 24;
+  const shift = Math.max(left - box.left, Math.min(0, right - box.right));
+  panel.style.setProperty("--status-panel-shift", `${Math.round(shift)}px`);
+  panel.style.maxHeight = `${Math.max(0, Math.floor((viewport?.offsetTop || 0) + height - box.top - 12))}px`;
 }
 // An iPad's on-screen keyboard takes half the screen: while typing with it the board's top
 // bar and the terminal's note fold away (phones fold their own way, "is-typing"). Beside a
@@ -13863,6 +13910,7 @@ window.addEventListener("DOMContentLoaded", () => {
   $("board-status-panel")?.addEventListener("click", (event) => {
     if (event.target?.closest?.("button")) $("board-status").open = false;
   });
+  $("board-status")?.addEventListener("toggle", positionBoardStatusPanel);
   $("update-banner")?.addEventListener("click", updateBannerPressed);
   $("quick-replies-save")?.addEventListener("click", saveSharedQuickReplies);
   $("quick-replies-reload")?.addEventListener("click", () => loadQuickReplyPreferences({ replaceEditor: true }));
@@ -14166,9 +14214,9 @@ window.addEventListener("DOMContentLoaded", () => {
     if (state.terminalVisible) {
       stopTerminalReader();
       state.inputEpoch++;
-      terminalStatus("네트워크 연결이 끊겼습니다.");
+      terminalStatus("네트워크 연결이 끊겼습니다.", false, { manualReconnect: false });
       terminalError(
-        "입력은 전송되지 않습니다. 연결이 돌아오면 다시 연결을 눌러 주세요.",
+        "입력은 전송되지 않습니다. 연결이 돌아오면 자동으로 다시 연결합니다. 초안은 유지됩니다.",
       );
     } else {
       clearTimeout(state.pollTimer);

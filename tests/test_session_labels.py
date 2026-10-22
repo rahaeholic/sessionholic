@@ -79,6 +79,19 @@ class SessionLabelsTest(unittest.TestCase):
         self.assertEqual(self.labels.path.read_bytes(), before)
         self.assertEqual(json.loads(before)['labels'], {})
 
+    def test_first_request_title_stays_fixed_when_native_auto_names_change_and_manual_aliases_win(self):
+        source = {**self.source, 'initialTitle': '첫 요청의 목적', 'title': '마지막 답변으로 붙은 이름'}
+        first = self.row(self.labels.decorate(self.snapshot(source)))
+        self.assertEqual(first['displayTitle'], '첫 요청의 목적')
+        later = {**source, 'title': '진행 후 다시 바뀐 자동 이름', 'initialTitle': 'preview까지 바뀐 뒤의 문구'}
+        reloaded = SessionLabels(self.directory)
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(later)))['displayTitle'], first['displayTitle'])
+        reloaded.set(source, '직접 정한 이름')
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(later)))['displayTitle'], '직접 정한 이름')
+        self.assertEqual(reloaded.set(later, None)['displayTitle'], '첫 요청의 목적')
+        native_manual = {**later, 'manualNativeTitle': 'CLI에서 직접 바꾼 이름'}
+        self.assertEqual(self.row(reloaded.decorate(self.snapshot(native_manual)))['displayTitle'], 'CLI에서 직접 바꾼 이름')
+
     def test_aliases_are_separate_for_host_home_agent_and_claude_transcript(self):
         claude = {**self.source, 'agent': 'claude', 'home': '.claude', 'sessionId': str(uuid.uuid4())}
         sources = [self.source, {**self.source, 'home': '.codex-other'},

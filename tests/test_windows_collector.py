@@ -824,6 +824,12 @@ class WindowsCollectorTest(unittest.TestCase):
         check('process_unverified')
         registry.write_text(json.dumps({**state, 'status': 'future-status'}))
         check('status_unsupported')
+        registry.write_text(json.dumps({**state, 'status': 'shell'}))
+        for shell in (self.reader.snapshot()['claude'][0], self.reader.read('claude', sid)):
+            self.assertEqual((shell['phase'], shell['runtimeKnown'], shell['runtimeReason']), ('idle', True, None))
+            self.assertTrue(shell['backgroundShellRunning'])
+        registry.write_text(json.dumps({**state, 'status': 'shell', 'procStart': 'reused'}))
+        check('process_unverified')
         registry.write_text(json.dumps(state))
         (directory / '78.json').write_text(json.dumps({**state, 'pid': 78}))
         check('owner_ambiguous')
@@ -879,9 +885,13 @@ class WindowsCollectorTest(unittest.TestCase):
         self.claude_transcript(sid, entries)
         row = self.reader.snapshot()['claude'][0]
         self.assertEqual((row['title'], row['snippet']), ('에이전트 이름', '마지막 답변'))
+        self.assertEqual(row['initialTitle'], '첫 요청 둘째 줄')
+        self.assertEqual(row['manualNativeTitle'], '처음 바꾼 이름')
         entries.insert(-2, {'type': 'custom-title', 'customTitle': '새 이름', 'sessionId': sid})
         self.claude_transcript(sid, entries)
         self.assertEqual(self.reader.snapshot()['claude'][0]['title'], '새 이름')
+        self.assertEqual(self.reader.snapshot()['claude'][0]['initialTitle'], '첫 요청 둘째 줄')
+        self.assertEqual(self.reader.snapshot()['claude'][0]['manualNativeTitle'], '새 이름')
         # No title record in the end: the first real request, on one line.
         self.claude_transcript(sid, [entry for entry in entries if entry['type'] in ('user', 'progress')])
         row = self.reader.snapshot()['claude'][0]

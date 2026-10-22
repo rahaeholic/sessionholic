@@ -273,7 +273,7 @@ def claude_phase(state, status):
         return "working"
     if state in ("done", "stopped"):
         return "done"
-    if state == "idle" or state is None and status == "idle":
+    if state == "idle" or state is None and status in ("idle", "shell"):
         return "idle"
     return "unknown"
 
@@ -613,16 +613,41 @@ def claude_session_rows(rows, errors, projects, transcripts=None):
     return out
 
 
-def claude_snippet(path, size):
+def claude_snippet(path, size, metadata=None):
     """Last answer preview from a small tail first; widen only when the tail has none."""
     for limit in SNIPPET_TAILS:
-        messages = claude_messages(tail_entries(path, limit))
+        entries = list(tail_entries(path, limit))
+        if metadata is not None:
+            manual = next((e.get("customTitle") for e in reversed(entries)
+                           if e.get("type") == "custom-title" and _metadata_text(e.get("customTitle"), 160)), None)
+            if manual:
+                metadata["manualNativeTitle"] = manual
+        messages = claude_messages(entries)
         last = next((m for m in reversed(messages) if m["role"] == "assistant"), None)
         if last:
             return one_line(last["text"], 140)
         if size <= limit:
             break
     return ""
+
+
+def claude_initial_titles(path, *, read_manual=True):
+    with path.open("rb") as stream:
+        raw = stream.read(65536)
+    head = []
+    for line in raw.splitlines()[:30]:
+        try:
+            entry = json.loads(line)
+            if isinstance(entry, dict):
+                head.append(entry)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+    first = next((m["text"] for m in claude_messages(head) if m["role"] == "user"
+                  and not m["text"].lstrip().startswith("<")), "")
+    manual = next((e.get("customTitle") for e in reversed(head + (list(tail_entries(path, 65536)) if read_manual else []))
+                   if e.get("type") == "custom-title" and _metadata_text(e.get("customTitle"), 160)), None)
+    return {"initialTitle": one_line(first, 60) or "(제목 없음)",
+            **({"manualNativeTitle": manual} if manual else {})}
 
 
 def _metadata_text(value, limit=256):
@@ -758,13 +783,14 @@ def claude_row(row, transcripts, projects):
         raise TypeError("Claude 세션 행 형식이 올바르지 않습니다.")
     session_id = str(row.get("sessionId") or "")
     path = transcripts.get(session_id) if SESSION_ID.match(session_id) else None
-    snippet, updated = "", to_epoch(row.get("startedAt"))
+    snippet, updated, titles = "", to_epoch(row.get("startedAt")), {}
     entrypoint = _metadata_text(row.get("entrypoint")) if not path else None
     if path:
         try:
             info = path.stat()
             updated = int(info.st_mtime)
-            snippet = claude_snippet(path, info.st_size)
+            titles = claude_initial_titles(path, read_manual=False)
+            snippet = claude_snippet(path, info.st_size, metadata=titles)
             entrypoint = claude_entrypoint(path, session_id)
         except OSError:
             # Removed or unreadable transcripts keep the session row without a preview.
@@ -779,6 +805,7 @@ def claude_row(row, transcripts, projects):
         "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
         **session_origin(row),
     }
+    out.update(titles)
     pid = row.get("pid")
     if not out["id"] and isinstance(pid, int) and not isinstance(pid, bool):
         # A row `claude agents` lists without an id (seen for a working interactive
@@ -1253,6 +1280,9 @@ def codex_row(thread, key, project_id, account, loaded, projects):
     cwd = str(thread.get("cwd") or "")
     name = thread.get("name")
     preview = one_line(thread.get("preview"), 140)
+    initial = next((thread[k] for k in ("first_user_message", "preview")
+                    if isinstance(thread.get(k), str) and thread[k].strip()), "")
+    initial = bot_request_text(codex_user_text(initial) or "")
     row = {
         "agent": "codex", "id": str(thread.get("id") or ""), "home": key,
         "title": name or preview[:60] or "(제목 없음)", "named": bool(name), "cwd": cwd,
@@ -1263,6 +1293,7 @@ def codex_row(thread, key, project_id, account, loaded, projects):
         "startedAt": to_epoch(thread.get("createdAt")), "updatedAt": to_epoch(thread.get("updatedAt")),
         "snippet": preview if name else "", "resume": "codex resume " + str(thread.get("id") or ""),
         **session_origin(thread),
+        "initialTitle": one_line(initial, 60) or "(제목 없음)",
     }
     if row['phase'] == 'unknown':
         row.update(runtimeKnown=False, runtimeReason='이 Codex CLI의 실행 상태를 해석하지 못했습니다.')

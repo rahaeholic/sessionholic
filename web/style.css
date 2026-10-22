@@ -699,7 +699,7 @@ select:disabled {
 }
 /* A compact overview opens the full device and usage panel. */
 .top-status {
-  position: static;
+  position: relative;
   flex: none;
   margin-left: auto;
   min-width: 0;
@@ -726,7 +726,8 @@ select:disabled {
 .board-status-panel {
   position: absolute;
   top: calc(100% + 6px);
-  right: 8px;
+  right: 0;
+  transform: translateX(var(--status-panel-shift, 0px));
   z-index: 60;
   width: min(320px, calc(100vw - 24px));
   max-height: calc(var(--app-height, 100dvh) - 84px);

@@ -968,7 +968,7 @@ class WindowsRuntime:
                 return {**observed, 'target': target, 'phase': state['phase'], 'capabilities': capabilities}
             observed = self._claude(source)
             row = observed['row']
-            phase = {'busy': 'working', 'idle': 'idle', 'waiting': 'needs_input'}.get(row.get('status'), 'unknown')
+            phase = wc._claude_phase(row.get('status'))
             capabilities['interrupt']['reason'] = '이 Claude 실행 방식은 응답만 중단하는 제어를 제공하지 않습니다.'
             capabilities['terminate'] = {'supported': True, 'method': 'claude-cli-process', 'reason': None,
                 'effect': '선택한 Claude CLI 프로세스를 종료합니다. 대화 기록은 유지되며 별도 하위 도구 프로세스의 종료는 확인하지 않습니다.',

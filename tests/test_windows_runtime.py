@@ -739,6 +739,14 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertTrue(result['confirmed'])
         self.assertEqual([item['pid'] for item in self.kills], [45])
 
+    def test_claude_shell_is_foreground_idle_and_other_registry_states_keep_their_meaning(self):
+        source, row, path = self.claude()
+        for status, phase in (('shell', 'idle'), ('busy', 'working'), ('waiting', 'needs_input'), ('future-state', 'unknown')):
+            path.write_text(json.dumps({**row, 'status': status}))
+            self.assertEqual(self.runtime.preview(source)['phase'], phase)
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual(self.kills, [])
+
     def test_claude_pid_reuse_is_stale(self):
         source, row, path = self.claude()
         preview = self.runtime.preview(source)

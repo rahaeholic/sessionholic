@@ -262,6 +262,9 @@ class PhaseTest(unittest.TestCase):
         self.assertEqual(collector.claude_phase("done", "busy"), "working")
         self.assertEqual(collector.claude_phase("done", "idle"), "done")
         self.assertEqual(collector.claude_phase("idle", "idle"), "idle")
+        self.assertEqual(collector.claude_phase(None, "shell"), "idle")
+        self.assertEqual(collector.claude_phase("working", "shell"), "working")
+        self.assertEqual(collector.claude_phase("blocked", "shell"), "needs_input")
         self.assertEqual(collector.claude_phase("something-new", None), "unknown")
         self.assertEqual(collector.claude_phase(None, None), "unknown")
 
@@ -1755,6 +1758,35 @@ class SavedHistoryTest(unittest.TestCase):
         other = folder / 'private-other.jsonl'; other.write_text('private'); path.unlink(); path.symlink_to(other)
         with patch.object(collector, 'HOME', self.home), self.assertRaises(ValueError): collector.saved_history_source(source)
         with self.assertRaises(ValueError): self.windows.WindowsCollector(self.home).saved_history_source(source)
+
+class InitialTitleTest(unittest.TestCase):
+    def test_first_claude_request_survives_new_answers_and_generated_titles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'fixture.jsonl'
+            first = [{'type': 'user', 'isMeta': True, 'message': {'content': '펼친 지침'}},
+                     {'type': 'user', 'message': {'content': '첫 요청\n작업 목적'}},
+                     {'type': 'ai-title', 'aiTitle': '처음 자동 제목'}]
+            path.write_text('\n'.join(json.dumps(row) for row in first) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['initialTitle'], '첫 요청 작업 목적')
+            with path.open('a') as stream:
+                for unused in range(80):
+                    stream.write(json.dumps({'type': 'progress', 'data': 'x' * 1000}) + '\n')
+                stream.write(json.dumps({'type': 'ai-title', 'aiTitle': '마지막 응답으로 바뀐 제목'}) + '\n')
+                stream.write(json.dumps({'type': 'assistant', 'message': {'content': '전혀 다른 최종 답변'}}) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['initialTitle'], '첫 요청 작업 목적')
+            with path.open('a') as stream:
+                stream.write(json.dumps({'type': 'custom-title', 'customTitle': '직접 정한 제목'}) + '\n')
+            self.assertEqual(collector.claude_initial_titles(path)['manualNativeTitle'], '직접 정한 제목')
+
+    def test_codex_first_request_is_not_replaced_by_the_native_name_or_harness(self):
+        thread = {'id': 'fixture', 'status': {'type': 'idle'}, 'preview': '첫 요청의 목적', 'name': '현재 자동 이름'}
+        first = collector.codex_row(thread, '.codex', None, '', set(), [])
+        later = collector.codex_row({**thread, 'name': '새 답변 제목'}, '.codex', None, '', set(), [])
+        self.assertEqual(first['initialTitle'], '첫 요청의 목적')
+        self.assertEqual(later['initialTitle'], first['initialTitle'])
+        harness = '# AGENTS.md instructions for /example\n<INSTRUCTIONS>rules</INSTRUCTIONS>\n<environment_context>env</environment_context>\n실제 첫 요청'
+        explicit = collector.codex_row({**thread, 'first_user_message': harness}, '.codex', None, '', set(), [])
+        self.assertEqual(explicit['initialTitle'], '실제 첫 요청')
 
 
 if __name__ == "__main__":

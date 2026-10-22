@@ -186,6 +186,11 @@ def _unknown_runtime(code, evidence='saved_record'):
             'runtimeEvidence': evidence, 'runtimeReasonCode': code}
 
 
+def _claude_phase(status):
+    # `shell`: foreground turn ended, background shell still alive.
+    return {'busy': 'working', 'waiting': 'needs_input', 'idle': 'idle', 'shell': 'idle'}.get(status, 'unknown') if isinstance(status, str) else 'unknown'
+
+
 def _codex_runtime(status):
     phase = _phase(status)
     if phase == 'unknown':
@@ -774,9 +779,13 @@ class WindowsCollector:
         status = live.get('status') if live else None
         project = self.project(raw.get('cwd'))
         preview = _text(raw.get('preview') or raw.get('first_user_message') or raw.get('title'), 140)
+        initial = next((raw[k] for k in ('first_user_message', 'preview', 'title')
+                        if isinstance(raw.get(k), str) and raw[k].strip()), '')
+        initial = _bot_request_text(_codex_user_text(initial) or '')
         name = _text((live or {}).get('name') or raw.get('name'), 160)
         return {'agent': 'codex', 'id': sid, 'home': '.codex', 'cwd': str(raw.get('cwd') or ''),
                 'title': name or preview[:60] or '(제목 없음)', 'named': bool(name),
+                'initialTitle': _one_line(initial, 60) or '(제목 없음)',
                 'project': project, 'account': '기기 Codex',
                 'state': status.get('type') if isinstance(status, dict) else 'unknown',
                 'status': ','.join(_flags(status)), 'loaded': live is not None,
@@ -1030,7 +1039,7 @@ class WindowsCollector:
                         cwd = entry['cwd']
                         break
             status = row.get('status')
-            phase = ('working' if status == 'busy' else 'needs_input' if status == 'waiting' else 'idle' if status == 'idle' else 'unknown') if exact else 'unknown'
+            phase = _claude_phase(status) if exact else 'unknown'
             if phase != 'unknown':
                 runtime = {'runtimeKnown': True, 'runtimeReason': None,
                            'runtimeEvidence': 'claude_registry_process', 'runtimeReasonCode': None}
@@ -1040,16 +1049,19 @@ class WindowsCollector:
                 runtime = _unknown_runtime(reason, 'unsupported' if exact else 'saved_record')
             project = self.project(cwd)
             title, snippet = _one_line(row.get('name'), 160), ''
+            titles = {}
             if path:
                 try:
-                    named, snippet = _claude_label(path)
+                    named, snippet = _claude_label(path, metadata=titles)
                     title = title or named
                 except (OSError, ValueError):
                     pass  # A transcript that cannot be read keeps the row without its label.
             output.append({'agent': 'claude', 'id': sid, 'sessionId': sid, 'home': '.claude',
                 'kind': 'background' if row.get('kind') == 'bg' else row.get('kind'), 'entrypoint': entrypoint,
                 'title': title or '(Claude 대화)', 'cwd': cwd, 'project': project,
+                **titles,
                 'phase': phase, 'state': phase, 'status': status if exact else None, **runtime,
+                'backgroundShellRunning': bool(exact and status == 'shell'),
                 'startedAt': _epoch(row.get('startedAt')), 'updatedAt': int(path.stat().st_mtime) if path else None,
                 'readOnly': True, 'canRead': path is not None or details.get('transcriptAvailability') == 'disabled',
                 'snippet': snippet, **_origin(row), **details})
@@ -1119,7 +1131,7 @@ class WindowsCollector:
                     **{key: row[key] for key in ('runtimeReason', 'runtimeReasonCode', 'runtimeEvidence') if key in row},
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
                     **({'cwd': row['cwd']} if isinstance(row.get('cwd'), str) and row['cwd'] else {}),
-                    **{key: row[key] for key in ('executionMode', 'transcriptAvailability') if key in row}}
+                    **{key: row[key] for key in ('executionMode', 'transcriptAvailability', 'backgroundShellRunning') if key in row}}
         if home != '.codex':
             raise ValueError('등록된 PC Codex home만 읽을 수 있습니다.')
         if str(uuid.UUID(sid)) != sid:
@@ -1272,10 +1284,12 @@ def _one_line(value, limit):
     return ' '.join(value.split())[:limit] if isinstance(value, str) else ''
 
 
-def _claude_label(path):
+def _claude_label(path, metadata=None):
     """A list row's (title, last answer): the newest rename, else agent name, else generated
     title from the transcript's end; with none, its first request from the start."""
     entries = _tail(path, CLAUDE_LABEL_TAIL)
+    if metadata is not None:
+        metadata.update(_claude_initial_titles(path, entries=entries))
     title = next((entry[key] for kind, key in CLAUDE_TITLES for entry in reversed(entries)
                   if entry.get('type') == kind and _metadata(entry.get(key))), '')
     if not title:
@@ -1287,6 +1301,17 @@ def _claude_label(path):
         title = _one_line(title, 60)
     answer = next((message['text'] for message in reversed(_claude_messages(entries)) if message['role'] == 'assistant'), '')
     return _one_line(title, 160), _one_line(answer, 140)
+
+
+def _claude_initial_titles(path, entries=None):
+    head = _head(path)
+    asked = [e for e in head if not any(e.get(flag) for flag in ('isMeta', 'isCompactSummary', 'isSidechain'))]
+    first = next((m['text'] for m in _claude_messages(asked) if m['role'] == 'user'
+                  and not m['text'].lstrip().startswith('<')), '')
+    manual = next((e.get('customTitle') for e in reversed(head + (entries if entries is not None else _tail(path, CLAUDE_LABEL_TAIL)))
+                   if e.get('type') == 'custom-title' and _metadata(e.get('customTitle'))), None)
+    return {'initialTitle': _one_line(first, 60) or '(제목 없음)',
+            **({'manualNativeTitle': _one_line(manual, 160)} if manual else {})}
 
 
 def _entries(lines):

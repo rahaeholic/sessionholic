@@ -14981,3 +14981,105 @@ test('continuous terminal output cannot postpone the same pending resize forever
   finish(); await pending;
   assert.equal(c.state.lastSize, '90x25');
 });
+
+test('a brief host-state gap never opens a recovery card, while a sustained gap does and a later gap gets its own grace period', () => {
+  let now = 1000;
+  const timers = [];
+  const c = client(undefined, { setTimeout(fn, ms) { timers.push({ fn, ms, cleared: false }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; } });
+  c.context.Date = class extends Date { static now() { return now; } };
+  const { entry } = selectChat(c); c.state.detailShown = true;
+  const healthy = entry.data;
+  entry.text = '쓰고 있는 한글'; c.get('chat-input').value = entry.text; entry.composing = true;
+  const gap = () => { entry.data = { ...healthy, capability: { supported: false }, phase: 'unknown', runtimeKnown: false, stateReadSuperseded: true }; c.updateChatComposer(entry); };
+  gap(); const first = entry.connectionNotice;
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(c.get('chat-input').disabled, false);
+  now += 5000; entry.data = healthy; c.updateChatComposer(entry);
+  assert.equal(entry.connectionNotice, null); assert.equal(c.get('chat-recovery').hidden, true);
+  first.timer && timers[first.timer - 1].fn();
+  assert.equal(c.get('chat-recovery').hidden, true);
+  gap(); const second = entry.connectionNotice;
+  now += 14999; c.updateChatComposer(entry); assert.equal(c.get('chat-recovery').hidden, true);
+  now++; timers[second.timer - 1].fn(); assert.equal(c.get('chat-recovery').hidden, false);
+  assert.equal(c.get('chat-input').value, '쓰고 있는 한글'); assert.equal(entry.composing, true);
+  assert.equal(c.get('chat-input').focusCount, undefined);
+  entry.data = healthy; c.updateChatComposer(entry); gap();
+  assert.equal(c.get('chat-recovery').hidden, true, 'the next outage is not shown immediately');
+});
+
+test('a delayed connection card cannot repaint another session or an unauthenticated screen', () => {
+  let now = 1000; const timers = [];
+  const c = client(undefined, { setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  c.context.Date = class extends Date { static now() { return now; } };
+  const { entry } = selectChat(c); c.state.detailShown = true;
+  c.state.snapshot.hosts[0].ok = false; c.updateChatComposer(entry);
+  const fire = timers[entry.connectionNotice.timer - 1].fn;
+  now += 16000; c.state.selected = 'another'; fire();
+  assert.equal(c.get('chat-recovery').hidden, true);
+  c.state.selected = c.state.snapshot.hosts[0].data.codex[0].key; c.state.authEpoch++;
+  c.updateChatComposer(entry); assert.equal(c.get('chat-recovery').hidden, true, 'a new auth epoch gets a new grace period');
+  const later = timers[entry.connectionNotice.timer - 1].fn;
+  now += 16000; c.state.authenticated = false; later();
+  assert.equal(c.get('chat-recovery').hidden, true);
+});
+
+test('an idle host being rechecked keeps automatic reads even with a healthy event stream, and recovery restores the normal interval', () => {
+  const timers = [], c = client(undefined, { setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c); c.state.detailShown = true;
+  c.context.eventsHealthy = () => true;
+  c.state.snapshot.hosts[0].ok = false; c.state.chatPollCount = 100;
+  c.scheduleChatPoll(s, entry); assert.equal(timers.at(-1).ms, 5000);
+  c.state.snapshot.hosts[0].ok = true; entry.data.phase = 'working';
+  c.scheduleChatPoll(s, entry); assert.equal(timers.at(-1).ms, 30000);
+  c.state.offline = true; const before = timers.length;
+  c.scheduleChatPoll(s, entry); assert.equal(timers.length, before);
+});
+
+test('connection notice transitions preserve the same listening microphone and draft control', () => {
+  const { c, FakeRecognition, recognitions } = dictationClient();
+  c.context.webkitSpeechRecognition = FakeRecognition;
+  const { s, entry } = selectChat(c); c.state.detailShown = true;
+  const composer = c.buildChatComposer(s), input = findId(composer, 'chat-input');
+  findId(composer, 'chat-mic').events.click(); const rec = recognitions.at(-1); rec.onstart();
+  c.state.snapshot.hosts[0].ok = false; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-recovery').hidden, true); assert.equal(input.disabled, false);
+  c.state.snapshot.hosts[0].ok = true; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-input'), input); assert.equal(c.state.dictation.field, input);
+  assert.equal(rec.stopped, 0); assert.equal(rec.aborted, 0);
+});
+
+test('terminal auto reconnect stays quiet until retries are exhausted and unknown input delivery still requires manual reconnect', async () => {
+  let reads = 0;
+  const c = client(async () => { reads++; throw Error('fixture temporary connection'); },
+    { setTimeout(fn, ms) { if (ms <= 15000) queueMicrotask(fn); return 1; }, clearTimeout() {} });
+  c.state.terminal = { id: 'read-retry' }; c.state.terminalVisible = true; c.state.term = {};
+  const pending = c.startTerminalReader(); assert.equal(c.get('terminal-reconnect').hidden, true);
+  await pending; assert.equal(reads, 7); assert.equal(c.get('terminal-reconnect').hidden, false);
+  assert.match(c.get('terminal-error').textContent, /새 입력은 보내지 않습니다/);
+  let sends = 0;
+  c.context.fetch = async () => { sends++; throw Error('fixture lost send acknowledgement'); };
+  c.state.connected = true; c.state.inputFailed = false;
+  await assert.rejects(c.sendInput('a'));
+  assert.equal(sends, 1); assert.equal(c.get('terminal-reconnect').hidden, false);
+  assert.match(c.get('terminal-error').textContent, /자동으로 다시 보내지 않습니다/);
+});
+
+test('device menu stays anchored to its button and clamps within the current pane and keyboard viewport', () => {
+  const c = client(undefined, noChatTimers), panel = c.get('board-status-panel'), writes = {};
+  panel.style.setProperty = (key, value) => { writes[key] = value; };
+  let measured = 0, box = { left: 200, right: 520, top: 58 };
+  panel.getBoundingClientRect = () => { measured++; return box; };
+  c.context.window.innerWidth = 900; c.context.window.innerHeight = 700;
+  vm.runInContext('positionBoardStatusPanel()', c.context); assert.equal(measured, 0);
+  c.get('board-status').open = true;
+  vm.runInContext('positionBoardStatusPanel()', c.context);
+  assert.equal(writes['--status-panel-shift'], '0px'); assert.equal(panel.style.maxHeight, '630px');
+  box = { left: -100, right: 220, top: 58 }; c.context.window.innerWidth = 360;
+  vm.runInContext('positionBoardStatusPanel()', c.context); assert.equal(writes['--status-panel-shift'], '112px');
+  box = { left: 280, right: 600, top: 58 };
+  vm.runInContext('positionBoardStatusPanel()', c.context); assert.equal(writes['--status-panel-shift'], '-252px');
+  c.context.window.visualViewport = { width: 360, height: 300, offsetLeft: 20, offsetTop: 40 };
+  vm.runInContext('positionBoardStatusPanel()', c.context);
+  assert.equal(writes['--status-panel-shift'], '-232px'); assert.equal(panel.style.maxHeight, '270px');
+  assert.equal(panel.focusCount, undefined);
+});
