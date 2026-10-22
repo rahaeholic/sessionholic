@@ -2871,7 +2871,7 @@ li[data-task] {
   grid-template-rows: repeat(2, 42px);
   grid-template-areas:
     "ctrl k1 k2 k3 k4 meta cup up   word  enter"
-    "alt  k5 k6 k7 k8 .    left down right enter";
+    "alt  k5 k6 k7 k8 pick left down right enter";
   gap: 5px;
   max-width: 680px;
 }
@@ -2903,6 +2903,7 @@ li[data-task] {
 .terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
 .terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
 .terminal-keys [data-key="ctrl-up"] { grid-area: cup; }
+.terminal-keys [data-key="shift-left"] { grid-area: pick; }
 .terminal-keys [data-key="alt-left"] { grid-area: word; }
 .terminal-keys [data-key="up"] { grid-area: up; }
 .terminal-keys [data-key="left"] { grid-area: left; }

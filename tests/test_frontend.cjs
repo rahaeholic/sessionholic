@@ -3948,12 +3948,12 @@ test('changing list filters removes hidden cards without changing the selected s
 test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'ctrl-up', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
+  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'ctrl-up', 'shift-left', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
     assert.match(html, new RegExp(`data-key="${key}"`));
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
   assert.match(css, /"ctrl k1 k2 k3 k4 meta cup up\s+word\s+enter"/);
-  assert.match(css, /"alt\s+k5 k6 k7 k8 \.\s+left down right enter"/);
+  assert.match(css, /"alt\s+k5 k6 k7 k8 pick left down right enter"/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
@@ -4047,6 +4047,13 @@ test('held bar modifiers combine with the next key from the bar, the input bar o
   c.pressTerminalKey('ctrl-up');
   await settle();
   assert.deepEqual(calls.splice(0), ['\x1b[1;5A'], 'the dedicated Codex key sends exactly one Ctrl+Up sequence');
+  c.pressTerminalKey('shift-left');
+  await settle();
+  assert.deepEqual(calls.splice(0), ['\x1b[1;2D'], 'the question-view key sends exactly one Shift+Left sequence');
+  c.toggleTerminalMod('ctrl'); c.pressTerminalKey('shift-left');
+  await settle();
+  assert.deepEqual(calls.splice(0), ['\x1b[1;6D']);
+  assert.equal(c.state.terminalMods.ctrl, false);
   c.pressTerminalKey('alt-left');
   await settle();
   assert.deepEqual(calls.splice(0), ['\x1bb']);

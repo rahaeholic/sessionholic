@@ -11944,7 +11944,8 @@ const TERMINAL_ALWAYS_KEYS = /^(F([1-9]|1[0-2])|PageUp|PageDown|Insert)$/;
 const TERMINAL_BAR_KEYS = {
   escape: ["Escape"], tab: ["Tab"], backtab: ["Tab", { shift: true }], interrupt: ["c", { ctrl: true }],
   "ctrl-j": ["j", { ctrl: true }], "ctrl-u": ["u", { ctrl: true }], "ctrl-x": ["x", { ctrl: true }],
-  "ctrl-l": ["l", { ctrl: true }], "ctrl-up": ["ArrowUp", { ctrl: true }], up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
+  "ctrl-l": ["l", { ctrl: true }], "ctrl-up": ["ArrowUp", { ctrl: true }], "shift-left": ["ArrowLeft", { shift: true }],
+  up: ["ArrowUp"], left: ["ArrowLeft"], down: ["ArrowDown"],
   right: ["ArrowRight"], enter: ["Enter"],
 };
 const TERMINAL_BAR_BYTES = {
@@ -11961,6 +11962,7 @@ const TERMINAL_BAR_BYTES = {
   "ctrl-x": "\x18",
   "ctrl-l": "\x0c",
   "ctrl-up": "\x1b[1;5A",
+  "shift-left": "\x1b[1;2D",
   enter: "\r",
 };
 function terminalKeyBytes(key, mods = {}, { windows = false } = {}) {
