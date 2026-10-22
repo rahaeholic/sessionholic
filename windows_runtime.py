@@ -3,7 +3,8 @@
 The board injects this module, windows_collector and windows_attachments over SSH stdin.
 It starts no server and accepts no arbitrary shell command, PID, binary or filesystem path.
 Besides uploads kept in the session's own work folder (windows_attachments), only metadata
-receipts, unresolved resume permissions and a local proof key are persisted; input is not logged.
+receipts, session model preferences, unresolved resume permissions and a local proof key are
+persisted; input is not logged.
 """
 from __future__ import annotations
 
@@ -367,6 +368,34 @@ def _capabilities(thread):
     return {'canRead': True, 'canSend': supported, 'canAttachImages': supported,
             'canAnswerApprovals': False, 'canAnswerQuestions': False,
             'reason': None if supported else '이 PC 세션의 직접 입력 지원을 확인하지 못했습니다. 터미널에서 이어가세요.'}
+
+
+def _models(client):
+    """Read the owning account's complete, bounded catalog; never invent model IDs."""
+    models, cursor, seen = [], None, set()
+    for _ in range(4):
+        result = client.call('model/list', {'limit': 100, **({'cursor': cursor} if cursor else {})})
+        if not isinstance(result, dict) or not isinstance(result.get('data'), list) or len(result['data']) > 100:
+            raise ValueError('PC 모델 목록 형식을 확인하지 못했습니다.')
+        for row in result['data']:
+            if (not isinstance(row, dict) or row.get('hidden') or not isinstance(row.get('model'), str)
+                    or not wc.MODEL_ID.fullmatch(row['model'])):
+                continue
+            supported = row.get('supportedReasoningEfforts')
+            if not isinstance(supported, list) or len(supported) > 16:
+                continue
+            efforts = list(dict.fromkeys(item.get('reasoningEffort') for item in supported
+                          if isinstance(item, dict) and item.get('reasoningEffort') in wc.EFFORTS))
+            if efforts:
+                models.append({'model': row['model'], 'label': str(row.get('displayName') or row['model'])[:120],
+                               'efforts': efforts, 'defaultEffort': row.get('defaultReasoningEffort')})
+        cursor = result.get('nextCursor')
+        if cursor is None:
+            return models
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            break
+        seen.add(cursor)
+    raise ValueError('PC 모델 목록을 모두 확인하지 못했습니다. 다시 시도해 주세요.')
 
 
 def _receipt(identity, request_id, thread):
@@ -794,7 +823,7 @@ class WindowsRuntime:
     def chat(self, args):
         source, action = args.get('source'), args.get('action')
         identity = _identity(source)
-        if action not in ('read', 'capabilities', 'send', 'receipt'):
+        if action not in ('read', 'capabilities', 'send', 'receipt', 'command'):
             raise ValueError('지원하지 않는 PC 대화 요청입니다.')
         if identity['agent'] != 'codex':
             if action not in ('read', 'capabilities'):
@@ -811,6 +840,8 @@ class WindowsRuntime:
             return {**self.reader.read('codex', identity['id'], '.codex'),
                     'capabilities': {'canSend': False, 'canRead': True, 'reason': '현재 실행 중인 PC 원본 서버를 확인하지 못했습니다.'}}
         thread = observed['thread']
+        if action == 'command':
+            return self._command(args, observed)
         if action == 'send':
             return self._send(args, observed)
         supplied_ids = args.get('requestIds') or []
@@ -851,11 +882,84 @@ class WindowsRuntime:
             capabilities.update(canSend=False, canLaunch=False, reason=str(exc))
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
         result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
-                  'modelSettings': wc._model_settings(thread),
+                  'modelSettings': {**wc._model_settings(thread), 'next': self._model_preferences(observed)},
                   'capabilities': capabilities, 'readOnly': not capabilities['canSend'], 'receipts': receipts}
         if action == 'receipt':
             result.update(receipts[0])
         return result
+
+    @staticmethod
+    def _model_binding(observed):
+        return {**observed['source'], 'cwd': wc._norm(observed['cwd'])}
+
+    def _model_preferences(self, observed):
+        value = self.store.read('model-settings-' + _digest(observed['source']) + '.json')
+        if value is None:
+            return {}
+        selected = value.get('selected') if isinstance(value, dict) else None
+        if (not isinstance(selected, dict) or set(selected) != {'model', 'effort'}
+                or value.get('binding') != self._model_binding(observed)
+                or not isinstance(selected['model'], str) or not wc.MODEL_ID.fullmatch(selected['model'])
+                or selected['effort'] not in wc.EFFORTS):
+            raise ValueError('PC 세션의 모델 설정 기록을 확인하지 못했습니다.')
+        return selected
+
+    def _command(self, args, observed):
+        command, value, request_id = args.get('command'), args.get('value'), args.get('requestId')
+        if command not in ('models', 'model', 'effort', 'compact'):
+            raise ValueError('지원하는 PC 채팅 명령을 선택해 주세요.')
+        if command in ('models', 'compact') and value is not None:
+            raise ValueError('모델 조회와 요약 명령에는 인자를 넣지 않습니다.')
+        if command != 'models' and (not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
+            raise ValueError('PC 명령 요청 식별자가 올바르지 않습니다.')
+        if command in ('model', 'effort') and not isinstance(value, str):
+            raise ValueError('모델 또는 에포트 목록에서 선택해 주세요.')
+        identity, binding = observed['source'], self._model_binding(observed)
+        digest, name = _digest([command, value]), 'command-' + _digest([identity, request_id]) + '.json'
+        with self.store.lock():
+            prior = self.store.read(name) if command != 'models' else None
+            if prior:
+                if prior.get('digest') != digest or prior.get('binding') != binding:
+                    raise ValueError('같은 명령 ID에 다른 대상이나 값을 사용할 수 없습니다.')
+                return prior['result']
+            with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
+                self._verify_endpoint(observed)
+                self._require_resume_verified(observed)
+                thread = self._thread(client, identity, observed['cwd'])
+                current = wc._model_settings(thread)
+                if command == 'models':
+                    return {'models': _models(client), 'current': current, 'next': self._model_preferences(observed)}
+                if not _capabilities(thread)['canSend']:
+                    raise ValueError('현재 PC 세션에서 이 명령을 사용할 수 없습니다.')
+                if command == 'compact' and _state(thread)['phase'] != 'idle':
+                    raise ValueError('진행 중인 작업이 끝난 뒤 요약해 주세요.')
+                if command in ('model', 'effort'):
+                    previous = self._model_preferences(observed) or current
+                    model = value if command == 'model' else previous.get('model')
+                    chosen = next((row for row in _models(client) if row['model'] == model), None)
+                    if chosen is None:
+                        raise ValueError('이 PC 계정에서 선택할 수 있는 모델을 골라 주세요.')
+                    effort = value if command == 'effort' else previous.get('effort')
+                    if command == 'model' and effort not in chosen['efforts']:
+                        effort = chosen['defaultEffort']
+                    if effort not in chosen['efforts']:
+                        raise ValueError('이 모델이 지원하는 에포트 레벨을 골라 주세요.')
+                    selected = {'model': model, 'effort': effort}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': {
+                        'status': 'unknown', 'reason': '모델 설정 결과를 다시 확인해 주세요.'}})
+                    self.store.save('model-settings-' + _digest(identity) + '.json', {'binding': binding, 'selected': selected})
+                    result = {'status': 'configured', 'current': current, 'next': selected,
+                              'reason': '다음 새 응답부터 적용됩니다. 진행 중인 응답은 현재 모델을 유지합니다.'}
+                else:
+                    result = {'status': 'unknown', 'reason': '요약 요청 결과를 확인하지 못했습니다. 자동으로 재실행하지 않습니다.'}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                    try:
+                        client.call('thread/compact/start', {'threadId': identity['id']})
+                        result = {'status': 'accepted', 'reason': '대화 요약을 시작했습니다.'}
+                    except (OSError, ValueError, TimeoutError):
+                        pass
+                self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                return result
 
     def attachment(self, args, data):
         """Store one upload (windows_attachments.receive) in the work folder this PC records
@@ -924,11 +1028,14 @@ class WindowsRuntime:
                 caps = _capabilities(thread)
                 if not caps['canSend']:
                     return {**before, 'delivery': 'rejected', 'reason': caps['reason']}
+                # A follow-up while a turn is running must not replace that turn's model.
+                preferences = self._model_preferences(observed) if _state(thread)['phase'] == 'idle' else {}
                 before = {**before, **named}
                 self.store.save(name, {'digest': digest, 'result': before, **named})
                 result = before
                 try:
-                    response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs, 'clientUserMessageId': request_id})
+                    response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs,
+                                                         'clientUserMessageId': request_id, **preferences})
                     turn = response.get('turn') if isinstance(response, dict) else None
                     if isinstance(turn, dict) and isinstance(turn.get('id'), str):
                         result = {**before, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True, 'turnId': turn['id'], 'reason': None}

@@ -95,6 +95,15 @@ class FakeReader:
                     return {'data': list(owner.loaded)}
                 if method == 'thread/read':
                     return {'thread': copy.deepcopy(owner.thread)}
+                if method == 'model/list':
+                    result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
+                    if isinstance(result, Exception):
+                        raise result
+                    return copy.deepcopy(result)
+                if method == 'thread/compact/start':
+                    if getattr(owner, 'compact_timeout', False):
+                        raise TimeoutError('synthetic lost compact reply')
+                    return {}
                 if method == 'thread/resume':
                     owner.loaded.append(params['threadId'])
                     modes = {'danger-full-access': 'dangerFullAccess', 'workspace-write': 'workspaceWrite',
@@ -158,6 +167,119 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.reader.thread['status']['type'] = 'active'
         self.reader.thread['turns'] = [{'id': 'turn-original', 'status': 'inProgress', 'items': []}]
 
+    def model_command(self, command, value=None, request='model-request-1234'):
+        return self.runtime.chat({'action': 'command', 'source': self.source, 'command': command,
+                                  'value': value, 'requestId': request})
+
+    def models(self):
+        self.reader.thread.update(model='example-one', reasoningEffort='high')
+        self.reader.catalog = {'data': [
+            {'model': name, 'displayName': name, 'defaultReasoningEffort': 'low',
+             'supportedReasoningEfforts': [{'reasoningEffort': value} for value in efforts]}
+            for name, efforts in [('example-one', ['low', 'high']), ('example-two', ['low'])]], 'nextCursor': None}
+
+    def test_model_command_lists_account_models_and_next_idle_send_uses_selection(self):
+        self.models()
+        catalog = self.model_command('models')
+        self.assertEqual([row['model'] for row in catalog['models']], ['example-one', 'example-two'])
+        self.assertEqual(catalog['current'], {'model': 'example-one', 'effort': 'high'})
+        chosen = self.model_command('model', 'example-two')
+        self.assertEqual(chosen['next'], {'model': 'example-two', 'effort': 'low'})
+        self.assertEqual(chosen['current']['model'], 'example-one')
+        self.assertEqual(self.reader.send_calls, 0)
+        state = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual(state['modelSettings']['next'], chosen['next'])
+        self.assertTrue(self.send()['confirmed'])
+        sent = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertEqual(set(sent), {'threadId', 'input', 'clientUserMessageId', 'model', 'effort'})
+        self.assertEqual((sent['model'], sent['effort']), ('example-two', 'low'))
+
+    def test_model_preferences_survive_restart_and_replay_does_not_revert_new_choice(self):
+        self.models()
+        first = self.model_command('model', 'example-two')
+        self.model_command('model', 'example-one', request='model-request-5678')
+        self.runtime = wr.WindowsRuntime(reader=self.reader, proxy_factory=self.reader.proxy)
+        self.assertEqual(self.model_command('model', 'example-two'), first)
+        self.assertEqual(self.model_command('models')['next']['model'], 'example-one')
+        with self.assertRaises(ValueError):
+            self.model_command('model', 'example-one')
+
+    def test_model_effort_validation_and_running_turn_preserves_its_configuration(self):
+        self.models()
+        for command, value in [('model', '../../auth.json'), ('effort', 'ultra'), ('models', 'extra')]:
+            with self.assertRaises(ValueError):
+                self.model_command(command, value)
+        self.assertEqual(self.model_command('effort', 'low')['next'], {'model': 'example-one', 'effort': 'low'})
+        self.active()
+        self.model_command('model', 'example-two', request='model-request-5678')
+        self.send()
+        sent = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertNotIn('model', sent)
+        self.assertNotIn('effort', sent)
+
+    def test_model_catalog_incomplete_or_unavailable_does_not_store_choice(self):
+        self.models()
+        for catalog in [TimeoutError('synthetic catalog timeout'), {'data': [], 'nextCursor': 'cycle'},
+                        {'data': 'malformed'}, {'data': [], 'nextCursor': 5}]:
+            self.reader.catalog = catalog
+            with self.assertRaises((ValueError, TimeoutError)):
+                self.model_command('model', 'example-one')
+        self.assertFalse(list(self.runtime.store.root.glob('model-settings-*.json')))
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_model_settings_are_bound_to_session_and_work_folder(self):
+        self.models()
+        self.model_command('model', 'example-two')
+        original = dict(self.source)
+        self.reader.sid = self.source['id'] = str(uuid.uuid4())
+        self.reader.row['id'] = self.reader.thread['id'] = self.source['id']
+        self.reader.loaded = [self.source['id']]
+        self.assertEqual(self.model_command('models')['next'], {})
+        self.source = original
+        self.reader.sid = self.reader.row['id'] = self.reader.thread['id'] = self.source['id']
+        self.reader.loaded = [self.source['id']]
+        self.reader.row['cwd'] = self.reader.thread['cwd'] = self.source['cwd'] = str(self.home / 'other')
+        with self.assertRaises(ValueError):
+            self.send()
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_malformed_model_settings_block_before_native_send(self):
+        self.models()
+        self.model_command('model', 'example-two')
+        path = next(self.runtime.store.root.glob('model-settings-*.json'))
+        value = json.loads(path.read_text())
+        value['selected']['effort'] = 'invalid'
+        path.write_text(json.dumps(value))
+        with self.assertRaises(ValueError):
+            self.send()
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_model_endpoint_change_and_unknown_runtime_never_configure(self):
+        self.models()
+        original = self.runtime._verify_endpoint
+        def changed(observed):
+            self.reader.processes[12]['start'] = '134362358929099999'
+            return original(observed)
+        with patch.object(self.runtime, '_verify_endpoint', side_effect=changed):
+            with self.assertRaises(ValueError):
+                self.model_command('model', 'example-two')
+        self.reader.thread['canAcceptDirectInput'] = False
+        with self.assertRaises(ValueError):
+            self.model_command('model', 'example-two')
+        self.assertFalse(list(self.runtime.store.root.glob('model-settings-*.json')))
+
+    def test_compact_is_idle_only_and_lost_reply_is_never_repeated(self):
+        self.active()
+        with self.assertRaises(ValueError):
+            self.model_command('compact')
+        self.reader.thread.update(status={'type': 'idle'}, turns=[])
+        self.reader.compact_timeout = True
+        first = self.model_command('compact')
+        self.assertEqual(first['status'], 'unknown')
+        self.assertEqual(self.model_command('compact'), first)
+        self.assertEqual(sum(method == 'thread/compact/start' for method, _ in self.reader.calls), 1)
+        self.assertEqual(self.reader.send_calls, 0)
+
     def execute(self, preview, action='terminate', request='request-1234', source=None):
         return self.runtime.execute({'source': source or self.source, 'action': action,
                                      'requestId': request, 'targetProof': preview['targetProof']})
@@ -199,7 +321,7 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.reader.thread.update(model='example-model', reasoningEffort='xhigh')
         value = self.runtime.chat({'action': 'read', 'source': self.source})
         # As a Mac read (native_chat.model_settings); a PC keeps no board choice for the next input.
-        self.assertEqual(value['modelSettings'], {'model': 'example-model', 'effort': 'xhigh'})
+        self.assertEqual(value['modelSettings'], {'model': 'example-model', 'effort': 'xhigh', 'next': {}})
 
     def test_claude_read_names_the_newest_responses_model_and_effort(self):
         reader = wc.WindowsCollector(self.home, hostname='fixture-pc', process_reader=lambda pid: None)

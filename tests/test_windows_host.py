@@ -453,6 +453,25 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs['timeout'], 20)
         self.assertFalse(self.flow.transfers.runtime_installed)
 
+    def test_mobile_model_commands_reach_the_windows_helper_through_chat_service(self):
+        service = chat.Chat(self.board, self.flow, self.root)
+        result = {'models': [{'model': 'fixture-model', 'efforts': ['high']}], 'next': {}}
+        envelope = json.dumps({'ok': True, 'result': result}).encode()
+        with patch('transfer.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=envelope)) as run, \
+                patch.object(self.board, 'request_refresh'), \
+                patch.object(self.flow.transfers, '_exchange', side_effect=AssertionError('POSIX worker')):
+            for command, value in [('models', None), ('model', 'fixture-model'), ('effort', 'high')]:
+                reply = service.command({'source': REF, 'command': command, 'value': value,
+                                         'requestId': 'model-request-1234'})
+                self.assertEqual(reply, result)
+                program = run.call_args.kwargs['input'].decode()
+                request = next(line for line in program.splitlines() if line.startswith(' result=m.handle('))
+                self.assertIn('"action": "command"', request)
+                self.assertIn('"command": "' + command + '"', request)
+                self.assertNotIn(SID, ' '.join(run.call_args.args[0]))
+        self.assertEqual(run.call_count, 3)
+
+
     def test_the_program_sent_to_a_pc_reads_the_conversation_with_its_model_and_effort(self):
         # Every request carries windows_collector and windows_runtime on stdin (nothing is
         # installed on the PC): that very program runs here, on a synthetic PC home.
