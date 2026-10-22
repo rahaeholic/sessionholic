@@ -2802,7 +2802,7 @@ li[data-task] {
 }
 .terminal-viewport .xterm {
   height: 100%;
-  -webkit-font-smoothing: auto;
+  -webkit-font-smoothing: antialiased;
   font-kerning: none;
   font-variant-ligatures: none;
   text-rendering: auto;

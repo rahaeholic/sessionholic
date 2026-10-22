@@ -11319,7 +11319,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
       fontFamily: TERMINAL_FONT,
       fontSize: state.fontSize,
       fontWeight: "400",
-      fontWeightBold: "700",
+      fontWeightBold: "400",
       lineHeight: TERMINAL_LINE_HEIGHT,
       letterSpacing: 0,
       minimumContrastRatio: 4.5,

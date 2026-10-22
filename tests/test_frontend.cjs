@@ -14933,7 +14933,7 @@ test('a terminal abandoned during font loading cannot replace the newly selected
   await Promise.all([first, second]);
   assert.equal(c.state.terminal.id, 'new'); assert.equal(created.length, 1);
   assert.equal(created[0].fontSize, 15); assert.equal(created[0].lineHeight, 1.35);
-  assert.equal(created[0].fontWeightBold, '700');
+  assert.equal(created[0].fontWeightBold, '400');
   assert.match(created[0].fontFamily, /^"Sessionholic Terminal"/);
   c.setTerminalFontSize(18); assert.equal(c.state.fontSize, 18);
 });
