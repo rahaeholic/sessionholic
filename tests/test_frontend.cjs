@@ -5081,25 +5081,19 @@ test('quick replies come from this browser\'s list and opening or cancelling nev
   assert.equal(c.get('action-list').children[0].disabled, true);
 });
 
-test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구 목록을 열고, 입력이 막히면 비활성이다', () => {
+test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, 입력이 막히면 비활성이다', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-attach-inline', 'chat-input', 'chat-mic', 'chat-quick-inline', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
   assert.match(c.get('action-eyebrow').textContent, /선택하면 바로 전송/);
   assert.equal(c.get('action-list').children[0].textContent, c.quickReplies()[0]);
   c.closeActionSheet();
-  // Shown only while the bars are folded (집중 모드), where 도구 › 빠른 답장 is out of sight.
-  const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  const hide = css.lastIndexOf('.chat-composer .chat-main > #chat-quick-inline {\n  display: none;');
-  const shared = css.indexOf('.chat-composer .chat-main > #chat-quick-inline,');
-  assert.ok(hide > shared && shared > 0, 'hidden by default after the shared button style');
-  assert.match(css, /\.detail-pane\.is-reading \.chat-composer \.chat-main > #chat-quick-inline \{\n  display: inline-flex;/);
-  // A short hint keeps one line beside four controls while the bars are folded.
+  // Folding the chrome keeps the same editor and action handlers.
   const pane = c.get('detail'); pane.classList = classes();
   c.get('chat-input').placeholder = c.chatPlaceholder(false);
   c.setReading(true);
@@ -15258,7 +15252,7 @@ test('기록에서 원본 capability를 잃어도 작성창은 유지하고 일�
 test('집중모드 첨부는 입력창 왼쪽에서 같은 파일 선택기를 열고 오프라인·전송 중 잠금을 공유한다', async () => {
   const { c, entry } = inlineDetailClient();
   const main = byClass(c.get('chat-composer'), 'chat-main')[0];
-  assert.equal(main.children[0], c.get('chat-attach-inline')); assert.equal(main.children[1], c.get('chat-input'));
+  assert.equal(main.children[0], c.get('chat-input')); assert.equal(main.children[1], c.get('chat-attach-inline'));
   let chosen = 0; c.get('chat-files').click = () => { chosen++; };
   c.get('chat-attach-inline').events.click(); assert.equal(chosen, 1);
   entry.sending = true; c.updateChatComposer(entry);

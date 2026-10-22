@@ -142,7 +142,9 @@
     return node;
   }
   function paneBar(id, container) {
-    const bar = make("header", "workspace-pane-bar"), title = make("button", "workspace-pane-title", "빈 창");
+    const bar = make("header", "workspace-pane-bar"), title = make("button", "workspace-pane-title");
+    const label = make("span", "workspace-pane-label", "빈 창"), meta = make("span", "workspace-pane-meta");
+    title.append(label, meta);
     bar.hidden = true;
     title.type = "button"; title.draggable = true; title.title = "창 제목을 끌어 배치 변경";
     title.addEventListener("click", () => focus(id));
@@ -168,13 +170,13 @@
       pointer = null; clearDrag();
     });
     title.addEventListener("pointercancel", () => { pointer = null; clearDrag(); });
-    bar.append(title, button("오른쪽으로 분할", "◫", () => add(null, id, "right")),
-      button("아래로 분할", "⬒", () => add(null, id, "bottom")),
-      button("창 확대·복원 · Control+Command+Enter", "⤢", () => { focus(id, false); maximize(); }),
+    const view = button("이 창 확대", "이 창 확대", () => { if (focus(id, false)) maximize(); });
+    view.classList.add("workspace-pane-view");
+    bar.append(title, view,
       button("이 창만 닫기 · 세션 실행은 유지", "×", () => closePane(id)));
     bar.addEventListener("pointerdown", () => focus(id, false));
     container.prepend(bar);
-    return { bar, title };
+    return { bar, title, label, meta, view };
   }
   function record(id, ref = null) {
     if (panes.has(id)) return panes.get(id);
@@ -212,13 +214,6 @@
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
-    const viewToggle = $("workspace-view-toggle");
-    if (viewToggle) {
-      viewToggle.hidden = !enabled;
-      viewToggle.textContent = maximized ? "분할 복원" : "단일 화면";
-      viewToggle.title = maximized ? "저장된 창 분할로 돌아가기" : "현재 창만 크게 보기 · 다른 창과 초안은 유지";
-      viewToggle.setAttribute("aria-pressed", String(maximized));
-    }
     const rects = geometry(tree).panes;
     const bounds = rootNode.getBoundingClientRect();
     const compact = root.innerWidth <= 700 || list.length > 1 && Object.values(rects).some((r) => r.w * bounds.width < 280 || r.h * bounds.height < 170);
@@ -231,6 +226,11 @@
       row.node.setAttribute("aria-hidden", String(!shown));
       row.node.inert = !shown;
       row.bar.hidden = !enabled;
+      row.view.textContent = maximized ? "분할로 돌아가기" : "이 창 확대";
+      row.view.title = `${row.view.textContent} · Control+Command+Enter`;
+      row.view.setAttribute("aria-label", row.view.textContent);
+      row.view.setAttribute("aria-pressed", String(maximized));
+      labelPane(row, list.indexOf(id));
       if (included && enabled) {
         const r = maximized || compact ? { x: 0, y: 0, w: 1, h: 1 } : rects[id];
         Object.assign(row.node.style, { left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` });
@@ -274,7 +274,7 @@
       });
       $("workspace-dividers").append(node);
     }
-    const switcher = $("workspace-switcher"); switcher.hidden = !enabled;
+    const switcher = $("workspace-switcher"); switcher.hidden = !enabled || !compact;
     switcher.replaceChildren();
     list.forEach((id, index) => {
       const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `⌥${index + 1}`, () => focus(id));
@@ -387,13 +387,18 @@
     if (restoring) return;
     for (const [id, row] of panes) {
       if (row.ref) applyRef(row);
-      const value = row.hooks?.describe();
-      const index = ids(tree).indexOf(id);
-      row.title.textContent = `${index >= 0 ? index + 1 : ""} · ${value?.title || (row.ref ? "저장한 세션 확인 중" : "목록에서 세션을 선택하세요")}`;
-      row.title.title = value?.route ? `${value.title}\n${value.route}\n끌어서 배치 변경` : "창 제목을 끌어 배치 변경";
-      row.title.setAttribute("aria-label", row.title.title);
+      labelPane(row, ids(tree).indexOf(id));
     }
     persist();
+  }
+  function labelPane(row, index) {
+    const value = row.hooks?.describe();
+    const title = value?.title || (row.ref ? "저장한 세션 확인 중" : "목록에서 세션을 선택하세요");
+    row.label.textContent = `${index >= 0 ? index + 1 : ""} · ${title}`;
+    row.meta.textContent = value?.route || "";
+    row.meta.hidden = !value?.route;
+    row.title.title = [title, value?.route, index >= 0 ? `Option+${index + 1}로 이동` : "", "끌어서 배치 변경"].filter(Boolean).join("\n");
+    row.title.setAttribute("aria-label", row.title.title);
   }
   function attach(id, win, childHooks) {
     const row = panes.get(id);
@@ -610,7 +615,6 @@
     keys.value = hooks.prefs.get("workspaceKeys", "ctrl-meta");
     keys.addEventListener("change", () => hooks.prefs.set("workspaceKeys", keys.value === "ctrl-alt-meta" ? keys.value : "ctrl-meta"));
     $("workspace-split-open").addEventListener("click", () => add(null));
-    $("workspace-view-toggle")?.addEventListener("click", () => maximize());
     $("home").addEventListener("click", (event) => {
       if (!enabled) return;
       event.preventDefault(); event.stopImmediatePropagation();

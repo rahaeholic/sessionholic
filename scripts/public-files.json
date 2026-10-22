@@ -176,5 +176,6 @@
   "windows_runtime.py",
   "work_service.py",
   "docs/plan/2026-10-22-pane-shortcuts-and-tab-labels.md",
-  "docs/plan/2026-10-22-pane-number-navigation.md"
+  "docs/plan/2026-10-22-pane-number-navigation.md",
+  "docs/plan/2026-10-22-composer-and-pane-hierarchy.md"
 ]

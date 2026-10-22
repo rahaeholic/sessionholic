@@ -104,7 +104,7 @@ function fixture(saved = null) {
       return { left, top, width, height, right: left + width, bottom: top + height };
     }
   }
-  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-split-open", "workspace-view-toggle", "groups", "home", "workspace-keys"])
+  for (const id of ["session-workspace", "workspace-primary", "workspace-dividers", "workspace-drop-cue", "workspace-switcher", "workspace-split-open", "groups", "home", "workspace-keys"])
     nodes.set(id, new Node());
   nodes.get("workspace-primary").dataset.paneId = "p1";
   nodes.get("session-workspace").append(nodes.get("workspace-primary"), nodes.get("workspace-dividers"), nodes.get("workspace-drop-cue"));
@@ -200,21 +200,21 @@ test("IME blocks pane changes and ongoing voice remains bound to its original pa
   second.info.dictation = false; assert.equal(f.workspace.claimDictation(), true);
 });
 
-test("single-screen button preserves every frame/editor and restores the split, including after reload", () => {
+test("each pane's expand/restore button preserves every frame/editor, including after reload", () => {
   const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
-  const toggle = f.nodes.get("workspace-view-toggle"), editor = second.info.editor;
-  assert.equal(toggle.textContent, "단일 화면");
+  const toggle = second.row.children[0].children[1], editor = second.info.editor;
+  assert.equal(toggle.textContent, "이 창 확대");
   toggle.fire("click", {});
-  assert.equal(toggle.textContent, "분할 복원");
+  assert.equal(toggle.textContent, "분할로 돌아가기");
   assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), true);
   assert.equal(second.row.classList.contains("workspace-pane-covered"), false);
   assert.equal(second.frame.appendCount, 1);
   assert.equal(second.info.editor, editor);
   assert.equal(f.preferences.get("workspace").single, true);
   const restored = fixture(f.preferences.get("workspace"));
-  assert.equal(restored.nodes.get("workspace-view-toggle").textContent, "분할 복원");
+  assert.equal(restored.attach("p2").row.children[0].children[1].textContent, "분할로 돌아가기");
   toggle.fire("click", {});
-  assert.equal(toggle.textContent, "단일 화면");
+  assert.equal(toggle.textContent, "이 창 확대");
   assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), false);
   assert.equal(f.calls.filter(([name]) => name === "api" || name === "close-view").length, 0);
 });
@@ -228,6 +228,26 @@ test("pane focus waits for Samsung IME blur without replacing the original edito
   second.info.composing = false; commit(true); await Promise.resolve();
   assert.equal(f.preferences.get("workspace").active, "p1");
   assert.equal(second.info.editor.text, "초안 p2");
+  assert.equal(f.calls.filter(([name]) => name === "api" || name === "close-view").length, 0);
+});
+
+test("pane headers show their own title and route, and expanding an inactive pane targets that document", () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
+  second.info.title = "입력창 개선"; second.info.route = "Mac mini · Codex"; f.workspace.changed();
+  const header = second.row.children[0], title = header.children[0], expand = header.children[1];
+  assert.equal(title.children[0].textContent, "2 · 입력창 개선");
+  assert.equal(title.children[1].textContent, "Mac mini · Codex");
+  assert.match(title.attrs["aria-label"], /Option\+2/);
+  assert.equal(header.children.length, 3, "title, pane view and view close have distinct roles");
+  f.workspace.focus("p1", false); const editor = second.info.editor;
+  expand.fire("click", {});
+  assert.equal(f.preferences.get("workspace").active, "p2");
+  assert.equal(f.preferences.get("workspace").single, true);
+  assert.equal(second.row.classList.contains("workspace-pane-covered"), false);
+  assert.equal(expand.attrs["aria-label"], "분할로 돌아가기");
+  expand.fire("click", {});
+  assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), false);
+  assert.equal(second.frame.appendCount, 1); assert.equal(second.info.editor, editor);
   assert.equal(f.calls.filter(([name]) => name === "api" || name === "close-view").length, 0);
 });
 
@@ -376,7 +396,9 @@ test("compact and maximized views preserve documents, passive panes remain unrea
   const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
   assert.equal(f.workspace.readingActive(), false);
   assert.equal(f.workspace.isActive("p2", second.frame.contentWindow), true);
+  assert.equal(f.nodes.get("workspace-switcher").hidden, true, "desktop panes already show their numbers");
   f.window.innerWidth = 650; f.workspace.layout();
+  assert.equal(f.nodes.get("workspace-switcher").hidden, false, "covered panes stay reachable on a narrow screen");
   assert.equal(f.nodes.get("workspace-primary").classList.contains("workspace-pane-covered"), true);
   f.workspace.handleKey(combo("1"));
   assert.equal(f.workspace.readingActive(), true);

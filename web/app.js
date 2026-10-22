@@ -6179,8 +6179,8 @@ function buildChatComposer(s) {
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
   actions.append(attach, expand, terminal, keyHint, tools);
-  // 빠른 답장 beside 보내기 while 집중 모드 folds 도구 (style.css shows it only then). The
-  // keyboard stays on the input: the press never takes focus.
+  // Primary actions stay below the full-width editor, including in focus mode.
+  // The keyboard stays on the input: the press never takes focus.
   const quickInline = button("", "chat-quick-inline", (event) => {
     if (!editorCurrent() || input.disabled || input.readOnly || entry.composing) return;
     openQuickReplies(entry, input, event.currentTarget);
@@ -6197,7 +6197,7 @@ function buildChatComposer(s) {
   attachInline.setAttribute("aria-label", "사진 또는 파일 첨부");
   attachInline.title = "사진 또는 파일 첨부";
   attachInline.addEventListener("pointerdown", (event) => event.preventDefault());
-  main.append(attachInline, input, mic, quickInline, send);
+  main.append(input, attachInline, mic, quickInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
