@@ -4251,6 +4251,41 @@ test('Enter in the input bar sends; Shift+Enter and IME composition keep editing
   assert.deepEqual(calls, ['\x1b[200~계속해\x1b[201~', '\r']);
 });
 
+test('mobile terminal composer Enter keeps newlines on phones, iPads and attached keyboards; sending stays explicit', async () => {
+  for (const [coarse, navigator] of [[true, {}], [false, { platform: 'MacIntel', maxTouchPoints: 5 }],
+    [false, { userAgent: 'Android', maxTouchPoints: 1 }]]) {
+    const calls = [];
+    const c = client(async (url, opts) => { calls.push(JSON.parse(opts.body).text); return { ok: true, status: 200, json: async () => ({ ok: true }) }; });
+    c.context.window.matchMedia = query => ({ matches: coarse && query === '(pointer: coarse)' });
+    c.context.navigator = navigator;
+    c.state.connected = c.state.terminalVisible = true;
+    c.state.terminal = { id: 'term-mobile' };
+    c.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+    const draft = c.get('terminal-draft'); draft.value = '첫 줄';
+    let prevented = 0;
+    for (const extra of [{}, { shiftKey: true }, { isComposing: true }, { keyCode: 229 }])
+      c.draftKeydown({ key: 'Enter', target: draft, preventDefault() { prevented++; }, ...extra });
+    assert.equal(prevented, 0, 'browser owns newline and IME commit');
+    assert.deepEqual(calls, [], 'Enter never sends input or a terminal CR');
+    draft.value = '첫 줄\n둘째 줄';
+    await c.pasteDraft(true);
+    assert.deepEqual(calls, ['\x1b[200~첫 줄\n둘째 줄\x1b[201~', '\r']);
+  }
+});
+
+test('mobile chat composer Enter neither sends nor selects slash commands and requests a return key', () => {
+  const calls = [];
+  const c = client(async url => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.window.matchMedia = query => ({ matches: query === '(pointer: coarse)' });
+  const { s, entry } = selectChat(c); entry.text = '/model';
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input'); let prevented = false;
+  input.events.keydown({ key: 'Enter', preventDefault() { prevented = true; } });
+  assert.equal(prevented, false); assert.deepEqual(calls, []);
+  assert.equal(input.attributes.enterkeyhint, 'enter');
+  assert.equal(entry.text, '/model');
+});
+
 test('touch devices keep the xterm keyboard closed unless direct terminal input is chosen', () => {
   const c = client();
   c.context.window.matchMedia = (query) => ({ matches: query === '(pointer: coarse)' });

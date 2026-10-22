@@ -6044,6 +6044,7 @@ function buildChatComposer(s) {
   input.rows = entry.expanded ? 3 : 1;
   input.placeholder = chatPlaceholder(false);
   input.setAttribute("aria-label", "메시지");
+  input.setAttribute("enterkeyhint", "enter");
   for (const [name, value] of [["spellcheck", "false"], ["autocorrect", "off"], ["autocomplete", "off"], ["autocapitalize", "off"]]) input.setAttribute(name, value);
   input.value = entry.text;
   // A send waiting for the input method to commit the word it still composes (see send).
@@ -6114,6 +6115,7 @@ function buildChatComposer(s) {
   });
   input.addEventListener("keydown", (event) => {
     if (!editorCurrent()) return;
+    if (mobileComposerEnter(event)) return;
     if (slashKeydown(entry, event, input)) return;
     // Esc leaves the input (a hardware keyboard's way out); an open tools menu
     // closes first (closeChatToolsEscape), and an IME keeps its own Esc.
@@ -12389,7 +12391,17 @@ function xtermKeyEvent(event) {
   sendTerminalBytes(bytes);
   return false;
 }
+function mobileComposerEnter(event) {
+  const nav = globalThis.navigator;
+  const mobile = touchDevice() || /Android|iPhone|iPad|iPod/i.test(String(nav?.userAgent || "")) ||
+    /Mac/i.test(String(nav?.platform || "")) && (nav?.maxTouchPoints || 0) > 1;
+  return mobile && event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey;
+}
 function draftKeydown(event) {
+  if (mobileComposerEnter(event)) {
+    if (releasesTerminalMods(event)) clearTerminalMods();
+    return; // The textarea inserts a newline; only the send button submits on touch keyboards.
+  }
   // A hardware keyboard's terminal keys go to the CLI (see terminalKeyFromEvent). A key held
   // down from a typed draft (⌫, say) stops at its start instead of going on into the CLI line.
   const empty = !event.target?.value;
@@ -12403,7 +12415,7 @@ function draftKeydown(event) {
     return;
   }
   if (state.terminalVisible && releasesTerminalMods(event)) clearTerminalMods();
-  // Enter sends like a chat box; Shift+Enter keeps a newline in the draft.
+  // Desktop Enter sends; Shift+Enter and mobile Enter keep a newline in the draft.
   if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
   pasteDraft(true);

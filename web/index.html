@@ -412,11 +412,12 @@
           </div>
           <input id="terminal-files" type="file" multiple hidden>
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
-          <p class="draft-mode-note">터미널에 직접 입력 · Enter로 실행</p>
+          <p class="draft-mode-note">터미널에 보낼 내용 · 보내기 버튼으로 실행</p>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
               id="terminal-draft"
+              enterkeyhint="enter"
               aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
