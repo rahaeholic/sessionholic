@@ -196,6 +196,8 @@ class _Terminal:
         # When this process saw it close (monotonic); a row loaded closed closed long ago.
         self.closed_at = None if self.alive else float("-inf")
         self.epoch = secrets.token_hex(16)
+        self.bracketed_paste = None
+        self.mode_tail = b""
         self.scrolled = False
         # Set when a new attach client starts: the first input then also leaves any
         # copy-mode, whose in-memory flag a gateway restart would have lost.
@@ -207,6 +209,13 @@ class _Terminal:
 
     def append(self, data):
         with self.condition:
+            modes = self.mode_tail + data
+            for match in re.finditer(rb"\x1b(?:c|\[\?([0-9;]{1,64})([hl]))", modes):
+                if match.group(1) is None:
+                    self.bracketed_paste = False
+                elif b"2004" in match.group(1).split(b";"):
+                    self.bracketed_paste = match.group(2) == b"h"
+            self.mode_tail = modes[-72:]
             self.output.extend(data)
             self.offset += len(data)
             if len(self.output) > self.limit:
@@ -239,7 +248,8 @@ class _Terminal:
             begin = start if reset else after
             data = bytes(self.output[begin - start:])
             return {"after": self.offset, "data": base64.b64encode(data).decode("ascii"),
-                    "reset": reset, "alive": self.alive, "epoch": self.epoch}
+                    "reset": reset, "alive": self.alive, "epoch": self.epoch,
+                    **({"bracketedPaste": self.bracketed_paste} if self.bracketed_paste is not None else {})}
 
 
 class TerminalManager:

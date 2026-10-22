@@ -290,6 +290,48 @@ class SessionControlTest(unittest.TestCase):
             result = self.api._apply(self.claude, 'terminate', observed, time.monotonic() + 3)
         self.assertFalse(result['confirmed'])
 
+    def test_finished_background_can_be_cleaned_without_stop_or_any_process_signal_and_replays_once(self):
+        for state in ('done', 'stopped', 'failed'):
+            row = self.claude_row('background', state)
+            source = {**self.claude, 'id': 'finished-' + state}
+            row['id'] = source['id']
+            with self.subTest(state=state), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()) as run, patch.object(os, 'kill') as kill, patch.object(os, 'killpg') as killpg:
+                preview = self.api.preview(source)
+                end = preview['capabilities']['terminate']
+                self.assertTrue(end['supported'])
+                self.assertTrue(end['alreadyEnded'])
+                self.assertEqual(end['method'], 'claude-background-finished')
+                result = self.api.execute(source, 'terminate', preview['targetProof'], 'request-ended-' + state)
+                self.assertTrue(result['confirmed']); self.assertTrue(result['alreadyEnded'])
+                count = run.call_count
+                repeated = self.api.execute(source, 'terminate', preview['targetProof'], 'request-ended-' + state)
+                self.assertTrue(repeated['replayed']); self.assertEqual(run.call_count, count)
+                self.assertEqual(self.api.close_provenance(source), {'blockedByBoard': True, 'status': 'terminated'})
+                self.assertTrue(all(call.args[1] == ['agents', '--json', '--all'] for call in run.call_args_list))
+                kill.assert_not_called(); killpg.assert_not_called()
+
+    def test_finished_background_with_busy_waiting_or_unknown_status_never_authorizes_cleanup(self):
+        for status in ('busy', 'waiting', 'future-status'):
+            row = {**self.claude_row('background', 'done'), 'status': status}
+            with self.subTest(status=status), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()):
+                self.assertFalse(self.api.preview(self.claude)['capabilities']['terminate']['supported'])
+
+    def test_finished_background_without_stable_native_identity_cannot_be_cleaned(self):
+        for change in ({'sessionId': None}, {'sessionId': 'bad'}, {'startedAt': None}, {'startedAt': True}, {'startedAt': -1}):
+            row = {**self.claude_row('background', 'done'), **change}
+            with self.subTest(change=change), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()):
+                self.assertFalse(self.api.preview(self.claude)['capabilities']['terminate']['supported'])
+
+    def test_finished_background_restarted_or_replaced_after_preview_never_confirms_cleanup(self):
+        row = self.claude_row('background', 'done')
+        for change in ({'state': 'working', 'status': 'busy'}, {'sessionId': str(uuid.uuid4())}, {'startedAt': 101}):
+            values = [json.dumps([row]).encode(), json.dumps([{**row, **change}]).encode()]
+            with self.subTest(change=change), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', side_effect=values) as run, patch.object(os, 'kill') as kill:
+                preview = self.api.preview(self.claude)
+                result = self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-replaced-' + str(len(change)) + '-' + str(change.get('startedAt', 0)))
+                self.assertFalse(result['confirmed']); self.assertEqual(result['status'], 'stale')
+                self.assertEqual(run.call_count, 2); kill.assert_not_called()
+
     def test_interactive_claude_lookup_uses_native_pid_registry(self):
         row = self.claude_row()
         with patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()), patch.object(control, '_claude_process', return_value=self.process):

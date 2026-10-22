@@ -37,6 +37,22 @@ class BufferTest(unittest.TestCase):
         self.assertEqual(stream.read(12, 0)["data"], "")
         self.assertTrue(stream.read(999, 0)["reset"])
 
+    def test_bracketed_paste_metadata_tracks_chunk_boundaries_disable_and_full_reset(self):
+        stream = terminal._Terminal({'id': 'a' * 32}, 8)
+        self.assertNotIn('bracketedPaste', stream.read(0, 0))
+        stream.append(b'\x1b[?20'); stream.append(b'04h')
+        self.assertTrue(stream.read(0, 0)['bracketedPaste'])
+        stream.append(b'x' * 100)
+        self.assertTrue(stream.read(0, 0)['bracketedPaste'], 'mode outlives bounded screen history')
+        stream.append(b'\x1b[?25;2004l')
+        self.assertFalse(stream.read(0, 0)['bracketedPaste'])
+        stream.append(b'\x1b[?2004h\x1bc')
+        self.assertFalse(stream.read(0, 0)['bracketedPaste'])
+        stream.append(b'\x1b[?25h')
+        self.assertFalse(stream.read(0, 0)['bracketedPaste'])
+        stream.append(b'\x1b[?2004h')
+        self.assertTrue(stream.read(0, 0)['bracketedPaste'])
+
     def test_public_metadata_cannot_override_identity(self):
         stream = terminal._Terminal({"id": "a" * 32, "key": "fixture",
             "metadata": {"id": "evil", "alive": False, "closed": True, "title": "fixture title"}}, 8)
@@ -1185,6 +1201,16 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertNotIn("env", saved[0])
         self.assertEqual((Path(self.directory.name) / "sessions.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual(list(Path(self.directory.name).glob("*.launch.json")), [])
+
+    def test_fresh_screen_preserves_observed_bracketed_paste_mode(self):
+        self.code = "import os,time,tty;tty.setraw(0);os.write(1,b'\\x1b[?2004hFIXTURE_READY');time.sleep(15)"
+        tid = self.create()['id']
+        self.wait_for(self.manager, tid, b'FIXTURE_READY')
+        first = self.manager.read(tid, 0, 0)
+        self.assertTrue(first['bracketedPaste'])
+        fresh = self.manager.read(tid, first['after'], 1, first['epoch'], fresh=True)
+        self.assertTrue(fresh['reset']); self.assertTrue(fresh['bracketedPaste'])
+        self.assertIn(b'FIXTURE_READY', base64.b64decode(fresh['data']))
 
     def test_fresh_view_redraws_at_server_geometry_and_unchanged_resize_does_not_signal(self):
         import fcntl

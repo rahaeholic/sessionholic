@@ -435,19 +435,28 @@ class SessionControl:
             row = matches[0]
             if row.get("kind") not in ("interactive", "background"):
                 return unavailable
+            if source.get("sessionId") and source["sessionId"] != row.get("sessionId"):
+                return unavailable
             phase = collector.claude_phase(row.get("state"), row.get("status"))
             background = row["kind"] == "background"
             ended = row.get("state") in ("stopped", "done", "failed")
+            started = row.get("startedAt")
+            start_known = (type(started) in (int, float) and 0 < started < 1e15
+                           or isinstance(started, str) and (collector.to_epoch(started) or 0) > 0)
+            sid_known = isinstance(row.get("sessionId"), str) and collector.SESSION_ID.fullmatch(row["sessionId"])
+            finished = bool(background and ended and row.get("status") in (None, "idle") and start_known and sid_known)
             process = _claude_process(row, self.home, deadline) if not background else None
-            terminate = (background and not ended) or process is not None
+            terminate = finished or (background and not ended) or process is not None
+            method = "claude-background-finished" if finished else "claude-background-stop" if background else "claude-cli-process"
             target = {"identity": identity, "kind": row["kind"], "nativeId": row.get("id"),
                       "sessionId": row.get("sessionId"), "startedAt": row.get("startedAt"),
                       "process": _process_key(process), "ended": ended}
             return {"source": identity, "phase": phase, "target": target, "process": process,
                     "native": row, "binary": binary, "capabilities": {
                         "interrupt": _capability(False, reason="이 Claude 실행 방식은 응답만 중단하는 공식 제어를 제공하지 않습니다. 실행 종료 후 기록에서 다시 이어갈 수 있습니다."),
-                        "terminate": _capability(terminate, "claude-background-stop" if background else "claude-cli-process",
-                            None if terminate else "종료된 세션이거나 원본 프로세스의 신원을 확인하지 못했습니다.")}}
+                        "terminate": _capability(terminate, method,
+                            None if terminate else "원본 실행을 종료 대상으로 확인하지 못했습니다.",
+                            **({"alreadyEnded": True, "effect": "원본 실행은 이미 끝났습니다. 연결된 터미널과 목록만 정리합니다."} if finished else {}))}}
         except (OSError, ValueError, collector.RpcError, TimeoutError, subprocess.TimeoutExpired):
             return unavailable
 
@@ -599,6 +608,15 @@ class SessionControl:
 
     def _apply(self, source, action, observed, deadline):
         method = observed["capabilities"][action]["method"]
+        if method == "claude-background-finished":
+            fresh = self._observe(source, deadline)
+            if (fresh["target"] != observed["target"]
+                    or not fresh["capabilities"]["terminate"]["supported"]
+                    or fresh["capabilities"]["terminate"]["method"] != method):
+                return {"applied": False, "confirmed": False, "status": "stale",
+                        "reason": "원본 세션이 변경되어 정리하지 않았습니다. 상태를 다시 확인해 주세요."}
+            return {"applied": True, "confirmed": True, "status": "terminated", "alreadyEnded": True,
+                    "reason": None}
         if method == "codex-turn-interrupt":
             return self._interrupt_codex(observed, deadline)
         if method == "codex-thread-archive":

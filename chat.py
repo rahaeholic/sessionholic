@@ -755,6 +755,10 @@ class Chat:
         reason_code = result.get('runtimeReasonCode')
         if isinstance(reason_code, str) and re.fullmatch(r'[a-z_]{1,80}', reason_code):
             response['runtimeReasonCode'] = reason_code
+        # Transport ownership is independent of the native CLI's runtime phase.
+        connected_input = bool(claude and terminal and not terminal_failed and response['capability']['supported'])
+        if connected_input:
+            response['terminalConnection'] = {'connected': True, 'id': terminal['id']}
         if observation_request is not None:
             observed = {**result, 'phase': phase, 'runtimeReason': response.get('runtimeReason')}
             if host.get('platform') != 'windows':
@@ -770,8 +774,9 @@ class Chat:
             accepted = annotation['runtimeObservation']
             response.update(phase=accepted['phase'], runtimeKnown=accepted['known'])
             if not accepted['known']:
-                response.update(prompt=None, promptOpenable=False, workingSince=None,
-                                capability={**response['capability'], 'supported': False,
+                response.update(prompt=None, promptOpenable=False, workingSince=None)
+            if not accepted['known'] and not connected_input:
+                response.update(capability={**response['capability'], 'supported': False,
                                             'reason': response.get('runtimeReason') or response['capability'].get('reason') or
                                             '현재 실행 상태를 확인하지 못했습니다. 터미널에서 확인해 주세요.'})
             if not kwargs.get('liveRow') and accepted['requestSeq'] != observation_request:

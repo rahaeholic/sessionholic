@@ -2941,7 +2941,21 @@ li[data-task] {
   opacity: 0.35;
 }
 .draft-panel {
-  margin-top: 8px;
+  margin: 8px -8px calc(-1 * max(8px, env(safe-area-inset-bottom)));
+  padding: 8px 8px max(8px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--sep);
+  background: var(--surface);
+  color: var(--label);
+  --t-bg: var(--surface);
+  --t-bg-2: var(--surface);
+  --t-label: var(--label);
+  --t-label-2: var(--label-2);
+  --t-sep: var(--sep-strong);
+  --t-placeholder: var(--label-3);
+  --t-key: var(--fill);
+  --t-blue: var(--accent-fill);
+  --t-blue-press: var(--accent-press);
+  --t-blue-text: var(--accent);
 }
 .draft-row {
   display: flex;
@@ -2999,6 +3013,7 @@ li[data-task] {
   background: var(--t-key);
   color: var(--t-label);
 }
+.chat-composer .chat-main > #chat-attach-inline,
 .chat-composer .chat-main > #chat-quick-inline,
 .chat-composer .chat-main > #chat-mic {
   flex: none;
@@ -3016,13 +3031,16 @@ li[data-task] {
   box-shadow: inset 0 0 0 1px var(--sep);
   color: var(--label-2);
 }
-/* 빠른 답장 beside 보내기, only while 집중 모드 folds the tools (where 빠른 답장 also is). */
+/* Keep attachment and quick-reply controls visible while focus mode folds the toolbar. */
+.chat-composer .chat-main > #chat-attach-inline,
 .chat-composer .chat-main > #chat-quick-inline {
   display: none;
 }
+.detail-pane.is-reading .chat-composer .chat-main > #chat-attach-inline,
 .detail-pane.is-reading .chat-composer .chat-main > #chat-quick-inline {
   display: inline-flex;
 }
+.chat-composer .chat-main > #chat-attach-inline { font-size: 22px; }
 .chat-composer .chat-main > #chat-mic.is-listening,
 .draft-row .draft-mic.is-listening {
   background: var(--red-fill);

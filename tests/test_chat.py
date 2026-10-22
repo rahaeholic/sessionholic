@@ -1341,6 +1341,44 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertNotIn('fixture', state['capability']['reason'])
         self.assertEqual([action for _, action in self.calls], ['read'] * 12)
 
+    def test_unknown_native_phase_keeps_only_the_exact_connected_terminal_input(self):
+        self.addCleanup(self.board.hosts[0].pop, 'platform', None)
+        self.board.hosts[0]['platform'] = 'windows'
+        self.kind('interactive'); self.phase = 'unknown'
+        row = self.terminal()
+        state = self.state()
+        self.assertFalse(state['runtimeKnown']); self.assertEqual(state['phase'], 'unknown')
+        self.assertTrue(state['capability']['supported'])
+        self.assertEqual(state['terminalConnection'], {'connected': True, 'id': TERMINAL_ID})
+        self.assertIsNone(state['prompt'])
+        self.assertEqual(self.send(text='첫 줄\n둘째 줄')['status'], 'accepted')
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '첫 줄\n둘째 줄', True)])
+        for change in ({'alive': False}, {'closed': True}, {'linkConfidence': 'estimated'},
+                       {'nativeSource': {**row['nativeSource'], 'sessionId': 'different-session'}}):
+            with self.subTest(change=change):
+                self.terms.rows = [{**row, **change}]
+                state = self.state()
+                self.assertFalse(state['capability']['supported'])
+                self.assertNotIn('terminalConnection', state)
+
+    def test_connected_claude_terminal_never_overrides_a_superseded_state_read(self):
+        self.terminal()
+        observations = self.board.runtime_observations
+        accept = observations.accept
+        def newer(source, result, request, lease):
+            accept(source, {**result, 'runtimeKnown': True, 'phase': 'working'}, request + 1, lease)
+            return accept(source, result, request, lease)
+        with patch.object(observations, 'accept', side_effect=newer):
+            state = self.state()
+        self.assertTrue(state['stateReadSuperseded'])
+        self.assertFalse(state['capability']['supported'])
+
+    def test_working_followup_uses_existing_terminal_without_waiting_for_idle_or_opening_another(self):
+        self.phase = 'working'; self.terminal()
+        with patch.object(self.chat, '_settled', side_effect=AssertionError('existing terminal needs no startup wait')), patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('no duplicate terminal')):
+            self.assertEqual(self.send(text='작업 중 추가 요청')['status'], 'accepted')
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '작업 중 추가 요청', True)])
+
     def test_send_pastes_into_board_terminal_once_and_stores_no_body(self):
         self.kind('interactive')
         self.terminal()

@@ -534,7 +534,7 @@ test("multiline draft requires bracketed paste and preserves its text when unava
   await c.pasteDraft();
   assert.equal(calls, 0);
   assert.equal(c.get("terminal-draft").value, "첫 줄\n둘째 줄");
-  assert.match(c.get("draft-note").textContent, /한 줄씩/);
+  assert.match(c.get("draft-note").textContent, /붙여넣기 모드를 확인하지 못했습니다/);
 });
 
 test("Korean draft is bracketed, acknowledged, and never followed by Enter", async () => {
@@ -3264,19 +3264,22 @@ test('chat resize preserves active Korean composition and respects keyboard view
   c.context.window.innerHeight = 800;
   let measured = 64;
   Object.defineProperty(input, 'scrollHeight', { get: () => measured });
+  input.style.height = '66px';
   input.value = '아직 입력 중인 한글'; input.events.compositionstart(); input.events.input();
   const epoch = entry.editorEpoch;
   assert.equal(input.style.height, '66px');
   measured = 152;
   c.updateViewport(); // A narrower width wraps the same text onto more lines.
-  assert.equal(input.style.height, '154px');
+  assert.equal(input.style.height, '66px', 'active composition preserves its layout');
   c.context.window.visualViewport = { height: 300 };
   c.updateViewport();
-  assert.equal(input.style.height, '100px');
-  assert.equal(input.style.overflowY, 'auto');
+  assert.equal(input.style.height, '66px', 'viewport changes wait for compositionend');
   assert.equal(entry.composing, true);
   assert.equal(entry.editorEpoch, epoch);
   assert.equal(c.context.document.activeElement, input);
+  input.events.compositionend();
+  assert.equal(input.style.height, '100px');
+  assert.equal(input.style.overflowY, 'auto');
   c.context.window.visualViewport.height = 240;
   c.updateViewport();
   assert.equal(input.style.height, '44px');
@@ -5083,7 +5086,7 @@ test('집중 모드에서는 보내기 옆 빠른 답장 버튼이 같은 문구
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-mic', 'chat-quick-inline', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-attach-inline', 'chat-input', 'chat-mic', 'chat-quick-inline', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -15250,4 +15253,103 @@ test('기록에서 원본 capability를 잃어도 작성창은 유지하고 일�
   assert.equal(c.get('chat-send').disabled, true); await c.sendChat(entry); assert.equal(calls, 0);
   s.executionMode = 'one-shot'; c.context.renderDetailMode();
   assert.equal(c.get('chat-composer').hidden, true); await c.sendChat(entry); assert.equal(calls, 0);
+});
+
+test('집중모드 첨부는 입력창 왼쪽에서 같은 파일 선택기를 열고 오프라인·전송 중 잠금을 공유한다', async () => {
+  const { c, entry } = inlineDetailClient();
+  const main = byClass(c.get('chat-composer'), 'chat-main')[0];
+  assert.equal(main.children[0], c.get('chat-attach-inline')); assert.equal(main.children[1], c.get('chat-input'));
+  let chosen = 0; c.get('chat-files').click = () => { chosen++; };
+  c.get('chat-attach-inline').events.click(); assert.equal(chosen, 1);
+  entry.sending = true; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-attach-inline').disabled, true);
+  c.get('chat-attach-inline').events.click(); assert.equal(chosen, 1);
+  entry.sending = false; c.updateChatComposer(entry); assert.equal(c.get('chat-attach-inline').disabled, false);
+  const input = c.get('chat-input'); entry.composing = true; input.value = entry.text = '한글 조합';
+  let prevented = false; c.get('chat-attach-inline').events.pointerdown({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true); assert.equal(entry.composing, true); assert.equal(input.value, '한글 조합');
+});
+
+test('Mac 작성창은 자동 보정이 꺼지고 한글 조합·상태 갱신 동안 높이와 커서를 재설정하지 않는다', () => {
+  const { c, entry } = inlineDetailClient(), input = c.get('chat-input');
+  for (const [key, val] of [['spellcheck', 'false'], ['autocorrect', 'off'], ['autocomplete', 'off'], ['autocapitalize', 'off']])
+    assert.equal(input.attributes[key], val);
+  input.value = entry.text = '조합 중'; entry.composing = true;
+  input.style.height = '86px'; input.scrollTop = 23; input.selectionStart = input.selectionEnd = 3;
+  c.updateChatComposer(entry);
+  assert.equal(input.style.height, '86px'); assert.equal(input.scrollTop, 23); assert.equal(input.selectionStart, 3);
+  entry.composing = false; c.updateChatComposer(entry); assert.notEqual(input.style.height, '86px');
+});
+
+test('포커스 없는 한글·IME 시작은 raw 자모를 보내지 않고 작성창에 포커스한다', async () => {
+  const calls = [], c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({ ok: true }) }; }, noChatTimers);
+  c.state.connected = true; c.state.terminalVisible = true; c.state.terminal = { id: 'ime-fixture' };
+  c.context.document.activeElement = null;
+  for (const fields of [{ key: 'ㅎ', code: 'KeyG' }, { key: 'Process', keyCode: 229 }, { key: 'Dead' }, { key: 'Unidentified', isComposing: true }]) {
+    const event = { ...fields, target: { closest: () => null }, preventDefault() { throw Error('browser owns composition'); } };
+    assert.equal(c.terminalDocumentKey(event), false);
+  }
+  await settle(); assert.equal(calls.length, 0); assert.equal(c.get('terminal-draft').focusCount, 4);
+  c.context.document.activeElement = { tagName: 'TEXTAREA' };
+  assert.equal(c.terminalDocumentKey({ key: 'ㅎ', target: { closest: () => null } }), false);
+  assert.equal(c.get('terminal-draft').focusCount, 4);
+});
+
+test('한글 키는 같은 세션의 공통 작성창에서 조합하고 저장 기록 대신 실제 터미널 연결을 표시한다', async () => {
+  const { c, entry, terminal } = inlineDetailClient({ agent: 'claude', home: '.claude' }); await c.openTerminal(terminal);
+  c.context.document.activeElement = null;
+  assert.equal(c.terminalDocumentKey({ key: 'ㅎ', target: { closest: () => null } }), false);
+  assert.equal(c.get('chat-input').focusCount, 1);
+  entry.data = { route: entry.source, phase: 'unknown', runtimeKnown: false, readOnly: true,
+    terminalConnection: { connected: true, id: terminal.id }, capability: { supported: true, attachments: true } };
+  entry.text = c.get('chat-input').value = '계속해'; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-send').disabled, false); assert.match(c.get('chat-status').textContent, /터미널에 연결됨/);
+  assert.doesNotMatch(c.get('chat-status').textContent, /저장된 기록/);
+});
+
+test('fresh 화면 reset 뒤 관측된 붙여넣기 모드를 복구하면 여러 줄은 한 번의 bracketed 입력으로 전달된다', async () => {
+  const calls = [], c = client(async (url, options) => {
+    if (url.includes('/events')) return { ok: true, status: 200, json: async () => ({ after: 90, epoch: 'fresh', alive: true, reset: true, redrawn: true, bracketedPaste: true, data: btoa('CURRENT_SCREEN') }) };
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  }, noChatTimers);
+  c.state.terminal = { id: 'paste-fresh' }; c.state.terminalAlive = true; c.state.terminalVisible = true;
+  const term = c.state.term = { modes: { bracketedPasteMode: true }, reset() { this.modes.bracketedPasteMode = false; },
+    write(bytes, done) { const text = Buffer.from(bytes).toString(); assert.match(text, /^\x1b\[\?2004hCURRENT_SCREEN/);
+      this.modes.bracketedPasteMode = true; c.state.terminalVisible = false; done(); }, scrollToBottom() {} };
+  await c.startTerminalReader(); assert.equal(c.state.connected, true); assert.equal(term.modes.bracketedPasteMode, true);
+  c.get('terminal-draft').value = '첫 줄\n둘째 줄\n셋째 줄';
+  await c.pasteDraft(false);
+  assert.equal(calls.length, 1); assert.equal(calls[0].body.text, '\x1b[200~첫 줄\n둘째 줄\n셋째 줄\x1b[201~');
+  assert.equal(c.get('terminal-draft').value, '');
+});
+
+test('끝난 Claude는 정리 범위를 표시하고 명시적 클릭 한 번으로만 종료 정리 요청을 보낸다', async () => {
+  const preview = { targetProof: 'finished-proof', capabilities: { terminate: { supported: true, alreadyEnded: true,
+    effect: '원본 실행은 이미 끝났습니다. 연결된 터미널과 목록만 정리합니다.' }, interrupt: { supported: false } } };
+  const { c, cards, press, requests } = keyboardBoard({ fetchImpl: async (url) => ({ ok: true, status: 200, json: async () =>
+    url === '/api/session/preview' ? preview : { confirmed: true, alreadyEnded: true, cleanup: { complete: true, version: 4 } } }) });
+  c.context.document.body.append = () => {};
+  press(cards[2], 'Delete'); await settle();
+  const terminate = c.get('end-session-terminate'); assert.equal(terminate.disabled, false); assert.equal(terminate.textContent, '끝난 세션 정리');
+  assert.match(c.get('end-session-status').textContent, /이미 끝났습니다/);
+  assert.equal(requests.some(r => r.url === '/api/session/action'), false);
+  await terminate.events.click(); await settle();
+  assert.equal(requests.filter(r => r.url === '/api/session/action').length, 1); assert.equal(c.get('end-session-dialog').open, false);
+});
+
+test('전송 영수증이 다음 한글 조합 시작과 첫 input 사이에 와도 공통·raw 작성창을 비우지 않는다', async () => {
+  const { c, entry } = inlineDetailClient(); const input = c.get('chat-input');
+  input.value = entry.text = '기존 전송 문구';
+  entry.pending = { requestId: 'ime-race-001', revision: entry.revision, text: entry.text, attachments: [] };
+  input.events.compositionstart();
+  c.applyChatReceipt(entry, { requestId: 'ime-race-001', status: 'accepted', confirmed: true });
+  assert.equal(input.value, '기존 전송 문구'); assert.equal(entry.composing, true); assert.equal(entry.pending, null);
+  let release;
+  const raw = client(async () => { await new Promise(resolve => { release = resolve; }); return { ok: true, status: 200, json: async () => ({ ok: true }) }; }, noChatTimers);
+  raw.state.connected = true; raw.state.terminal = { id: 'ime-race-terminal' };
+  raw.state.term = { modes: { bracketedPasteMode: true }, scrollToBottom() {} };
+  const field = raw.get('terminal-draft'); field.value = '기존 raw 전송 문구';
+  const pasted = raw.pasteDraft(false); await settle(); raw.state.composing = true; release(); await pasted;
+  assert.equal(field.value, '기존 raw 전송 문구'); assert.equal(raw.state.composing, true);
 });

@@ -3289,7 +3289,7 @@ function terminationCopy(result) {
   const cleanup = result.cleanup;
   if (cleanup?.complete && cleanup.unverified?.length)
     return `실행을 종료하고 목록에서 정리했습니다. 연결을 확인하지 못한 터미널 ${cleanup.unverified.length}개는 열어 두었습니다. 열린 터미널 목록에서 확인할 수 있습니다.`;
-  if (cleanup?.complete) return "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.";
+  if (cleanup?.complete) return result.alreadyEnded ? "끝난 세션의 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다." : "실행을 끝내고 터미널과 목록을 정리했습니다. 대화 기록은 남아 있습니다.";
   if (cleanup?.unverified?.length) return "실행 종료는 확인했습니다. 연결을 확인하지 못한 터미널은 열어 두었습니다. 터미널 또는 목록 정리가 남아 있습니다.";
   if (cleanup?.remotePending?.length) return "실행 종료는 확인했습니다. 실행 기기의 터미널 정리가 남았습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
   return "실행 종료는 확인했습니다. 터미널 또는 목록 정리가 남아 있습니다. 남은 정리만 다시 시도할 수 있습니다.";
@@ -5935,6 +5935,7 @@ function buildChatComposer(s) {
   input.rows = entry.expanded ? 3 : 1;
   input.placeholder = chatPlaceholder(false);
   input.setAttribute("aria-label", "메시지");
+  for (const [name, value] of [["spellcheck", "false"], ["autocorrect", "off"], ["autocomplete", "off"], ["autocapitalize", "off"]]) input.setAttribute(name, value);
   input.value = entry.text;
   // A send waiting for the input method to commit the word it still composes (see send).
   let sendCommit = null;
@@ -6191,7 +6192,12 @@ function buildChatComposer(s) {
   quickInline.title = "빠른 답장";
   quickInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const main = el("div", "chat-main");
-  main.append(input, mic, quickInline, send);
+  const attachInline = button("＋", "chat-attach-inline", () => { if (editorCurrent() && !attach.disabled) files.click(); });
+  attachInline.id = "chat-attach-inline";
+  attachInline.setAttribute("aria-label", "사진 또는 파일 첨부");
+  attachInline.title = "사진 또는 파일 첨부";
+  attachInline.addEventListener("pointerdown", (event) => event.preventDefault());
+  main.append(attachInline, input, mic, quickInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -6202,6 +6208,8 @@ function buildChatComposer(s) {
 function resizeChatInput(entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const input = $("chat-input");
+  // Do not collapse a live IME candidate region to zero height during a poll or input event.
+  if (entry.composing) return;
   const style = window.getComputedStyle?.(input);
   const line = parseFloat(style?.lineHeight) || 22;
   const padding = (parseFloat(style?.paddingTop) || 10) + (parseFloat(style?.paddingBottom) || 10);
@@ -6563,8 +6571,9 @@ async function confirmEndSession(s, trigger = null) {
     context.preview = result;
     const end = result.capabilities?.terminate, stop = result.capabilities?.interrupt;
     terminate.disabled = !end?.supported;
+    if (end?.alreadyEnded) terminate.textContent = "끝난 세션 정리";
     interrupt.hidden = !stop?.supported;
-    status.textContent = end?.supported ? `${end.effect || "원본 실행을 종료합니다."} 이어서 터미널과 목록을 정리합니다.`
+    status.textContent = end?.supported ? (end.alreadyEnded ? end.effect : `${end.effect || "원본 실행을 종료합니다."} 이어서 터미널과 목록을 정리합니다.`)
       : `실행 종료: ${end?.reason || "현재 실행에서 지원하지 않습니다."}`;
     (end?.supported ? terminate : removed ? cancel : remove).focus?.();
   } catch (err) {
@@ -6598,7 +6607,7 @@ async function endSessionRun(context) {
       (context.used || !context.preview?.capabilities?.terminate?.supported))) return;
   context.used = true;
   endSessionBusy(context, true);
-  $("end-session-status").textContent = "실행을 끝내고 있습니다…";
+  $("end-session-status").textContent = context.preview?.capabilities?.terminate?.alreadyEnded ? "끝난 세션을 정리하고 있습니다…" : "실행을 끝내고 있습니다…";
   const next = cardAfter(context.s);
   try {
     const result = await terminateAndCleanup(context);
@@ -6753,6 +6762,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
+  $("chat-attach-inline").disabled = $("chat-attach").disabled;
   // A word still composing does not lock it: the send commits it first (buildChatComposer).
   $("chat-send").disabled = blocked || (!entry.text.trim() && !entry.attachments.length);
   // A listening mic always stays pressable, so a locked input can still end it.
@@ -6775,7 +6785,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-terminal-close").hidden = !openTerminalRow;
   if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
-  const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
+  const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.data?.terminalConnection?.connected && supported ? "터미널에 연결됨 · 실행 상태는 터미널에서 확인하세요." : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
   const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? CHAT_CHECKS_PAUSED : "";
   // The gate itself says what to do; the status line only adds that a refused
   // message was not sent.
@@ -6977,7 +6987,7 @@ function applyChatReceipt(entry, receipt, selected) {
   if (!entry.pending || !["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status)) return;
   // Only the draft that was sent is cleared; a resend from a bubble leaves
   // any other draft in the editor.
-  if (!entry.pending.preserveDraft && (receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision &&
+  if (!entry.composing && !entry.pending.preserveDraft && (receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision &&
       draftIsPending(entry)) {
     entry.text = "";
     entry.attachments = [];
@@ -11481,8 +11491,11 @@ async function startTerminalReader({ manual = false } = {}) {
           "최근 출력부터 다시 연결했습니다. 이전 대화는 보드에서 확인할 수 있습니다.",
         );
       }
-      if (result.data) {
-        const bytes = Uint8Array.from(atob(result.data), (char) =>
+      const restorePaste = typeof result.bracketedPaste === "boolean" &&
+        (result.reset || screen.modes?.bracketedPasteMode !== result.bracketedPaste)
+        ? `\x1b[?2004${result.bracketedPaste ? "h" : "l"}` : "";
+      if (result.data || restorePaste) {
+        const bytes = Uint8Array.from(restorePaste + atob(result.data || ""), (char) =>
           char.charCodeAt(0),
         );
         const written = new Promise((resolve) => screen.write(bytes, resolve));
@@ -11837,7 +11850,7 @@ function bindTerminalTouchScroll(node) {
 }
 function resizeDraft() {
   const input = $("terminal-draft");
-  if (!input?.style) return;
+  if (!input?.style || state.composing) return;
   const before = input.style.height;
   input.style.height = "auto";
   const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
@@ -12058,6 +12071,15 @@ function terminalDocumentKey(event) {
   }
   if (event.target?.closest?.(".xterm, dialog[open], details[open]")) return false;
   if (document.querySelector?.("dialog[open]")) return false;
+  if (!event.ctrlKey && !event.altKey && !event.metaKey && !anyTerminalMod() &&
+      (event.isComposing || event.keyCode === 229 || ["Process", "Dead"].includes(event.key) ||
+       [...String(event.key || "")].length === 1 && /[^\x00-\x7f]/.test(event.key))) {
+    // A body keydown has no editor in which the IME can compose. Give the
+    // browser a real textarea; never send the intermediate Hangul jamo.
+    const input = sessionComposerTerminal() ? $("chat-input") : $("terminal-draft");
+    if (input && !input.disabled && !input.readOnly) input.focus?.({ preventScroll: true });
+    return false;
+  }
   const bytes = terminalKeyFromEvent(event, { focusless: true });
   if (!bytes) {
     if (releasesTerminalMods(event)) clearTerminalMods();
@@ -12154,7 +12176,7 @@ async function pasteDraft(submit = false) {
     const bracketed = !!state.term?.modes?.bracketedPasteMode;
     if (/[\r\n]/.test(text) && !bracketed) {
       $("draft-note").textContent =
-        "현재 터미널 입력칸은 안전한 여러 줄 붙여넣기를 지원하지 않습니다. 한 줄씩 전달해 주세요.";
+        "터미널의 붙여넣기 모드를 확인하지 못했습니다. 다시 연결한 뒤 보내 주세요. 여러 줄 초안은 유지됩니다.";
       return;
     }
     const separator = bracketed ? "\n" : " ";
@@ -12176,7 +12198,7 @@ async function pasteDraft(submit = false) {
       if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
       await sendInput("\r");
     }
-    if (state.draftRevision === revision && $("terminal-draft").value === text) {
+    if (!state.composing && state.draftRevision === revision && $("terminal-draft").value === text) {
       $("terminal-draft").value = "";
       state.drafts.delete(pending.key);
       resizeDraft();
