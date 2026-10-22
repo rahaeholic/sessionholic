@@ -7547,6 +7547,12 @@ input.switch:focus-visible {
 .work-context-item p, .work-context-scope { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
 .detail-pane.is-typing .work-context, .detail-pane.is-typing .session-relations { display: none; }
 .detail-terminal-host { flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
+.launcher-chat { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.launcher-chat-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px var(--detail-pad); border-bottom: 1px solid var(--sep); }
+.launcher-chat-picker label { flex: 0 0 100%; font-weight: 600; }
+.launcher-chat-picker select { flex: 1 1 220px; min-width: 0; max-width: 100%; min-height: 44px; font: inherit; color: var(--label); background: var(--surface); border: 1px solid var(--sep); border-radius: 10px; padding: 8px 32px 8px 10px; }
+.launcher-chat-picker .detail-note { flex: 0 0 100%; margin: 0; }
+.launcher-chat-messages { min-height: 0; padding-top: 14px; }
 /* Native choices and their uncertain delivery receipts stay in the chat view.
    The visible terminal already owns that menu and its keyboard controls. */
 #detail.is-terminal-mode #chat-prompt { display: none; }

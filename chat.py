@@ -451,7 +451,7 @@ class Chat:
         # The conversation cache key; event watchers use the same key (events.watch_key).
         return json.dumps(cls.watch_identity(source), sort_keys=True)
 
-    def resolve(self, ref):
+    def resolve(self, ref, allow_chat_source=False):
         """The listed source a client reference names, whether or not its host is reachable."""
         if not isinstance(ref, dict):
             raise ValueError('작업을 선택해 주세요.')
@@ -469,13 +469,17 @@ class Chat:
                 if (isinstance(native, dict) and self.identity(native) == self.identity(ref or {})
                         and (not ref.get('sessionId') or native.get('sessionId') == ref['sessionId'])):
                     return {**native, 'title': terminal.get('title', '이어가는 작업')}
+                selected = terminal.get('chatSource') or terminal.get('metadata', {}).get('chatSource')
+                if (allow_chat_source and isinstance(selected, dict) and self.identity(selected) == self.identity(ref)
+                        and (not ref.get('sessionId') or selected.get('sessionId') == ref['sessionId'])):
+                    return {**selected, 'readOnly': True}
             raise
 
     def source(self, ref, sending=True):
         """The listed source and its host. Sending needs the host's collection to be up; a read
         does not (right after a restart nothing is collected yet, and a host that went away
         still has the conversation last read, see _stale)."""
-        source = self.resolve(ref)
+        source = self.resolve(ref, allow_chat_source=True) if not sending else self.resolve(ref)
         host = next(h for h in self.board.hosts if h['name'] == source['host'])
         if sending and not self.board.state[host['name']]['ok']:
             raise RuntimeError('기기 연결을 다시 확인한 뒤 메시지를 보내 주세요.')

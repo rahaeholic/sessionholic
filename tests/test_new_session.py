@@ -210,6 +210,61 @@ class WorkflowNewSessionTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_chat_selection_uses_server_source_and_never_changes_execution_identity(self):
+        native = codex_row('1', 1000)
+        self.board.state['remote']['data']['codex'] = [native]
+        target = {'id': 'a' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True,
+                  'program': 'codex', 'linkConfidence': 'estimated'}
+        self.terms.rows = [target]
+        self.terms.link_chat = lambda tid, source: {**target, 'chatSource': source}
+        selector = {'host': 'remote', 'agent': 'codex', 'home': '.codex', 'id': native['id'], 'cwd': '/forged'}
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('no native operation')):
+            result = self.flow.bind_terminal_chat(target['id'], selector)
+        self.assertEqual(result['terminal']['chatSource']['cwd'], '/work/project')
+        self.assertEqual(result['terminal']['linkConfidence'], 'estimated')
+        self.assertNotIn('nativeSource', result['terminal'])
+        self.assertEqual(self.terms.created, [])
+        for changed in ({'host': 'local'}, {'alive': False}, {'closed': True}, {'mode': 'attach'}, {'program': 'claude'},
+                        {'nativeSource': {**selector, 'cwd': native['cwd']}, 'linkConfidence': 'exact'}):
+            self.terms.rows = [{**target, **changed}]
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                self.flow.bind_terminal_chat(target['id'], selector)
+        self.terms.rows = [target]
+        with self.assertRaises(ValueError): self.flow.bind_terminal_chat(target['id'], {**selector, 'id': 'not-listed'})
+
+    def test_terminal_chat_selection_http_requires_auth_and_csrf_and_never_sends_input(self):
+        native = codex_row('1', 1000)
+        self.board.state['remote']['data']['codex'] = [native]
+        row = {'id': 'a' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True, 'program': 'codex'}
+        calls = []
+        def link(tid, source):
+            calls.append((tid, source))
+            return {**row, 'chatSource': source}
+        terminals = SimpleNamespace(list=lambda: [row], close=lambda: None, link_chat=link)
+        httpd = server.make_server('127.0.0.1', 0, self.board, 'fixture-token', state_dir=self.temp.name, terminals=terminals)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True); thread.start()
+        self.addCleanup(lambda: (httpd.shutdown(), thread.join(2), httpd.server_close()))
+        def request(path, body, cookie=None, csrf=None):
+            client = http.client.HTTPConnection('127.0.0.1', httpd.server_address[1], timeout=5)
+            headers = {'Content-Type': 'application/json'}
+            if cookie: headers['Cookie'] = cookie
+            if csrf: headers['X-CSRF-Token'] = csrf
+            client.request('POST', path, body=json.dumps(body), headers=headers)
+            response = client.getresponse(); result = json.loads(response.read()); client.close()
+            return response, result
+        path = '/api/terminal/' + row['id'] + '/conversation'
+        body = {'source': {'host': 'remote', 'agent': 'codex', 'home': '.codex', 'id': native['id']}}
+        self.assertEqual(request(path, body)[0].status, 401)
+        response, login = request('/login', {'token': 'fixture-token'})
+        cookie = response.getheader('Set-Cookie').split(';', 1)[0]
+        self.assertEqual(request(path, body, cookie)[0].status, 403)
+        self.assertEqual(calls, [])
+        response, result = request(path, body, cookie, login['csrfToken'])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(result['terminal']['chatSource']['id'], native['id'])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('nativeSource', result['terminal'])
+
     def test_local_new_session_opens_the_launcher_once_per_request(self):
         first = self.flow.new_session({'host': 'local', 'requestId': 'request-0001'})
         again = self.flow.new_session({'host': 'local', 'requestId': 'request-0001'})

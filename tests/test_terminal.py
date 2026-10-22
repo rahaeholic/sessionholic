@@ -1206,6 +1206,26 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertEqual(saved["nativeSource"], native)
         self.assertEqual(saved["linkConfidence"], "exact")
 
+    def test_chat_selection_persists_without_promoting_estimated_execution_identity(self):
+        created = self.connection('chat-selection', 'new-session', idle=False)
+        source = {'host': 'local', 'agent': 'codex', 'home': '.codex',
+                  'id': '019a0000-0000-7000-8000-000000000001', 'cwd': '/work/project'}
+        self.assertTrue(self.manager.link_native(created['id'], source, confidence='estimated'))
+        chosen = {**source, 'id': '019a0000-0000-7000-8000-000000000002'}
+        before = dict(self.manager._get(created['id']).record['metadata'])
+        with patch.object(self.manager, '_save', side_effect=OSError('fixture full disk')):
+            with self.assertRaises(OSError): self.manager.link_chat(created['id'], chosen)
+        self.assertEqual(self.manager._get(created['id']).record['metadata'], before)
+        with self.assertRaises(ValueError): self.manager.link_chat(created['id'], {**chosen, 'id': 'bad'})
+        self.manager.link_chat(created['id'], chosen)
+        self.manager.close()
+        restored = terminal.TerminalManager(state_dir=self.directory.name, socket_name=self.socket)
+        self.managers.append(restored)
+        row = next(row for row in restored.list() if row['id'] == created['id'])
+        self.assertEqual((row['chatSource'], row['nativeSource'], row['linkConfidence']), (chosen, source, 'estimated'))
+        restored.close_terminal(created['id'])
+        with self.assertRaises(ValueError): restored.link_chat(created['id'], chosen)
+
     def test_exact_host_evidence_can_correct_a_wrong_new_session_estimate(self):
         created = self.create()
         self.manager.terminals[created['id']].record['metadata']['mode'] = 'new-session'

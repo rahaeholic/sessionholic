@@ -2060,6 +2060,20 @@ class Workflow:
             if not settled:
                 self._finish(request_id, signature, record=False)
 
+    def bind_terminal_chat(self, terminal_id, ref):
+        """A user-selected read association never proves which native run a launcher owns."""
+        row = next((t for t in self.terminals.list() if t.get("id") == terminal_id), None)
+        if (row is None or not row.get("alive") or row.get("closed") or row.get("mode") != "new-session"
+                or row.get("linkConfidence") == "exact"):
+            raise ValueError("이 터미널의 채팅 연결을 다시 확인해 주세요.")
+        source = self.board.source(ref)
+        agent = ref.get("agent")
+        native = self._native_of(source["host"], agent, source)
+        if (native is None or native["host"] != row.get("host")
+                or row.get("program") in ("codex", "claude") and agent != row["program"]):
+            raise ValueError("이 터미널과 같은 기기·프로그램의 대화를 선택해 주세요.")
+        return {"terminal": self.terminals.link_chat(terminal_id, native)}
+
     HOLD_SWEEP_SECONDS = 300
     HOLD_SWEEP_FIRST = 180  # after a start
     HOLD_GRACE_SECONDS = 120  # a hold younger than this may belong to a terminal being created
@@ -4172,6 +4186,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.workflow.new_session(data))
             if path == "/api/app-server":
                 return self.send_json(200, self.server.workflow.start_app_server(data))
+            match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/conversation", path)
+            if match:
+                return self.send_json(200, self.server.workflow.bind_terminal_chat(match[1], data.get("source")))
             match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/(input|resize|scroll|scroll-end|detach|close)", path)
             if match:
                 tid, action = match.groups()

@@ -127,7 +127,7 @@ def _metadata(value):
     for key, item in value.items():
         if not isinstance(key, str):
             raise ValueError("터미널 정보가 올바르지 않습니다.")
-        if key != "nativeSource":
+        if key not in ("nativeSource", "chatSource"):
             if not isinstance(item, (str, int, bool, type(None))):
                 raise ValueError("터미널 정보가 올바르지 않습니다.")
             continue
@@ -989,6 +989,26 @@ class TerminalManager:
             except OSError:
                 raise RuntimeError("터미널 크기를 변경하지 못했습니다.") from None
         return {"ok": True}
+
+    def link_chat(self, terminal_id, source):
+        """Persist an explicitly selected transcript, without granting native input/cleanup identity."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+            previous = terminal.record["metadata"]
+            if (terminal.record.get("closed") or not terminal.alive or previous.get("mode") != "new-session"
+                    or previous.get("linkConfidence") == "exact" or not isinstance(source, dict)
+                    or source.get("host") != previous.get("host")
+                    or previous.get("program") in ("codex", "claude") and source.get("agent") != previous["program"]):
+                raise ValueError("이 터미널의 채팅 연결을 다시 확인해 주세요.")
+            terminal.record["metadata"] = _metadata({**previous, "chatSource": source})
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+            result = self._public(terminal)
+        self._changed()
+        return result
 
     def link_native(self, terminal_id, native, confidence="exact"):
         """Exact host-owned evidence can correct a new launcher's estimate, never an exact binding."""

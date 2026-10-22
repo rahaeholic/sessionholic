@@ -172,6 +172,7 @@ const state = {
   refreshDeadline: 0,
   csrf: "",
   selected: null,
+  launcherChatView: null,
   filters: { host: "", agent: "", project: "", account: "", initiator: "" },
   // The status chips above the list (a GROUPS key: "needs_input", "working",
   // "finished" or "rest"); tapping the active chip again clears it.
@@ -6979,6 +6980,10 @@ function sendUpload(file, headers, onProgress) {
   });
 }
 function stopChatPolling() {
+  if (state.launcherChatView) {
+    clearTimeout(state.launcherChatView.timer);
+    state.launcherChatView = null;
+  }
   clearTimeout(state.chatPollTimer);
   state.chatPollTimer = null;
   state.chatPollRun++;
@@ -8957,11 +8962,11 @@ function openQuestion(item) {
   showHistoryPreview(entry);
   return loadLongMessage(s, entry.historyPreview.item);
 }
-function renderMessages(s, messages, error = "", fresh = false) {
-  const list = $("messages");
+function renderMessages(s, messages, error = "", fresh = false, options = {}) {
+  const list = options.list || $("messages");
   if (!list) return;
   const source = chatKey(sourceOf(s));
-  const entry = state.chats.get(source) || null;
+  const entry = options.readOnly ? null : state.chats.get(source) || null;
   const historyNotice = messages?.length ? "" : conversationHistoryNotice(s, entry);
   const previous = list.conversationSource === source ? list.conversationRows || [] : [];
   // A failed refresh never removes a conversation that was already readable.
@@ -9045,7 +9050,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
     // on touch, right click or this button (shown on hover) with a mouse.
     const item = { key, message, row, bubble, role, truncated, truncatedNote: row.truncatedNote };
     row.messageItem = item;
-    if (role !== "system") {
+    if (role !== "system" && !options.readOnly) {
       const more = button("", "msg-more", () => openMessageMenu(row));
       more.setAttribute("aria-label", "메시지 메뉴");
       more.setAttribute("aria-haspopup", "dialog");
@@ -9089,7 +9094,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   if (error) {
     // A Codex account without its app-server daemon: listed from its state DB, readable
     // once the daemon runs. "앱 서버 켜기" starts it on that host.
-    const serverOff = s.agent === "codex" && s.appServer === "off";
+    const serverOff = !options.readOnly && s.agent === "codex" && s.appServer === "off";
     const errorKey = error + (serverOff ? "\0off" : "");
     if (!list.conversationError || list.conversationErrorText !== errorKey || list.conversationSource !== source) {
       const warning = el("div", `conversation-read-error${serverOff ? " app-server-off" : ""}`);
@@ -9100,6 +9105,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
           button("앱 서버 켜기", "primary app-server-start", (event) => startAppServer(s, event?.currentTarget)));
       } else {
         warning.append(button("대화 다시 불러오기", "secondary", () => {
+          if (options.retry) return options.retry();
           const current = selectedSession();
           if (current?.key === s.key) loadDetail(current, !list.conversationRows?.length);
         }));
@@ -9170,8 +9176,10 @@ function renderMessages(s, messages, error = "", fresh = false) {
   if (stick) setMessagesScroll(list, list.scrollHeight);
   else if (anchorBox) setMessagesScroll(list, anchorBox.top - anchorOffset);
   else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
-  if (working) tickWorking();
-  else stopWorkingClock();
+  if (!options.readOnly) {
+    if (working) tickWorking();
+    else stopWorkingClock();
+  }
   // While reading back, count what arrived below instead of jumping to it. A
   // row that only got its time (Codex's final answer takes its turn's end) is
   // not new, nor this board's own message that took the place of its bubble.
@@ -9194,6 +9202,7 @@ function renderMessages(s, messages, error = "", fresh = false) {
   } else if (stick) list.unread = 0;
   restoreConversationView(list);
   if (list.pendingView && typeof requestAnimationFrame === "function") requestAnimationFrame(() => restoreConversationView(list));
+  if (options.readOnly) return;
   renderJump();
   // A new question of the user's (sent from here or read in the transcript) shows above.
   renderQuestionPin(s);
@@ -10787,8 +10796,7 @@ function terminalHasRawDraft(terminal) {
 }
 function sessionDetailMode(s = selectedSession()) {
   if (sessionRecordOnly(s)) return "chat";
-  return state.detailModes.get(conversationIdentity(s)) || (s.readOnly === true ||
-    sessionRemoved(s) && !["working", "needs_input"].includes(s.phase) ? "chat" : "terminal");
+  return state.detailModes.get(conversationIdentity(s)) || "chat";
 }
 function sessionComposerTerminal(s = selectedSession()) {
   return s && !sessionRecordOnly(s) && state.terminalVisible && state.inlineTerminal?.key === s.key &&
@@ -10891,8 +10899,113 @@ function showLauncherChat(terminalId) {
     state.launcherWorkspace = null;
     openNativeChat(terminal);
     chooseDetailMode("chat");
-  }
+  } else renderLauncherChat();
   renderDetailMode();
+}
+function launcherChatViewCurrent(view) {
+  const terminal = launcherWorkspaceTerminal();
+  return !!view && state.authenticated && view.authEpoch === state.authEpoch && state.launcherChatView === view &&
+    terminal?.alive !== false && !terminal?.closed && view.root === $("launcher-chat-waiting") &&
+    launcherWorkspaceCurrent(view.terminalId) && state.launcherWorkspace.mode === "chat" && !state.inlineTerminal;
+}
+function launcherChatCandidates(terminal) {
+  const info = terminalInfo(terminal);
+  return allSessions().filter((s) => s.host === info.host && s.id && !claudeWithoutId(s) && !sessionOneShot(s) &&
+    (!['codex', 'claude'].includes(info.program) || s.agent === info.program) && s.kind !== 'background' &&
+    (s.agent !== 'codex' || !s.source || ['cli', 'vscode'].includes(s.source)) && s.cwd);
+}
+function renderLauncherChat() {
+  const terminal = launcherWorkspaceTerminal(), root = $("launcher-chat-waiting");
+  if (!terminal || !root || !launcherWorkspaceCurrent(terminal.id) || state.inlineTerminal || state.launcherWorkspace.mode !== "chat") return;
+  let view = state.launcherChatView;
+  if (!view || view.root !== root || view.terminalId !== terminal.id || view.authEpoch !== state.authEpoch) {
+    clearTimeout(view?.timer);
+    view = { root, terminalId: terminal.id, authEpoch: state.authEpoch, sourceKey: "", run: 0, failures: 0 };
+    state.launcherChatView = view;
+    const picker = el("div", "launcher-chat-picker");
+    const label = el("label", null, "이 터미널의 대화"); label.htmlFor = "launcher-chat-source";
+    view.select = el("select"); view.select.id = "launcher-chat-source";
+    view.connect = button("채팅 연결", "primary", () => bindLauncherChat(view));
+    view.note = el("p", "detail-note"); view.note.setAttribute("role", "status");
+    view.refresh = button("기록 새로고침", "secondary", () => readLauncherChat(view));
+    view.list = el("div", "messages launcher-chat-messages"); view.list.setAttribute("role", "log");
+    view.list.setAttribute("aria-label", "선택한 대화 기록"); view.list.tabIndex = 0;
+    picker.append(label, view.select, view.connect, view.refresh, view.note);
+    root.className = "launcher-chat"; root.replaceChildren(picker, view.list);
+  }
+  const candidates = launcherChatCandidates(terminal), source = terminalInfo(terminal).chatSource;
+  const signature = JSON.stringify(candidates.map((s) => [s.key, s.title, s.account, s.project]));
+  if (signature !== view.candidates) {
+    const chosen = view.select.value;
+    const placeholder = el("option", null, "연결할 대화를 선택하세요"); placeholder.value = "";
+    const options = candidates.map((s) => {
+      const option = el("option", null, `${s.title || s.initialTitle || s.project || '대화'} · ${AGENTS[s.agent] || s.agent} · ${s.account || s.home || '현재 계정'}`);
+      option.value = s.key; return option;
+    });
+    view.select.replaceChildren(placeholder, ...options);
+    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : source && candidates.some((s) => s.key === chatKey(source)) ? chatKey(source) : "";
+    view.candidates = signature;
+  }
+  view.connect.disabled = view.saving === true;
+  view.select.disabled = view.saving === true;
+  view.refresh.hidden = !source;
+  if (!view.error) view.note.textContent = source
+    ? "선택한 대화의 기록입니다. 입력은 터미널 탭에서 계속할 수 있습니다."
+    : "자동 연결을 확인하지 못했습니다. 이 터미널에서 진행 중인 대화를 선택해 주세요. 입력은 터미널 탭에서 계속할 수 있습니다.";
+  const key = source ? JSON.stringify(source) : "";
+  if (key !== view.sourceKey) {
+    clearTimeout(view.timer); view.timer = null; view.run++; view.reading = false;
+    view.sourceKey = key; view.source = source; view.messages = null; view.failures = 0; view.loaded = false;
+    view.list.replaceChildren(); view.list.conversationSource = null; view.list.conversationRows = [];
+    if (source) readLauncherChat(view);
+  } else if (source && !view.reading && !view.timer) readLauncherChat(view);
+}
+async function bindLauncherChat(view) {
+  if (!launcherChatViewCurrent(view) || view.saving) return;
+  const terminal = launcherWorkspaceTerminal();
+  const chosen = launcherChatCandidates(terminal).find((s) => s.key === view.select.value);
+  if (!chosen) { view.note.textContent = "연결할 대화를 선택해 주세요."; return; }
+  view.saving = true; view.error = ""; renderLauncherChat();
+  try {
+    const result = await api(`/api/terminal/${encodeURIComponent(view.terminalId)}/conversation`, {
+      method: "POST", body: { source: sourceOf(chosen) }, authEpoch: view.authEpoch,
+    });
+    if (!launcherChatViewCurrent(view)) return;
+    if (result.terminal?.id !== view.terminalId || !result.terminal.chatSource ||
+        !sameRecoverySource(result.terminal.chatSource, sourceOf(chosen))) throw new Error("선택한 대화의 연결 결과를 확인하지 못했습니다.");
+    rememberTerminal(result.terminal);
+  } catch (err) {
+    if (launcherChatViewCurrent(view)) { view.error = err.message || "대화를 연결하지 못했습니다."; view.note.textContent = view.error; }
+  } finally {
+    view.saving = false;
+    if (launcherChatViewCurrent(view)) renderLauncherChat();
+  }
+}
+async function readLauncherChat(view) {
+  if (!launcherChatViewCurrent(view) || !view.source || view.reading) return;
+  clearTimeout(view.timer); view.timer = null;
+  const run = ++view.run, source = view.source, sourceKey = view.sourceKey;
+  const current = () => launcherChatViewCurrent(view) && view.run === run && view.sourceKey === sourceKey;
+  view.reading = true; view.refresh.disabled = true;
+  try {
+    const data = await api("/api/chat/state", { method: "POST", body: { source }, authEpoch: view.authEpoch });
+    if (!current()) return;
+    if (!Array.isArray(data.messages) || !sameRecoverySource(data.route, source)) throw new Error("선택한 대화의 조회 결과를 확인하지 못했습니다.");
+    view.messages = data.messages; view.failures = 0;
+    renderMessages(source, view.messages, "", !view.loaded, { list: view.list, readOnly: true });
+    view.loaded = true;
+  } catch (err) {
+    if (!current()) return;
+    view.failures++;
+    renderMessages(source, view.messages, err.message || "기록을 불러오지 못했습니다.", false,
+      { list: view.list, readOnly: true, retry: () => readLauncherChat(view) });
+  } finally {
+    if (current()) {
+      view.reading = false; view.refresh.disabled = false;
+      view.timer = setTimeout(() => { view.timer = null; readLauncherChat(view); }, Math.min(30000, 5000 * (1 + view.failures)));
+      view.timer?.unref?.();
+    }
+  }
 }
 function syncLauncherWorkspace() {
   const id = state.launcherWorkspace?.terminalId;
@@ -10900,6 +11013,7 @@ function syncLauncherWorkspace() {
   // Never redraw underneath terminal input or infer the conversation from its title/time.
   if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.detailShown &&
       launcherConversation(launcherWorkspaceTerminal())) showLauncherChat(id);
+  else if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.launcherWorkspace.mode === "chat") renderLauncherChat();
   else if (launcherWorkspaceCurrent(id) && state.inlineTerminal && launcherConversation(launcherWorkspaceTerminal())) {
     renderSessionComposerLink();
   }

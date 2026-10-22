@@ -723,6 +723,16 @@ class ChatTest(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(results[0]['messages'][0]['text'],'older')
         self.assertEqual(self.chat.state({'source':REF})['messages'][0]['text'],'newer')
+    def test_selected_terminal_chat_survives_list_eviction_but_is_not_a_send_identity(self):
+        ref = {**REF, 'id': SID[:-1] + '3'}
+        selected = {**ref, 'cwd': str(self.project)}
+        self.flow.terminals.list = lambda: [{'chatSource': selected, 'linkConfidence': 'estimated',
+                                            'nativeSource': {**self.source}}]
+        self.assertEqual(self.chat.state({'source': ref})['route'], ref)
+        self.assertTrue(all(args['action'] == 'read' for _, _, args in self.calls))
+        with self.assertRaises(ValueError): self.chat.source(ref, sending=True)
+        with self.assertRaises(ValueError): self.chat.state({'source': {**ref, 'home': '.codex-other'}})
+
     def test_native_terminal_identity_supports_new_destination(self):
         ref={**REF,'id':SID[:-1]+'3'}
         self.flow.terminals.list=lambda:[{'nativeSource':{**ref,'cwd':str(self.project)}}]

@@ -356,7 +356,7 @@ test("dropping another session at an occupied pane center previews and creates a
   assert.equal(f.frames.length, 1);
   assert.deepEqual(f.infos.get("p1").ref, { key: "session-a", mode: "chat" });
   const second = f.attach("p2");
-  assert.deepEqual(second.info.ref, { key: "session-b", mode: "terminal" });
+  assert.deepEqual(second.info.ref, { key: "session-b", mode: "chat" });
   assert.equal(f.nodes.get("workspace-primary").style.width, "50%");
   assert.equal(second.row.style.width, "50%");
 });
@@ -370,8 +370,8 @@ test("a center drop into a loading empty pane is retained until its document is 
   assert.equal(f.nodes.get("workspace-drop-cue").textContent, "빈 창에서 열기");
   f.document.fire("drop", { clientX: 990, clientY: 400, dataTransfer: transfer, preventDefault() {} });
   assert.equal(f.frames.length, 1, "the empty pane is filled rather than split again");
-  assert.deepEqual(f.preferences.get("workspace").panes.p2, { key: "session-b", mode: "terminal" });
-  assert.deepEqual(f.attach("p2").info.ref, { key: "session-b", mode: "terminal" });
+  assert.deepEqual(f.preferences.get("workspace").panes.p2, { key: "session-b", mode: "chat" });
+  assert.deepEqual(f.attach("p2").info.ref, { key: "session-b", mode: "chat" });
   assert.equal(f.calls.filter(([name]) => name === "api").length, 0);
 });
 
@@ -523,15 +523,15 @@ test('answer intent reaches an already mounted record pane without creating a ne
   assert.equal(f.calls.some((call) => call[0] === 'api' && /launch|new-session/.test(call[1])), false);
 });
 
-test('a loading pane retains answer intent until restore completes and opens in work mode', () => {
+test('a loading pane retains answer intent until restore completes and opens in chat mode', () => {
   const f = fixture(); f.workspace.add(null);
   assert.equal(f.workspace.routeSession('session-b', { answer: true }), true);
-  assert.deepEqual(f.preferences.get('workspace').panes.p2, { key: 'session-b', mode: 'terminal' });
+  assert.deepEqual(f.preferences.get('workspace').panes.p2, { key: 'session-b', mode: 'chat' });
   const row = f.nodes.get('session-workspace').children.find((node) => node.dataset.paneId === 'p2');
   const frame = row.children.find((node) => node.tagName === 'IFRAME'), child = f.app('p2'), answers = [];
   child.answerSession = (key) => answers.push(key);
   assert.equal(f.workspace.attach('p2', frame.contentWindow, child), true);
-  assert.deepEqual(answers, ['session-b']); assert.equal(f.infos.get('p2').ref.mode, 'terminal');
+  assert.deepEqual(answers, ['session-b']); assert.equal(f.infos.get('p2').ref.mode, 'chat');
   f.workspace.changed(); assert.equal(answers.length, 1, 'answer intent is consumed only once');
 });
 

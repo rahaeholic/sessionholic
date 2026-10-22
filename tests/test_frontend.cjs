@@ -14530,6 +14530,111 @@ test('새 세션 시작·대기 채팅·터미널 복귀는 모바일과 데스�
   }
 });
 
+function launcherRecoveryClient() {
+  const { c, s, entry } = newSessionWorkspaceClient(390);
+  Object.assign(c, vm.runInContext('({ renderLauncherChat, readLauncherChat, bindLauncherChat, launcherChatCandidates, launcherChatViewCurrent, terminalMatchesDetail })', c.context));
+  s.cwd = '/fixture/project';
+  const selected = { ...c.sourceOf(s), cwd: s.cwd };
+  const guessed = { ...selected, id: 'wrong-estimate' };
+  const terminal = { id: 'a'.repeat(32), mode: 'new-session', host: s.host, program: 'codex', alive: true,
+    nativeSource: guessed, linkConfidence: 'estimated' };
+  c.state.terminals = [terminal]; c.state.terminal = terminal;
+  const calls = [];
+  c.context.fetch = async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    return { ok: true, status: 200, json: async () => url.endsWith('/conversation')
+      ? { terminal: { ...terminal, chatSource: selected } }
+      : url === '/api/chat/state' ? { route: selected, messages: [{ role: 'assistant', text: '선택한 실제 대화의 답변' }] }
+      : url === '/api/terminals' ? { terminals: c.state.terminals } : {} };
+  };
+  return { c, s, entry, terminal, selected, guessed, calls };
+}
+
+test('미확인 터미널은 자동 추정을 열지 않고 선택한 채팅을 기록으로 복구하며 원래 실행과 초안을 보존한다', async () => {
+  const { c, s, entry, terminal, selected, guessed, calls } = launcherRecoveryClient();
+  entry.text = '원래 세션에 남은 초안';
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
+  c.get('detail-mode-chat').events.click();
+  let view = c.state.launcherChatView;
+  assert.equal(view.select.value, '', 'a guessed conversation never becomes the selected transcript');
+  assert.equal(calls.some((r) => r.url === '/api/chat/state'), false);
+  view.select.value = s.key;
+  await view.connect.events.click(); await settle();
+  assert.equal(c.state.selected, null, 'this transcript does not silently select a different work session');
+  assert.equal(c.state.launcherWorkspace.terminalId, terminal.id);
+  assert.equal(c.state.terminals[0].chatSource.id, selected.id);
+  assert.equal(c.state.terminals[0].nativeSource.id, guessed.id);
+  assert.equal(c.state.terminals[0].linkConfidence, 'estimated');
+  assert.equal(c.terminalMatchesDetail(c.state.terminals[0], s), false, 'a read selection grants no execution identity');
+  assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  assert.equal(view.list.conversationRows[0].row.moreButton, undefined, 'read-only rows have no execute/edit action menu');
+  assert.equal(c.get('chat-composer').hidden, true);
+  assert.equal(entry.text, '원래 세션에 남은 초안');
+  assert.equal(calls.filter((r) => r.url.endsWith('/conversation')).length, 1);
+  assert.equal(calls.some((r) => /\/input|\/launch|\/send|\/close|\/api\/new-session/.test(r.url)), false);
+  c.get('detail-mode-terminal').events.click(); await settle();
+  assert.equal(c.state.terminal.id, terminal.id); assert.equal(c.state.terminalVisible, true);
+  clearTimeout(view.timer); view.timer = null;
+  const before = calls.length; await c.readLauncherChat(view);
+  assert.equal(calls.length, before, 'the terminal view does not poll an invisible transcript');
+  c.get('detail-mode-chat').events.click(); await settle();
+  view = c.state.launcherChatView;
+  assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  c.stopChatPolling();
+});
+
+test('기록 연결 저장의 늦은 응답은 다른 터미널 화면을 갱신하지 않는다', async () => {
+  const { c, s, terminal, selected } = launcherRecoveryClient();
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0], { restoreChat: true })', c.context);
+  const view = c.state.launcherChatView;
+  c.state.snapshot.hosts.push({ name: 'another-host', ok: true, data: { codex: [{ ...s, id: 'elsewhere' }] } });
+  c.state.snapshot.hosts[0].data.codex.push({ ...s, id: 'one-shot', source: 'exec' });
+  assert.deepEqual(Array.from(c.launcherChatCandidates(terminal), (item) => item.id), [s.id]);
+  view.select.value = s.key;
+  let finish;
+  c.context.fetch = () => new Promise((resolve) => { finish = resolve; });
+  const pending = c.bindLauncherChat(view); await settle();
+  c.state.launcherWorkspace = { terminalId: 'another-terminal', authEpoch: c.state.authEpoch, mode: 'chat' };
+  finish({ ok: true, status: 200, json: async () => ({ terminal: { ...terminal, chatSource: selected } }) });
+  await pending;
+  assert.equal(c.state.terminals[0].chatSource, undefined);
+  assert.equal(c.state.launcherWorkspace.terminalId, 'another-terminal');
+  c.stopChatPolling();
+});
+
+test('선택한 터미널 기록은 다시 열어도 복원되고 조회 실패가 기존 답변을 지우지 않는다', async () => {
+  const { c, terminal, selected } = launcherRecoveryClient();
+  terminal.chatSource = selected;
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0], { restoreChat: true })', c.context); await settle();
+  const view = c.state.launcherChatView;
+  assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  c.context.fetch = async () => { throw new Error('fixture network failed'); };
+  await c.readLauncherChat(view);
+  assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  assert.match(textOf(view.list), /fixture network failed/);
+  c.stopChatPolling();
+});
+
+test('터미널 기록 조회의 늦은 응답은 다른 대화·인증·화면에 붙지 않는다', async () => {
+  for (const change of ['source', 'auth', 'pane']) {
+    const { c, terminal, selected } = launcherRecoveryClient();
+    terminal.chatSource = selected;
+    let finish;
+    c.context.fetch = () => new Promise((resolve) => { finish = resolve; });
+    await vm.runInContext('openNewSessionTerminal(state.terminals[0], { restoreChat: true })', c.context);
+    const view = c.state.launcherChatView;
+    await settle();
+    if (change === 'source') { view.sourceKey = 'changed'; view.run++; }
+    else if (change === 'auth') c.state.authEpoch++;
+    else c.state.launcherWorkspace = { terminalId: 'another-terminal', authEpoch: c.state.authEpoch, mode: 'chat' };
+    finish({ ok: true, status: 200, json: async () => ({ route: selected, messages: [{ role: 'assistant', text: 'stale answer' }] }) });
+    await settle();
+    assert.doesNotMatch(textOf(view.list), /stale answer/);
+    assert.equal(view.timer, null);
+    c.stopChatPolling();
+  }
+});
+
 function terminalFilesClient(fetchImpl) {
   const c = client(fetchImpl);
   Object.assign(c, vm.runInContext('({ uploadTerminalFiles, pasteTerminalFiles, terminalAttachmentEntry, terminalAttachmentDrafts, renderTerminalAttachments, restoreTerminalDraft, unsavedWork })', c.context));
@@ -14708,13 +14813,27 @@ test('터미널 첨부 업로드 실패는 재시도할 선택을 보관하고 �
   assert.equal(c.terminalAttachmentDrafts.size, 0);
 });
 
-test('기본 작업 보기는 기존 exact 터미널만 재사용하며 입력 DOM과 한글 조합을 유지한다', async () => {
+test('새로 고른 세션은 모든 실행 상태에서 채팅이 기본이며 기존 터미널과 초안을 건드리지 않는다', async () => {
+  for (const phase of ['idle', 'working', 'needs_input']) {
+    const { c, s, entry, terminal } = inlineDetailClient(); s.phase = phase;
+    c.state.detailModes.delete(c.conversationIdentity(s));
+    entry.text = '유지할 채팅 초안'; c.get('chat-input').value = entry.text;
+    let opened = 0; c.context.openTerminal = () => { opened++; };
+    c.context.renderDetailMode(); await vm.runInContext('syncSessionTerminal()', c.context);
+    assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
+    assert.equal(c.state.inlineTerminal, null); assert.equal(c.get('detail-terminal-host').hidden, true);
+    assert.equal(c.get('chat-composer').hidden, false); assert.equal(c.get('chat-input').value, entry.text);
+    assert.equal(c.state.terminal.id, terminal.id); assert.equal(opened, 0);
+  }
+});
+
+test('명시한 터미널 보기는 기존 exact 터미널만 재사용하며 입력 DOM과 한글 조합을 유지한다', async () => {
   const { c, s, entry, terminal } = inlineDetailClient();
   const input = c.get('chat-input'); let blurred = 0;
   input.blur = () => { blurred++; };
   c.context.document.activeElement = input;
   input.value = entry.text = '조합 중인 다음 문장'; entry.composing = true;
-  c.state.detailModes.delete(c.conversationIdentity(s));
+  c.state.detailModes.set(c.conversationIdentity(s), 'terminal');
   await vm.runInContext('syncSessionTerminal()', c.context);
   assert.equal(c.state.terminal.id, terminal.id); assert.equal(c.state.inlineTerminal.key, s.key);
   assert.equal(c.get('chat-input'), input); assert.equal(input.value, entry.text);
@@ -14742,7 +14861,7 @@ test('기록 선택과 복원은 실행을 시작하지 않고 공통 작성·�
 test('터미널이 없거나 추정 연결뿐인 작업을 읽어도 실행을 만들지 않는다', async () => {
   for (const estimated of [false, true]) {
     const { c, s, terminal } = inlineDetailClient(), opens = [];
-    c.state.detailModes.delete(c.conversationIdentity(s));
+    c.state.detailModes.set(c.conversationIdentity(s), 'terminal');
     c.state.terminals = estimated ? [{ ...terminal, linkConfidence: 'estimated' }] : [];
     c.context.openTerminal = async (value) => { opens.push(value); };
     await vm.runInContext('syncSessionTerminal()', c.context); await settle();
@@ -14904,7 +15023,7 @@ test('통합 작성창에서 받아쓰는 동안 포커스 없는 키를 raw 터
 test('목록에서 지운 세션이 다시 답을 기다리면 작업과 승인 UI를 사용할 수 있다', async () => {
   const { c, s } = inlineDetailClient(); s.phase = 'needs_input'; c.context.sessionRemoved = () => true;
   c.state.detailModes.delete(c.conversationIdentity(s)); c.context.renderDetailMode();
-  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'terminal');
+  assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
   assert.equal(c.get('detail-mode-terminal').disabled, false); assert.equal(c.get('chat-composer').hidden, false);
   c.renderPrompt(s, { prompt: { fingerprint: 'waiting-again', current: 1, agent: 'codex', options: [{ number: 1, label: '계속' }] } });
   assert.equal(c.get('chat-prompt').hidden, false);
@@ -14920,7 +15039,7 @@ test('기록으로 보던 세션의 답 필요 알림도 공통 입력을 유지
 
 test('자동 터미널 동기화는 다른 분할 창의 포커스를 빼앗는 경로를 호출하지 않는다', async () => {
   const { c, s, entry } = inlineDetailClient(), claims = [];
-  c.state.detailModes.delete(c.conversationIdentity(s)); entry.text = '이 창에서 작성 중';
+  c.state.detailModes.set(c.conversationIdentity(s), 'terminal'); entry.text = '이 창에서 작성 중';
   c.context.window.SessionholicWorkspace = { visible: () => true, readingActive: () => true, changed() {},
     routeTerminal() { throw Error('passive synchronization must not route focus'); },
     claimTerminal(terminal, options) { claims.push(options.passive); return false; } };

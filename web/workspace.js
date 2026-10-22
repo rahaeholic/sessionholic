@@ -447,13 +447,13 @@
       if (answer) {
         const row = panes.get(existing);
         if (row.hooks) row.hooks.answerSession?.(key);
-        else { row.pendingAnswer = key; if (row.ref) row.ref.mode = "terminal"; changed(); }
+        else { row.pendingAnswer = key; changed(); }
       }
       return true;
     }
     if (active === "p1") return false;
     const row = panes.get(active);
-    if (!row?.hooks) { row.ref = { key, mode: "terminal" }; if (answer) row.pendingAnswer = key; changed(); return true; }
+    if (!row?.hooks) { row.ref = { key, mode: "chat" }; if (answer) row.pendingAnswer = key; changed(); return true; }
     row.ref = null; row.hooks.select(key); if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed();
     return true;
   }
@@ -633,8 +633,8 @@
       tree = move(tree, target.from, target.id, target.edge); active = target.from; maximized = false; layout(); focus(active);
     } else if (target.edge === "center") {
       const row = panes.get(target.id);
-      focus(target.id, false); row.ref = { key: data.key, mode: "terminal" }; applyRef(row); changed();
-    } else add({ key: data.key, mode: "terminal" }, target.id, target.edge);
+      focus(target.id, false); row.ref = { key: data.key, mode: "chat" }; applyRef(row); changed();
+    } else add({ key: data.key, mode: "chat" }, target.id, target.edge);
   }
   function init(appHooks) {
     hooks = appHooks;
