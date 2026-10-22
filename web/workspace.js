@@ -78,16 +78,21 @@
       }).sort((a, b) => a.score - b.score)[0]?.id || null;
   }
   function shortcut(event, modifiers = "ctrl-meta") {
-    if (event.shiftKey || event.isComposing || event.keyCode === 229) return null;
+    if (event.shiftKey) return null;
+    const physicalDigit = /^Digit([1-4])$/.exec(event.code || "")?.[1];
+    const digit = physicalDigit || (/^[1-4]$/.test(event.key) ? event.key : null);
+    const composing = event.isComposing || event.keyCode === 229;
+    // A physical Option+number is an explicit pane selection, even while an
+    // IME owns its last word. focus() commits that editor before moving it.
+    if (!event.ctrlKey && !event.metaKey && event.altKey && digit && (!composing || physicalDigit))
+      return { number: Number(digit) };
+    if (composing) return null;
     const key = ({ UIKeyInputLeftArrow: "ArrowLeft", UIKeyInputRightArrow: "ArrowRight",
       UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown" })[event.key] || event.key;
-    const direction = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key);
-    const commandOption = !event.ctrlKey && event.metaKey && event.altKey && direction;
     const configured = event.ctrlKey && event.metaKey && !!event.altKey === (modifiers === "ctrl-alt-meta");
-    if (!commandOption && !configured) return null;
-    if (direction) return { direction: key };
+    if (!configured) return null;
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) return { direction: key };
     if (event.key === "Enter") return { maximize: true };
-    const digit = /^Digit([1-4])$/.exec(event.code || "")?.[1] || (/^[1-4]$/.test(event.key) ? event.key : null);
     return digit ? { number: Number(digit) } : null;
   }
   function validRef(value) {
@@ -272,7 +277,8 @@
     const switcher = $("workspace-switcher"); switcher.hidden = !enabled;
     switcher.replaceChildren();
     list.forEach((id, index) => {
-      const tab = button(`창 ${index + 1}로 이동 · Control+Command+${index + 1}`, `${index + 1}`, () => focus(id));
+      const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `⌥${index + 1}`, () => focus(id));
+      tab.setAttribute("aria-keyshortcuts", `Alt+${index + 1}`);
       tab.setAttribute("aria-pressed", String(id === active)); switcher.append(tab);
     });
     hooks.listChanged?.();
@@ -307,7 +313,7 @@
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));
     if (!action || !ids(tree).includes(id) || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
-    if (!event.ctrlKey && event.metaKey && event.altKey && ids(tree).length < 2) return false;
+    if (!event.ctrlKey && !event.metaKey && event.altKey && ids(tree).length < 2) return false;
     if (event.repeat && action.maximize) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
     event.preventDefault(); event.stopImmediatePropagation();
     if (action.maximize) { if (ids(tree).length > 1) maximize(); }
@@ -594,7 +600,7 @@
         frameReady = !!parent?.attach(ownId, root, hooks);
       } catch { frameReady = false; }
       if (!frameReady) { root.location.replace("/"); return; }
-      doc.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
+      root.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
       doc.addEventListener("pointerdown", () => parent.focus(ownId, false), true);
       doc.addEventListener("focusin", () => parent.focus(ownId, false));
       return;
@@ -610,7 +616,7 @@
       event.preventDefault(); event.stopImmediatePropagation();
       doc.body.classList.toggle("workspace-list-open");
     }, true);
-    doc.addEventListener("keydown", (event) => handleKey(event), true);
+    root.addEventListener("keydown", (event) => handleKey(event), true);
     $("workspace-primary").addEventListener("pointerdown", () => { if (enabled) focus("p1", false); }, true);
     $("workspace-primary").addEventListener("focusin", () => { if (enabled) focus("p1", false); });
     $("groups").addEventListener("dragstart", (event) => {

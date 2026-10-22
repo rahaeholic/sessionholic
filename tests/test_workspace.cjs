@@ -420,12 +420,12 @@ test('a loading pane retains answer intent until restore completes and opens in 
   f.workspace.changed(); assert.equal(answers.length, 1, 'answer intent is consumed only once');
 });
 
-test('Command+Option direction keys work with every saved modifier setting and keep editing, IME and send keys', () => {
+test('browser-reserved Command+Option directions remain with the browser in every saved setting', () => {
   for (const saved of [undefined, 'ctrl-meta', 'ctrl-alt-meta']) {
     for (const [key, direction] of [['ArrowLeft', 'ArrowLeft'], ['ArrowRight', 'ArrowRight'], ['ArrowUp', 'ArrowUp'], ['ArrowDown', 'ArrowDown'],
       ['UIKeyInputLeftArrow', 'ArrowLeft'], ['UIKeyInputRightArrow', 'ArrowRight'], ['UIKeyInputUpArrow', 'ArrowUp'], ['UIKeyInputDownArrow', 'ArrowDown']]) {
       const event = combo(key, { ctrlKey: false, altKey: true });
-      assert.deepEqual(W.shortcut(event, saved), { direction });
+      assert.equal(W.shortcut(event, saved), null);
     }
   }
   for (const extra of [{ isComposing: true }, { keyCode: 229 }, { shiftKey: true }, { metaKey: false }])
@@ -441,26 +441,69 @@ test('pane movement starts from the document that received the key even before i
   assert.equal(f.workspace.handleKey(combo('ArrowRight'), 'removed-pane'), false);
 });
 
-test('embedded textarea and xterm Command+Option keys are captured before CLI input and use their own pane', () => {
+test('embedded textarea and xterm Option number keys are captured at the window before CLI input', () => {
   const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
   const listeners = new Map(), childDocument = { body: { classList: { add() {} } },
     addEventListener(name, fn, capture) { listeners.set(name, { fn, capture }); } };
   const childWindow = second.frame.contentWindow;
-  Object.assign(childWindow, { document: childDocument, location: { pathname: '/pane', search: '?pane=p2', origin: f.window.location.origin }, parent: f.window });
+  Object.assign(childWindow, { addEventListener(name, fn, capture) { listeners.set(name, { fn, capture }); }, document: childDocument, location: { pathname: '/pane', search: '?pane=p2', origin: f.window.location.origin }, parent: f.window });
   vm.runInNewContext(source, { window: childWindow, URLSearchParams, console, Set, Map, Date, Promise });
   childWindow.SessionholicWorkspace.init(second.child);
   assert.equal(listeners.get('keydown').capture, true);
   for (const target of [{ tagName: 'TEXTAREA', id: 'chat-input' }, { className: 'xterm-helper-textarea', id: 'xterm' }]) {
     f.workspace.focus('p1', false); f.calls.length = 0;
-    const event = combo('ArrowLeft', { ctrlKey: false, altKey: true, target });
+    const event = combo('1', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit1', target });
     listeners.get('keydown').fn(event);
     assert.ok(event.prevented && event.stopped);
     assert.ok(f.calls.some(([name, id]) => name === 'focus' && id === 'p1'));
     assert.equal(f.calls.some(([name]) => name === 'api'), false);
   }
   second.info.dialog = true;
-  const event = combo('ArrowLeft', { ctrlKey: false, altKey: true }); listeners.get('keydown').fn(event);
+  const event = combo('1', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit1' }); listeners.get('keydown').fn(event);
   assert.equal(event.prevented, undefined);
-  const single = fixture(), singleKey = combo('ArrowLeft', { ctrlKey: false, altKey: true });
+  const single = fixture(), singleKey = combo('1', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit1' });
   assert.equal(single.workspace.handleKey(singleKey), false); assert.equal(singleKey.prevented, undefined);
+});
+
+test('Option plus physical pane numbers selects the matching visible pane in any saved configuration', () => {
+  for (const saved of [undefined, 'ctrl-meta', 'ctrl-alt-meta']) {
+    for (let number = 1; number <= 4; number++) {
+      const event = combo('¡', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit' + number });
+      assert.deepEqual(W.shortcut(event, saved), { number });
+    }
+  }
+  assert.deepEqual(W.shortcut(combo('2', { ctrlKey: false, metaKey: false, altKey: true })), { number: 2 });
+  for (const extra of [{ altKey: false }, { shiftKey: true }, { code: 'Digit5' }, { code: '' }, { code: '', key: 'Process', isComposing: true, keyCode: 229 }])
+    assert.equal(W.shortcut(combo('¡', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit1', ...extra })), null);
+});
+
+test('a physical Option pane number commits Korean in the original pane before moving, with no message sent', async () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  second.info.composing = true;
+  let done; second.child.commitComposition = () => new Promise(resolve => { done = resolve; });
+  const originalEditor = second.info.editor;
+  const event = combo('Process', { ctrlKey: false, metaKey: false, altKey: true, code: 'Digit1', isComposing: true, keyCode: 229 });
+  assert.equal(f.workspace.handleKey(event, 'p2'), true);
+  assert.ok(event.prevented && event.stopped); assert.equal(f.workspace.isActive('p2', second.frame.contentWindow), true);
+  assert.equal(typeof done, 'function');
+  second.info.composing = false; done(true); await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.workspace.readingActive(), true); assert.equal(second.info.editor, originalEditor);
+  assert.equal(originalEditor.text, '초안 p2'); assert.equal(originalEditor.caret, 3);
+  assert.equal(f.calls.some(([name]) => name === 'api'), false);
+});
+
+test('the root window capture and visible Option number buttons select the same mounted editor', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  const tabs = f.nodes.get('workspace-switcher').children;
+  assert.deepEqual(tabs.map(tab => tab.textContent), ['⌥1', '⌥2']);
+  assert.deepEqual(tabs.map(tab => tab.attrs['aria-keyshortcuts']), ['Alt+1', 'Alt+2']);
+  const editor = second.info.editor;
+  f.workspace.focus('p1', false); f.calls.length = 0;
+  const event = combo('™', { code: 'Digit2', ctrlKey: false, metaKey: false, altKey: true, target: { tagName: 'TEXTAREA', id: 'chat-input' } });
+  f.document.fire('window:keydown', event);
+  assert.ok(event.prevented && event.stopped); assert.equal(f.workspace.isActive('p2', second.frame.contentWindow), true);
+  assert.equal(second.info.editor, editor); assert.equal(editor.text, '초안 p2');
+  f.nodes.get('workspace-switcher').children[0].fire('click', {});
+  assert.equal(f.workspace.readingActive(), true); assert.equal(second.frame.appendCount, 1);
+  assert.equal(f.calls.some(([name]) => name === 'api'), false);
 });
