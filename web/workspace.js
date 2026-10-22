@@ -57,12 +57,11 @@
     }
     return out;
   }
-  function tiled(list, short = false) {
+  function tiled(list) {
     if (list.length === 1) return leaf(list[0]);
     const middle = Math.ceil(list.length / 2);
-    const branch = (part) => part.length === 1 ? leaf(part[0]) :
-      { axis: short ? "x" : "y", ratio: 0.5, children: part.map(leaf) };
-    return { axis: "x", ratio: 0.5, children: [branch(list.slice(0, middle)), branch(list.slice(middle))] };
+    return { axis: "x", ratio: middle / list.length,
+      children: [tiled(list.slice(0, middle)), tiled(list.slice(middle))] };
   }
   function ratioAt(tree, path, ratio) {
     if (tree.pane || !/^[01]*$/.test(path)) return tree;
@@ -223,18 +222,11 @@
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
-    const bounds = rootNode.getBoundingClientRect();
-    const tooSmall = (rects) => Object.values(rects).some((r) => r.w * bounds.width < 240 || r.h * bounds.height < 170);
-    let rects = geometry(tree).panes;
-    // Repeatedly splitting the active right pane produces 1/2, 1/4, 1/8,
-    // 1/8 widths. That is a layout problem, not a mobile-sized workspace.
-    // Retile coordinates only; keep every document, editor and CLI mounted.
-    if (!maximized && list.length > 1 && root.innerWidth > 700 && bounds.width > 0 && bounds.height > 0 && tooSmall(rects)) {
-      const candidate = tiled(list, bounds.height < 340);
-      const next = geometry(candidate).panes;
-      if (!tooSmall(next)) { tree = candidate; rects = next; }
-    }
-    const compact = root.innerWidth <= 700 || list.length > 1 && bounds.width > 0 && bounds.height > 0 && tooSmall(rects);
+    const rects = geometry(tree).panes;
+    // Only the viewport selects mobile tabs. A narrow user-created pane must
+    // never hide its neighbors or rewrite a drag/resize into a different tree.
+    // Equal-sized tiles are an explicit arrange() action.
+    const compact = root.innerWidth <= 700;
     doc.body.classList.toggle("workspace-compact", compact && enabled);
     for (const [id, row] of panes) {
       const included = list.includes(id), shown = included && (!(maximized || compact) || active === id);
@@ -294,7 +286,7 @@
     }
     const switcher = $("workspace-switcher"); switcher.hidden = !enabled || !compact;
     const arrange = $("workspace-arrange");
-    if (arrange) { arrange.hidden = !enabled || root.innerWidth <= 700; arrange.textContent = maximized ? "분할로 돌아가기" : "분할 정렬"; }
+    if (arrange) { arrange.hidden = !enabled || root.innerWidth <= 700; arrange.textContent = maximized ? "분할로 돌아가기" : "세로 정렬"; }
     switcher.replaceChildren();
     list.forEach((id, index) => {
       const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `창 ${index + 1}`, () => focus(id));
@@ -333,8 +325,8 @@
   function arrange() {
     const list = ids(tree);
     if (list.length < 2) return;
-    const bounds = $("session-workspace").getBoundingClientRect();
-    tree = tiled(list, bounds.height > 0 && bounds.height < 340); maximized = false; layout();
+    if (!maximized) tree = tiled(list);
+    maximized = false; layout();
   }
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));

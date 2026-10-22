@@ -437,7 +437,7 @@ test("compact and maximized views preserve documents, passive panes remain unrea
   assert.equal(event.returnValue, "");
 });
 
-test('four repeated right splits retile into four visible panes before considering compact mode', () => {
+test('desktop splits preserve the chosen direction and ratios until explicit arrangement', () => {
   const f = fixture(), editors = [f.infos.get('p1').editor], children = [];
   for (const [id, key] of [['p2', 'session-b'], ['p3', 'session-c'], ['p4', null]]) {
     f.workspace.add(key ? { key } : null);
@@ -446,16 +446,26 @@ test('four repeated right splits retile into four visible panes before consideri
   assert.equal(f.document.body.classList.contains('workspace-compact'), false);
   const saved = f.preferences.get('workspace'), geometry = f.workspace.geometry(saved.tree).panes;
   assert.equal(Object.keys(geometry).length, 4);
-  for (const box of Object.values(geometry)) { assert.equal(box.w, .5); assert.equal(box.h, .5); }
+  assert.deepEqual(Object.values(geometry).map(box => box.w), [.5, .25, .125, .125]);
+  for (const box of Object.values(geometry)) assert.equal(box.h, 1);
   for (const child of children) {
     assert.equal(child.row.classList.contains('workspace-pane-covered'), false);
     assert.equal(child.frame.appendCount, 1);
   }
   assert.equal(f.nodes.get('workspace-arrange').hidden, false);
+  for (const width of [900, 1440, 720, 1440]) {
+    f.window.innerWidth = width; f.workspace.layout();
+    assert.deepEqual(f.preferences.get('workspace').tree, saved.tree, 'window resize cannot rewrite the split tree');
+    for (const child of children) assert.equal(child.row.classList.contains('workspace-pane-covered'), false);
+  }
   f.workspace.handleKey(combo('Enter'));
   assert.equal(f.nodes.get('workspace-arrange').textContent, '분할로 돌아가기');
   f.nodes.get('workspace-arrange').fire('click', {});
-  assert.equal(f.nodes.get('workspace-arrange').textContent, '분할 정렬');
+  assert.equal(f.nodes.get('workspace-arrange').textContent, '세로 정렬');
+  assert.deepEqual(f.preferences.get('workspace').tree, saved.tree, 'returning from a maximized pane preserves the prior layout');
+  f.nodes.get('workspace-arrange').fire('click', {});
+  const arranged = f.workspace.geometry(f.preferences.get('workspace').tree).panes;
+  for (const box of Object.values(arranged)) { assert.equal(box.w, .25); assert.equal(box.h, 1); }
   for (const [index, child] of children.entries()) {
     assert.equal(child.row.classList.contains('workspace-pane-covered'), false);
     assert.equal(child.info.editor, editors[index + 1]);
@@ -463,17 +473,34 @@ test('four repeated right splits retile into four visible panes before consideri
   assert.equal(f.calls.some(([name]) => name === 'api' || name === 'close-view'), false);
 });
 
-test('restored narrow desktop splits recover while genuine small screens keep reachable tabs', () => {
+test('explicit arrangement uses full-height equal-width columns for two, three and four panes', () => {
+  for (let count = 2; count <= 4; count++) {
+    const list = Array.from({ length: count }, (_, index) => 'p' + (index + 1));
+    const tree = W.tiled(list), boxes = W.geometry(tree).panes;
+    assert.equal(W.validTree(tree), true);
+    assert.deepEqual(W.ids(tree), list);
+    list.forEach((id, index) => {
+      assert.ok(Math.abs(boxes[id].x - index / count) < 1e-9);
+      assert.ok(Math.abs(boxes[id].w - 1 / count) < 1e-9);
+      assert.equal(boxes[id].y, 0); assert.equal(boxes[id].h, 1);
+    });
+  }
+});
+
+test('saved custom split trees survive desktop and mobile transitions with reachable mobile tabs', () => {
   let tree = W.leaf('p1');
   for (let number = 2; number <= 4; number++) tree = W.split(tree, 'p' + (number - 1), 'p' + number, 'right');
   const f = fixture({ version: 1, tree, active: 'p4', panes: {} });
   assert.equal(f.document.body.classList.contains('workspace-compact'), false);
+  assert.deepEqual(f.preferences.get('workspace').tree, tree);
   f.window.innerWidth = 650; f.workspace.layout();
   assert.equal(f.document.body.classList.contains('workspace-compact'), true);
   assert.equal(f.nodes.get('workspace-switcher').hidden, false);
   assert.equal(f.nodes.get('workspace-arrange').hidden, true);
+  assert.deepEqual(f.preferences.get('workspace').tree, tree, 'mobile tabs do not rewrite the desktop arrangement');
   f.window.innerWidth = 1440; f.workspace.layout();
   assert.equal(f.document.body.classList.contains('workspace-compact'), false);
+  assert.deepEqual(f.preferences.get('workspace').tree, tree);
 });
 
 test('passive terminal claims never move focus or notify when another pane owns the terminal', () => {
