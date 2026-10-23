@@ -181,6 +181,45 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(self.command(client, 'compact', request='control-0002')['status'], 'accepted')
         self.assertNotIn('turn/start', methods(client))
 
+    def test_unknown_model_receipt_reads_settings_without_reapplying_or_reverting(self):
+        client = FakeClient({**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}, {'model/list': self.models()})
+        save = chat._Ledger.save
+        def fail_final(ledger, value):
+            if value.get('result', {}).get('status') == 'configured':
+                raise OSError('synthetic receipt storage failure')
+            return save(ledger, value)
+        for index, (command, value) in enumerate([('model', 'example-two'), ('effort', 'low')]):
+            request = 'recovery-000' + str(index)
+            with patch.object(chat._Ledger, 'save', fail_final):
+                with self.assertRaises(OSError): self.command(client, command, value, request)
+                # Even persistent receipt failure must not hide successful settings readback.
+                result = self.command(client, command, value, request)
+                self.assertEqual(result['status'], 'configured')
+                self.assertEqual(result['next'][command], value)
+            self.command(client, 'model', 'example-one', 'later-model-000' + str(index))
+            if command == 'effort': self.command(client, 'effort', 'high', 'later-effort-0001')
+            client.calls.clear()
+            result = self.command(client, command, value, request)
+            self.assertEqual(result['status'], 'rejected')
+            self.assertEqual(result['next']['model'], 'example-one')
+            self.assertNotIn('model/list', methods(client))
+            self.assertEqual(self.writes(client), [])
+
+    def test_unknown_model_receipt_with_failed_settings_write_requires_new_explicit_request(self):
+        client = FakeClient({**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}, {'model/list': self.models()})
+        save = chat._Ledger.save
+        def fail_settings(ledger, value):
+            if set(value) == {'model', 'effort'}: raise OSError('synthetic settings failure')
+            return save(ledger, value)
+        with patch.object(chat._Ledger, 'save', fail_settings):
+            with self.assertRaises(OSError): self.command(client, 'model', 'example-two')
+        client.calls.clear()
+        result = self.command(client, 'model', 'example-two')
+        self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(result['next'], {})
+        self.assertEqual(self.writes(client), [])
+        self.assertEqual(self.command(client, 'model', 'example-two', 'fresh-control-0001')['status'], 'configured')
+
     def test_a_running_turn_keeps_its_model_and_damaged_settings_block_before_send(self):
         client = FakeClient({**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}, {'model/list': self.models()})
         self.command(client, 'model', 'example-two')

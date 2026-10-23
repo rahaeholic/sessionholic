@@ -95,6 +95,8 @@
     if (!event.ctrlKey && !event.metaKey && event.altKey && digit && (!composing || physicalDigit))
       return { number: Number(digit) };
     if (composing) return null;
+    if (event.ctrlKey && event.metaKey && !event.altKey &&
+        (event.code === "KeyW" || event.key?.toLowerCase() === "w")) return { close: true };
     const key = ({ UIKeyInputLeftArrow: "ArrowLeft", UIKeyInputRightArrow: "ArrowRight",
       UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown" })[event.key] || event.key;
     const configured = event.ctrlKey && event.metaKey && !!event.altKey === (modifiers === "ctrl-alt-meta");
@@ -132,6 +134,8 @@
   const doc = root.document;
   const $ = (id) => doc.getElementById(id);
   const embedded = root.location.pathname === "/pane";
+  // An inspection window must neither restore nor overwrite the main workspace.
+  const detached = !embedded && new URLSearchParams(root.location.search).get("window") === "1";
   const ownId = embedded ? new URLSearchParams(root.location.search).get("pane") : "p1";
   let hooks, parent, tree = leaf("p1"), active = "p1", maximized = false, restored = false, enabled = false, internal = 0;
   let frameReady = false, restoring = false, drag = null, pointer = null, refreshTimer = null;
@@ -180,8 +184,9 @@
     title.addEventListener("pointercancel", () => { pointer = null; clearDrag(); });
     const view = button("이 창 확대", "이 창 확대", () => { if (focus(id, false)) maximize(); });
     view.classList.add("workspace-pane-view");
-    bar.append(title, view,
-      button("이 창만 닫기 · 세션 실행은 유지", "×", () => closePane(id)));
+    const close = button("이 창만 닫기 (⌃⌘W) · 세션 실행은 유지", "×", () => closePane(id));
+    close.setAttribute("aria-keyshortcuts", "Control+Meta+W");
+    bar.append(title, view, close);
     bar.addEventListener("pointerdown", () => focus(id, false));
     container.prepend(bar);
     return { bar, title, label, meta, view };
@@ -210,7 +215,7 @@
   function visible(id = ownId) { return embedded ? frameReady : !enabled || ids(tree).includes(id); }
   function managed() { return embedded || enabled; }
   function persist() {
-    if (restoring || !hooks?.describe().authenticated) return;
+    if (detached || restoring || !hooks?.describe().authenticated) return;
     const refs = {};
     for (const id of ids(tree)) refs[id] = validRef(panes.get(id)?.ref || panes.get(id)?.hooks?.describe().ref);
     hooks.prefs.set("workspace", { version: 1, tree: copy(tree), active, panes: refs, ...(maximized ? { single: true } : {}) });
@@ -335,9 +340,10 @@
     if (!action || !ids(tree).includes(id) || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
     if (action.view && !panes.get(id)?.hooks?.describe().canToggleView) return false;
     if (!action.view && !event.ctrlKey && !event.metaKey && event.altKey && ids(tree).length < 2) return false;
-    if (event.repeat && action.maximize) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
+    if (event.repeat && (action.maximize || action.close)) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
     event.preventDefault(); event.stopImmediatePropagation();
     if (action.view) { if (!event.repeat) panes.get(id).hooks.toggleView(); }
+    else if (action.close) closePane(id);
     else if (action.maximize) { if (ids(tree).length > 1) maximize(); }
     else {
       const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, id, action.direction);
@@ -407,7 +413,7 @@
       restored = true;
       // A new phone document starts at the list, including when a desktop
       // layout or a terminal pane was saved by the previous document.
-      const saved = hooks.startOnList?.() ? null : restoreLayout(hooks.prefs.get("workspace", null));
+      const saved = detached || hooks.startOnList?.() ? null : restoreLayout(hooks.prefs.get("workspace", null));
       if (saved) {
         restoring = true; tree = saved.tree; active = saved.active; maximized = saved.single === true;
         for (const id of ids(tree)) record(id, saved.panes[id]);
@@ -460,7 +466,15 @@
     if (active === "p1") return false;
     const row = panes.get(active);
     if (!row?.hooks) { row.ref = { key, mode: "chat" }; if (answer) row.pendingAnswer = key; changed(); return true; }
-    row.ref = null; row.hooks.select(key); if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed();
+    row.ref = null;
+    const selected = row.hooks.select(key);
+    const finish = () => {
+      if (panes.get(active) !== row || row.hooks.describe().ref?.key !== key) return;
+      if (answer) row.hooks.answerSession?.(key);
+      row.hooks.focus(); changed();
+    };
+    if (selected?.then) selected.then(finish).catch(() => {});
+    else { if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed(); }
     return true;
   }
   function routeNew() {
@@ -709,7 +723,7 @@
       }
     });
   }
-  root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
+  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
     add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList };
 })(typeof window !== "undefined" ? window : null);

@@ -77,7 +77,7 @@ test("Mac and iPad use the same Control+Command keys without taking IME, send, o
 
 // A small DOM fixture tests lifetime and cross-document boundaries. It does not
 // pretend to test Safari hardware keys or microphone capture.
-function fixture(saved = null, { mobile = false } = {}) {
+function fixture(saved = null, { mobile = false, search = "" } = {}) {
   const nodes = new Map(), calls = [], preferences = new Map(saved ? [["workspace", saved]] : []), frames = [];
   class Node {
     constructor(tag = "div") {
@@ -110,7 +110,7 @@ function fixture(saved = null, { mobile = false } = {}) {
   nodes.get("session-workspace").append(nodes.get("workspace-primary"), nodes.get("workspace-dividers"), nodes.get("workspace-drop-cue"));
   const document = new Node(); document.body = new Node(); document.createElement = (tag) => new Node(tag);
   document.getElementById = (id) => nodes.get(id); document.querySelector = () => null;
-  const window = { document, location: { pathname: "/", search: "", origin: "https://board.example" }, innerWidth: mobile ? 390 : 1440,
+  const window = { document, location: { pathname: "/", search, origin: "https://board.example" }, innerWidth: mobile ? 390 : 1440,
     addEventListener: (key, fn) => document.addEventListener("window:" + key, fn), requestAnimationFrame: () => {},
     setTimeout: () => 1 };
   const prefs = { get: (key, fallback) => preferences.get(key) ?? fallback, set: (key, value) => preferences.set(key, plain(value)) };
@@ -176,6 +176,18 @@ test('showing the mobile launch list keeps existing split editors and live termi
   assert.equal(f.document.body.classList.contains('workspace-list-open'), false);
 });
 
+test('a separate inspection window starts alone and never overwrites the saved four-pane workspace', () => {
+  const saved = { version: 1, tree: W.tiled(['p1', 'p2', 'p3', 'p4']), active: 'p3', panes: {
+    p1: { key: 'session-a' }, p2: { key: 'session-b' }, p3: { key: 'session-c' }, p4: { key: 'session-d' } } };
+  const f = fixture(saved, { search: '?window=1&session=session-e' });
+  assert.equal(f.workspace.detached, true); assert.equal(f.frames.length, 0);
+  assert.equal(f.calls.some(([name]) => name === 'restore'), false);
+  f.primary.select('session-e'); f.workspace.changed();
+  f.workspace.add({ key: 'session-b' }); f.attach('p2'); f.workspace.closePane('p2');
+  assert.deepEqual(f.preferences.get('workspace'), saved);
+  assert.equal(f.calls.some(([name]) => name === 'api'), false);
+});
+
 test("split, focus, maximize and resize retain editor/recognition/frame identity and do not invoke execution APIs", () => {
   const f = fixture(), editor = f.infos.get("p1").editor;
   assert.equal(f.nodes.get("workspace-primary").children[0].hidden, true, "single-pane chrome remains unchanged");
@@ -207,6 +219,31 @@ test("closing a pane only closes its view, guards pending sends, and closing pri
   assert.equal(f.workspace.visible("p1"), false);
   assert.equal(f.workspace.visible("p2"), true);
   assert.equal(f.nodes.get("workspace-primary").parentNode, f.nodes.get("session-workspace"));
+});
+
+test('Control Command W closes the receiving pane, keeps the last pane and respects guards', () => {
+  const key = (extra = {}) => combo('ㅈ', { code: 'KeyW', ...extra });
+  for (const setting of ['ctrl-meta', 'ctrl-alt-meta'])
+    assert.deepEqual(W.shortcut(key(), setting), { close: true });
+  for (const extra of [{ ctrlKey: false }, { metaKey: false }, { altKey: true }, { shiftKey: true }, { isComposing: true }, { keyCode: 229 }])
+    assert.equal(W.shortcut(key(extra)), null);
+  const f = fixture();
+  f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  f.workspace.focus('p1');
+  second.info.busy = true;
+  assert.equal(f.workspace.handleKey(key(), 'p2'), true); assert.ok(second.row.parentNode);
+  second.info.busy = false; second.info.dialog = true;
+  assert.equal(f.workspace.handleKey(key(), 'p2'), false); assert.ok(second.row.parentNode);
+  second.info.dialog = false;
+  assert.equal(f.workspace.handleKey(key({ repeat: true }), 'p2'), true); assert.ok(second.row.parentNode);
+  assert.equal(f.workspace.handleKey(key(), 'p2'), true); assert.equal(second.row.parentNode, null);
+  assert.equal(f.workspace.visible('p1'), true);
+  assert.equal(f.workspace.handleKey(key(), 'p1'), true); assert.equal(f.workspace.visible('p1'), true);
+  assert.equal(f.calls.filter(([name]) => name === 'close-view').length, 1);
+  assert.equal(f.calls.filter(([name]) => name === 'api').length, 0);
+  f.workspace.add({ key: 'session-c' }); f.attach('p2');
+  assert.equal(f.workspace.handleKey(key(), 'p1'), true);
+  assert.equal(f.workspace.visible('p1'), false); assert.equal(f.workspace.visible('p2'), true);
 });
 
 test("selection and new sessions target the active pane, duplicate sessions and terminals focus their existing pane", () => {

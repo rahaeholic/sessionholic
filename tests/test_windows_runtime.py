@@ -8,6 +8,7 @@ import struct
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest.mock import patch
 import uuid
@@ -203,6 +204,79 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(self.model_command('models')['next']['model'], 'example-one')
         with self.assertRaises(ValueError):
             self.model_command('model', 'example-one')
+
+    def test_slow_model_catalog_does_not_block_other_session_input(self):
+        self.models()
+        entered, release = threading.Event(), threading.Event()
+        proxy = self.reader.proxy
+        class SlowCatalog:
+            def __init__(self, *args): self.client = proxy(*args)
+            def __enter__(self): self.client.__enter__(); return self
+            def __exit__(self, *args): return self.client.__exit__(*args)
+            def call(self, method, params):
+                if method == 'model/list':
+                    entered.set()
+                    if not release.wait(3): raise TimeoutError('synthetic catalog wait')
+                return self.client.call(method, params)
+        self.runtime.proxy_factory = SlowCatalog
+        other = copy.deepcopy(self.reader)
+        other.sid = other.row['id'] = other.thread['id'] = str(uuid.uuid4())
+        other.loaded = [other.sid]
+        runtime = wr.WindowsRuntime(reader=other, proxy_factory=other.proxy)
+        results, errors = [], []
+        def read():
+            try: results.append(self.model_command('models'))
+            except Exception as exc: errors.append(exc)
+        thread = threading.Thread(target=read)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            result = runtime.chat({'action': 'send', 'source': {**self.source, 'id': other.sid},
+                'requestId': 'other-request-1234', 'input': [{'type': 'text', 'text': 'synthetic'}]})
+            self.assertTrue(result['confirmed'])
+            self.assertEqual(other.send_calls, 1)
+        finally:
+            release.set(); thread.join(3)
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 1)
+
+    def test_unknown_model_receipt_reads_settings_without_reapplying_or_reverting(self):
+        self.models()
+        for index, (command, value) in enumerate([('model', 'example-two'), ('effort', 'low')]):
+            save = self.runtime.store.save
+            def fail_final(name, data):
+                if data.get('result', {}).get('status') == 'configured':
+                    raise OSError('synthetic receipt storage failure')
+                return save(name, data)
+            request = 'recovery-000' + str(index)
+            with patch.object(self.runtime.store, 'save', side_effect=fail_final):
+                with self.assertRaises(OSError): self.model_command(command, value, request)
+                result = self.model_command(command, value, request)
+                self.assertEqual(result['status'], 'configured')
+                self.assertEqual(result['next'][command], value)
+            self.runtime = wr.WindowsRuntime(reader=self.reader, proxy_factory=self.reader.proxy)
+            self.model_command('model', 'example-one', 'later-model-000' + str(index))
+            if command == 'effort': self.model_command('effort', 'high', 'later-effort-0001')
+            self.reader.calls.clear()
+            result = self.model_command(command, value, request)
+            self.assertEqual(result['status'], 'rejected')
+            self.assertEqual(result['next']['model'], 'example-one')
+            self.assertNotIn('model/list', [method for method, _ in self.reader.calls])
+            self.assertEqual(self.reader.send_calls, 0)
+
+    def test_unknown_model_receipt_with_failed_settings_write_requires_new_explicit_request(self):
+        self.models()
+        save = self.runtime.store.save
+        def fail_settings(name, data):
+            if name.startswith('model-settings-'): raise OSError('synthetic settings failure')
+            return save(name, data)
+        with patch.object(self.runtime.store, 'save', side_effect=fail_settings):
+            with self.assertRaises(OSError): self.model_command('model', 'example-two')
+        result = self.model_command('model', 'example-two')
+        self.assertEqual(result['status'], 'rejected')
+        self.assertEqual(result['next'], {})
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual(self.model_command('model', 'example-two', 'fresh-control-0001')['status'], 'configured')
 
     def test_model_effort_validation_and_running_turn_preserves_its_configuration(self):
         self.models()

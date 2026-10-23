@@ -1,5 +1,6 @@
 """Durable termination receipts. Recovery never resends a native mutation."""
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
@@ -29,7 +30,8 @@ class Jobs:
         self.path = settings.safe_path(folder / 'termination-jobs.sqlite', private=True, allow_missing=True)
         if not self.path.exists():
             self.path.touch(mode=0o600)
-        self.lock, self.stop = threading.RLock(), threading.Event()
+        self.lock, self.stop = threading.Lock(), threading.Event()
+        self.source_locks = {}
         self.runner, self.thread = runner, None
         with self.db() as db:
             db.execute('CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, source TEXT NOT NULL, active INTEGER NOT NULL, due REAL NOT NULL, value TEXT NOT NULL)')
@@ -48,6 +50,23 @@ class Jobs:
         with self.db() as db:
             row = db.execute('SELECT value FROM jobs WHERE id=?', (request_id,)).fetchone()
         return json.loads(row[0]) if row else None
+
+    @contextmanager
+    def source_lock(self, source):
+        key = source_key(source)
+        with self.lock:
+            # Keep the selected job until concurrent waiters have consumed its
+            # result, even when it completed just before they acquired the lock.
+            entry = self.source_locks.setdefault(key, [threading.RLock(), 0, None])
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield entry
+        finally:
+            with self.lock:
+                entry[1] -= 1
+                if not entry[1]:
+                    del self.source_locks[key]
 
     def pending(self, source):
         with self.db() as db:
@@ -83,10 +102,11 @@ class Jobs:
     def run(self, job, initial=None):
         # Serialize initial dispatch with readback. A second process can only
         # reconcile the durable claim, and native tombstones fence late dispatch.
-        with self.lock:
+        with self.source_lock(job['source']) as entry:
             job = self.get(job['requestId'])
             if job['state'] != 'pending':
                 return {**self.view(job), 'historical': True}
+            entry[2] = job['requestId']
             try:
                 result = self.runner(job, initial)
                 if not isinstance(result, dict) or type(result.get('confirmed')) is not bool:
@@ -110,17 +130,27 @@ class Jobs:
             return self.view(job)
 
     def submit(self, source, request_id, terminals, initial=None):
-        with self.lock:
-            job, created = self.claim(source, request_id, terminals)
+        with self.source_lock(source) as entry:
+            previous = self.get(request_id)
+            if previous is not None and source_key(previous['source']) != source_key(source):
+                raise ValueError('같은 종료 요청 ID를 다른 세션에 사용할 수 없습니다.')
+            job = previous or self.pending(source) or (self.get(entry[2]) if entry[2] else None)
+            if job is None:
+                job, created = self.claim(source, request_id, terminals)
+            else:
+                created = False
             return self.run(job, initial if created else None)
 
     def tick(self):
         with self.db() as db:
             rows = db.execute('SELECT id FROM jobs WHERE active=1 AND due<=? ORDER BY due LIMIT 2', (time.time(),)).fetchall()
-        for row in rows:
-            if self.stop.is_set():
-                break
-            self.run(self.get(row[0]))
+        if rows and not self.stop.is_set():
+            # Keep the existing two-job budget, without one host's network wait
+            # delaying the other. Initial dispatch uses the same source locks.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix='termination-readback') as pool:
+                futures = [pool.submit(self.run, self.get(row[0])) for row in rows if not self.stop.is_set()]
+                for future in futures:
+                    future.result()
 
     def start(self):
         def work():

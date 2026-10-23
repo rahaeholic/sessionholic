@@ -808,8 +808,25 @@ function openRequestedSession() {
     navigateView("detail", false, { notice: request.key });
   }
   const target = allSessions().find((session) => session.key === request.key);
-  if (target && groupOf(target) === "needs_input") answerOnOpen(target);
+  if (target && groupOf(target) === "needs_input" && !window.SessionholicWorkspace?.detached) answerOnOpen(target);
   select(request.key);
+}
+function openSessionWindow(s) {
+  if (!state.authenticated || !allSessions().some((row) => row.key === s?.key)) return;
+  const url = new URL("/", window.location.origin);
+  url.searchParams.set("window", "1"); url.searchParams.set("session", s.key);
+  let opened;
+  try {
+    // Open synchronously from the click. Detach before navigating, while the
+    // blank window is still ours; this also lets us detect a blocked popup.
+    opened = window.open("about:blank", "_blank", "popup,width=1000,height=800");
+    if (!opened) throw new Error("popup blocked");
+    opened.opener = null;
+    opened.location.replace(url.href);
+  } catch {
+    opened?.close?.();
+    toast("새 창을 열지 못했습니다. 이 앱의 팝업을 허용한 뒤 다시 열어 주세요.");
+  }
 }
 // Opened from the 답 필요 group or its notification: the question is loaded once,
 // as "질문 불러오기" would, so the choices are there without another tap.
@@ -3086,11 +3103,12 @@ function cardActions(s) {
   const terminal = terminalForSession(s);
   const actions = [
     { label: "대화 열기", run: () => select(s.key) },
+    { label: "새 창에서 보기", run: () => openSessionWindow(s) },
     { label: sessionPinned(s) ? "★ 상단 고정 해제" : "☆ 상단 고정 (즐겨찾기)", run: () => pinSession(s) },
     { label: "세션 관리", run: () => manageSession(s) },
   ];
   if (window.SessionholicWorkspace)
-    actions.splice(1, 0, { label: "다른 창에서 보기", run: () => window.SessionholicWorkspace.add({ key: s.key, mode: "chat" }) });
+    actions.splice(2, 0, { label: "분할창에서 보기", run: () => window.SessionholicWorkspace.add({ key: s.key, mode: "chat" }) });
   if (window.SessionholicLabels?.eligible?.(s)) actions.push({ label: "제목 수정", run: () => window.SessionholicLabels.open(s, document.activeElement) });
   if (!sessionOneShot(s)) actions.push({ label: terminal ? "터미널로 돌아가기" : "터미널 열기", run: () => openSessionTerminal(s), disabled: state.launchBusy });
   if (terminal) {
@@ -3621,6 +3639,19 @@ function restoreConversationView(list) {
   setMessagesScroll(list, view.pinned ? list.scrollHeight : box ? box.top - view.offset : view.top);
 }
 function select(key) {
+  const previous = selectedSession(), entry = previous && state.chats.get(chatKey(sourceOf(previous)));
+  const pending = state.selectionPending = { key };
+  if (previous?.key !== key && entry?.composing) {
+    const epoch = state.authEpoch, identity = conversationIdentity(previous);
+    return commitChatComposition(entry).then((committed) => {
+      if (state.selectionPending !== pending || epoch !== state.authEpoch ||
+          conversationIdentity(selectedSession()) !== identity) return;
+      state.selectionPending = null;
+      if (!committed) { toast("입력 확정을 기다리고 있습니다. 입력창을 확인한 뒤 다시 이동해 주세요."); return; }
+      if (allSessions().some((session) => session.key === key)) return select(key);
+    });
+  }
+  state.selectionPending = null;
   if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key })) {
     // The visible conversation may live in a child document. Its parent's
     // Android Back still needs a list entry beneath it.
@@ -6566,7 +6597,7 @@ function enterSession(s, card = null) {
   state.inputFocusFor = groupOf(s) === "needs_input" ? null : s.key;
   if (typeof card?.click === "function") card.click();
   else select(s.key);
-  if (state.selected !== s.key) { state.inputFocusFor = null; return; }
+  if (state.selected !== s.key) { if (state.selectionPending?.key !== s.key) state.inputFocusFor = null; return; }
   // A phone layout focuses on showing the conversation (setDetailShown).
   if (!phoneLayout() && !focusPendingInput()) $("messages")?.focus?.({ preventScroll: true });
 }
@@ -14063,7 +14094,7 @@ async function handleAppLaunch(params) {
   try { target = new URL(params.targetURL, window.location.origin); } catch { return; }
   if (target.origin !== window.location.origin || target.pathname !== "/") return;
   if (requestSessionOpen(target.href)) {
-    window.history.replaceState(window.history.state, "", "/");
+    if (!window.SessionholicWorkspace?.detached) window.history.replaceState(window.history.state, "", "/");
     return;
   }
   await openLaunchList();
@@ -14125,6 +14156,16 @@ function workspaceComposing() {
   const s = selectedSession();
   return !!s && !!chatEntry(s).composing && document.activeElement === $("chat-input");
 }
+async function commitChatComposition(entry) {
+  if (!entry?.composing) return true;
+  const field = $("chat-input"), epoch = state.authEpoch, editor = entry.editorEpoch;
+  if (!currentChat(entry)) return false;
+  field?.blur?.();
+  // Keep the original editor mounted until its final input has settled.
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  return epoch === state.authEpoch && currentChat(entry) && entry.editorEpoch === editor &&
+    $("chat-input") === field && !entry.composing;
+}
 function workspaceHooks() {
   let lastField = null;
   document.addEventListener("focusin", (event) => {
@@ -14158,6 +14199,8 @@ function workspaceHooks() {
       if (target?.key === key) { answerOnOpen(target); loadChatState(target, true); }
     },
     commitComposition: async () => {
+      const s = selectedSession(), entry = s && state.chats.get(chatKey(sourceOf(s)));
+      if (entry?.composing) return commitChatComposition(entry);
       if (!workspaceComposing()) return true;
       const field = document.activeElement;
       field?.blur?.();
@@ -14213,7 +14256,7 @@ function workspaceHooks() {
     },
     canClose: () => {
       const busy = state.launchBusy || state.newSessionBusy || state.terminalCloseBusy || state.draftPaste || workspaceComposing() ||
-        [...state.chats.values(), ...terminalAttachmentDrafts.values()].some((entry) => entry.sending || entry.pending || entry.commandBusy || entry.uploads || entry.uploadQueue?.length);
+        [...state.chats.values(), ...terminalAttachmentDrafts.values()].some((entry) => entry.composing || entry.sending || entry.pending || entry.commandBusy || entry.uploads || entry.uploadQueue?.length);
       if (busy) { toast("입력·전송 중인 작업이 끝난 뒤 창을 닫아 주세요. 세션은 계속 실행됩니다."); return false; }
       if (state.dictation && !window.confirm("이 창의 음성 입력을 멈추고 창만 닫을까요? 세션 실행은 유지됩니다.")) return false;
       const saved = persistAllDrafts();
@@ -14648,7 +14691,7 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   }
   // Opened from a notification: remember the session, then drop it from the address.
-  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href))
+  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href) && !window.SessionholicWorkspace?.detached)
     window.history.replaceState(window.history.state, "", "/");
   if (!window.SessionholicWorkspace?.embedded)
     window.launchQueue?.setConsumer((params) => handleAppLaunch(params).catch(() => {}));

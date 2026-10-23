@@ -3,6 +3,8 @@ import concurrent.futures
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import Mock
 
@@ -84,3 +86,67 @@ class JobsTest(unittest.TestCase):
             results = [f.result() for f in futures]
         self.assertEqual(sum(created for _, created in results), 1)
         self.assertEqual(results[0][0]['requestId'], results[1][0]['requestId'])
+
+    def test_slow_host_does_not_delay_other_source_submit_or_background_readback(self):
+        for background in (False, True):
+            with self.subTest(background=background):
+                entered, other_entered, release = threading.Event(), threading.Event(), threading.Event()
+                calls = []
+                def runner(job, initial):
+                    calls.append(initial)
+                    if job['source']['host'] == 'slow':
+                        entered.set()
+                        if not release.wait(3): raise TimeoutError('synthetic wait')
+                    else:
+                        other_entered.set()
+                    return {'confirmed': True, 'cleanup': {'complete': True}}
+                self.jobs.runner = runner
+                slow, fast = ({**self.source, 'host': host} for host in ('slow', 'fast'))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                    if background:
+                        self.jobs.claim(slow, 'background-slow', {})
+                        self.jobs.claim(fast, 'background-fast', {})
+                        with self.jobs.db() as db: db.execute('UPDATE jobs SET due=0 WHERE active=1')
+                        pending = pool.submit(self.jobs.tick)
+                    else:
+                        pending = pool.submit(self.jobs.submit, slow, 'initial-slow', {}, {'proof': 'fixture'})
+                    try:
+                        self.assertTrue(entered.wait(2))
+                        if not background:
+                            other = pool.submit(self.jobs.submit, fast, 'initial-fast', {}, {'proof': 'fixture'})
+                        self.assertTrue(other_entered.wait(2), 'another source must progress before slow host releases')
+                    finally:
+                        release.set()
+                    pending.result(timeout=3)
+                    if not background: other.result(timeout=3)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(sum(call is not None for call in calls), 0 if background else 2)
+                self.assertEqual(self.jobs.source_locks, {}, 'idle source locks are released')
+
+    def test_duplicate_submit_and_tick_wait_for_same_source_initial_result(self):
+        entered, release = threading.Event(), threading.Event()
+        def runner(job, initial):
+            entered.set()
+            if not release.wait(3): raise TimeoutError('synthetic wait')
+            return {'confirmed': True, 'cleanup': {'complete': True}}
+        self.runner.side_effect = runner
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            first = pool.submit(self.jobs.submit, self.source, 'same-initial', {}, {'proof': 'fixture'})
+            self.assertTrue(entered.wait(2))
+            duplicate = pool.submit(self.jobs.submit, self.source, 'same-duplicate', {}, {'proof': 'fixture'})
+            until = time.monotonic() + 2
+            while time.monotonic() < until:
+                with self.jobs.lock:
+                    if next(iter(self.jobs.source_locks.values()))[1] >= 3: break
+                time.sleep(.001)
+            else:
+                release.set()
+                self.fail('duplicate did not join the initial request')
+            with self.jobs.db() as db: db.execute('UPDATE jobs SET due=0')
+            readback = pool.submit(self.jobs.tick)
+            release.set()
+            results = [first.result(timeout=3), duplicate.result(timeout=3)]
+            readback.result(timeout=3)
+        self.assertEqual({result['requestId'] for result in results}, {'same-initial'})
+        self.assertEqual(self.runner.call_count, 1)
+        self.assertEqual(self.jobs.source_locks, {})

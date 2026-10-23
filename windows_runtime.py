@@ -9,7 +9,7 @@ persisted; input is not logged.
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -916,11 +916,24 @@ class WindowsRuntime:
             raise ValueError('모델 또는 에포트 목록에서 선택해 주세요.')
         identity, binding = observed['source'], self._model_binding(observed)
         digest, name = _digest([command, value]), 'command-' + _digest([identity, request_id]) + '.json'
-        with self.store.lock():
+        # Catalog reads never mutate receipts or the runtime. Atomic preference
+        # replacement lets them read without excluding another session's input.
+        with nullcontext() if command == 'models' else self.store.lock():
             prior = self.store.read(name) if command != 'models' else None
             if prior:
                 if prior.get('digest') != digest or prior.get('binding') != binding:
                     raise ValueError('같은 명령 ID에 다른 대상이나 값을 사용할 수 없습니다.')
+                if command in ('model', 'effort') and prior['result'].get('status') == 'unknown':
+                    selected = self._model_preferences(observed)
+                    matches = selected.get(command) == value
+                    result = {'status': 'configured' if matches else 'rejected', 'next': selected,
+                              'reason': '현재 모델 설정이 요청값과 일치합니다.' if matches else
+                              '현재 설정에서 요청값을 확인하지 못했습니다. 설정을 확인한 뒤 다시 선택해 주세요.'}
+                    try:
+                        self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                    except OSError:
+                        pass  # Readback still confirms the current selection; never reapply it.
+                    return result
                 return prior['result']
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
                 self._verify_endpoint(observed)

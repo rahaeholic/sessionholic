@@ -207,6 +207,9 @@ test("embedded panes never create global EventSources and layout restore never s
   assert.equal(hooks.canClose(), false);
   assert.equal(entry.text, "keep this draft");
   assert.equal(entry.pending.requestId, "uncertain");
+  entry.pending = null; entry.composing = true;
+  c.context.document.activeElement = c.get("workspace-split-open");
+  assert.equal(hooks.canClose(), false, "a delayed composition commit still owns the original editor after blur");
 });
 
 test("routing uses runtime identity; Codex accounts preserve home isolation", () => {
@@ -7663,7 +7666,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   c.cancelTerminalClose();
   c.openCardMenu(row);
   assert.deepEqual(c.get('action-list').children.map((item) => item.textContent),
-    ['대화 열기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '터미널 닫기', '실행 종료하고 정리', '목록에서 지우기']);
+    ['대화 열기', '새 창에서 보기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '터미널 닫기', '실행 종료하고 정리', '목록에서 지우기']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
@@ -8849,7 +8852,7 @@ test('대화 상단 세션 메뉴는 목록과 같은 동작을 제공하고 분
   assert.ok(byClass(c.get('detail'), 'detail-head-actions')[0].children.includes(menu));
   c.openCardMenu({ dataset: { sessionKey: s.key }, card: node() });
   const labels = c.get('action-list').children.map((item) => item.textContent);
-  assert.ok(labels.includes('제목 수정') && labels.includes('실행 종료하고 정리') && labels.includes('다른 창에서 보기'));
+  assert.ok(labels.includes('제목 수정') && labels.includes('실행 종료하고 정리') && labels.includes('분할창에서 보기') && labels.includes('새 창에서 보기'));
   c.closeActionSheet();
   menu.getBoundingClientRect = () => ({ right: 680, bottom: 60 });
   c.context.window.innerWidth = 1200; c.context.window.innerHeight = 800;
@@ -8862,7 +8865,7 @@ test('대화 상단 세션 메뉴는 목록과 같은 동작을 제공하고 분
   assert.equal(c.get('action-sheet').style.left, '420px');
   assert.equal(c.state.actionTrigger, menu);
   assert.equal(c.get('chat-input'), input); assert.equal(input.value, '보존할 초안'); assert.equal(entry.composing, true);
-  c.get('action-list').children.find((item) => item.textContent === '다른 창에서 보기').events.click({ detail: 0 });
+  c.get('action-list').children.find((item) => item.textContent === '분할창에서 보기').events.click({ detail: 0 });
   assert.equal(opened.length, 1); assert.equal(opened[0].key, s.key); assert.equal(opened[0].mode, 'chat');
   menu.events.click(); c.closeActionSheet(); assert.equal(menu.focusCount, 1, 'cancel returns focus to the same menu button');
 });
@@ -8874,6 +8877,44 @@ test('대화 세션 메뉴는 최신 제목으로 열리고 다른 세션으로 
   menu.events.click(); assert.equal(c.get('action-title').textContent, '갱신된 제목'); c.closeActionSheet();
   c.state.selected = 'different-session'; menu.events.click(); assert.equal(c.get('action-sheet').open, false);
   c.state.selected = s.key; c.state.authenticated = false; menu.events.click(); assert.equal(c.get('action-sheet').open, false);
+});
+
+test('새 창에서 보기는 기존 분할과 조합 초안을 건드리지 않고 팝업에 세션 링크만 연다', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.window.location = { origin: 'https://board.example' };
+  c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true,
+    add() { throw new Error('must not add a fifth pane'); }, routeSession() { throw new Error('must not replace a pane'); } };
+  entry.text = '확인 후 이어 쓸 초안'; entry.composing = true;
+  const navigations = [], opens = [], popup = { opener: {}, location: { replace(url) {
+    assert.equal(popup.opener, null); navigations.push(url);
+  } } };
+  c.context.window.open = (...args) => { opens.push(args); return popup; };
+  c.openCardMenu({ dataset: { sessionKey: s.key }, card: node() });
+  c.get('action-list').children.find((item) => item.textContent === '새 창에서 보기').events.click({ detail: 0 });
+  assert.equal(opens.length, 1); assert.equal(opens[0][0], 'about:blank'); assert.match(opens[0][2], /popup/);
+  const target = new URL(navigations[0]);
+  assert.equal(target.origin, 'https://board.example'); assert.equal(target.pathname, '/');
+  assert.equal(target.searchParams.get('session'), s.key); assert.equal(target.searchParams.get('window'), '1');
+  assert.equal(c.state.selected, s.key); assert.equal(entry.text, '확인 후 이어 쓸 초안'); assert.equal(entry.composing, true);
+  c.context.window.open = () => null;
+  vm.runInContext('openSessionWindow', c.context)(s);
+  assert.match(c.get('toast').textContent, /팝업/); assert.equal(c.state.selected, s.key);
+  c.state.authenticated = false; c.context.window.open = () => { throw new Error('logged out'); };
+  vm.runInContext('openSessionWindow', c.context)(s);
+});
+
+test('별도 창의 세션 링크는 새로고침 주소를 유지하고 질문 대기 중에도 채팅을 먼저 연다', () => {
+  const c = client(undefined, noChatTimers), s = recentSession('inspect-question', { phase: 'needs_input' });
+  const href = 'https://board.example/?window=1&session=' + encodeURIComponent(s.key);
+  c.context.window.location = c.context.location = { origin: 'https://board.example', href, search: new URL(href).search };
+  c.context.window.SessionholicWorkspace = { detached: true, init() {}, changed() {}, visible: () => true,
+    managed: () => false, readingActive: () => true, routeSession: () => false };
+  const urls = [];
+  c.context.window.history.replaceState = function (state, _, url) { this.state = state; if (url) urls.push(url); };
+  c.context.navigator = { onLine: false }; c.windowEvents.DOMContentLoaded();
+  setRecentSnapshot(c, [s]); c.openRequestedSession();
+  assert.equal(c.state.selected, s.key); assert.equal(c.state.answerOnOpen ?? null, null);
+  assert.equal(c.state.terminalVisible, false); assert.equal(urls.length, 0);
 });
 
 test('a conversation header replaced during cache clearing is released when the refresh wait ends', async () => {
@@ -15798,4 +15839,34 @@ test('전송 영수증이 다음 한글 조합 시작과 첫 input 사이에 와
   const field = raw.get('terminal-draft'); field.value = '기존 raw 전송 문구';
   const pasted = raw.pasteDraft(false); await settle(); raw.state.composing = true; release(); await pasted;
   assert.equal(field.value, '기존 raw 전송 문구'); assert.equal(raw.state.composing, true);
+});
+
+test('세션 선택은 늦은 한글 확정 입력을 원 초안에 보관한 뒤 이동한다', async () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c); c.drawDetail(s);
+  const other = recentSession('ime-other'); c.state.snapshot.hosts[0].data.codex.push(other);
+  const input = c.get('chat-input'); input.value = 'ㅎ'; input.events.compositionstart(); input.events.input({ isComposing: true });
+  c.context.document.activeElement = input;
+  input.blur = () => { c.context.document.activeElement = null; };
+  const selected = c.select(other.key);
+  assert.equal(c.state.selected, s.key);
+  input.value = '하'; input.events.input({ isComposing: false }); input.events.compositionend();
+  c.flushFrames(); await selected;
+  assert.equal(entry.text, '하'); assert.equal(c.state.selected, other.key);
+  assert.equal(c.chatEntry(other).text, ''); assert.equal(entry.pending, null);
+});
+
+test('조합 중 연속 선택은 마지막 선택만 적용하고 확정 실패·인증 변경은 이동하지 않는다', async () => {
+  for (const mode of ['latest', 'uncommitted', 'auth']) {
+    const c = client(undefined, noChatTimers);
+    const { s, entry } = selectChat(c); c.drawDetail(s);
+    const a = recentSession('ime-a'), b = recentSession('ime-b'); c.state.snapshot.hosts[0].data.codex.push(a, b);
+    const input = c.get('chat-input'); input.value = 'ㅎ'; input.events.compositionstart(); input.events.input({ isComposing: true });
+    const first = c.select(a.key), last = c.select(b.key);
+    if (mode !== 'uncommitted') { input.value = '하'; input.events.input({ isComposing: false }); input.events.compositionend(); }
+    if (mode === 'auth') c.beginAuthEpoch();
+    c.flushFrames(); await Promise.all([first, last]);
+    assert.equal(c.state.selected, mode === 'latest' ? b.key : s.key);
+    assert.equal(entry.pending, null);
+  }
 });
