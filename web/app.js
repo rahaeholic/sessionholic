@@ -4760,7 +4760,17 @@ function updateChatDeliveryEvidence(entry) {
   return true;
 }
 function submissionRequestIds(entry, lastRequestId) {
-  return [lastRequestId].filter((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id));
+  return [...new Set([lastRequestId, ...unconfirmedChatRequests(entry).map((item) => item.requestId)])]
+    .filter((id) => typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(id)).slice(0, 20);
+}
+// A delayed receipt belongs to its immutable message, not to the next draft.
+function unconfirmedChatRequests(entry) {
+  return [...(entry.outbox || []).map((item) => item.pending).filter(Boolean), ...(entry.pending ? [entry.pending] : [])];
+}
+function chatPendingBlocks(entry, text = entry.text, attachments = entry.attachments) {
+  const requests = unconfirmedChatRequests(entry);
+  return requests.length >= 20 || requests.some((pending) => !Array.isArray(pending.attachments) || typeof pending.text !== "string" || outboxText(pending.text) === outboxText(text) &&
+    pending.attachments.length === attachments.length && pending.attachments.every((id, index) => id === attachments[index]?.id));
 }
 function chatEntry(s) {
   const source = sourceOf(s);
@@ -4859,22 +4869,26 @@ function clearSavedDrafts() {
 function draftStorageNotice(text) {
   if ($("draft-recovery-status")) $("draft-recovery-status").textContent = text;
 }
+function validSavedPending(pending) {
+  return pending && typeof pending.requestId === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(pending.requestId) &&
+    (pending.preserveDraft === undefined || typeof pending.preserveDraft === "boolean") &&
+    Number.isInteger(pending.revision) && pending.revision >= 0 && typeof pending.text === "string" &&
+    new TextEncoder().encode(pending.text).length <= 32768 && Array.isArray(pending.attachments) &&
+    pending.attachments.length <= MAX_ATTACHMENTS && pending.attachments.every((id) => typeof id === "string" && id.length <= 128);
+}
 function readSavedDraft(key) {
   if (!state.authenticated || !draftRecoveryEnabled()) return null;
   try {
     const raw = localStorage.getItem(key);
-    if (!raw || raw.length > 150000) return null;
+    if (!raw || raw.length > 1024 * 1024) return null;
     const row = JSON.parse(raw);
     if (row?.version !== 1 || typeof row.text !== "string" || new TextEncoder().encode(row.text).length > 32768 ||
         !Number.isFinite(row.at) || row.at > Date.now() + 60000 || Date.now() - row.at > DRAFT_TTL ||
         !Array.isArray(row.attachments) || row.attachments.length > MAX_ATTACHMENTS ||
         row.attachments.some((item) => !item || typeof item.id !== "string" || item.id.length > 128) ||
-        row.pending && (typeof row.pending.requestId !== "string" || row.pending.requestId.length > 128 ||
-          row.pending.preserveDraft !== undefined && typeof row.pending.preserveDraft !== "boolean" ||
-          !Number.isInteger(row.pending.revision) || row.pending.revision < 0 ||
-          typeof row.pending.text !== "string" || new TextEncoder().encode(row.pending.text).length > 32768 ||
-          !Array.isArray(row.pending.attachments) || row.pending.attachments.length > MAX_ATTACHMENTS ||
-          row.pending.attachments.some((id) => typeof id !== "string" || id.length > 128)) ||
+        row.pending && !validSavedPending(row.pending) ||
+        row.unconfirmed !== undefined && (!Array.isArray(row.unconfirmed) || row.unconfirmed.length > 19 ||
+          row.unconfirmed.some((pending) => !validSavedPending(pending))) ||
         row.commandRequest && (typeof row.commandRequest.requestId !== "string" || row.commandRequest.requestId.length > 128 ||
           !['model', 'effort', 'compact'].includes(row.commandRequest.command) ||
           !['pending', 'unknown', 'applied'].includes(row.commandRequest.status) ||
@@ -4887,6 +4901,7 @@ function readSavedDraft(key) {
 }
 function savedDraftShape(row) {
   return JSON.stringify({ text: row.text, attachments: row.attachments, pending: row.pending ?? null,
+    unconfirmed: row.unconfirmed?.length ? row.unconfirmed : null,
     revision: row.revision || 0, commandRequest: row.commandRequest ?? null, promptRequest: row.promptRequest ?? null });
 }
 function writeSavedDraft(key, row) {
@@ -4896,14 +4911,14 @@ function writeSavedDraft(key, row) {
     const shape = savedDraftShape(row), previousShape = state.draftSavedShapes.get(key);
     // Status polling in an idle tab must never overwrite another tab's newer edits.
     if (previousShape === shape && localStorage.getItem(key) !== null) return true;
-    if (!row.text && !row.attachments.length && !row.pending && !row.promptRequest) {
+    if (!row.text && !row.attachments.length && !row.pending && !row.unconfirmed?.length && !row.promptRequest) {
       const prior = readSavedDraft(key);
       if (!prior || previousShape === savedDraftShape(prior)) localStorage.removeItem(key);
       state.draftSavedShapes.set(key, shape); return true;
     }
     if (new TextEncoder().encode(row.text).length > 32768) throw new Error("draft size");
     const raw = JSON.stringify({ ...row, version: 1, at: Date.now() });
-    if (raw.length > 150000) throw new Error("draft size");
+    if (raw.length > 1024 * 1024) throw new Error("draft size");
     const prior = readSavedDraft(key);
     if (prior && JSON.stringify({ ...prior, at: null }) === JSON.stringify({ ...row, version: 1, at: null })) return true;
     const newKey = localStorage.getItem(key) === null;
@@ -4934,6 +4949,10 @@ function chatDraftPayload(entry) {
     text: entry.pending.text, attachments: entry.pending.attachments,
     attachmentDetails: attachmentMetadata(entry.pending.attachmentDetails) } : null;
   return { text: entry.text || "", attachments: attachmentMetadata(entry.attachments), pending, revision: entry.revision || 0,
+    unconfirmed: (entry.outbox || []).filter((item) => item.pending).map((item) => ({
+      requestId: item.pending.requestId, revision: item.pending.revision, preserveDraft: true,
+      text: item.pending.text, attachments: item.pending.attachments,
+      attachmentDetails: attachmentMetadata(item.pending.attachmentDetails) })),
     promptRequest: entry.promptRequest ? { requestId: entry.promptRequest.requestId, fingerprint: entry.promptRequest.fingerprint,
       number: entry.promptRequest.number, status: entry.promptRequest.status } : null,
     commandRequest: entry.commandRequest ? { requestId: entry.commandRequest.requestId, command: entry.commandRequest.command,
@@ -4963,8 +4982,15 @@ function restoreChatDraft(entry) {
     entry.outbox = [{ requestId: row.pending.requestId, text: row.pending.text,
       attachments: entry.pending.attachmentDetails, attachmentObjects: entry.attachments,
       state: "uncertain", status: "unknown", reason: "", at: row.at }];
-    entry.notice = "전송 확인 중이던 메시지를 복원했습니다. 다시 보내지 않고 전송 상태를 확인합니다.";
+    entry.notice = "";
   } else if (!entry.notice && (entry.text || entry.attachments.length)) entry.notice = "이 기기에 보관한 초안을 복원했습니다.";
+  for (const pending of row.unconfirmed || []) {
+    if (pending.requestId === entry.pending?.requestId) continue;
+    entry.outbox.unshift({ requestId: pending.requestId, text: pending.text,
+      attachments: attachmentMetadata(pending.attachmentDetails), attachmentObjects: attachmentMetadata(pending.attachmentDetails),
+      state: "uncertain", status: "unknown", at: row.at,
+      pending: { ...pending, source: entry.source, preserveDraft: true } });
+  }
   state.draftSavedShapes.set(key, savedDraftShape(chatDraftPayload(entry)));
 }
 function terminalDraftIdentity(terminal) { return JSON.stringify([terminal?.id, draftKey(terminal)]); }
@@ -6077,6 +6103,15 @@ function buildChatComposer(s) {
   input.setAttribute("enterkeyhint", "enter");
   for (const [name, value] of [["spellcheck", "false"], ["autocorrect", "off"], ["autocomplete", "off"], ["autocapitalize", "off"]]) input.setAttribute(name, value);
   input.value = entry.text;
+  const beginNextDraft = () => {
+    if (!editorCurrent() || entry.composing || !draftIsPending(entry)) return;
+    entry.pending.preserveDraft = true;
+    entry.text = input.value = "";
+    entry.attachments = [];
+    entry.revision++;
+    updateChatComposer(entry);
+  };
+  input.addEventListener("beforeinput", beginNextDraft);
   // A send waiting for the input method to commit the word it still composes (see send).
   let sendCommit = null;
   const settleSendCommit = () => {
@@ -6116,6 +6151,9 @@ function buildChatComposer(s) {
   // A tablet folds them only once its on-screen keyboard takes the space
   // (syncChromeMode on the viewport's resize); a hardware keyboard never does.
   input.addEventListener("focus", () => {
+    // The sent bubble owns these words. Start the next draft with a genuinely
+    // empty editor instead of leaving invisible text under the mobile keyboard.
+    beginNextDraft();
     dictationFieldEvent(input, "focus");
     setTyping(typingFolds());
   });
@@ -6161,7 +6199,7 @@ function buildChatComposer(s) {
     sendChat(entry);
   });
   input.addEventListener("paste", (event) => {
-    if (editorCurrent()) pasteChat(entry, event, input);
+    if (editorCurrent()) { beginNextDraft(); pasteChat(entry, event, input); }
   });
   const files = el("input");
   files.id = "chat-files";
@@ -6176,11 +6214,12 @@ function buildChatComposer(s) {
   const actions = el("div", "chat-toolbar");
   const tools = el("details", "chat-tools");
   tools.id = "chat-tools";
-  const attach = button("첨부", "secondary", () => { if (editorCurrent()) files.click(); });
+  const attach = button("첨부", "secondary", () => { if (editorCurrent()) { beginNextDraft(); files.click(); } });
   attach.id = "chat-attach";
   attach.setAttribute("aria-label", "사진 또는 파일 첨부");
   const clipboard = button("클립보드 붙여넣기", "secondary", () => {
     if (!editorCurrent()) return;
+    beginNextDraft();
     tools.open = false;
     readChatClipboard(entry, input, files, editorEpoch);
   });
@@ -6254,6 +6293,7 @@ function buildChatComposer(s) {
     }
     if (entry.inputError && entry.error === entry.inputError) entry.error = "";
     entry.inputError = "";
+    beginNextDraft();
     warmChat(entry);
     startDictation(input, { report: reportDictation, releaseKeyboard: true,
       active: () => editorCurrent() && chatVisible() });
@@ -6333,7 +6373,7 @@ function buildChatComposer(s) {
   quickInline.title = "빠른 답장";
   quickInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const main = el("div", "chat-main");
-  const attachInline = button("＋", "chat-attach-inline", () => { if (editorCurrent() && !attach.disabled) files.click(); });
+  const attachInline = button("＋", "chat-attach-inline", () => { if (editorCurrent() && !attach.disabled) { beginNextDraft(); files.click(); } });
   attachInline.id = "chat-attach-inline";
   attachInline.setAttribute("aria-label", "사진 또는 파일 첨부");
   attachInline.title = "사진 또는 파일 첨부";
@@ -6840,7 +6880,7 @@ function chatReceiptCopy(receipt) {
     queued: "메시지를 접수했습니다. 답변은 대화에서 확인해 주세요.",
     completed: "응답이 끝났습니다. 목표 완료 여부는 결과와 완료 조건을 확인해 주세요.",
     interrupted: "접수했던 작업이 중단되었습니다. 대화를 확인한 뒤 새 메시지를 보내 주세요.",
-    unknown: "전송 결과를 아직 확인하지 못했습니다. 중복 전송하지 않고 상태를 확인합니다.",
+    unknown: "이전 메시지의 전달 여부를 확인 중입니다. 새 메시지는 계속 작성하고 보낼 수 있습니다.",
     failed: "메시지를 접수하지 못했습니다. 초안은 유지됩니다.",
   };
   return labels[receipt?.status] || "";
@@ -6889,7 +6929,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
-  const blocked = offline || !supported || entry.sending || !!entry.pending || !!entry.uploads || !!entry.commandBusy;
+  const blocked = offline || !supported || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.commandBusy;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
   const recovery = chatRecovery(entry, selected);
@@ -6903,7 +6943,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-terminal-gate-text").textContent = gateOn ? gateReason : "";
   $("chat-open-terminal").disabled = offline || state.launchBusy;
   // Reads and pending sends never lock drafting or dictation. The request and
-  // its receipt retain an immutable copy; sendChat refuses a second send.
+  // its receipt retain an immutable copy; only the same unresolved message is blocked.
   const input = $("chat-input");
   input.placeholder = chatPlaceholder(oneShot);
   // Drafting belongs to this conversation, not to a transient send capability.
@@ -6911,7 +6951,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   input.disabled = !state.authenticated || oneShot || !!botRequestForNative(entry.source);
   input.readOnly = false;
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
-  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.pending || !!entry.uploads;
+  $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
   $("chat-attach-inline").disabled = $("chat-attach").disabled;
   // A word still composing does not lock it: the send commits it first (buildChatComposer).
@@ -7134,12 +7174,20 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
   }, reconnecting ? Math.min(5000, chatPollDelay(state.chatPollCount)) : chatPollDelay(state.chatPollCount));
 }
 function applyChatReceipt(entry, receipt, selected) {
-  if (!receipt || (entry.pending && receipt.requestId !== entry.pending.requestId)) return;
+  if (!receipt) return;
+  const settled = ["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status);
+  const earlier = entry.outbox?.find((item) => item.pending?.requestId === receipt.requestId);
+  if (earlier) {
+    markOutbox(entry, receipt.requestId, receipt);
+    if (settled) { delete earlier.pending; persistChatDraft(entry); }
+    return;
+  }
+  if (entry.pending && receipt.requestId !== entry.pending.requestId) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
   entry.receipt = { ...receipt, attachments: attachmentMetadata(Array.isArray(receipt.attachments) ? receipt.attachments : fallback) };
   markOutbox(entry, receipt.requestId, entry.receipt);
-  if (!entry.pending || !["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status)) return;
+  if (!entry.pending || !settled) return;
   // Only the draft that was sent is cleared; a resend from a bubble leaves
   // any other draft in the editor.
   if (!entry.composing && !entry.pending.preserveDraft && (receipt.status !== "failed" || receipt.confirmed === true) && entry.revision === entry.pending.revision &&
@@ -7159,6 +7207,8 @@ function applyChatReceipt(entry, receipt, selected) {
     pruneThumbs(entry);
   }
   entry.pending = null;
+  entry.notice = "";
+  if (entry.error !== entry.inputError) entry.error = "";
   persistChatDraft(entry);
 }
 const CHAT_RECHECK_RETRY_MS = 3000;
@@ -7211,7 +7261,7 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     outcome = { status: "success", data };
     clearError();
     for (const receipt of data.receipts || []) {
-      if (receipt.requestId === entry.pending?.requestId ||
+      if (unconfirmedChatRequests(entry).some((pending) => pending.requestId === receipt.requestId) ||
           (entry.receipt?.dispatchState !== "not_started" && receipt.requestId === entry.receipt?.requestId))
         applyChatReceipt(entry, receipt, selected);
     }
@@ -7329,7 +7379,7 @@ async function sendChat(entry, message = null) {
   if (!message && currentChat(entry) && /^\/[a-z]+(?:\s|$)/.test(text.trim())) {
     return runSlashCommand(entry, text.trim(), attachments);
   }
-  if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || entry.pending || entry.uploads ||
+  if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || chatPendingBlocks(entry, text, attachments) || entry.uploads ||
       (!text.trim() && !attachments.length)) return;
   if (new TextEncoder().encode(text).length > 32768 || attachments.length > MAX_ATTACHMENTS) {
     entry.error = entry.inputError = `메시지는 32KiB, 첨부는 ${MAX_ATTACHMENTS}개까지 보낼 수 있습니다. 초안은 유지됩니다.`;
@@ -7346,6 +7396,15 @@ async function sendChat(entry, message = null) {
       !entry.attachments.every((file, index) => file.id === attachments[index]?.id)) ? { preserveDraft: true } : {}),
     text, attachments: attachments.map((item) => item.id),
     attachmentDetails: attachmentMetadata(attachments) };
+  if (entry.pending) {
+    let previous = entry.outbox.find((item) => item.requestId === entry.pending.requestId);
+    if (!previous) {
+      previous = { requestId: entry.pending.requestId, text: entry.pending.text,
+        attachments: entry.pending.attachmentDetails || [], state: "uncertain", status: "unknown", at: Date.now() };
+      entry.outbox.push(previous);
+    }
+    previous.pending = { ...entry.pending, preserveDraft: true };
+  }
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
@@ -7403,7 +7462,7 @@ async function sendChat(entry, message = null) {
         // HTTP status alone cannot establish whether the native runtime started.
         sent = true;
         entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
-        entry.error = "전송 결과를 확인하지 못했습니다. 상태 다시 확인을 눌러 주세요. 중복 전송은 잠겼습니다.";
+        entry.error = chatReceiptCopy(entry.receipt);
       }
     }
   } finally {
@@ -7422,8 +7481,8 @@ async function sendChat(entry, message = null) {
 }
 // --- Sent-from-here bubbles (outbox) ------------------------------------------
 // Memory only, per conversation. "sending" until the server answers; then
-// "sent" (accepted or queued), "uncertain" (no answer: the send stays locked
-// as before) or "failed" (never started: the draft is still in the editor).
+// "sent" (accepted or queued), "uncertain" (no answer: that message cannot be
+// duplicated) or "failed" (never started: the draft or retry bubble retains it).
 const OUTBOX_LABELS = { sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
   queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
 const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
@@ -7595,7 +7654,17 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
     const view = { codex, cut: outboxCut(item, list), known: Array.isArray(item.known) ? new Set(item.known) : null };
     views.set(item, view);
     const row = rows.find((value) => outboxMatches(item, value, view));
-    if (row) claim(item, row, view);
+    if (row) {
+      // Exact native client identity proves delivery even if its HTTP receipt
+      // was lost. Text equality or the arrival of an answer never does.
+      if (row.message.clientId === item.requestId &&
+          (entry.pending?.requestId === item.requestId || item.pending)) {
+        const status = ["completed", "interrupted", "failed"].includes(row.message.turnStatus) ? row.message.turnStatus : "accepted";
+        applyChatReceipt(entry, { requestId: item.requestId, status, confirmed: true,
+          readbackConfirmed: true, turnId: row.message.turnId });
+      }
+      claim(item, row, view);
+    }
   }
   for (const item of entry.outbox) {
     if (settled.has(item) || item.state === "failed") continue;
@@ -7620,7 +7689,7 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
     entry.outboxClaims.splice(0, entry.outboxClaims.length - OUTBOX_CLAIM_LIMIT);
   const before = entry.outbox.length;
   entry.outbox = entry.outbox.filter((item) => {
-    const keep = !settled.has(item) &&
+    const keep = item.pending || entry.pending?.requestId === item.requestId || !settled.has(item) &&
       !(item.state !== "failed" && item.settledAt && now - item.settledAt > OUTBOX_SETTLED_MS) &&
       now - item.at < OUTBOX_MAX_MS;
     // The composer's "접수했습니다" note was about this message; the conversation
@@ -7759,7 +7828,7 @@ function refreshConversationView(entry, toEnd = false) {
 }
 async function uploadChatFiles(entry, files) {
   if (networkOffline()) { updateChatComposer(entry); return; }
-  if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.pending || entry.uploads || !files.length) return;
+  if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.uploads || !files.length) return;
   if (entry.attachments.length + files.length > MAX_ATTACHMENTS) {
     entry.error = entry.inputError = `한 메시지에는 첨부 파일을 ${MAX_ATTACHMENTS}개까지 추가할 수 있습니다.`;
     updateChatComposer(entry);
@@ -8258,7 +8327,7 @@ function pasteChat(entry, event, input) {
   insertChatText(entry, input, clipboard.getData("text/plain"));
   const blocked = networkOffline() ? "오프라인이라 파일을 추가하지 못했습니다. 연결 후 다시 붙여넣어 주세요."
     : entry.uploads ? "첨부를 올리고 있습니다. 완료된 뒤 파일을 다시 붙여넣어 주세요."
-    : entry.sending || entry.pending ? "전송 결과를 확인한 뒤 파일을 다시 붙여넣어 주세요."
+    : entry.sending ? "전송 결과를 확인한 뒤 파일을 다시 붙여넣어 주세요."
     : !chatAttachmentsSupported(entry) ? "이 세션은 파일 첨부를 지원하지 않습니다. 터미널에서 파일을 확인해 주세요."
     : "";
   if (blocked) {
@@ -8271,7 +8340,7 @@ function pasteChat(entry, event, input) {
 async function readChatClipboard(entry, input, files, editorEpoch = entry.editorEpoch) {
   const editorCurrent = () => currentChat(entry) && entry.editorEpoch === editorEpoch;
   if (networkOffline()) { updateChatComposer(entry); return; }
-  if (!editorCurrent() || !chatAttachmentsSupported(entry) || entry.sending || entry.pending || entry.uploads) return;
+  if (!editorCurrent() || !chatAttachmentsSupported(entry) || entry.sending || entry.uploads) return;
   if (entry.composing) {
     entry.notice = "한글 입력을 마친 뒤 붙여넣기를 눌러 주세요.";
     updateChatComposer(entry);

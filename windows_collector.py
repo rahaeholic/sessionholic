@@ -1400,6 +1400,7 @@ def _codex_rows(turns):
                 continue
             metadata = {'turnId': turn.get('id'), 'turnStatus': turn.get('status'), 'messageId': item.get('id')}
             if item.get('type') == 'userMessage':
+                metadata.update(itemId=item.get('id'), clientId=item.get('clientId'))
                 content = item.get('content') if isinstance(item.get('content'), list) else []
                 texts = (_codex_user_text(block.get('text', '')) for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str))
                 text = '\n'.join(value for value in texts if value is not None)

@@ -487,6 +487,17 @@ class WindowsRuntimeTest(unittest.TestCase):
         result = self.runtime.chat({'action': 'read', 'source': self.source, 'requestIds': ['request-1234']})
         self.assertEqual(result['receipts'][0]['turnId'], 'turn-sent')
         self.assertTrue(result['receipts'][0]['confirmed'])
+        self.assertEqual(result['messages'][0]['clientId'], 'request-1234')
+
+    def test_delivered_message_identity_survives_lost_receipt_file(self):
+        self.send()
+        for path in self.runtime.store.root.glob('chat-*.json'):
+            path.unlink()
+        before = self.reader.send_calls
+        result = self.runtime.chat({'action': 'read', 'source': self.source, 'requestId': 'request-1234'})
+        self.assertTrue(result['receipts'][0]['confirmed'])
+        self.assertEqual(result['messages'][0]['clientId'], 'request-1234')
+        self.assertEqual(self.reader.send_calls, before)
 
     def stored(self, name, data):
         return wa.store(str(self.reader.cwd), name, data)

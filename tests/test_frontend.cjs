@@ -9312,7 +9312,7 @@ test('sending preserves the editor and next draft while duplicate submits remain
   input.events.keydown(key);
   input.events.paste({ clipboardData: { files: [{ name: 'a.png', size: 1, type: 'image/png' }], items: [], getData: () => '끼어든 글' },
     preventDefault() {} });
-  assert.equal(entry.text, '첫 메시지끼어든 글', 'mixed paste keeps next-draft text while files wait for the receipt');
+  assert.equal(entry.text, '끼어든 글', 'mixed paste starts the next draft without appending invisible sent text');
   assert.equal(entry.attachments.length, 0);
   await settle();
   assert.equal(sends.length, 1, 'a second ⌘↩ meanwhile sends nothing');
@@ -9320,7 +9320,7 @@ test('sending preserves the editor and next draft while duplicate submits remain
   assert.equal(entry.pending, null);
   assert.equal(input.readOnly, false);
   assert.equal(input.attributes['aria-disabled'], 'false');
-  assert.equal(input.value, '첫 메시지끼어든 글', 'editing after dispatch preserves the next draft');
+  assert.equal(input.value, '끼어든 글', 'editing after dispatch preserves only the next draft');
   // The next message goes out with the same key, without touching the field again.
   input.value = '두 번째 메시지'; input.events.input();
   input.events.keydown(key);
@@ -13503,6 +13503,85 @@ test('recovered unknown sends keep the original receipt id and cannot send a dup
   assert.equal(restored.text, ''); assert.equal(storage.store.size, 0);
 });
 
+test('restored send settles from exact native identity despite an unknown receipt, preserving the next IME draft', async () => {
+  const storage = draftStorage(), first = client(undefined, noChatTimers);
+  first.context.localStorage = storage;
+  const original = selectChat(first).entry;
+  original.text = '이미 전달한 질문'; original.revision = 2;
+  original.pending = { requestId: 'request-native-proof', revision: 2, text: original.text, attachments: [], source: original.source };
+  first.updateChatComposer(original);
+  let entry, messages = [{ role: 'user', text: '이미 전달한 질문', clientId: 'different-request', itemId: 'old-item' }];
+  const c = client(async (url) => {
+    assert.equal(url, '/api/chat/state');
+    return { ok: true, status: 200, json: async () => attachmentState(entry,
+      [{ requestId: 'request-native-proof', status: 'unknown' }], messages) };
+  }, noChatTimers);
+  c.context.localStorage = storage; const selected = selectChat(c); entry = selected.entry;
+  wireTree(c, c.buildChatComposer(selected.s));
+  await c.loadChatState(selected.s, true);
+  assert.ok(entry.pending, 'same text under another client id proves nothing');
+  c.get('chat-input').events.focus();
+  assert.equal(c.get('chat-input').value, '', 'no invisible sent text under the mobile keyboard');
+  entry.text = c.get('chat-input').value = '새 한글 초안'; entry.revision++; entry.composing = true;
+  messages = [{ role: 'user', text: '이미 전달한 질문', clientId: 'request-native-proof', itemId: 'actual-item', turnStatus: 'completed', turnId: 'turn-proof' }];
+  await c.loadChatState(selected.s, true);
+  assert.equal(entry.pending, null); assert.equal(entry.outbox.length, 0);
+  assert.equal(entry.receipt.confirmed, true); assert.equal(entry.receipt.status, 'completed');
+  assert.equal(entry.text, '새 한글 초안'); assert.equal(c.get('chat-input').value, '새 한글 초안');
+  assert.equal(entry.composing, true); assert.equal(entry.notice, '');
+  assert.equal(c.get('chat-input').disabled, false);
+});
+
+test('uncertain sends survive reload separately while distinct sends proceed and duplicates stay blocked', async () => {
+  const storage = draftStorage(), sends = [];
+  let entry;
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/send') {
+      const body = JSON.parse(options.body); sends.push(body);
+      return { ok: true, status: 200, json: async () => ({ status: 'unknown', receipt: { requestId: body.requestId } }) };
+    }
+    return { ok: true, status: 200, json: async () => attachmentState(entry, [], []) };
+  }, noChatTimers);
+  c.context.localStorage = storage; const selected = selectChat(c); entry = selected.entry;
+  wireTree(c, c.buildChatComposer(selected.s));
+  entry.text = '첫 질문'; entry.revision++;
+  await c.sendChat(entry); await settle();
+  await c.sendChat(entry); assert.equal(sends.length, 1);
+  entry.text = '다음 질문'; entry.revision++; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-send').disabled, false);
+  assert.equal(c.get('chat-attach').disabled, false);
+  await c.sendChat(entry); await settle();
+  assert.equal(sends.length, 2); assert.notEqual(sends[0].requestId, sends[1].requestId);
+  entry.text = '첫 질문'; entry.revision++;
+  await c.sendChat(entry); assert.equal(sends.length, 2, 'even an older unresolved request cannot be duplicated');
+  c.updateChatComposer(entry);
+  const requests = [], second = client(async (url, options) => {
+    assert.equal(url, '/api/chat/state'); requests.push(JSON.parse(options.body));
+    return { ok: true, status: 200, json: async () => attachmentState(restored,
+      sends.map((send) => ({ requestId: send.requestId, status: 'completed', confirmed: true, readbackConfirmed: true })), []) };
+  }, noChatTimers);
+  second.context.localStorage = storage;
+  const again = selectChat(second), restored = again.entry;
+  assert.equal(restored.outbox.length, 2);
+  restored.text = '작성 중인 다음 내용'; restored.revision++;
+  wireTree(second, second.buildChatComposer(again.s));
+  restored.composing = true;
+  await second.loadChatState(again.s, true);
+  assert.deepEqual(new Set(requests[0].requestIds), new Set(sends.map((send) => send.requestId)));
+  assert.equal(restored.pending, null); assert.equal(restored.outbox.length, 0);
+  assert.equal(restored.text, '작성 중인 다음 내용'); assert.equal(restored.composing, true);
+  assert.ok([...storage.store.values()].every((raw) => !JSON.parse(raw).pending && !JSON.parse(raw).unconfirmed.length));
+});
+
+test('unconfirmed bubbles never time out into permission to resend', () => {
+  const c = client(undefined, noChatTimers), { entry } = selectChat(c);
+  entry.text = '오래된 전송';
+  entry.pending = { requestId: 'request-still-unknown', text: entry.text, revision: 0, attachments: [] };
+  entry.outbox = [{ requestId: entry.pending.requestId, text: entry.text, at: Date.now() - 3600000, state: 'uncertain' }];
+  c.settleOutbox(entry, []); c.updateChatComposer(entry);
+  assert.equal(entry.outbox.length, 1); assert.ok(entry.pending); assert.equal(c.get('chat-send').disabled, true);
+});
+
 test('draft storage failure before send removes stale text; auth expiry clears it and late work cannot restore it', () => {
   const storage = draftStorage(); const c = client(undefined, noChatTimers); c.context.localStorage = storage;
   const { entry } = selectChat(c); entry.text = 'saved'; c.updateChatComposer(entry);
@@ -15740,14 +15819,14 @@ test('작업·기록 탭 전환은 동일한 입력 DOM·한글 조합·첨부�
   assert.equal(c.get('chat-input'), input); assert.equal(c.state.dictation, mic); assert.equal(entry.composing, true);
 });
 
-test('기록 탭에서도 전송 결과 불명은 중복 전송을 잠그며 다음 초안은 계속 작성할 수 있다', async () => {
+test('기록 탭에서 전송 결과 불명은 같은 메시지만 잠그고 다른 새 메시지는 보낼 수 있다', async () => {
   const { c, entry } = inlineDetailClient(); let sends = 0;
   c.context.fetch = async (url) => { assert.equal(url, '/api/chat/send'); sends++; throw Error('lost receipt'); };
   entry.text = c.get('chat-input').value = '한 번만 전달할 내용'; entry.revision++;
   await c.sendChat(entry); assert.equal(sends, 1); assert.equal(entry.receipt.status, 'unknown');
   assert.ok(entry.pending); assert.equal(c.get('chat-input').disabled, false);
   entry.text = c.get('chat-input').value = '전송하지 않은 다음 초안'; entry.revision++;
-  await c.sendChat(entry); assert.equal(sends, 1); assert.equal(entry.text, '전송하지 않은 다음 초안');
+  await c.sendChat(entry); assert.equal(sends, 2); assert.equal(entry.text, '전송하지 않은 다음 초안');
   assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
 });
 
