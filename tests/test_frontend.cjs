@@ -8903,6 +8903,26 @@ test('새 창에서 보기는 기존 분할과 조합 초안을 건드리지 않
   vm.runInContext('openSessionWindow', c.context)(s);
 });
 
+test('목록 Shift 클릭은 현재 대화와 초안을 유지하고 해당 세션만 새 창으로 연다', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  const other = recentSession('shift-click', { phase: 'needs_input' });
+  setRecentSnapshot(c, [s, other]); c.renderGroups([s, other], 1100);
+  const row = c.get('groups').children.flatMap((section) => section.children).find((row) => row.dataset?.sessionKey === other.key);
+  const opened = [];
+  c.context.window.location = { origin: 'https://board.example' };
+  c.context.window.open = () => ({ opener: {}, location: { replace(url) { opened.push(url); } } });
+  entry.text = '현재 창의 초안'; entry.composing = true;
+  let prevented = 0, stopped = 0;
+  const event = { shiftKey: true, preventDefault() { prevented++; }, stopPropagation() { stopped++; } };
+  row.card.events.click(event);
+  assert.equal(opened.length, 1); assert.equal(new URL(opened[0]).searchParams.get('session'), other.key);
+  assert.equal(c.state.selected, s.key); assert.equal(entry.text, '현재 창의 초안'); assert.equal(entry.composing, true);
+  assert.equal(c.state.answerOnOpen ?? null, null); assert.equal(prevented, 1); assert.equal(stopped, 1);
+  assert.match(row.card.title, /Shift\+클릭/);
+  c.state.authenticated = false; row.card.events.click(event); assert.equal(opened.length, 1);
+  c.state.authenticated = true; c.get('groups').replaceChildren(); row.card.events.click(event); assert.equal(opened.length, 1);
+});
+
 test('별도 창의 세션 링크는 새로고침 주소를 유지하고 질문 대기 중에도 채팅을 먼저 연다', () => {
   const c = client(undefined, noChatTimers), s = recentSession('inspect-question', { phase: 'needs_input' });
   const href = 'https://board.example/?window=1&session=' + encodeURIComponent(s.key);

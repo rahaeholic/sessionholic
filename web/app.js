@@ -2671,11 +2671,16 @@ function card(s) {
   const action = button("", "card-swipe-action", () => runSwipeAction(row));
   action.tabIndex = -1;
   action.setAttribute("aria-hidden", "true");
-  const node = button("", "card", () => {
+  const node = button("", "card", (event) => {
     if (state.swipeOpen === row) { closeSwipe(row); return; }
     const mounted = [...$("groups").children].some((section) => [...(section.children || [])].includes(row));
     const current = allSessions().find((session) => session.key === row.dataset.sessionKey);
     if (state.authenticated && mounted && current && chatKey(sourceOf(current)) === row.dataset.sourceKey) {
+      if (event?.shiftKey) {
+        event.preventDefault(); event.stopPropagation();
+        openSessionWindow(current);
+        return;
+      }
       if (groupOf(current) === "needs_input") answerOnOpen(current);
       select(current.key);
     }
@@ -2743,7 +2748,7 @@ function updateCard(node, s, now, folderHint = "") {
     label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
     s.stale ? "마지막 확인 기준" : "", sessionRemoved(s) ? "목록에서 지움" : ""].filter(Boolean).join(". ");
   markCardTerminal(node, s);
-  node.title = `${project}\n${title}`;
+  node.title = `${project}\n${title}\nShift+클릭: 새 창에서 보기`;
   const place = folderHint ? `${project} · ${folderHint}` : project;
   write(p.title, (sessionPinned(s) ? "★ " : "") + title); p.title.title = title;
   write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
