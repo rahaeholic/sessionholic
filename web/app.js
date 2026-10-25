@@ -8036,7 +8036,8 @@ function openQuickReplies(entry, input, trigger) {
     // The session, editor or send state may have changed while the choices were open.
     if (!ready()) return;
     insertChatText(entry, input, text);
-    if (document.activeElement !== input) input.focus?.({ preventScroll: true });
+    // A phone's or an iPad's on-screen keyboard would come up over the reply it just sent.
+    if (document.activeElement !== input && !mobileDevice()) input.focus?.({ preventScroll: true });
     return sendChat(entry);
   };
   // A saved prompt goes in as a block of its own; one marked [입력창] waits there to be edited.
@@ -8044,7 +8045,7 @@ function openQuickReplies(entry, input, trigger) {
     closeQuickReplies();
     if (!ready()) return;
     insertPromptText(entry, input, prompt.body);
-    if (document.activeElement !== input) input.focus?.({ preventScroll: true });
+    if (document.activeElement !== input && (prompt.mode === "insert" || !mobileDevice())) input.focus?.({ preventScroll: true });
     return prompt.mode === "insert" ? undefined : sendChat(entry);
   };
   const replies = quickReplies(), prompts = savedPrompts();
@@ -8076,11 +8077,12 @@ function openQuickReplies(entry, input, trigger) {
     return;
   }
   // Chosen or cancelled, the keyboard goes back to the input, not to the closed tools menu.
+  // A phone or an iPad goes back to the button: the input would bring up its on-screen keyboard.
   trigger?.setAttribute?.("aria-haspopup", "dialog");
   const actions = [...replies.map((text) => ({ label: text, run: () => choose(text) })),
     ...prompts.map((prompt) => ({ label: prompt.title, run: () => choosePrompt(prompt),
       detail: (prompt.mode === "insert" ? "입력창에만 넣기 · " : "") + prompt.body.split("\n").find((line) => line.trim()).trim() }))];
-  openActionSheet({ eyebrow: "문구를 선택하면 바로 전송", title: "빠른 답장", trigger: input || trigger,
+  openActionSheet({ eyebrow: "문구를 선택하면 바로 전송", title: "빠른 답장", trigger: mobileDevice() ? trigger : input || trigger,
     actions: actions.length ? actions : [{ label: "설정 › 빠른 답장에서 문구를 추가해 주세요", disabled: true, run() {} }] });
 }
 function closeQuickReplies() {

@@ -13223,6 +13223,41 @@ test('touch quick replies list saved prompts after the phrases, and prompts alon
   assert.deepEqual(panel.children.map((item) => item.textContent), ['깊게 다시', '검토 · 입력창에만', '닫기']);
 });
 
+test('빠른 답장 시트는 PC·Mac에서 입력창으로 포커스를 돌리고 휴대폰·iPad는 보내거나 닫아도 키보드를 올리지 않는다', async () => {
+  for (const [device, coarse, navigator] of [['pc', false, {}], ['phone', true, {}],
+    ['ipad-keyboard', false, { platform: 'MacIntel', maxTouchPoints: 5 }]]) {
+    const mobile = device !== 'pc';
+    const setup = () => {
+      const sends = [];
+      const c = client(async (url, options) => {
+        if (url === '/api/chat/send') sends.push(JSON.parse(options.body).text);
+        return { ok: true, status: 200, json: async () => url === '/api/chat/state'
+          ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' } };
+      }, noChatTimers);
+      c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+      c.context.navigator = navigator;
+      const { entry } = selectChat(c);
+      vm.runInContext('adoptSavedPrompts', c.context)({ ok: true, revision: 1, prompts: SAVED_PROMPTS });
+      const input = c.get('chat-input'), trigger = node();
+      c.openQuickReplies(entry, input, trigger);
+      return { c, sends, input, trigger, items: c.get('action-list').children };
+    };
+    let { c, input, trigger } = setup();
+    vm.runInContext('closeActionSheet', c.context)();
+    assert.equal(input.focusCount || 0, mobile ? 0 : 1, device + ': cancel');
+    assert.equal(trigger.focusCount || 0, mobile ? 1 : 0, device + ': cancel returns to the button');
+    for (const pick of [0, -2]) {
+      const sent = setup();
+      sent.items.at(pick).events.click(); await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(sent.sends.length, 1, device);
+      assert.equal(sent.input.focusCount || 0, mobile ? 0 : 1, device + ': sending brings no on-screen keyboard');
+    }
+    const insert = setup();
+    insert.items.at(-1).events.click(); await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(insert.sends, [], device); assert.equal(insert.input.focusCount, 1, device + ': [입력창] waits there to be edited');
+  }
+});
+
 test('saved prompt settings save the parsed list, refuse a malformed text without posting, and keep edits on conflict', async () => {
   const bodies = [];
   const c = client(async (url, options) => {
