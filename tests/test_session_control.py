@@ -132,6 +132,160 @@ class SessionControlTest(unittest.TestCase):
         self.assertEqual(result['status'], 'unconfirmed')
         self.assertTrue(self.api.close_provenance(self.codex)['blockedByBoard'])
 
+    def pending_archive(self):
+        self.codex_record()
+        clients = [Client([self.thread()]), Client([self.thread()]),
+                   Client([self.thread()], archive=lambda: (_ for _ in ()).throw(TimeoutError()))]
+        with patch.object(native, '_client', side_effect=clients), patch.object(control, '_codex_process', return_value=None):
+            preview = self.api.preview(self.codex)
+            result = self.api.execute(self.codex, 'terminate', preview['targetProof'], 'request-archive',
+                                      cleanup_terminals=['a' * 32])
+        self.assertFalse(result['confirmed'])
+        self.assertIsNone(result['applied'])
+        return preview
+
+    def closed_thread(self):
+        thread = self.thread(False)
+        thread['thread']['status'] = {'type': 'notLoaded'}
+        thread['thread']['turns'][0]['status'] = 'completed'
+        return thread
+
+    def test_already_unloaded_codex_session_is_cleaned_without_an_archive_mutation(self):
+        self.codex_record()
+        clients = [Client([self.closed_thread()]), Client([self.closed_thread()]), Client([self.closed_thread()])]
+        with patch.object(native, '_client', side_effect=clients), patch.object(control, '_codex_process', return_value=None), patch.object(os, 'kill') as kill:
+            preview = self.api.preview(self.codex)
+            self.assertEqual(preview['capabilities']['terminate']['method'], 'codex-thread-finished')
+            self.assertTrue(preview['capabilities']['terminate']['alreadyEnded'])
+            result = self.api.execute(self.codex, 'terminate', preview['targetProof'], 'request-finished')
+        self.assertTrue(result['confirmed'])
+        self.assertFalse(result['archived'])
+        self.assertFalse(any(method in ('thread/archive', 'turn/interrupt') for client in clients for method, args in client.calls))
+        kill.assert_not_called()
+
+    def test_missing_receipt_is_fenced_before_late_original_dispatch(self):
+        with patch.object(self.api, '_observe') as observe, patch.object(self.api, '_apply') as apply:
+            result = self.api.receipt(self.codex, 'terminate', 'request-delayed', seal_missing=True)
+            late = self.api.execute(self.codex, 'terminate', 'synthetic.' + 'a' * 64, 'request-delayed')
+        self.assertEqual(result['dispatchState'], 'not_started')
+        self.assertEqual(late['dispatchState'], 'not_started')
+        observe.assert_not_called(); apply.assert_not_called()
+
+    def test_replaced_marker_retires_old_pending_without_native_calls(self):
+        self.pending_archive()
+        path = next(self.api.directory.glob('closed-*.json'))
+        marker = json.loads(path.read_text()); marker['requestId'] = 'request-newer'
+        control._save(path, marker)
+        with patch.object(native, '_client') as client:
+            result = self.api.receipt(self.codex, 'terminate', 'request-archive', verify_cleanup=True)
+        self.assertEqual(result['reconcileCode'], 'superseded')
+        self.assertFalse(result['cleanupEligible'])
+        client.assert_not_called()
+
+    def test_missing_old_receipt_with_newer_marker_is_superseded_and_fenced(self):
+        self.pending_archive()
+        result = self.api.receipt(self.codex, 'terminate', 'request-older', seal_missing=True)
+        self.assertEqual(result['reconcileCode'], 'superseded')
+        self.assertNotEqual(result.get('dispatchState'), 'not_started')
+        with patch.object(self.api, '_apply') as apply:
+            late = self.api.execute(self.codex, 'terminate', 'synthetic.' + 'a' * 64, 'request-older')
+        self.assertEqual(late['reconcileCode'], 'superseded'); apply.assert_not_called()
+
+    def test_missing_receipt_with_same_marker_cannot_claim_not_started(self):
+        self.pending_archive()
+        (self.api.directory / 'request-archive.json').unlink()
+        result = self.api.receipt(self.codex, 'terminate', 'request-archive', seal_missing=True)
+        self.assertEqual(result['reconcileCode'], 'insufficient_evidence')
+        self.assertIsNone(result['applied'])
+
+    def test_pending_archive_rechecks_closed_execution_without_resending_or_requiring_archive(self):
+        self.pending_archive()
+        restarted = control.SessionControl(self.home, self.home / 'control')
+        client = Client([self.closed_thread()])
+        with patch.object(native, '_client', return_value=client), patch.object(restarted, '_apply') as apply, patch.object(os, 'kill') as kill:
+            result = restarted.receipt(self.codex, 'terminate', 'request-archive')
+        self.assertTrue(result['confirmed'])
+        self.assertTrue(result['reconciled'])
+        self.assertFalse(result['archived'], 'execution termination does not pretend archiving succeeded')
+        self.assertEqual(result['cleanupTerminals'], ['a' * 32])
+        self.assertEqual(result['scope'], 'selected-session')
+        self.assertEqual({method for method, args in client.calls}, {'thread/read', 'thread/turns/list', 'thread/queue/list', 'thread/loaded/list'})
+        apply.assert_not_called()
+        kill.assert_not_called()
+        with patch.object(native, '_client') as connect:
+            self.assertTrue(restarted.receipt(self.codex, 'terminate', 'request-archive')['confirmed'])
+            connect.assert_not_called()
+
+    def test_legacy_pending_archive_recovers_from_matching_marker(self):
+        self.pending_archive()
+        path = self.api.directory / 'request-archive.json'
+        record = json.loads(path.read_text())
+        record.pop('termination')
+        control._save(path, record)
+        with patch.object(native, '_client', return_value=Client([self.closed_thread()])):
+            self.assertTrue(self.api.receipt(self.codex, 'terminate', 'request-archive')['confirmed'])
+
+    def test_pending_archive_live_unknown_or_changed_source_cannot_authorize_cleanup(self):
+        self.pending_archive()
+        for snapshot, loaded in ((self.thread(), []), (self.closed_thread(), [self.codex['id']])):
+            client = Client([snapshot], loaded=loaded)
+            with patch.object(native, '_client', return_value=client), patch.object(self.api, '_apply') as apply:
+                self.assertFalse(self.api.receipt(self.codex, 'terminate', 'request-archive')['confirmed'])
+                apply.assert_not_called()
+        with patch.object(native, '_client', side_effect=TimeoutError()):
+            self.assertFalse(self.api.receipt(self.codex, 'terminate', 'request-archive')['confirmed'])
+        with patch.object(native, '_client') as connect, self.assertRaises(ValueError):
+            self.api.receipt({**self.codex, 'cwd': '/other'}, 'terminate', 'request-archive')
+        connect.assert_not_called()
+
+    def test_loaded_readback_checks_pages_and_refuses_incomplete_or_cyclic_results(self):
+        from unittest.mock import Mock
+        client = Mock()
+        client.call.side_effect = [{'data': ['other'], 'nextCursor': 'next'}, {'data': [self.codex['id']], 'nextCursor': None}]
+        self.assertTrue(self.api._loaded_codex(client, native._identity(self.codex)))
+        self.assertEqual(client.call.call_args_list[1].args[1]['cursor'], 'next')
+        for page in ({'data': [], 'nextCursor': 'loop'}, {'data': None}, {'data': [None]}):
+            client.call.side_effect = None; client.call.return_value = page
+            self.assertIsNone(self.api._loaded_codex(client, native._identity(self.codex)))
+
+    def test_lost_process_readback_persists_child_identities_before_signal_and_recovers_without_resignal(self):
+        observed = self.observed()
+        child = {**self.process, 'pid': self.process['pid'] + 1, 'start': '42.200'}
+        with patch.object(self.api, '_observe', return_value=observed), patch.object(control, '_descendants', return_value=[child]), \
+                patch.object(control, '_process_info', side_effect=[self.process, TimeoutError()]), patch.object(os, 'kill') as kill:
+            preview = self.api.preview(self.claude)
+            result = self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-process')
+            self.assertFalse(result['confirmed'])
+            kill.assert_called_once_with(self.process['pid'], signal.SIGTERM)
+        stored = json.loads((self.api.directory / 'request-process.json').read_text())
+        self.assertEqual([row['pid'] for row in stored['termination']['signalProcesses']], [self.process['pid'], child['pid']])
+        with patch.object(control, '_process_info', return_value=None), patch.object(control, '_process_ended', side_effect=[True, False]), patch.object(os, 'kill') as kill:
+            self.assertFalse(self.api.receipt(self.claude, 'terminate', 'request-process')['confirmed'])
+            kill.assert_not_called()
+        with patch.object(control, '_process_info', return_value=None), patch.object(control, '_process_ended', return_value=True), patch.object(self.api, '_observe', return_value=observed):
+            self.assertFalse(self.api.receipt(self.claude, 'terminate', 'request-process')['confirmed'], 'a new live execution blocks cleanup on the old receipt')
+        with patch.object(control, '_process_info', return_value=None), patch.object(control, '_process_ended', return_value=True), \
+                patch.object(self.api, '_observe', return_value={'phase': 'unknown', 'process': None}), patch.object(os, 'kill') as kill:
+            self.assertTrue(self.api.receipt(self.claude, 'terminate', 'request-process')['confirmed'])
+            kill.assert_not_called()
+
+    def test_uncertain_background_stop_rechecks_exact_native_run_without_stopping_twice(self):
+        row = self.claude_row('background')
+        with patch.object(native, '_claude_binary', return_value='/fixture/claude'), \
+                patch.object(native, '_claude_run', return_value=json.dumps([row])), patch.object(self.api, '_apply', side_effect=TimeoutError()):
+            preview = self.api.preview(self.claude)
+            self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-background')
+        ended = {**row, 'state': 'stopped', 'status': 'idle'}
+        for candidate in (row, {**ended, 'startedAt': 200}, {**ended, 'sessionId': str(uuid.uuid4())}, {**ended, 'cwd': '/other'}):
+            with patch.object(native, '_claude_binary', return_value='/fixture/claude'), \
+                    patch.object(native, '_claude_run', return_value=json.dumps([candidate])) as run:
+                self.assertFalse(self.api.receipt(self.claude, 'terminate', 'request-background')['confirmed'])
+                self.assertEqual(run.call_args.args[1], ['agents', '--json', '--all'])
+        with patch.object(native, '_claude_binary', return_value='/fixture/claude'), \
+                patch.object(native, '_claude_run', return_value=json.dumps([ended])) as run:
+            self.assertTrue(self.api.receipt(self.claude, 'terminate', 'request-background')['confirmed'])
+            self.assertEqual(run.call_count, 1)
+
     def test_archive_requires_exact_saved_cwd_and_account(self):
         self.codex_record()
         with patch.object(native, '_client', return_value=Client([self.thread()])), patch.object(control, '_codex_process', return_value=None):
@@ -289,6 +443,48 @@ class SessionControlTest(unittest.TestCase):
         with patch.object(native, '_claude_run', side_effect=[b'', json.dumps([replaced]).encode()]):
             result = self.api._apply(self.claude, 'terminate', observed, time.monotonic() + 3)
         self.assertFalse(result['confirmed'])
+
+    def test_finished_background_can_be_cleaned_without_stop_or_any_process_signal_and_replays_once(self):
+        for state in ('done', 'stopped', 'failed'):
+            row = self.claude_row('background', state)
+            source = {**self.claude, 'id': 'finished-' + state}
+            row['id'] = source['id']
+            with self.subTest(state=state), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()) as run, patch.object(os, 'kill') as kill, patch.object(os, 'killpg') as killpg:
+                preview = self.api.preview(source)
+                end = preview['capabilities']['terminate']
+                self.assertTrue(end['supported'])
+                self.assertTrue(end['alreadyEnded'])
+                self.assertEqual(end['method'], 'claude-background-finished')
+                result = self.api.execute(source, 'terminate', preview['targetProof'], 'request-ended-' + state)
+                self.assertTrue(result['confirmed']); self.assertTrue(result['alreadyEnded'])
+                count = run.call_count
+                repeated = self.api.execute(source, 'terminate', preview['targetProof'], 'request-ended-' + state)
+                self.assertTrue(repeated['replayed']); self.assertEqual(run.call_count, count)
+                self.assertEqual(self.api.close_provenance(source), {'blockedByBoard': True, 'status': 'terminated'})
+                self.assertTrue(all(call.args[1] == ['agents', '--json', '--all'] for call in run.call_args_list))
+                kill.assert_not_called(); killpg.assert_not_called()
+
+    def test_finished_background_with_busy_waiting_or_unknown_status_never_authorizes_cleanup(self):
+        for status in ('busy', 'waiting', 'future-status'):
+            row = {**self.claude_row('background', 'done'), 'status': status}
+            with self.subTest(status=status), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()):
+                self.assertFalse(self.api.preview(self.claude)['capabilities']['terminate']['supported'])
+
+    def test_finished_background_without_stable_native_identity_cannot_be_cleaned(self):
+        for change in ({'sessionId': None}, {'sessionId': 'bad'}, {'startedAt': None}, {'startedAt': True}, {'startedAt': -1}):
+            row = {**self.claude_row('background', 'done'), **change}
+            with self.subTest(change=change), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', return_value=json.dumps([row]).encode()):
+                self.assertFalse(self.api.preview(self.claude)['capabilities']['terminate']['supported'])
+
+    def test_finished_background_restarted_or_replaced_after_preview_never_confirms_cleanup(self):
+        row = self.claude_row('background', 'done')
+        for change in ({'state': 'working', 'status': 'busy'}, {'sessionId': str(uuid.uuid4())}, {'startedAt': 101}):
+            values = [json.dumps([row]).encode(), json.dumps([{**row, **change}]).encode()]
+            with self.subTest(change=change), patch.object(native, '_claude_binary', return_value='/fixture/claude'), patch.object(native, '_claude_run', side_effect=values) as run, patch.object(os, 'kill') as kill:
+                preview = self.api.preview(self.claude)
+                result = self.api.execute(self.claude, 'terminate', preview['targetProof'], 'request-replaced-' + str(len(change)) + '-' + str(change.get('startedAt', 0)))
+                self.assertFalse(result['confirmed']); self.assertEqual(result['status'], 'stale')
+                self.assertEqual(run.call_count, 2); kill.assert_not_called()
 
     def test_interactive_claude_lookup_uses_native_pid_registry(self):
         row = self.claude_row()

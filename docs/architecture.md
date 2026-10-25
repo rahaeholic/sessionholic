@@ -2,6 +2,8 @@
 
 세션홀릭(Sessionholic)은 개인이 관리하는 macOS 호스트의 Claude Code·Codex CLI 세션을 발견하고, 선택한 세션의 상태·대화·실행 위치를 이어주는 self-hosted 애플리케이션입니다. 앱 자체가 모델을 실행하거나 native CLI 인증을 소유하지 않습니다. 브라우저는 로컬 보드 서버와 통신하고, native 세션·파일·CLI 명령은 이를 소유한 호스트에서 처리합니다.
 
+작업/기록은 터미널 출력과 대화 본문 중 무엇을 읽을지 정하는 보기입니다. 일반 native 세션은 두 보기 모두 같은 하단 작성창·첨부·음성·모델 제어·승인 카드를 사용하며 전송은 기존 Chat API와 원본 capability·영수증 검증을 재사용합니다. 보기 전환·복원은 자동 전송이나 native 실행을 만들지 않고 입력 DOM을 유지합니다. 일회성·봇 기록은 입력을 제공하지 않습니다.
+
 ```mermaid
 flowchart LR
     B[브라우저 · PWA · xterm] -->|인증 HTTP API| S[보드 서버 · loopback]

@@ -97,6 +97,18 @@ def _codex_command(client, identity, args, thread, home):
         prior = receipt.read()
         if prior:
             if prior.get('digest') != digest: raise ValueError('같은 명령 ID에 다른 값을 사용할 수 없습니다.')
+            if command in ('model', 'effort') and prior['result'].get('status') == 'unknown':
+                with _Ledger(identity, 'model-settings', home):
+                    selected = _preferences(identity, home)
+                    matches = selected.get(command) == value
+                    result = {'status': 'configured' if matches else 'rejected', 'next': selected,
+                              'reason': '현재 모델 설정이 요청값과 일치합니다.' if matches else
+                              '현재 설정에서 요청값을 확인하지 못했습니다. 설정을 확인한 뒤 다시 선택해 주세요.'}
+                    try:
+                        receipt.save({'digest': digest, 'result': result})
+                    except OSError:
+                        pass  # The settings readback is valid even if receipt storage is unavailable.
+                    return result
             return prior['result']
         if not _capabilities(thread)['canSend']:
             raise ValueError('현재 세션에서 이 명령을 사용할 수 없습니다.')

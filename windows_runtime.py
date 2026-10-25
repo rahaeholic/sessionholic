@@ -3,12 +3,13 @@
 The board injects this module, windows_collector and windows_attachments over SSH stdin.
 It starts no server and accepts no arbitrary shell command, PID, binary or filesystem path.
 Besides uploads kept in the session's own work folder (windows_attachments), only metadata
-receipts, unresolved resume permissions and a local proof key are persisted; input is not logged.
+receipts, session model preferences, unresolved resume permissions and a local proof key are
+persisted; input is not logged.
 """
 from __future__ import annotations
 
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -298,7 +299,7 @@ class Store:
 
 class NativeProxy(wc.Proxy):
     ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume',
-                                  'thread/settings/update'}
+                                  'thread/settings/update', 'model/list', 'thread/compact/start'}
 
     def notification(self, until):
         """The next server notification before `until` (monotonic), else None. Waiting stops
@@ -367,6 +368,34 @@ def _capabilities(thread):
     return {'canRead': True, 'canSend': supported, 'canAttachImages': supported,
             'canAnswerApprovals': False, 'canAnswerQuestions': False,
             'reason': None if supported else '이 PC 세션의 직접 입력 지원을 확인하지 못했습니다. 터미널에서 이어가세요.'}
+
+
+def _models(client):
+    """Read the owning account's complete, bounded catalog; never invent model IDs."""
+    models, cursor, seen = [], None, set()
+    for _ in range(4):
+        result = client.call('model/list', {'limit': 100, **({'cursor': cursor} if cursor else {})})
+        if not isinstance(result, dict) or not isinstance(result.get('data'), list) or len(result['data']) > 100:
+            raise ValueError('PC 모델 목록 형식을 확인하지 못했습니다.')
+        for row in result['data']:
+            if (not isinstance(row, dict) or row.get('hidden') or not isinstance(row.get('model'), str)
+                    or not wc.MODEL_ID.fullmatch(row['model'])):
+                continue
+            supported = row.get('supportedReasoningEfforts')
+            if not isinstance(supported, list) or len(supported) > 16:
+                continue
+            efforts = list(dict.fromkeys(item.get('reasoningEffort') for item in supported
+                          if isinstance(item, dict) and item.get('reasoningEffort') in wc.EFFORTS))
+            if efforts:
+                models.append({'model': row['model'], 'label': str(row.get('displayName') or row['model'])[:120],
+                               'efforts': efforts, 'defaultEffort': row.get('defaultReasoningEffort')})
+        cursor = result.get('nextCursor')
+        if cursor is None:
+            return models
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            break
+        seen.add(cursor)
+    raise ValueError('PC 모델 목록을 모두 확인하지 못했습니다. 다시 시도해 주세요.')
 
 
 def _receipt(identity, request_id, thread):
@@ -794,7 +823,7 @@ class WindowsRuntime:
     def chat(self, args):
         source, action = args.get('source'), args.get('action')
         identity = _identity(source)
-        if action not in ('read', 'capabilities', 'send', 'receipt'):
+        if action not in ('read', 'capabilities', 'send', 'receipt', 'command'):
             raise ValueError('지원하지 않는 PC 대화 요청입니다.')
         if identity['agent'] != 'codex':
             if action not in ('read', 'capabilities'):
@@ -811,6 +840,8 @@ class WindowsRuntime:
             return {**self.reader.read('codex', identity['id'], '.codex'),
                     'capabilities': {'canSend': False, 'canRead': True, 'reason': '현재 실행 중인 PC 원본 서버를 확인하지 못했습니다.'}}
         thread = observed['thread']
+        if action == 'command':
+            return self._command(args, observed)
         if action == 'send':
             return self._send(args, observed)
         supplied_ids = args.get('requestIds') or []
@@ -851,11 +882,97 @@ class WindowsRuntime:
             capabilities.update(canSend=False, canLaunch=False, reason=str(exc))
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
         result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
-                  'modelSettings': wc._model_settings(thread),
+                  'modelSettings': {**wc._model_settings(thread), 'next': self._model_preferences(observed)},
                   'capabilities': capabilities, 'readOnly': not capabilities['canSend'], 'receipts': receipts}
         if action == 'receipt':
             result.update(receipts[0])
         return result
+
+    @staticmethod
+    def _model_binding(observed):
+        return {**observed['source'], 'cwd': wc._norm(observed['cwd'])}
+
+    def _model_preferences(self, observed):
+        value = self.store.read('model-settings-' + _digest(observed['source']) + '.json')
+        if value is None:
+            return {}
+        selected = value.get('selected') if isinstance(value, dict) else None
+        if (not isinstance(selected, dict) or set(selected) != {'model', 'effort'}
+                or value.get('binding') != self._model_binding(observed)
+                or not isinstance(selected['model'], str) or not wc.MODEL_ID.fullmatch(selected['model'])
+                or selected['effort'] not in wc.EFFORTS):
+            raise ValueError('PC 세션의 모델 설정 기록을 확인하지 못했습니다.')
+        return selected
+
+    def _command(self, args, observed):
+        command, value, request_id = args.get('command'), args.get('value'), args.get('requestId')
+        if command not in ('models', 'model', 'effort', 'compact'):
+            raise ValueError('지원하는 PC 채팅 명령을 선택해 주세요.')
+        if command in ('models', 'compact') and value is not None:
+            raise ValueError('모델 조회와 요약 명령에는 인자를 넣지 않습니다.')
+        if command != 'models' and (not isinstance(request_id, str) or not REQUEST.fullmatch(request_id)):
+            raise ValueError('PC 명령 요청 식별자가 올바르지 않습니다.')
+        if command in ('model', 'effort') and not isinstance(value, str):
+            raise ValueError('모델 또는 에포트 목록에서 선택해 주세요.')
+        identity, binding = observed['source'], self._model_binding(observed)
+        digest, name = _digest([command, value]), 'command-' + _digest([identity, request_id]) + '.json'
+        # Catalog reads never mutate receipts or the runtime. Atomic preference
+        # replacement lets them read without excluding another session's input.
+        with nullcontext() if command == 'models' else self.store.lock():
+            prior = self.store.read(name) if command != 'models' else None
+            if prior:
+                if prior.get('digest') != digest or prior.get('binding') != binding:
+                    raise ValueError('같은 명령 ID에 다른 대상이나 값을 사용할 수 없습니다.')
+                if command in ('model', 'effort') and prior['result'].get('status') == 'unknown':
+                    selected = self._model_preferences(observed)
+                    matches = selected.get(command) == value
+                    result = {'status': 'configured' if matches else 'rejected', 'next': selected,
+                              'reason': '현재 모델 설정이 요청값과 일치합니다.' if matches else
+                              '현재 설정에서 요청값을 확인하지 못했습니다. 설정을 확인한 뒤 다시 선택해 주세요.'}
+                    try:
+                        self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                    except OSError:
+                        pass  # Readback still confirms the current selection; never reapply it.
+                    return result
+                return prior['result']
+            with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
+                self._verify_endpoint(observed)
+                self._require_resume_verified(observed)
+                thread = self._thread(client, identity, observed['cwd'])
+                current = wc._model_settings(thread)
+                if command == 'models':
+                    return {'models': _models(client), 'current': current, 'next': self._model_preferences(observed)}
+                if not _capabilities(thread)['canSend']:
+                    raise ValueError('현재 PC 세션에서 이 명령을 사용할 수 없습니다.')
+                if command == 'compact' and _state(thread)['phase'] != 'idle':
+                    raise ValueError('진행 중인 작업이 끝난 뒤 요약해 주세요.')
+                if command in ('model', 'effort'):
+                    previous = self._model_preferences(observed) or current
+                    model = value if command == 'model' else previous.get('model')
+                    chosen = next((row for row in _models(client) if row['model'] == model), None)
+                    if chosen is None:
+                        raise ValueError('이 PC 계정에서 선택할 수 있는 모델을 골라 주세요.')
+                    effort = value if command == 'effort' else previous.get('effort')
+                    if command == 'model' and effort not in chosen['efforts']:
+                        effort = chosen['defaultEffort']
+                    if effort not in chosen['efforts']:
+                        raise ValueError('이 모델이 지원하는 에포트 레벨을 골라 주세요.')
+                    selected = {'model': model, 'effort': effort}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': {
+                        'status': 'unknown', 'reason': '모델 설정 결과를 다시 확인해 주세요.'}})
+                    self.store.save('model-settings-' + _digest(identity) + '.json', {'binding': binding, 'selected': selected})
+                    result = {'status': 'configured', 'current': current, 'next': selected,
+                              'reason': '다음 새 응답부터 적용됩니다. 진행 중인 응답은 현재 모델을 유지합니다.'}
+                else:
+                    result = {'status': 'unknown', 'reason': '요약 요청 결과를 확인하지 못했습니다. 자동으로 재실행하지 않습니다.'}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                    try:
+                        client.call('thread/compact/start', {'threadId': identity['id']})
+                        result = {'status': 'accepted', 'reason': '대화 요약을 시작했습니다.'}
+                    except (OSError, ValueError, TimeoutError):
+                        pass
+                self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                return result
 
     def attachment(self, args, data):
         """Store one upload (windows_attachments.receive) in the work folder this PC records
@@ -924,11 +1041,14 @@ class WindowsRuntime:
                 caps = _capabilities(thread)
                 if not caps['canSend']:
                     return {**before, 'delivery': 'rejected', 'reason': caps['reason']}
+                # A follow-up while a turn is running must not replace that turn's model.
+                preferences = self._model_preferences(observed) if _state(thread)['phase'] == 'idle' else {}
                 before = {**before, **named}
                 self.store.save(name, {'digest': digest, 'result': before, **named})
                 result = before
                 try:
-                    response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs, 'clientUserMessageId': request_id})
+                    response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs,
+                                                         'clientUserMessageId': request_id, **preferences})
                     turn = response.get('turn') if isinstance(response, dict) else None
                     if isinstance(turn, dict) and isinstance(turn.get('id'), str):
                         result = {**before, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True, 'turnId': turn['id'], 'reason': None}
@@ -964,7 +1084,8 @@ class WindowsRuntime:
                     'terminate': {'supported': can_end, 'method': 'codex-thread-archive', 'reason': None if can_end else 'PC 실행 상태를 확인하지 못했습니다.',
                                   'effect': ARCHIVE_EFFECT, 'scope': 'session-and-descendants', 'scopeReadback': 'selected-session'}}
                 target = {'identity': identity, 'path': observed['path'], 'cwd': wc._norm(observed['cwd']),
-                          'server': observed['server'], 'turnId': state['activeTurnId'], 'phase': state['phase']}
+                          'server': observed['server'], 'turnId': state['activeTurnId'], 'phase': state['phase'],
+                          'lastTurnId': (observed['thread'].get('turns') or [{}])[-1].get('id')}
                 return {**observed, 'target': target, 'phase': state['phase'], 'capabilities': capabilities}
             observed = self._claude(source)
             row = observed['row']
@@ -991,6 +1112,66 @@ class WindowsRuntime:
         with self.store.lock():
             return self._view(observed)
 
+    def _reconcile_control(self, source, record, name, verify_cleanup=False):
+        result = record['result']
+        if result.get('action') != 'terminate' or result.get('applied') is False:
+            return result
+        if result.get('confirmed') and not verify_cleanup:
+            return result
+        evidence = record.get('termination') or {}
+        target, method = evidence.get('target') or {}, evidence.get('method')
+        details, code = None, 'insufficient_evidence'
+        try:
+            if method == 'codex-thread-archive' and target.get('server') and target.get('path'):
+                current = self.reader.process_reader(target['server']['pid'])
+                key = {'pid': current['pid'], 'start': current['start'], 'exe': wc._norm(current['exe'])} if current else None
+                if key != target['server']:
+                    return {**result, 'cleanupEligible': False, 'reconcileCode': 'execution_changed',
+                            'reason': '원본 서버 실행이 바뀌었습니다. 이전 요청으로 새 실행을 정리하지 않습니다.'}
+                self._verify_endpoint({'path': target['path'], 'server': target['server']})
+                before = self.reader.database_rows(source['id'])
+                with self.proxy_factory(self.reader.binary, target['path'], time.monotonic() + 8) as client:
+                    loaded, complete = _loaded(client)
+                    if 'lastTurnId' in target:
+                        response = client.call('thread/read', {'threadId': source['id'], 'includeTurns': True})
+                        thread = response.get('thread') if isinstance(response, dict) else None
+                        if (not isinstance(thread, dict) or thread.get('id') != source['id']
+                                or wc._norm(thread.get('cwd')) != target['cwd'] or not isinstance(thread.get('turns'), list)):
+                            raise ValueError('종료한 대화의 실행 이력을 확인하지 못했습니다.')
+                        turns = thread['turns']
+                        last = turns[-1].get('id') if turns else None
+                        if last != target['lastTurnId']:
+                            return {**result, 'cleanupEligible': False, 'reconcileCode': 'execution_changed',
+                                    'reason': '새 대화 실행이 확인됐습니다. 이전 요청으로 정리하지 않습니다.'}
+                after = self.reader.database_rows(source['id'])
+                if (before == after and len(after) == 1 and complete and source['id'] not in loaded
+                        and after[0].get('archived') == 1 and wc._norm(after[0].get('cwd')) == target['cwd']):
+                    details = {'archived': True, 'scopeReadback': 'selected-session', 'descendantsConfirmed': False}
+                else:
+                    code = ('execution_changed' if result.get('confirmed') else 'execution_present') if source['id'] in loaded else 'readback_pending'
+            elif method == 'claude-cli-process' and target.get('process'):
+                expected = target['process']
+                current = self.reader.process_reader(expected['pid'])
+                # PID disappearance/reuse only proves this saved process ended. A
+                # replacement registry for the same session must not be cleaned up.
+                if current is None or current != expected:
+                    running = self._claude_running(source['id'])
+                    if not running:
+                        details = {'scopeReadback': 'selected-process', 'descendantsConfirmed': False}
+                    else:
+                        code = 'execution_changed'
+                else:
+                    code = 'execution_present'
+        except (OSError, ValueError, TimeoutError):
+            code = 'readback_unavailable'
+        if details is None:
+            return {**result, 'cleanupEligible': False, 'reconcileCode': code,
+                    'reason': '종료 대상의 현재 상태를 다시 확인하고 있습니다. 종료 명령은 반복하지 않습니다.'}
+        result = {**result, **details, 'confirmed': True, 'cleanupEligible': True,
+                  'reconcileCode': 'verified', 'status': 'terminated', 'reconciled': True, 'reason': None}
+        self.store.save(name, {**record, 'result': result})
+        return result
+
     def execute(self, args):
         source, action, request_id, proof = args.get('source'), args.get('action'), args.get('requestId'), args.get('targetProof')
         identity = _identity(source)
@@ -1009,15 +1190,25 @@ class WindowsRuntime:
         with self.store.lock():
             prior = self.store.read(name)
             if receipt_only:
+                if not prior and action == 'terminate' and args.get('sealMissing') is True:
+                    # Fence a delayed original request: it will find this tombstone
+                    # before it can dispatch, even if it arrives after this read.
+                    result = {'source': identity, 'action': action, 'requestId': request_id,
+                              'confirmed': False, 'applied': False, 'status': 'not_started',
+                              'dispatchState': 'not_started', 'reason': '종료 명령이 실행되지 않았습니다. 상태를 확인한 뒤 다시 요청할 수 있습니다.'}
+                    prior = {'binding': binding, 'cancelled': True, 'result': result}
+                    self.store.save(name, prior)
                 if (action != 'terminate' or not prior or prior.get('binding') != binding
                         or prior.get('result', {}).get('source') != identity
                         or prior['result'].get('action') != action or prior['result'].get('requestId') != request_id):
                     raise ValueError('기존 종료 결과의 대상을 확인하지 못했습니다. 종료를 다시 요청하지 않았습니다.')
-                return {**prior['result'], 'replayed': True}
+                return {**self._reconcile_control(source, prior, name, args.get('verifyCleanup') is True), 'replayed': True}
             if prior:
+                if prior.get('cancelled') and prior.get('binding') == binding:
+                    return {**prior['result'], 'replayed': True}
                 if prior.get('digest') != digest:
                     raise ValueError('같은 요청 ID로 다른 세션을 제어할 수 없습니다.')
-                return {**prior['result'], 'replayed': True}
+                return {**self._reconcile_control(source, prior, name), 'replayed': True}
             data, signature = proof.split('.')
             if not hmac.compare_digest(signature, hmac.new(self.store.secret(), data.encode(), hashlib.sha256).hexdigest()):
                 raise ValueError('PC 세션 확인 정보가 변경되었습니다.')
@@ -1040,14 +1231,17 @@ class WindowsRuntime:
             if not cap['supported']:
                 return {**result, 'reason': cap['reason']}
             pending = {**result, 'applied': None, 'status': 'unconfirmed', 'reason': 'PC 실행 결과를 확인하지 못했습니다. 자동 재실행하지 않습니다.'}
-            self.store.save(name, {'digest': digest, 'binding': binding, 'result': pending})
+            record = {'digest': digest, 'binding': binding, 'result': pending}
+            if action == 'terminate':
+                record['termination'] = {'method': cap['method'], 'target': observed['target']}
+            self.store.save(name, record)
             self.store.save(proof_name, {'result': pending})
             try:
                 details = self._apply(observed, action)
                 result.update(details)
             except (OSError, ValueError, TimeoutError):
                 result = pending
-            self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+            self.store.save(name, {**record, 'result': result})
             self.store.save(proof_name, {'result': result})
             return result
 

@@ -107,7 +107,11 @@ def latest_codex():
 
 
 def update_npm(row, root, current, latest):
-    if tuple(map(int, current.split("-")[0].split("."))) >= tuple(map(int, latest.split("."))):
+    if not VERSION.fullmatch(current) or not VERSION.fullmatch(latest) or "-" in latest:
+        raise ValueError("invalid stable release version")
+    current_core = tuple(map(int, current.split("-", 1)[0].split(".")))
+    latest_core = tuple(map(int, latest.split(".")))
+    if current_core > latest_core or (current_core == latest_core and "-" not in current):
         return current
     launcher = Path(row["path"])
     if not launcher.is_symlink():

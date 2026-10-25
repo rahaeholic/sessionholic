@@ -165,6 +165,28 @@ class BotRequestsTest(unittest.TestCase):
         with self.assertRaisesRegex(bots.SourceError, '인덱스'):
             bots.read_source(source, self.home)
 
+    def test_hermes_latest_activity_precedes_limit_including_old_schema_and_large_ledger(self):
+        for with_activity in (True, False):
+            with self.subTest(with_activity=with_activity):
+                source = {**self.source, 'kind': 'hermes_sqlite', 'path': f'hermes-{with_activity}.db'}
+                path = self.database(source)
+                with closing(sqlite3.connect(path)) as db, db:
+                    db.executescript('CREATE TABLE sessions(id TEXT PRIMARY KEY,source TEXT,session_key TEXT,user_id TEXT,chat_id TEXT,'
+                        'started_at REAL,ended_at REAL,origin_json TEXT' + (',last_activity_at REAL' if with_activity else '') + ');'
+                        'CREATE INDEX idx_started ON sessions(started_at);')
+                    db.executemany('INSERT INTO sessions VALUES(' + ','.join('?' for _ in range(9 if with_activity else 8)) + ')',
+                        [(f's{n:05}', 'slack', 'thread', 'user', 'channel', n, None, '{}') + ((n,) if with_activity else ())
+                         for n in range(1, 30001)])
+                    column = 'last_activity_at' if with_activity else 'ended_at'
+                    db.execute('UPDATE sessions SET ' + column + '=50000 WHERE id IN (\'s00001\',\'s00002\')')
+                    db.execute('UPDATE sessions SET ended_at=60000 WHERE id=\'s00003\'')
+                before = hashlib.sha256(path.read_bytes()).hexdigest()
+                rows = bots.read_source(source, self.home)['requests']
+                self.assertEqual(len(rows), bots.LIMIT)
+                self.assertEqual([row['id'] for row in rows[:3]], [bots._opaque(source, f's{n:05}') for n in (3, 2, 1)])
+                self.assertEqual([row['updatedAt'] for row in rows[:3]], [bots._stamp(n) for n in (60000, 50000, 50000)])
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+
     def test_query_deadline_interrupts_read_without_retry(self):
         self.ledger(125)
         with patch.object(bots.time, 'monotonic', side_effect=[0] + [2] * 1000):

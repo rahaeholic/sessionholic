@@ -214,16 +214,18 @@ def _holicii(connection, source):
 
 def _hermes(connection, source):
     columns = _columns(connection, "sessions", {"id", "source", "session_key", "user_id", "chat_id", "started_at", "ended_at", "origin_json"})
-    # Use an existing time index; the list never reads message bodies or imported native
-    # history (a conversation is read on its own, for one request: read_conversation).
+    # The list never reads message bodies or imported native history. Old sessions
+    # may be the most recently active, so apply LIMIT only after activity ordering.
+    # A bounded SQLite deadline also covers ledgers without an activity index.
     index = _index_on(connection, "sessions", ("started_at",))
     if index is None:
         raise SourceError("봇 세션의 최신 기록 인덱스를 확인하지 못했습니다.")
     activity = "last_activity_at" if "last_activity_at" in columns else "started_at"
+    activity = 'max(coalesce(' + activity + ',0),coalesce(ended_at,0),coalesce(started_at,0))'
     query = ('SELECT id,user_id,chat_id,substr(session_key,1,512) AS session_key,started_at,ended_at,'
              + activity + ' AS activity,substr(origin_json,1,16384) AS origin '
-             'FROM sessions INDEXED BY "' + index.replace('"', '""') + '" '
-             "WHERE source='slack' AND session_key IS NOT NULL ORDER BY started_at DESC LIMIT ?")
+             "FROM sessions WHERE source='slack' AND session_key IS NOT NULL "
+             "ORDER BY activity DESC,started_at DESC,id DESC LIMIT ?")
     result = []
     for row in connection.execute(query, (LIMIT,)):
         try:
@@ -233,7 +235,7 @@ def _hermes(connection, source):
         if not isinstance(origin, dict):
             raise SourceError("봇 세션의 출처 정보를 확인하지 못했습니다.")
         result.append(_base(source, row["id"], title="Slack 봇 대화", status="closed" if row["ended_at"] else "unknown",
-                            updated=row["ended_at"] or row["activity"] or row["started_at"],
+                            updated=row["activity"],
                             channel=_text(origin.get("chat_name"), _alias("채널", source, row["chat_id"]), 60),
                             requester=_text(origin.get("user_name"), _alias("요청자", source, row["user_id"]), 40),
                             conversation=row["id"] if isinstance(row["id"], str) and HERMES_ID.fullmatch(row["id"]) else None,

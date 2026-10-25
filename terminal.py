@@ -68,6 +68,8 @@ CODEX_ATTACH_IDLE = 1800
 # only when it rests at an empty prompt and the session it names is not at work.
 RUN_IDLE = 3 * 3600
 RUN_MODES = ("new-session", "resume", "handoff", "transfer")
+ACTIVITY_SAVE_INTERVAL = 30
+ACTIVITY_RECONNECT_GRACE = 300
 # After a look on other tmux servers told nothing (_elsewhere), the next one waits this long.
 LOOK_AGAIN_SECONDS = 600
 # Closed rows kept, the oldest forgotten first. The user's own closes are kept longer:
@@ -125,7 +127,7 @@ def _metadata(value):
     for key, item in value.items():
         if not isinstance(key, str):
             raise ValueError("터미널 정보가 올바르지 않습니다.")
-        if key != "nativeSource":
+        if key not in ("nativeSource", "chatSource"):
             if not isinstance(item, (str, int, bool, type(None))):
                 raise ValueError("터미널 정보가 올바르지 않습니다.")
             continue
@@ -196,17 +198,27 @@ class _Terminal:
         # When this process saw it close (monotonic); a row loaded closed closed long ago.
         self.closed_at = None if self.alive else float("-inf")
         self.epoch = secrets.token_hex(16)
+        self.bracketed_paste = None
+        self.mode_tail = b""
         self.scrolled = False
         # Set when a new attach client starts: the first input then also leaves any
         # copy-mode, whose in-memory flag a gateway restart would have lost.
         self.attached_fresh = False
-        # Last read, input or resize from a browser (monotonic). A row loaded after a
-        # restart counts from now, so a connection in use is not released before its
-        # browser reads again.
+        # Last actual browser use. The manager restores its age from activity.json;
+        # reconnect_until protects returning browsers without resetting that age.
         self.touched = time.monotonic()
+        self.last_used_at = int(time.time())
+        self.reconnect_until = 0
 
     def append(self, data):
         with self.condition:
+            modes = self.mode_tail + data
+            for match in re.finditer(rb"\x1b(?:c|\[\?([0-9;]{1,64})([hl]))", modes):
+                if match.group(1) is None:
+                    self.bracketed_paste = False
+                elif b"2004" in match.group(1).split(b";"):
+                    self.bracketed_paste = match.group(2) == b"h"
+            self.mode_tail = modes[-72:]
             self.output.extend(data)
             self.offset += len(data)
             if len(self.output) > self.limit:
@@ -239,7 +251,8 @@ class _Terminal:
             begin = start if reset else after
             data = bytes(self.output[begin - start:])
             return {"after": self.offset, "data": base64.b64encode(data).decode("ascii"),
-                    "reset": reset, "alive": self.alive, "epoch": self.epoch}
+                    "reset": reset, "alive": self.alive, "epoch": self.epoch,
+                    **({"bracketedPaste": self.bracketed_paste} if self.bracketed_paste is not None else {})}
 
 
 class TerminalManager:
@@ -253,6 +266,9 @@ class TerminalManager:
         self.state_dir = Path(state_dir) if state_dir is not None else DEFAULT_STATE
         _private_directory(self.state_dir)
         self.state_path = self.state_dir / "sessions.json"
+        self.activity_path = self.state_dir / "activity.json"
+        self._activity_flushed = time.monotonic()
+        self._activity_persistence_available = True
         self.max_terminals = max_terminals
         self.buffer_limit = buffer_limit
         self.lock = threading.RLock()
@@ -287,6 +303,15 @@ class TerminalManager:
             raise RuntimeError("다른 보드가 같은 터미널 상태 경로를 사용 중이거나 경로가 안전하지 않습니다.") from None
         try:
             self._load()
+            try:
+                self._load_activity()
+            except (OSError, ValueError, RuntimeError):
+                # This optional usage ledger is not a native identity/control
+                # receipt. Keep the board available and preserve the bad file.
+                self._activity_persistence_available = False
+                for item in self.terminals.values():
+                    item.reconnect_until = time.monotonic() + ACTIVITY_RECONNECT_GRACE
+                sys.stderr.write("터미널 사용 기록을 읽지 못해 이번 시작 시점부터 미사용 시간을 확인합니다. 기존 파일은 유지합니다.\n")
         except BaseException:
             os.close(self._lock_fd)
             raise
@@ -454,6 +479,58 @@ class TerminalManager:
     def _save(self):
         _private_json(self.state_path, [t.record for t in self.terminals.values()])
 
+    def _load_activity(self):
+        try:
+            fd = os.open(str(self.activity_path), os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            data = {"version": 1, "lastUsed": {}}
+        except OSError:
+            raise ValueError("터미널 사용 기록 경로가 안전하지 않습니다.") from None
+        else:
+            with os.fdopen(fd, encoding="utf-8") as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1 or info.st_size > 2 * 1024 * 1024):
+                    raise ValueError("터미널 사용 기록 경로가 안전하지 않습니다.")
+                os.fchmod(stream.fileno(), 0o600)
+                try:
+                    data = json.load(stream)
+                except ValueError:
+                    raise RuntimeError("터미널 사용 기록을 읽지 못했습니다.") from None
+        if (not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1
+                or not isinstance(data.get("lastUsed"), dict) or len(data["lastUsed"]) > 10000
+                or any(not isinstance(key, str) or not ID.fullmatch(key) or type(stamp) is not int or stamp < 0
+                       for key, stamp in data["lastUsed"].items())):
+            raise ValueError("터미널 사용 기록 형식이 올바르지 않습니다.")
+        now, wall, seed = time.monotonic(), int(time.time()), False
+        for identifier, item in self.terminals.items():
+            stamp = data["lastUsed"].get(identifier)
+            if stamp is None:
+                stamp = wall; seed = True
+            item.last_used_at = min(stamp, wall)
+            item.touched = now - max(0, wall - stamp)
+            if not item.record.get("closed", False):
+                item.reconnect_until = now + ACTIVITY_RECONNECT_GRACE
+        if seed or not self.activity_path.exists():
+            self._persist_activity(force=True)
+
+    def _persist_activity(self, force=False):
+        if not self._activity_persistence_available:
+            return
+        now = time.monotonic()
+        if not force and now - self._activity_flushed < ACTIVITY_SAVE_INTERVAL:
+            return
+        self._activity_flushed = now
+        try:
+            _private_json(self.activity_path, {"version": 1, "lastUsed": {
+                identifier: item.last_used_at for identifier, item in self.terminals.items()}})
+        except (OSError, ValueError, RuntimeError):
+            pass  # Housekeeping persistence never blocks a live input/read.
+
+    @staticmethod
+    def _idle_seconds(terminal, now):
+        return 0 if now < terminal.reconnect_until else max(0, now - terminal.touched)
+
     @staticmethod
     def _public(terminal):
         # Seconds since a browser last read, typed into or resized it (the board's own screen
@@ -462,7 +539,7 @@ class TerminalManager:
         return {**copy.deepcopy(terminal.record["metadata"]), "id": terminal.record["id"], "key": terminal.record["key"],
                 "metadata": copy.deepcopy(terminal.record["metadata"]), "alive": terminal.alive,
                 "closed": terminal.record.get("closed", False), "closedReason": terminal.record.get("closedReason"),
-                "closedAt": terminal.record.get("closedAt"), "idleSeconds": idle}
+                "closedAt": terminal.record.get("closedAt"), "idleSeconds": idle, "lastUsedAt": terminal.last_used_at}
 
     def _get(self, terminal_id):
         if self._closed:
@@ -477,7 +554,12 @@ class TerminalManager:
     def _use(self, terminal_id):
         """A terminal a browser reads, types into or resizes; marks it recently used."""
         terminal = self._get(terminal_id)
-        terminal.touched = time.monotonic()
+        now = time.monotonic()
+        first_after_idle = now - terminal.touched >= ACTIVITY_SAVE_INTERVAL
+        terminal.touched = now
+        terminal.last_used_at = int(time.time())
+        terminal.reconnect_until = 0
+        self._persist_activity(force=first_after_idle)
         return terminal
 
     @contextmanager
@@ -525,7 +607,7 @@ class TerminalManager:
                         raise RuntimeError("이 터미널의 CLI가 종료되었습니다. 새 작업으로 시작하세요.")
                     self._adopt(terminal)
                     self._attach(terminal)
-                    terminal.touched = time.monotonic()
+                    self._use(terminal.record["id"])
                     return self._public(terminal)
             if not self._make_room(len(self.reservations - {key}), key):
                 raise RuntimeError("열 수 있는 터미널 수를 초과했습니다.")
@@ -560,6 +642,7 @@ class TerminalManager:
                 if terminal_id not in self.terminals:
                     launch_path.unlink(missing_ok=True)
                 raise
+            self._persist_activity(force=True)
             return self._public(terminal)
 
     def _started(self, terminal, launch_path):
@@ -907,15 +990,37 @@ class TerminalManager:
                 raise RuntimeError("터미널 크기를 변경하지 못했습니다.") from None
         return {"ok": True}
 
+    def link_chat(self, terminal_id, source):
+        """Persist an explicitly selected transcript, without granting native input/cleanup identity."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+            previous = terminal.record["metadata"]
+            if (terminal.record.get("closed") or not terminal.alive or previous.get("mode") != "new-session"
+                    or previous.get("linkConfidence") == "exact" or not isinstance(source, dict)
+                    or source.get("host") != previous.get("host")
+                    or previous.get("program") in ("codex", "claude") and source.get("agent") != previous["program"]):
+                raise ValueError("이 터미널의 채팅 연결을 다시 확인해 주세요.")
+            terminal.record["metadata"] = _metadata({**previous, "chatSource": source})
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+            result = self._public(terminal)
+        self._changed()
+        return result
+
     def link_native(self, terminal_id, native, confidence="exact"):
-        """Record a launcher's native session; exact evidence may confirm the same estimate."""
+        """Exact host-owned evidence can correct a new launcher's estimate, never an exact binding."""
         with self.lock:
             if confidence not in ("exact", "estimated"):
                 raise ValueError("세션 연결 근거를 확인해 주세요.")
             terminal = self._get(terminal_id)
             previous = terminal.record["metadata"]
-            if previous.get("nativeSource") and not (confidence == "exact" and
-                    previous.get("linkConfidence") == "estimated" and previous["nativeSource"] == native):
+            correction = (confidence == "exact" and previous.get("linkConfidence") == "estimated"
+                          and (previous.get("nativeSource") == native or previous.get("mode") == "new-session"
+                               and isinstance(native, dict) and native.get("host") == previous.get("host")))
+            if previous.get("nativeSource") and not correction:
                 return False
             metadata = _metadata({**terminal.record["metadata"], "nativeSource": native, "linkConfidence": confidence})
             terminal.record["metadata"] = metadata
@@ -938,7 +1043,7 @@ class TerminalManager:
                 # Only Claude connections, which the board opens itself to send or answer;
                 # a Codex connection the user opened closes only when room is needed.
                 if (terminal.alive and self._releasable(terminal) and terminal.record["metadata"].get("agent") == "claude"
-                        and now - terminal.touched >= CLOSE_IDLE):
+                        and self._idle_seconds(terminal, now) >= CLOSE_IDLE):
                     try:
                         self._end(terminal, "released")
                         released = True
@@ -1095,7 +1200,7 @@ class TerminalManager:
                         or terminal.record["key"] in self.reservations or self._unrecorded(terminal)
                         or self._foreign(terminal) or type(read) is not int or wall - read > LAUNCHER_PROGRAM_FRESH):
                     continue
-                idle = now - terminal.touched
+                idle = self._idle_seconds(terminal, now)
                 if metadata.get("program") == "claude-agents" and idle >= LAUNCHER_AGENTS_IDLE:
                     found.append(terminal.record["id"])
                 elif (metadata.get("program") is None and metadata.get("programMenu") is True
@@ -1110,7 +1215,7 @@ class TerminalManager:
         with self.lock:
             return [self._public(t) for t in self.terminals.values()
                     if self._releasable(t) and t.record["metadata"].get("agent") == "codex"
-                    and now - t.touched >= CODEX_ATTACH_IDLE and self._exists(t)]
+                    and self._idle_seconds(t, now) >= CODEX_ATTACH_IDLE and self._exists(t)]
 
     def release_codex_attach(self, terminal_id):
         """End one connection idle_codex_attaches named, if it still is one; its row, else None."""
@@ -1147,7 +1252,7 @@ class TerminalManager:
                 metadata = terminal.record["metadata"]
                 if (metadata.get("mode") not in RUN_MODES or terminal.record.get("closed", False)
                         or terminal.record["key"] in self.reservations or self._unrecorded(terminal)
-                        or self._foreign(terminal) or now - terminal.touched < RUN_IDLE
+                        or self._foreign(terminal) or self._idle_seconds(terminal, now) < RUN_IDLE
                         or (metadata.get("mode") == "new-session"
                             and metadata.get("program") not in ("claude", "codex", "ssh"))):
                     continue
@@ -1190,7 +1295,7 @@ class TerminalManager:
                 keep = (next((terminal for terminal in group if not self._releasable(terminal)), None)
                         or max(group, key=lambda terminal: terminal.touched))
                 spare += [self._public(terminal) for terminal in group if terminal is not keep
-                          and self._releasable(terminal) and now - terminal.touched >= CLOSE_IDLE]
+                          and self._releasable(terminal) and self._idle_seconds(terminal, now) >= CLOSE_IDLE]
             return spare
 
     def release_spare_attach(self, terminal_id):
@@ -1345,7 +1450,7 @@ class TerminalManager:
         idle = [t for t in self.terminals.values()
                 if self._releasable(t) and t.record["key"] != keep
                 and t.record["metadata"].get("agent") != "codex"
-                and now - t.touched >= RELEASE_IDLE and self._exists(t)]
+                and self._idle_seconds(t, now) >= RELEASE_IDLE and self._exists(t)]
         if not idle:
             return False
         self._end(min(idle, key=lambda t: t.touched), "released")
@@ -1356,6 +1461,7 @@ class TerminalManager:
         with self.lock:
             if self._closed:
                 return
+            self._persist_activity(force=True)
             try:
                 for terminal_id in list(self.terminals):
                     self.detach(terminal_id)

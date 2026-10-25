@@ -33,6 +33,7 @@
     <script src="/session_delegation.js" defer></script>
     <script src="/push.js" defer></script>
     <script src="/workspace.js" defer></script>
+    <script src="/terminal-ime.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
@@ -147,8 +148,8 @@
           </svg>
         </button>
         <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
-        <button id="workspace-view-toggle" class="quiet workspace-view-toggle" type="button" hidden>단일 화면</button>
-        <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>◫ 분할</button>
+        <button id="workspace-arrange" class="quiet workspace-split-open" type="button" title="창을 좌우에 같은 너비로 나란히 배치" hidden>세로 정렬</button>
+        <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>＋ 분할 추가</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
       <div
@@ -278,8 +279,8 @@
         <main id="detail" class="detail-pane" aria-label="세션 대화">
           <div class="welcome">
             <img class="welcome-mark" src="/icon.svg" alt="" />
-            <h2>맥락부터 확인하세요.</h2>
-            <p>세션을 고르면 최근 대화를 볼 수 있습니다.<br />이어서 사용할 에이전트와 계정도 여기서 선택하세요.</p>
+            <h2>빈 창</h2>
+            <p>새 세션을 시작하거나 기존 세션을 이 창에서 여세요.</p>
           </div>
         </main>
         </section>
@@ -393,6 +394,8 @@
           ><button type="button" data-key="ctrl-u" aria-label="Ctrl+U 줄 지우기">^U</button
           ><button type="button" data-key="ctrl-x" aria-label="Ctrl+X">^X</button
           ><button type="button" data-key="ctrl-l" aria-label="Ctrl+L 화면 다시 그리기">^L</button
+          ><button type="button" data-key="ctrl-up" aria-label="Ctrl+위 화살표, Codex 선택창">⌃↑</button
+          ><button type="button" data-key="shift-left" aria-label="Shift+왼쪽 화살표, Codex 질문 보기">⇧←</button
           ><button type="button" data-key="alt-left" aria-label="Option+왼쪽 화살표">⌥←</button
           ><button type="button" data-key="up" class="arrow-key" aria-label="위 방향키">↑</button
           ><button type="button" data-key="left" class="arrow-key" aria-label="왼쪽 방향키">←</button
@@ -409,17 +412,20 @@
           </div>
           <input id="terminal-files" type="file" multiple hidden>
           <label for="terminal-draft" class="sr-only">터미널에 보낼 입력</label>
-          <p class="draft-mode-note">터미널에 직접 입력 · Enter로 실행</p>
+          <p class="draft-mode-note">터미널에 보낼 내용 · 보내기 버튼으로 실행</p>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
             <textarea
               id="terminal-draft"
+              enterkeyhint="enter"
               aria-describedby="terminal-draft-keys"
               rows="1"
               maxlength="32000"
               placeholder="터미널에 직접 입력할 내용"
               autocapitalize="off"
               spellcheck="false"
+              autocorrect="off"
+              autocomplete="off"
             ></textarea
             ><button id="draft-attach" class="draft-attach" type="button" aria-label="사진 또는 파일 첨부" title="파일 첨부 · 입력창에 바로 붙여넣어도 됩니다">＋</button
             ><button id="draft-mic" class="draft-mic" type="button" aria-label="음성 입력" aria-pressed="false" title="음성 입력 (브라우저 음성 인식)" hidden>
@@ -585,11 +591,13 @@
           <button id="saved-prompts-reload" class="push-button" type="button">최신 프롬프트 불러오기</button>
         </div>
         <label class="theme-label settings-section" for="workspace-keys">창 이동 단축키 · Mac / iPad</label>
+        <p class="plan-preserve">Option+0: 터미널/채팅 전환 · Option+1~4: 창 번호 선택. 추가 단축키 조합:</p>
         <select id="workspace-keys" class="workspace-keys">
-          <option value="ctrl-meta">Control + Command (기본)</option>
+          <option value="ctrl-meta">Control + Command</option>
           <option value="ctrl-alt-meta">Control + Option + Command</option>
         </select>
         <p class="plan-preserve">선택한 조합 + 방향키: 창 이동 · 1~4: 바로 이동 · Enter: 확대·복원</p>
+        <p class="plan-preserve">Control+Command+W: 현재 분할창만 닫기 · 세션 실행은 유지</p>
         <p id="push-label" class="theme-label settings-section">알림</p>
         <p id="push-status" class="plan-preserve" role="status" aria-live="polite"></p>
         <div class="push-actions">
@@ -714,6 +722,7 @@
         <dl class="shortcuts">
           <dt><kbd>↑</kbd> <kbd>↓</kbd></dt><dd>세션 이동 (<kbd>Home</kbd> <kbd>End</kbd> 처음·끝, <kbd>PgUp</kbd> <kbd>PgDn</kbd> 5개씩)</dd>
           <dt><kbd>→</kbd> <kbd>Enter</kbd></dt><dd>대화로 들어가 입력창에 바로 입력 (답 필요 세션은 선택지부터)</dd>
+          <dt><kbd>Shift+클릭</kbd></dt><dd>기존 분할을 유지하고 세션을 새 창에서 보기</dd>
           <dt><kbd>Space</kbd></dt><dd>들어가지 않고 옆에 보기</dd>
           <dt><kbd>P</kbd></dt><dd>상단 고정·해제</dd>
           <dt><kbd>R</kbd></dt><dd>제목 수정</dd>
@@ -731,9 +740,11 @@
         </dl>
         <p class="theme-label">창 분할 · Mac / iPad 외장 키보드</p>
         <dl class="shortcuts">
-          <dt><kbd>Control+Command+← ↑ ↓ →</kbd></dt><dd>해당 방향의 세션 창으로 이동</dd>
+          <dt><kbd>Option+1</kbd>–<kbd>4</kbd></dt><dd>상단 번호의 창으로 바로 이동</dd>
+          <dt><kbd>Control+Command+← ↑ ↓ →</kbd></dt><dd>창 이동의 추가 단축키</dd>
           <dt><kbd>Control+Command+1</kbd>–<kbd>4</kbd></dt><dd>배치 순서의 창으로 바로 이동</dd>
           <dt><kbd>Control+Command+Enter</kbd></dt><dd>현재 창 확대·원래 배치 복원</dd>
+          <dt><kbd>Control+Command+W</kbd></dt><dd>현재 분할창만 닫기 · 세션 실행은 유지</dd>
         </dl>
         <p class="theme-label">세션 끝내기</p>
         <dl class="shortcuts">

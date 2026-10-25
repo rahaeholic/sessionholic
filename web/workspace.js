@@ -57,6 +57,12 @@
     }
     return out;
   }
+  function tiled(list) {
+    if (list.length === 1) return leaf(list[0]);
+    const middle = Math.ceil(list.length / 2);
+    return { axis: "x", ratio: middle / list.length,
+      children: [tiled(list.slice(0, middle)), tiled(list.slice(middle))] };
+  }
   function ratioAt(tree, path, ratio) {
     if (tree.pane || !/^[01]*$/.test(path)) return tree;
     if (!path) return { ...tree, ratio: Math.max(0.15, Math.min(0.85, ratio)) };
@@ -78,10 +84,25 @@
       }).sort((a, b) => a.score - b.score)[0]?.id || null;
   }
   function shortcut(event, modifiers = "ctrl-meta") {
-    if (!event.ctrlKey || !event.metaKey || !!event.altKey !== (modifiers === "ctrl-alt-meta") || event.shiftKey || event.isComposing || event.keyCode === 229) return null;
-    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return { direction: event.key };
+    if (event.shiftKey) return null;
+    const composing = event.isComposing || event.keyCode === 229;
+    if (!event.ctrlKey && !event.metaKey && event.altKey &&
+        (event.code === "Digit0" || event.key === "0" && !composing)) return { view: true };
+    const physicalDigit = /^Digit([1-4])$/.exec(event.code || "")?.[1];
+    const digit = physicalDigit || (/^[1-4]$/.test(event.key) ? event.key : null);
+    // A physical Option+number is an explicit pane selection, even while an
+    // IME owns its last word. focus() commits that editor before moving it.
+    if (!event.ctrlKey && !event.metaKey && event.altKey && digit && (!composing || physicalDigit))
+      return { number: Number(digit) };
+    if (composing) return null;
+    if (event.ctrlKey && event.metaKey && !event.altKey &&
+        (event.code === "KeyW" || event.key?.toLowerCase() === "w")) return { close: true };
+    const key = ({ UIKeyInputLeftArrow: "ArrowLeft", UIKeyInputRightArrow: "ArrowRight",
+      UIKeyInputUpArrow: "ArrowUp", UIKeyInputDownArrow: "ArrowDown" })[event.key] || event.key;
+    const configured = event.ctrlKey && event.metaKey && !!event.altKey === (modifiers === "ctrl-alt-meta");
+    if (!configured) return null;
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) return { direction: key };
     if (event.key === "Enter") return { maximize: true };
-    const digit = /^Digit([1-4])$/.exec(event.code || "")?.[1] || (/^[1-4]$/.test(event.key) ? event.key : null);
     return digit ? { number: Number(digit) } : null;
   }
   function validRef(value) {
@@ -106,13 +127,15 @@
     return { version: 1, tree: copy(value.tree), active: ids(value.tree).includes(value.active) ? value.active : ids(value.tree)[0], panes,
       ...(value.single === true ? { single: true } : {}) };
   }
-  const model = { MAX_PANES, ids, leaf, validTree, remove, split, move, geometry, ratioAt, neighbor, shortcut, validRef, restoreLayout };
+  const model = { MAX_PANES, ids, leaf, validTree, remove, split, move, geometry, tiled, ratioAt, neighbor, shortcut, validRef, restoreLayout };
   if (typeof module !== "undefined" && module.exports) { module.exports = model; return; }
   if (!root?.document) return;
 
   const doc = root.document;
   const $ = (id) => doc.getElementById(id);
   const embedded = root.location.pathname === "/pane";
+  // An inspection window must neither restore nor overwrite the main workspace.
+  const detached = !embedded && new URLSearchParams(root.location.search).get("window") === "1";
   const ownId = embedded ? new URLSearchParams(root.location.search).get("pane") : "p1";
   let hooks, parent, tree = leaf("p1"), active = "p1", maximized = false, restored = false, enabled = false, internal = 0;
   let frameReady = false, restoring = false, drag = null, pointer = null, refreshTimer = null;
@@ -131,7 +154,9 @@
     return node;
   }
   function paneBar(id, container) {
-    const bar = make("header", "workspace-pane-bar"), title = make("button", "workspace-pane-title", "빈 창");
+    const bar = make("header", "workspace-pane-bar"), title = make("button", "workspace-pane-title");
+    const label = make("span", "workspace-pane-label", "빈 창"), meta = make("span", "workspace-pane-meta");
+    title.append(label, meta);
     bar.hidden = true;
     title.type = "button"; title.draggable = true; title.title = "창 제목을 끌어 배치 변경";
     title.addEventListener("click", () => focus(id));
@@ -157,13 +182,14 @@
       pointer = null; clearDrag();
     });
     title.addEventListener("pointercancel", () => { pointer = null; clearDrag(); });
-    bar.append(title, button("오른쪽으로 분할", "◫", () => add(null, id, "right")),
-      button("아래로 분할", "⬒", () => add(null, id, "bottom")),
-      button("창 확대·복원 · Control+Command+Enter", "⤢", () => { focus(id, false); maximize(); }),
-      button("이 창만 닫기 · 세션 실행은 유지", "×", () => closePane(id)));
+    const view = button("이 창 확대", "이 창 확대", () => { if (focus(id, false)) maximize(); });
+    view.classList.add("workspace-pane-view");
+    const close = button("이 창만 닫기 (⌃⌘W) · 세션 실행은 유지", "×", () => closePane(id));
+    close.setAttribute("aria-keyshortcuts", "Control+Meta+W");
+    bar.append(title, view, close);
     bar.addEventListener("pointerdown", () => focus(id, false));
     container.prepend(bar);
-    return { bar, title };
+    return { bar, title, label, meta, view };
   }
   function record(id, ref = null) {
     if (panes.has(id)) return panes.get(id);
@@ -189,7 +215,7 @@
   function visible(id = ownId) { return embedded ? frameReady : !enabled || ids(tree).includes(id); }
   function managed() { return embedded || enabled; }
   function persist() {
-    if (restoring || !hooks?.describe().authenticated) return;
+    if (detached || restoring || !hooks?.describe().authenticated) return;
     const refs = {};
     for (const id of ids(tree)) refs[id] = validRef(panes.get(id)?.ref || panes.get(id)?.hooks?.describe().ref);
     hooks.prefs.set("workspace", { version: 1, tree: copy(tree), active, panes: refs, ...(maximized ? { single: true } : {}) });
@@ -201,16 +227,11 @@
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
-    const viewToggle = $("workspace-view-toggle");
-    if (viewToggle) {
-      viewToggle.hidden = !enabled;
-      viewToggle.textContent = maximized ? "분할 복원" : "단일 화면";
-      viewToggle.title = maximized ? "저장된 창 분할로 돌아가기" : "현재 창만 크게 보기 · 다른 창과 초안은 유지";
-      viewToggle.setAttribute("aria-pressed", String(maximized));
-    }
     const rects = geometry(tree).panes;
-    const bounds = rootNode.getBoundingClientRect();
-    const compact = root.innerWidth <= 700 || list.length > 1 && Object.values(rects).some((r) => r.w * bounds.width < 280 || r.h * bounds.height < 170);
+    // Only the viewport selects mobile tabs. A narrow user-created pane must
+    // never hide its neighbors or rewrite a drag/resize into a different tree.
+    // Equal-sized tiles are an explicit arrange() action.
+    const compact = root.innerWidth <= 700;
     doc.body.classList.toggle("workspace-compact", compact && enabled);
     for (const [id, row] of panes) {
       const included = list.includes(id), shown = included && (!(maximized || compact) || active === id);
@@ -220,6 +241,11 @@
       row.node.setAttribute("aria-hidden", String(!shown));
       row.node.inert = !shown;
       row.bar.hidden = !enabled;
+      row.view.textContent = maximized ? "분할로 돌아가기" : "이 창 확대";
+      row.view.title = `${row.view.textContent} · Control+Command+Enter`;
+      row.view.setAttribute("aria-label", row.view.textContent);
+      row.view.setAttribute("aria-pressed", String(maximized));
+      labelPane(row, list.indexOf(id));
       if (included && enabled) {
         const r = maximized || compact ? { x: 0, y: 0, w: 1, h: 1 } : rects[id];
         Object.assign(row.node.style, { left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` });
@@ -263,10 +289,13 @@
       });
       $("workspace-dividers").append(node);
     }
-    const switcher = $("workspace-switcher"); switcher.hidden = !enabled;
+    const switcher = $("workspace-switcher"); switcher.hidden = !enabled || !compact;
+    const arrange = $("workspace-arrange");
+    if (arrange) { arrange.hidden = !enabled || root.innerWidth <= 700; arrange.textContent = maximized ? "분할로 돌아가기" : "세로 정렬"; }
     switcher.replaceChildren();
     list.forEach((id, index) => {
-      const tab = button(`창 ${index + 1}로 이동 · Control+Command+${index + 1}`, `${index + 1}`, () => focus(id));
+      const tab = button(`창 ${index + 1}로 이동 · Option+${index + 1}`, `창 ${index + 1}`, () => focus(id));
+      tab.setAttribute("aria-keyshortcuts", `Alt+${index + 1}`);
       tab.setAttribute("aria-pressed", String(id === active)); switcher.append(tab);
     });
     hooks.listChanged?.();
@@ -293,19 +322,31 @@
     active = id;
     if (changed) layout();
     if (editor) {
+      doc.body.classList.remove("workspace-list-open");
+      hooks.paneOpened?.();
       const row = panes.get(id); row.frame?.contentWindow?.focus(); row.hooks?.focus();
     }
     return true;
   }
   function maximize() { maximized = !maximized; layout(); }
+  function arrange() {
+    const list = ids(tree);
+    if (list.length < 2) return;
+    if (!maximized) tree = tiled(list);
+    maximized = false; layout();
+  }
   function handleKey(event, id = active) {
     const action = shortcut(event, hooks?.prefs.get("workspaceKeys", "ctrl-meta"));
-    if (!action || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
-    if (event.repeat && action.maximize) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
+    if (!action || !ids(tree).includes(id) || !hooks?.describe().authenticated || doc.querySelector("dialog[open]") || panes.get(id)?.hooks?.describe().dialog) return false;
+    if (action.view && !panes.get(id)?.hooks?.describe().canToggleView) return false;
+    if (!action.view && !event.ctrlKey && !event.metaKey && event.altKey && ids(tree).length < 2) return false;
+    if (event.repeat && (action.maximize || action.close)) { event.preventDefault(); event.stopImmediatePropagation(); return true; }
     event.preventDefault(); event.stopImmediatePropagation();
-    if (action.maximize) { if (ids(tree).length > 1) maximize(); }
+    if (action.view) { if (!event.repeat) panes.get(id).hooks.toggleView(); }
+    else if (action.close) closePane(id);
+    else if (action.maximize) { if (ids(tree).length > 1) maximize(); }
     else {
-      const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, active, action.direction);
+      const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, id, action.direction);
       if (target) focus(target);
     }
     return true;
@@ -319,6 +360,7 @@
     return null;
   }
   function add(ref, target = active, edge = "right") {
+    if (embedded) return frameReady ? parent.addFromPane(ownId, root, ref, edge) : false;
     if (!hooks?.describe().authenticated) return false;
     ref = validRef(ref);
     const existing = findRef(ref);
@@ -330,8 +372,16 @@
     const row = record(id, ref); row.ref = ref;
     tree = split(tree, target, id, edge); maximized = false;
     active = id; layout();
+    doc.body.classList.remove("workspace-list-open");
+    hooks.paneOpened?.();
     if (row.hooks) applyRef(row);
     return true;
+  }
+  function addFromPane(id, win, ref, edge = "right") {
+    const row = panes.get(id);
+    if (embedded || !row?.frame || row.frame.contentWindow !== win || !ids(tree).includes(id) ||
+        !["left", "right", "top", "bottom"].includes(edge)) return false;
+    return add(ref, id, edge);
   }
   function closePane(id) {
     if (ids(tree).length < 2) { notify("마지막 창은 유지합니다."); return; }
@@ -361,7 +411,9 @@
     if (!info.authenticated) return;
     if (!restored) {
       restored = true;
-      const saved = restoreLayout(hooks.prefs.get("workspace", null));
+      // A new phone document starts at the list, including when a desktop
+      // layout or a terminal pane was saved by the previous document.
+      const saved = detached || hooks.startOnList?.() ? null : restoreLayout(hooks.prefs.get("workspace", null));
       if (saved) {
         restoring = true; tree = saved.tree; active = saved.active; maximized = saved.single === true;
         for (const id of ids(tree)) record(id, saved.panes[id]);
@@ -374,13 +426,18 @@
     if (restoring) return;
     for (const [id, row] of panes) {
       if (row.ref) applyRef(row);
-      const value = row.hooks?.describe();
-      const index = ids(tree).indexOf(id);
-      row.title.textContent = `${index >= 0 ? index + 1 : ""} · ${value?.title || (row.ref ? "저장한 세션 확인 중" : "목록에서 세션을 선택하세요")}`;
-      row.title.title = value?.route ? `${value.title}\n${value.route}\n끌어서 배치 변경` : "창 제목을 끌어 배치 변경";
-      row.title.setAttribute("aria-label", row.title.title);
+      labelPane(row, ids(tree).indexOf(id));
     }
     persist();
+  }
+  function labelPane(row, index) {
+    const value = row.hooks?.describe();
+    const title = value?.title || (row.ref ? "저장한 세션 확인 중" : "빈 창");
+    row.label.textContent = `${index >= 0 ? index + 1 : ""} · ${title}`;
+    row.meta.textContent = value?.route || "";
+    row.meta.hidden = !value?.route;
+    row.title.title = [title, value?.route, index >= 0 ? `Option+${index + 1}로 이동` : "", "끌어서 배치 변경"].filter(Boolean).join("\n");
+    row.title.setAttribute("aria-label", row.title.title);
   }
   function attach(id, win, childHooks) {
     const row = panes.get(id);
@@ -402,19 +459,47 @@
       if (answer) {
         const row = panes.get(existing);
         if (row.hooks) row.hooks.answerSession?.(key);
-        else { row.pendingAnswer = key; if (row.ref) row.ref.mode = "terminal"; changed(); }
+        else { row.pendingAnswer = key; changed(); }
       }
       return true;
     }
     if (active === "p1") return false;
     const row = panes.get(active);
-    if (!row?.hooks) { row.ref = { key, mode: "terminal" }; if (answer) row.pendingAnswer = key; changed(); return true; }
-    row.ref = null; row.hooks.select(key); if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed();
+    if (!row?.hooks) { row.ref = { key, mode: "chat" }; if (answer) row.pendingAnswer = key; changed(); return true; }
+    row.ref = null;
+    const selected = row.hooks.select(key);
+    const finish = () => {
+      if (panes.get(active) !== row || row.hooks.describe().ref?.key !== key) return;
+      if (answer) row.hooks.answerSession?.(key);
+      row.hooks.focus(); changed();
+    };
+    if (selected?.then) selected.then(finish).catch(() => {});
+    else { if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed(); }
     return true;
   }
   function routeNew() {
     if (embedded || internal || !enabled || active === "p1") return false;
-    panes.get(active)?.hooks?.newSession(); return true;
+    const row = panes.get(active);
+    if (!row?.hooks) { notify("빈 창을 준비하고 있습니다. 잠시 후 다시 열어 주세요."); return true; }
+    row.hooks.newSession(); return true;
+  }
+  function browseSessions(id = ownId, win = root) {
+    if (embedded) return frameReady ? parent.browseSessions(ownId, root) : false;
+    if (!enabled || !hooks?.describe().authenticated || !ids(tree).includes(id) ||
+        id !== "p1" && panes.get(id)?.frame?.contentWindow !== win) return false;
+    // The list lives in the parent. Its next selection still belongs to this
+    // pane, even while the search field has keyboard focus in the parent.
+    if (!focus(id, false)) return true;
+    doc.body.classList.add("workspace-list-open");
+    hooks.browseSessions?.();
+    return true;
+  }
+  function showList(shown = true) {
+    if (embedded || !hooks?.describe().authenticated) return false;
+    // Keep child documents mounted: their drafts, uploads and terminal readers
+    // still belong to the same pane when the user opens it again.
+    doc.body.classList.toggle("workspace-list-open", shown && enabled);
+    return true;
   }
   function routeTerminal(terminal) {
     if (embedded || internal || !enabled) return false;
@@ -575,8 +660,8 @@
       tree = move(tree, target.from, target.id, target.edge); active = target.from; maximized = false; layout(); focus(active);
     } else if (target.edge === "center") {
       const row = panes.get(target.id);
-      focus(target.id, false); row.ref = { key: data.key, mode: "terminal" }; applyRef(row); changed();
-    } else add({ key: data.key, mode: "terminal" }, target.id, target.edge);
+      focus(target.id, false); row.ref = { key: data.key, mode: "chat" }; applyRef(row); changed();
+    } else add({ key: data.key, mode: "chat" }, target.id, target.edge);
   }
   function init(appHooks) {
     hooks = appHooks;
@@ -587,7 +672,7 @@
         frameReady = !!parent?.attach(ownId, root, hooks);
       } catch { frameReady = false; }
       if (!frameReady) { root.location.replace("/"); return; }
-      doc.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
+      root.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
       doc.addEventListener("pointerdown", () => parent.focus(ownId, false), true);
       doc.addEventListener("focusin", () => parent.focus(ownId, false));
       return;
@@ -597,13 +682,13 @@
     keys.value = hooks.prefs.get("workspaceKeys", "ctrl-meta");
     keys.addEventListener("change", () => hooks.prefs.set("workspaceKeys", keys.value === "ctrl-alt-meta" ? keys.value : "ctrl-meta"));
     $("workspace-split-open").addEventListener("click", () => add(null));
-    $("workspace-view-toggle")?.addEventListener("click", () => maximize());
+    $("workspace-arrange")?.addEventListener("click", arrange);
     $("home").addEventListener("click", (event) => {
       if (!enabled) return;
       event.preventDefault(); event.stopImmediatePropagation();
       doc.body.classList.toggle("workspace-list-open");
     }, true);
-    doc.addEventListener("keydown", (event) => handleKey(event), true);
+    root.addEventListener("keydown", (event) => handleKey(event), true);
     $("workspace-primary").addEventListener("pointerdown", () => { if (enabled) focus("p1", false); }, true);
     $("workspace-primary").addEventListener("focusin", () => { if (enabled) focus("p1", false); });
     $("groups").addEventListener("dragstart", (event) => {
@@ -638,7 +723,7 @@
       }
     });
   }
-  root.SessionholicWorkspace = { ...model, embedded, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
+  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, closePane, layout, activeSessionKey, readingActive, isActive };
+    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList };
 })(typeof window !== "undefined" ? window : null);

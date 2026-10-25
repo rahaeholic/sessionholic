@@ -1,15 +1,23 @@
 /* The original single-pane screen keeps its DOM and layout until split. */
 .session-workspace, .workspace-pane { display: contents; }
-.workspace-pane[hidden], .workspace-pane-bar[hidden], #workspace-switcher[hidden], #workspace-drop-cue[hidden] { display: none !important; }
+.workspace-pane[hidden], .workspace-pane-bar[hidden], #workspace-switcher[hidden], #workspace-arrange[hidden], #workspace-drop-cue[hidden] { display: none !important; }
 .workspace-split-open { white-space: nowrap; min-height: 36px; padding: 0 10px; color: var(--accent); }
-.workspace-view-toggle { white-space: nowrap; min-height: 36px; padding: 0 8px; color: var(--accent); }
 .workspace-keys { display: block; width: 100%; min-height: 40px; margin: 8px 0; padding: 8px; border: 1px solid var(--sep); border-radius: 8px; color: var(--label); background: var(--surface); }
 #workspace-switcher { display: flex; gap: 2px; margin-left: auto; }
+/* App controls are global; view controls belong to the pane they affect. */
+.top-status { margin-left: 0; }
+.top > .quick-reload { margin-left: auto; }
 .workspace-button { flex: none; min-width: 30px; min-height: 32px; padding: 0 7px; border: 0; border-radius: 7px; background: transparent; color: var(--label-2); cursor: pointer; font-size: 16px; }
 .workspace-button:hover, .workspace-button:focus-visible { color: var(--accent); background: var(--fill-soft); }
 .workspace-button[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft, var(--fill-soft)); font-weight: 700; }
 .workspace-pane-bar { display: flex; align-items: center; gap: 2px; min-height: 38px; flex: none; padding: 2px 5px; border-bottom: 1px solid var(--sep); background: var(--bg); }
 .workspace-pane-title { flex: 1; min-width: 0; padding: 5px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; color: var(--label-2); background: transparent; border: 0; cursor: grab; touch-action: none; font-size: 12px; }
+.workspace-pane-label, .workspace-pane-meta { display: block; overflow: hidden; text-overflow: ellipsis; }
+.workspace-pane-label { color: var(--label); font-weight: 600; }
+.workspace-pane-meta { margin-top: 2px; color: var(--label-2); font-size: 11px; font-weight: 400; }
+.workspace-pane-meta[hidden] { display: none; }
+.workspace-pane-view { min-height: 36px; white-space: nowrap; font-size: 12px; }
+body.workspace-split .workspace-pane-active .workspace-pane-label { color: var(--accent); }
 body.workspace-split #session-workspace { display: block; position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--sep); }
 body.workspace-split .workspace-pane { position: absolute; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; border: 2px solid transparent; border-radius: 5px; background: var(--surface); }
 body.workspace-split .workspace-pane-active { border-color: var(--accent); }
@@ -43,7 +51,7 @@ body.workspace-embedded .back { visibility: hidden; pointer-events: none; }
 body.workspace-embedded .detail-head { padding-top: 4px; }
 @media (max-width: 700px) {
   body.workspace-split .top { display: flex; min-height: 42px; }
-  body.workspace-split .top > :not(#home):not(#workspace-switcher):not(#workspace-split-open):not(#workspace-view-toggle) { display: none; }
+  body.workspace-split .top > :not(#home):not(#workspace-switcher):not(#workspace-split-open) { display: none; }
   body.workspace-split #task-list-pane { display: none; }
   body.workspace-split #session-layout { display: flex; flex-direction: column; }
   body.workspace-split #session-workspace { flex: 1; }
@@ -54,9 +62,13 @@ body.workspace-embedded .detail-head { padding-top: 4px; }
 @media (prefers-reduced-motion: reduce) { .workspace-pane { transition: none; } }
 @media (min-width: 701px) {
   body.workspace-split #session-layout { grid-template-columns: 240px minmax(0, 1fr); }
+  body.workspace-split .top .home-label { display: inline; }
 }
 @media (max-width: 1100px) {
   body.workspace-split #session-layout { position: relative; grid-template-columns: minmax(0, 1fr); }
   body.workspace-split #task-list-pane { display: none; }
   body.workspace-split.workspace-list-open #task-list-pane { display: flex; position: absolute; inset: 0 auto 0 0; width: min(320px, 90vw); z-index: 20; border-right: 1px solid var(--sep); box-shadow: 8px 0 30px #0002; }
+}
+@media (max-width: 700px) {
+  body.workspace-split.workspace-list-open #task-list-pane { inset: 0; width: 100%; border-right: 0; box-shadow: none; }
 }

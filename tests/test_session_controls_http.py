@@ -90,6 +90,56 @@ class SessionControlsHTTPTest(unittest.TestCase):
         return {'id': name * 32, 'host': self.host['name'], 'mode': 'attach', 'createdAt': 100,
                 'alive': True, 'closed': False, 'nativeSource': {**self.source, 'cwd': self.row['cwd']}, **changes}
 
+    def test_predispatch_refusals_are_definitely_not_started(self):
+        with patch.object(self.httpd.workflow.transfers, 'rpc') as rpc:
+            for kwargs in ({'csrf': False}, {'authenticated': False}):
+                response, result = self.request('/api/session/action', self.action(action='terminate'), **kwargs)
+                self.assertIn(response.status, (401, 403))
+                self.assertEqual(result['dispatchState'], 'not_started')
+            response, result = self.request('/api/session/action', self.action(action='terminate', targetProof='invalid'))
+            self.assertEqual(result['dispatchState'], 'not_started')
+        rpc.assert_not_called()
+
+    def test_lost_reply_is_durable_discovered_by_another_client_and_reconciled(self):
+        calls = []
+        def rpc(host, operation, args, **kwargs):
+            calls.append(args)
+            if not args.get('receiptOnly'):
+                raise OSError('lost response after dispatch')
+            return {'confirmed': True, 'cleanupTerminals': []}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), patch.object(self.board, 'request_refresh'):
+            response, first = self.request('/api/session/action', self.action(action='terminate'))
+            self.assertEqual(response.status, 200)
+            self.assertEqual(first['job']['state'], 'pending')
+            response, preview = self.request('/api/session/preview', {'source': self.source})
+            self.assertEqual(preview['termination']['requestId'], first['requestId'])
+            self.assertEqual(len(calls), 1, 'preview discovers stored operation without native dispatch')
+            response, second = self.request('/api/session/action', self.action(action='terminate', requestId='second-device-request'))
+        self.assertEqual(second['requestId'], first['requestId'])
+        self.assertTrue(second['cleanup']['complete'])
+        self.assertTrue(calls[1]['receiptOnly']); self.assertTrue(calls[1]['verifyCleanup']); self.assertTrue(calls[1]['sealMissing'])
+        self.assertNotIn('targetProof', calls[1])
+
+    def test_legacy_browser_pending_adopts_trusted_locator_and_fences_missing_receipt(self):
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={
+                'confirmed': False, 'applied': False, 'dispatchState': 'not_started'}) as rpc:
+            response, result = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(response.status, 200, result)
+        self.assertEqual(result['job']['state'], 'not_started')
+        self.assertTrue(rpc.call_args.args[2]['sealMissing'])
+        self.assertNotIn('targetProof', rpc.call_args.args[2])
+
+    def test_new_execution_after_partial_cleanup_is_not_closed_or_hidden(self):
+        closed = self.linked_terminals([self.terminal()])
+        replies = [{'confirmed': False, 'applied': None},
+                   {'confirmed': True, 'cleanupEligible': False, 'reconcileCode': 'execution_changed'}]
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=replies):
+            self.request('/api/session/action', self.action(action='terminate'))
+            response, result = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(result['job']['state'], 'superseded')
+        self.assertEqual(closed, [])
+        self.assertNotIn('cleanup', result)
+
     def test_termination_closes_all_exact_terminals_then_removes_in_one_request(self):
         rows = [self.terminal(), self.terminal('b', mode='resume')]
         closed = self.linked_terminals(rows)
@@ -111,6 +161,41 @@ class SessionControlsHTTPTest(unittest.TestCase):
         snapshot = self.httpd.session_removed.decorate(self.board.snapshot())
         self.assertIsNone(snapshot['hosts'][0]['data']['codex'][0]['removedAt'])
 
+    def test_pending_native_receipt_reconciles_then_closes_original_terminal_and_removes_card(self):
+        import session_control
+        import transfer_native
+        root = Path(self.temporary.name).resolve()
+        control = session_control.SessionControl(root, root / 'native-control')
+        selector = {key: self.row.get(key) for key in ('agent', 'id', 'home', 'cwd', 'kind', 'sessionId', 'phase')}
+        record = {'id': self.source['id'], 'home': self.source['home'], 'cwd': self.row['cwd'], 'archived': False}
+        observed = {'source': transfer_native._identity(selector), 'phase': 'closed', 'process': None,
+                    'target': {'record': record}, 'capabilities': {'terminate': {'supported': True, 'method': 'codex-thread-archive'}}}
+        with patch.object(control, '_observe', return_value=observed):
+            preview = control.preview(selector)
+        operations = []
+        def rpc(host, operation, args, **kwargs):
+            operations.append(args.get('receiptOnly', False))
+            if args.get('receiptOnly'):
+                return control.receipt(args['source'], args['action'], args['requestId'])
+            return control.execute(args['source'], args['action'], args['targetProof'], args['requestId'], cleanup_terminals=args['cleanupTerminals'])
+        closed = self.linked_terminals([self.terminal()])
+        with patch.object(self.httpd.workflow.transfers, 'rpc', side_effect=rpc), patch.object(self.board, 'request_refresh'), \
+                patch.object(control, '_observe', return_value=observed), patch.object(control, '_apply', side_effect=TimeoutError()) as apply:
+            response, first = self.request('/api/session/action', self.action(action='terminate', targetProof=preview['targetProof']))
+            self.assertEqual(response.status, 200, first)
+            self.assertFalse(first['confirmed']); self.assertEqual(closed, [])
+            self.board.state[self.host['name']]['data']['codex'] = []
+            from unittest.mock import MagicMock
+            client = MagicMock(); client.__enter__.return_value = client; client.call.return_value = {'data': [], 'nextCursor': None}
+            with patch.object(session_control.launch, 'saved_codex_thread', return_value=record), \
+                    patch.object(transfer_native, '_client', return_value=client), \
+                    patch.object(transfer_native, '_codex_state', return_value={'phase': 'closed', 'safeToTransfer': True}):
+                response, second = self.request('/api/session/action', self.action(action='terminate', cleanupOnly=True))
+        self.assertEqual(response.status, 200, second)
+        self.assertTrue(second['confirmed']); self.assertTrue(second['cleanup']['complete'])
+        self.assertEqual(closed, ['a' * 32]); self.assertEqual(operations, [False, True])
+        self.assertEqual(apply.call_count, 1, 'rechecking never dispatches another termination')
+
     def test_estimated_changed_identity_and_newer_terminals_are_not_closed(self):
         wrong = [{**self.source, **change, 'cwd': change.get('cwd', self.row['cwd'])} for change in (
             {'home': '.codex-other'}, {'host': 'other'}, {'id': str(uuid.uuid4())}, {'cwd': '/other'})]
@@ -124,10 +209,12 @@ class SessionControlsHTTPTest(unittest.TestCase):
                 patch.object(self.board, 'request_refresh'):
             response, result = self.request('/api/session/action', self.action(action='terminate'))
         self.assertEqual(response.status, 200, result)
-        self.assertEqual(closed, ['a' * 32])
-        self.assertTrue(result['cleanup']['complete'])
-        self.assertEqual(result['cleanup']['list'], 'done')
-        self.assertEqual(result['cleanup']['unverified'], ['b' * 32, 'c' * 32])
+        self.assertEqual(closed, [])
+        self.assertFalse(result['cleanup']['complete'])
+        self.assertTrue(result['cleanup']['superseded'])
+        self.assertEqual(result['job']['state'], 'superseded')
+        self.assertEqual(result['cleanup']['list'], 'pending')
+        self.assertEqual(result['cleanup']['unverified'], ['c' * 32])
 
     def test_partial_cleanup_retry_reads_existing_receipt_after_row_disappears(self):
         rows = [self.terminal()]

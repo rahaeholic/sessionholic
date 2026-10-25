@@ -54,6 +54,19 @@ class MaintenanceTest(unittest.TestCase):
         with patch.object(cm, 'command') as command:
             cm.update_npm(self.row, self.root, '0.164.0', '0.164.0')
             cm.update_npm(self.row, self.root, '0.165.0', '0.164.0')
+            cm.update_npm(self.row, self.root, '0.165.0-beta.1', '0.164.0')
+        command.assert_not_called()
+
+    def test_prerelease_moves_to_same_core_stable_after_probe(self):
+        with patch.object(cm, 'command') as command, patch.object(cm, 'version', return_value='0.164.0'):
+            self.assertEqual(cm.update_npm(self.row, self.root, '0.164.0-beta.1', '0.164.0'), '0.164.0')
+        self.assertIn('@openai/codex@0.164.0', command.call_args_list[0].args[0])
+        self.assertEqual(self.launcher.readlink(), self.root / 'codex-releases/0.164.0/bin/codex')
+
+    def test_invalid_or_unstable_target_version_never_installs(self):
+        with patch.object(cm, 'command') as command:
+            for current, latest in [('0.164', '0.164.0'), ('0.163.0', '0.164.0-beta.1')]:
+                with self.assertRaises(ValueError): cm.update_npm(self.row, self.root, current, latest)
         command.assert_not_called()
 
     def test_partial_failure_keeps_last_success_and_native_channel(self):

@@ -381,7 +381,7 @@ class Transfers:
         if (agent not in ('codex', 'claude') or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid)
                 or agent == 'codex' and (not isinstance(home, str) or not HOME_KEY.fullmatch(home))):
             raise ValueError('Windows 세션 정보를 확인해 주세요.')
-        if op == 'chat' and args.get('action') not in ('read', 'capabilities', 'send', 'receipt'):
+        if op == 'chat' and args.get('action') not in ('read', 'capabilities', 'send', 'receipt', 'command'):
             raise ValueError('지원하지 않는 Windows 대화 요청입니다.')
         data = None
         if op == 'attachment':
