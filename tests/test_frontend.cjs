@@ -15276,6 +15276,38 @@ test('분할 창의 작업·기록 복원과 포커스는 같은 입력 DOM을 �
   assert.equal(c.get('chat-composer').hidden, false); hooks.focus(); assert.equal(input.focusCount, 2);
 });
 
+test('분할 창 포커스는 PC·Mac에서 입력창, 휴대폰·iPad의 탭에서는 대화 본문으로 가고 하드웨어 키보드 이동은 입력창으로 간다', async () => {
+  for (const [device, coarse, navigator] of [['pc', false, {}], ['phone', true, {}],
+    ['ipad-keyboard', false, { platform: 'MacIntel', maxTouchPoints: 5 }]]) {
+    const { c, s } = inlineDetailClient();
+    c.context.window.matchMedia = (query) => ({ matches: coarse && query === '(pointer: coarse)' });
+    c.context.navigator = navigator;
+    const hooks = vm.runInContext('workspaceHooks()', c.context), input = c.get('chat-input');
+    hooks.restore({ key: s.key, mode: 'chat' }); await settle();
+    let blurred = 0; input.tagName = 'TEXTAREA'; input.blur = () => { blurred++; };
+    c.context.document.activeElement = input;
+    const messages = c.get('messages'), before = messages.focusCount || 0;
+    hooks.focus();
+    if (device === 'pc') { assert.equal(input.focusCount, 1, device); assert.equal(blurred, 0, device); }
+    else {
+      assert.equal(input.focusCount || 0, 0, device + ': no on-screen keyboard for a tap');
+      assert.equal(blurred, 1, device); assert.equal(messages.focusCount, before + 1, device);
+    }
+    hooks.focus({ keyboard: true }); assert.equal(input.focusCount, device === 'pc' ? 2 : 1, device);
+  }
+});
+
+test('목록 탭 선택은 분할 창에 키보드 이동이 아니라고 넘기고 →·Enter 진입은 키보드 이동으로 넘긴다', () => {
+  const { c, s, cards, press } = keyboardBoard(), routed = [];
+  c.context.window.SessionholicWorkspace = { routeSession: (key, options) => { routed.push([key, options.keyboard]); return true; },
+    visible: () => true, readingActive: () => true, managed: () => false };
+  cards[2].click();
+  assert.deepEqual(press(cards[2], 'Enter'), [true, true]);
+  assert.equal(c.state.inputFocusFor, null, 'a routed entry leaves no focus pending for a later tap');
+  cards[2].click();
+  assert.deepEqual(routed, [[s.key, false], [s.key, true], [s.key, false]]);
+});
+
 test('터미널 크기는 포커스를 받은 창만 보내고 재포커스 때 같은 크기도 다시 보낸다', async () => {
   const timers = [], calls = [], c = client(async (url) => {
     calls.push(url); return { ok: true, status: 200, json: async () => ({}) };
