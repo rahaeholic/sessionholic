@@ -3657,7 +3657,8 @@ function select(key) {
     });
   }
   state.selectionPending = null;
-  if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key })) {
+  // A keyboard entry (enterSession) still asks its pane for the input on a phone or an iPad.
+  if (window.SessionholicWorkspace?.routeSession(key, { answer: state.answerOnOpen?.key === key, keyboard: state.inputFocusFor === key })) {
     // The visible conversation may live in a child document. Its parent's
     // Android Back still needs a list entry beneath it.
     if (mobileStartOnList() && !state.detailShown) { navigateView("detail"); setDetailShown(true); }
@@ -12490,11 +12491,14 @@ function xtermKeyEvent(event) {
   sendTerminalBytes(bytes);
   return false;
 }
-function mobileComposerEnter(event) {
+// A phone or a tablet: an iPad with a keyboard and trackpad attached reports a fine pointer.
+function mobileDevice() {
   const nav = globalThis.navigator;
-  const mobile = touchDevice() || /Android|iPhone|iPad|iPod/i.test(String(nav?.userAgent || "")) ||
+  return touchDevice() || /Android|iPhone|iPad|iPod/i.test(String(nav?.userAgent || "")) ||
     /Mac/i.test(String(nav?.platform || "")) && (nav?.maxTouchPoints || 0) > 1;
-  return mobile && event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey;
+}
+function mobileComposerEnter(event) {
+  return mobileDevice() && event.key === "Enter" && !event.ctrlKey && !event.metaKey && !event.altKey;
 }
 function draftKeydown(event) {
   if (mobileComposerEnter(event)) {
@@ -14297,7 +14301,15 @@ function workspaceHooks() {
     sessionKeyForTerminal: (terminal) => allSessions().find((s) => terminalMatchesDetail(terminal, s))?.key || null,
     listChanged: () => { if (state.snapshot) renderSessionList(allSessions(), state.snapshot.serverTime || Date.now() / 1000); },
     sessionExists: (key) => allSessions().some((s) => s.key === key),
-    focus: () => {
+    // A PC or a Mac takes the pane's focus in its editor. On a phone or an iPad the on-screen
+    // keyboard would cover the screen: a tap (a list selection, a pane's title) gives the
+    // conversation the focus, only a hardware keyboard's move (→/Enter, Option+number) the editor.
+    focus: ({ keyboard = false } = {}) => {
+      if (!keyboard && mobileDevice()) {
+        if (editingText()) document.activeElement.blur?.();
+        $("messages")?.focus?.({ preventScroll: true });
+        return;
+      }
       const previous = lastField?.isConnected && !lastField.disabled && lastField;
       const s = selectedSession();
       const field = s && sessionDetailMode(s) === "chat" ? !sessionRecordOnly(s) && !$("chat-input")?.disabled ? $("chat-input") : $("messages") :

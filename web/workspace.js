@@ -302,7 +302,8 @@
     if (save) persist();
     root.requestAnimationFrame?.(() => { for (const id of list) fit(panes.get(id)); });
   }
-  function focus(id, editor = true) {
+  // keyboard: moved from a hardware keyboard, whose editor focus a phone or an iPad keeps too.
+  function focus(id, editor = true, keyboard = false) {
     if (!ids(tree).includes(id)) return false;
     if (active !== id && panes.get(active)?.hooks?.describe().composing) {
       const from = active, owner = panes.get(from)?.hooks;
@@ -311,7 +312,7 @@
         Promise.resolve(owner.commitComposition()).then((ok) => {
           if (pendingFocus !== request) return;
           pendingFocus = null;
-          if (ok && active === from && !owner.describe().composing) focus(id, editor);
+          if (ok && active === from && !owner.describe().composing) focus(id, editor, keyboard);
           else if (!ok) notify("입력창 밖을 누른 뒤 창을 이동해 주세요.");
         }).catch(() => { if (pendingFocus === request) pendingFocus = null; });
         return false;
@@ -324,7 +325,7 @@
     if (editor) {
       doc.body.classList.remove("workspace-list-open");
       hooks.paneOpened?.();
-      const row = panes.get(id); row.frame?.contentWindow?.focus(); row.hooks?.focus();
+      const row = panes.get(id); row.frame?.contentWindow?.focus(); row.hooks?.focus({ keyboard });
     }
     return true;
   }
@@ -347,7 +348,7 @@
     else if (action.maximize) { if (ids(tree).length > 1) maximize(); }
     else {
       const target = action.number ? ids(tree)[action.number - 1] : neighbor(tree, id, action.direction);
-      if (target) focus(target);
+      if (target) focus(target, true, true);
     }
     return true;
   }
@@ -450,12 +451,12 @@
     if (panes.get(id)?.frame?.contentWindow !== win) return;
     changed();
   }
-  function routeSession(key, { answer = false } = {}) {
+  function routeSession(key, { answer = false, keyboard = false } = {}) {
     if (embedded || internal || !enabled) return false;
     doc.body.classList.remove("workspace-list-open");
     const existing = findRef({ key });
     if (existing) {
-      focus(existing);
+      focus(existing, true, keyboard);
       if (answer) {
         const row = panes.get(existing);
         if (row.hooks) row.hooks.answerSession?.(key);
@@ -471,10 +472,10 @@
     const finish = () => {
       if (panes.get(active) !== row || row.hooks.describe().ref?.key !== key) return;
       if (answer) row.hooks.answerSession?.(key);
-      row.hooks.focus(); changed();
+      row.hooks.focus({ keyboard }); changed();
     };
     if (selected?.then) selected.then(finish).catch(() => {});
-    else { if (answer) row.hooks.answerSession?.(key); row.hooks.focus(); changed(); }
+    else { if (answer) row.hooks.answerSession?.(key); row.hooks.focus({ keyboard }); changed(); }
     return true;
   }
   function routeNew() {

@@ -258,6 +258,17 @@ test("selection and new sessions target the active pane, duplicate sessions and 
   assert.equal(f.workspace.claim("p2", {}, "a".repeat(32)), false);
 });
 
+test("a pane's focus says whether a hardware keyboard moved it: list taps and titles do not, entries and Option numbers do", () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2"), focused = [];
+  second.child.focus = (options) => focused.push(options.keyboard);
+  assert.equal(f.workspace.routeSession("session-c"), true);
+  assert.equal(f.workspace.routeSession("session-c", { keyboard: true }), true);
+  f.workspace.focus("p1", false);
+  assert.equal(f.workspace.handleKey(combo("¡", { ctrlKey: false, metaKey: false, altKey: true, code: "Digit2" }), "p1"), true);
+  f.workspace.focus("p2");
+  assert.deepEqual(focused, [false, true, true, false]);
+});
+
 test("empty panes restore without starting sessions and browsing keeps the target pane with strict frame ownership", () => {
   const f = fixture();
   f.workspace.add(null);
