@@ -7939,14 +7939,19 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
   assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
   // An iPad home-screen app gets room for iPadOS's window controls; nothing else does.
-  const device = (userAgent, maxTouchPoints, standalone) => ({ navigator: { userAgent, maxTouchPoints },
-    matchMedia: (query) => ({ matches: standalone && query === '(display-mode: standalone)' }) });
+  // Every iPad (its trackpad's fine pointer too) and a tablet-sized touch screen is a tablet.
+  const device = (userAgent, maxTouchPoints, standalone, { coarse = false, screen = { width: 1180, height: 820 } } = {}) => ({
+    navigator: { userAgent, maxTouchPoints }, screen,
+    matchMedia: (query) => ({ matches: standalone && query === '(display-mode: standalone)' || coarse && query === '(pointer: coarse)' }) });
   const ipadOS = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
-  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad-app': '' });
-  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad-app': '' });
-  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, {}, 'the same iPad in a Safari tab');
-  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 5, true) }).attributes, {});
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad-app': '', 'data-tablet': '' });
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad-app': '', 'data-tablet': '' });
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, { 'data-tablet': '' }, 'the same iPad in a Safari tab');
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 5, true, { coarse: true, screen: { width: 393, height: 852 } }) }).attributes, {});
   assert.deepEqual(run({}, { extra: device(ipadOS, 0, true) }).attributes, {}, 'a Mac browser has no touch points');
+  const android = 'Mozilla/5.0 (Linux; Android 15)';
+  assert.deepEqual(run({}, { extra: device(android, 5, false, { coarse: true, screen: { width: 800, height: 1280 } }) }).attributes, { 'data-tablet': '' });
+  assert.deepEqual(run({}, { extra: device(android, 5, false, { coarse: true, screen: { width: 412, height: 915 } }) }).attributes, {}, 'a phone');
   const css = styleSheet();
   assert.match(css, /:root\[data-ipad-app\] \{\s*--top-inset: max\(env\(safe-area-inset-top\), 36px\);/);
   assert.equal((css.match(/env\(safe-area-inset-top\)/g) || []).length, 2, 'every other top inset reads --top-inset');
@@ -9460,8 +9465,11 @@ test('wide touch screens read like the PC: its text size and 820px column, a pho
 
 test('an iPad list as wide as the PC\'s fits more sessions; a narrower one (upright, split) keeps two-line titles', () => {
   const css = styleSheet();
-  const block = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) \{\s*\.list-pane \{\s*container: session-list \/ inline-size;\s*\}([\s\S]*?)\n\}/);
-  assert.ok(block, 'touch screens beside the conversation measure the list itself');
+  assert.match(css, /@media \(pointer: coarse\) and \(min-width: 701px\) \{\s*\.list-pane \{\s*container: session-list \/ inline-size;\s*\}\s*\}/,
+    'touch screens beside the conversation measure the list itself');
+  // An iPad whose trackpad reports a fine pointer too (theme-init.js data-tablet).
+  const block = css.match(/@media \(min-width: 701px\) \{\s*:root\[data-tablet\] \.list-pane \{\s*container: session-list \/ inline-size;\s*\}([\s\S]*?)\n\}/);
+  assert.ok(block, 'so does a tablet');
   // 300px inside the list's 16px margins: the PC's 340px list, not 300px (upright) or 240px (split).
   const wide = block[1].match(/@container session-list \(min-width: 300px\) \{([\s\S]*?)\n  \}/);
   assert.ok(wide);
@@ -9471,6 +9479,32 @@ test('an iPad list as wide as the PC\'s fits more sessions; a narrower one (upri
   assert.doesNotMatch(wide[1], /line-clamp/, 'titles stay one line as on the PC');
   assert.match(block[1], /@container session-list \(max-width: 299\.98px\) \{\s*\.card-title \{\s*-webkit-line-clamp: 2;/);
   assert.ok(css.indexOf(block[0]) > css.indexOf('.card-provenance { grid-area: provenance;'), 'after the rules it refines');
+});
+
+test('a tablet held sideways gives the conversation more height: slimmer bars, model controls on the title line, one-row composer', () => {
+  const css = styleSheet();
+  const block = css.match(/@media \(orientation: landscape\) and \(min-width: 701px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
+  assert.ok(block, 'tablets held sideways only (a phone held sideways is shorter)');
+  const rules = block[1];
+  const selectors = rules.match(/^[ \t]*[^@\s{}][^{}\n]*\{[ \t]*$/gm);
+  assert.ok(selectors.length >= 7);
+  for (const selector of selectors) assert.match(selector.trim(), /^:root\[data-tablet\] /, 'tablets only: ' + selector.trim());
+  assert.match(rules, /:root\[data-tablet\] \.top \{\s*min-height: 44px;\s*padding-top: 0;\s*padding-bottom: 0;/);
+  assert.match(rules, /:root\[data-tablet\] \.detail-mode-tabs \{\s*padding-top: 2px;\s*padding-bottom: 2px;/, 'the tabs keep their own 40px');
+  // Its actions are in the ⋯ menu (cardActions) and 맨 아래 is the jump button.
+  assert.match(rules, /:root\[data-tablet\] \.detail-pane > \.conversation-bar \{\s*display: none;/);
+  const head = rules.match(/@container conversation \(min-width: 760px\) \{([\s\S]*?)\n  \}/);
+  assert.ok(head);
+  assert.match(head[1], /\.detail-head > \.chat-model-controls \{\s*grid-column: 3;\s*grid-row: 1;/);
+  assert.match(head[1], /:not\(\.is-reading\):not\(\.is-typing\)/, 'the folded header (집중 모드) keeps its own layout');
+  const composer = rules.match(/@container conversation \(min-width: 640px\) \{([\s\S]*?)\n  \}/);
+  assert.ok(composer, 'a narrow split pane keeps the input on its own row');
+  assert.match(composer[1], /\.chat-main \{\s*flex-wrap: nowrap;/);
+  assert.match(composer[1], /\.chat-input \{\s*flex: 1 1 auto;\s*width: auto;\s*order: 1;/);
+  assert.match(composer[1], /#chat-send \{\s*order: 2;\s*margin-left: 0;/);
+  // :root[data-tablet] outweighs the narrower-conversation header rules wherever they stand.
+  for (const earlier of ['.chat-composer .chat-main > #chat-send {', '.detail-mode-tabs {', '.top {'])
+    assert.ok(css.indexOf(block[0]) > css.indexOf(earlier), 'after ' + earlier);
 });
 
 test('a hardware keyboard: the folded composer shows the send key once one is known, Esc leaves the input, and 1-9 choose on a question card', async () => {

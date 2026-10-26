@@ -46,4 +46,9 @@
   var standalone = nav.standalone === true ||
     !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
   if (ipad && standalone) root.setAttribute("data-ipad-app", "");
+  // A tablet (style.css :root[data-tablet]): an iPad by its name, since one with a
+  // trackpad reports a fine pointer, or another touch screen of a tablet's size.
+  var coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+  var screen = window.screen || {};
+  if (ipad || (coarse && Math.min(screen.width || 0, screen.height || 0) >= 600)) root.setAttribute("data-tablet", "");
 })();
