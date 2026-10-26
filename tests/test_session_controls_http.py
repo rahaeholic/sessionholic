@@ -152,6 +152,22 @@ class SessionControlsHTTPTest(unittest.TestCase):
         self.assertIsInstance(result['cleanup']['removedAt'], int)
         self.assertEqual(self.httpd.workflow.recoveries.get(self.source)['provenance']['closure'], 'explicit_termination')
 
+    def test_a_claude_session_that_moved_folders_since_it_was_remembered_can_still_be_ended(self):
+        # Its cwd followed its shell into a worktree; the locator saved before dispatch was refused
+        # as a conflict (400, not started) on every try.
+        recoveries = self.httpd.workflow.recoveries
+        recoveries.remember({**self.claude, 'kind': 'interactive', 'sessionId': self.claude_sid, 'cwd': '/fixture/first'},
+                            'c' * 32, 'released')
+        self.linked_terminals([])
+        receipt = {'confirmed': True, 'requestedAt': int(time.time()), 'cleanupTerminals': []}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=receipt), patch.object(self.board, 'request_refresh'):
+            response, result = self.request('/api/session/action', self.action(source=self.claude, action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertTrue(result['cleanup']['complete'])
+        saved = recoveries.get({**self.claude, 'sessionId': self.claude_sid})
+        self.assertEqual(saved['source']['cwd'], '/fixture/first', 'its transcript and resume stay in the first folder')
+        self.assertEqual(saved['provenance']['closure'], 'explicit_termination')
+
     def test_unknown_termination_leaves_connections_and_list_untouched(self):
         closed = self.linked_terminals([self.terminal()])
         with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': False, 'status': 'unconfirmed'}):
