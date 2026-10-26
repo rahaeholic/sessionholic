@@ -1298,14 +1298,14 @@ function allSessions() {
     if (out.some((s) => s.key === session.key)) continue;
     const aliases = out.map((value, index) => ({ value, index })).filter(({ value }) =>
       sameRecoverySource(session, value) && sameRecoverySource(value, session) &&
-      (session.cwd || null) === (value.cwd || null) &&
+      (sameClaudeConversation(session, value) || (session.cwd || null) === (value.cwd || null)) &&
       (session.agent !== "claude" || (session.sessionId || null) === (value.sessionId || null)));
     if (aliases.length === 1) {
       const { value, index } = aliases[0];
       // The same listed conversation keeps its recovery identity after navigating
       // away, so reopening it returns to the same draft and saved reading position.
       const merged = { ...session, ...value, ...sourceOf(session), home: session.home,
-        key: session.key, cwd: session.cwd, sessionId: session.sessionId,
+        key: session.key, cwd: value.cwd, sessionId: session.sessionId,
         nativeSource: session.nativeSource, recoverySource: session.recoverySource,
         phase: value.listedPhase, runtimeKnown: value.listedRuntimeKnown, runtimeReason: value.listedRuntimeReason };
       out[index] = labeledSession({ ...merged, ...sessionRuntime(merged, session.key, value.fetchedAt, following) });
@@ -1407,7 +1407,7 @@ function renderRecoveries() {
   const section = $("session-recoveries"), list = $("session-recovery-list");
   if (!section || !list) return;
   const sessions = allSessions();
-  const sameConversation = (ref, source) => sameRecoverySource(ref, source) && (!ref.cwd || ref.cwd === source.cwd);
+  const sameConversation = (ref, source) => sameRecoverySource(ref, source) && (!ref.cwd || ref.cwd === source.cwd || sameClaudeConversation(ref, source));
   const refs = recentRecoveries().filter((ref) => !sessions.some((s) => sameConversation(ref, s)) &&
     !state.terminals.some((terminal) => {
       const native = terminal.nativeSource || terminal.metadata?.nativeSource;
@@ -4726,7 +4726,17 @@ function chatKey(source) {
 }
 function conversationIdentity(s) {
   if (!s) return null;
-  return JSON.stringify([chatKey(sourceOf(s)), s.cwd || null, s.agent === "claude" ? s.sessionId || s.id : s.id]);
+  const transcript = s.agent === "claude" ? s.sessionId || s.id : s.id;
+  const folder = s.agent === "claude" && conversationUUID(transcript) ? null : s.cwd || null;
+  return JSON.stringify([chatKey(sourceOf(s)), folder, transcript]);
+}
+function conversationUUID(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+}
+function sameClaudeConversation(a, b) {
+  const transcript = a?.sessionId || a?.id;
+  return a?.agent === "claude" && b?.agent === "claude" && !!a.host && a.host === b.host &&
+    (a.home || ".claude") === (b.home || ".claude") && conversationUUID(transcript) && transcript === (b.sessionId || b.id);
 }
 function chatReadSupported(entry, data = entry.data) {
   return !!data && !data.error && chatKey(data.route || {}) === chatKey(entry.source) && Array.isArray(data.messages);
@@ -6094,7 +6104,7 @@ async function executeChatCommand(entry, command, value = null) {
   }
 }
 async function runSlashCommand(entry, text, attachments) {
-  if (entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.composing) return;
+  if (entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.uploadQueue?.length || entry.composing) return;
   const match = /^\/(model|effort|compact|clear)(?:\s+(\S+))?$/.exec(text);
   if (!match || attachments.length || ["compact", "clear"].includes(match?.[1]) && match?.[2]) {
     entry.error = entry.inputError = "지원하는 명령을 첨부 없이 입력해 주세요: /model, /effort, /compact, /clear"; updateChatComposer(entry); return;
@@ -6987,7 +6997,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
-  const blocked = offline || !supported || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.commandBusy;
+  const blocked = offline || !supported || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.uploadQueue?.length || !!entry.commandBusy;
   // No board terminal yet (Claude background): the draft can be written now and
   // sent once the user opened the terminal from the gate.
   const recovery = chatRecovery(entry, selected);
@@ -7116,6 +7126,24 @@ function attachmentTile(entry, file, { key, uploading = null } = {}) {
     tile.uploadRing = ring;
     tile.append(ring);
     setUploadProgress(tile, uploading);
+    if (uploading.state === "failed") {
+      ring.hidden = true;
+      const retry = button("다시 올리기", "chat-attachment-copy", () => entry.terminalId ? uploadTerminalFiles() : uploadChatFiles(entry));
+      retry.disabled = !!entry.uploads || !!entry.sending || networkOffline();
+      tile.append(retry);
+    }
+    const cancel = button("×", "chat-attachment-remove", () => {
+      if (entry.uploads) cancelUploads(entry);
+      else {
+        entry.uploadQueue = entry.uploadQueue.filter((item) => item !== uploading);
+        revokeThumb(entry, key);
+        if (!entry.uploadQueue.length) entry.error = entry.inputError = "";
+        updateUploadEntry(entry);
+      }
+    });
+    cancel.setAttribute("aria-label", entry.uploads ? "첨부파일 올리기 취소" : `${file.name || "첨부파일"} 제거`);
+    cancel.disabled = !!entry.sending;
+    tile.append(cancel);
     return tile;
   }
   const remove = button("×", "chat-attachment-remove", () => {
@@ -7163,33 +7191,73 @@ function renderAttachmentTiles(entry, box = $("chat-attachments")) {
   for (const item of entry.uploadQueue) item.tile = tiles.find((tile) => tile.dataset.key === item.key) || null;
   box.replaceChildren(...tiles);
 }
-// Uploads report progress through XMLHttpRequest where it exists; fetch is
-// the fallback (same request, no progress).
-function sendUpload(file, headers, onProgress) {
-  if (typeof XMLHttpRequest !== "function") {
-    return fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store", body: file, headers })
-      .then(async (response) => ({ status: response.status, ok: response.ok, data: await response.json().catch(() => ({})) }));
-  }
-  return new Promise((resolve, reject) => {
-    const request = new XMLHttpRequest();
-    request.open("POST", "/api/chat/upload");
-    for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
-    request.upload?.addEventListener?.("progress", (event) => {
-      if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
-    });
-    request.addEventListener("load", () => {
-      let data = {};
-      try {
-        data = JSON.parse(request.responseText || "{}") || {};
-      } catch {
-        data = {};
-      }
-      resolve({ status: request.status, ok: request.status >= 200 && request.status < 300, data });
-    });
-    request.addEventListener("error", () => reject(new Error("첨부파일을 올리지 못했습니다. 연결을 확인해 주세요.")));
-    request.addEventListener("abort", () => reject(new Error("첨부파일 올리기를 멈췄습니다.")));
-    request.send(file);
+// The browser may keep a phone's File upload pending across sleep or a network
+// change. Bound the whole exchange (including response JSON), and keep cancellation
+// available until it settles. Retry only an explicit pre-write CSRF refusal.
+const UPLOAD_TIMEOUT_MS = 120000;
+const UPLOAD_TIMEOUT_MESSAGE = "첨부 응답이 늦어 기다리기를 멈췄습니다. 다시 올리거나 취소해 주세요.";
+async function sendUpload(file, headers, onProgress, { signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
+  const response = await new Promise((resolve, reject) => {
+    let request = null, timer = null, finished = false;
+    const controller = new AbortController();
+    const finish = (error, result) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", cancel);
+      if (error) { reject(error); request?.abort?.(); controller.abort(); }
+      else resolve(result);
+    };
+    const cancel = () => finish(new Error("첨부파일 올리기를 취소했습니다."));
+    const timeout = () => finish(new Error(UPLOAD_TIMEOUT_MESSAGE));
+    if (signal?.aborted) { cancel(); return; }
+    signal?.addEventListener?.("abort", cancel, { once: true });
+    timer = setTimeout(timeout, UPLOAD_TIMEOUT_MS);
+    if (typeof XMLHttpRequest !== "function") {
+      fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store",
+        body: file, headers, signal: controller.signal })
+        .then(async (r) => ({ status: r.status, ok: r.ok, data: await r.json().catch(() => ({})) }))
+        .then((result) => finish(null, result), () => finish(new Error("첨부파일을 올리지 못했습니다. 연결 후 다시 올려 주세요.")));
+      return;
+    }
+    try {
+      request = new XMLHttpRequest();
+      request.open("POST", "/api/chat/upload");
+      request.timeout = UPLOAD_TIMEOUT_MS;
+      for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
+      request.upload?.addEventListener?.("progress", (event) => {
+        if (!finished && event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
+      });
+      request.addEventListener("load", () => {
+        let data = {};
+        try { data = JSON.parse(request.responseText || "{}") || {}; } catch { /* invalid response */ }
+        finish(null, { status: request.status, ok: request.status >= 200 && request.status < 300, data });
+      });
+      request.addEventListener("error", () => finish(new Error("첨부파일을 올리지 못했습니다. 연결 후 다시 올려 주세요.")));
+      request.addEventListener("abort", cancel);
+      request.addEventListener("timeout", timeout);
+      request.send(file);
+    } catch (error) { finish(error); }
   });
+  assertAuthEpoch(authEpoch);
+  if (csrfRetry && response.status === 403 && response.data?.code === "csrf_expired" && !signal?.aborted) {
+    await loadCapabilities(authEpoch, { refreshView: false });
+    assertAuthEpoch(authEpoch);
+    return sendUpload(file, { ...headers, "X-CSRF-Token": state.csrf }, onProgress,
+      { signal, authEpoch, csrfRetry: false });
+  }
+  return response;
+}
+function updateUploadEntry(entry) {
+  if (entry.terminalId) renderTerminalAttachments();
+  else updateChatComposer(entry);
+}
+function cancelUploads(entry) {
+  entry.uploadController?.abort();
+  entry.uploadQueue = [];
+  entry.error = entry.inputError = "";
+  entry.notice = "첨부파일 올리기를 취소했습니다.";
+  updateUploadEntry(entry);
 }
 function stopChatPolling() {
   if (state.launcherChatView) {
@@ -7437,7 +7505,7 @@ async function sendChat(entry, message = null) {
   if (!message && currentChat(entry) && /^\/[a-z]+(?:\s|$)/.test(text.trim())) {
     return runSlashCommand(entry, text.trim(), attachments);
   }
-  if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || chatPendingBlocks(entry, text, attachments) || entry.uploads ||
+  if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || chatPendingBlocks(entry, text, attachments) || entry.uploads || (!message && entry.uploadQueue?.length) ||
       (!text.trim() && !attachments.length)) return;
   if (new TextEncoder().encode(text).length > 32768 || attachments.length > MAX_ATTACHMENTS) {
     entry.error = entry.inputError = `메시지는 32KiB, 첨부는 ${MAX_ATTACHMENTS}개까지 보낼 수 있습니다. 초안은 유지됩니다.`;
@@ -7884,76 +7952,63 @@ function refreshConversationView(entry, toEnd = false) {
   if (!s || !list || !currentChat(entry) || list.conversationSource !== chatKey(entry.source)) return;
   renderMessages(s, null, list.conversationErrorText || "", toEnd);
 }
-async function uploadChatFiles(entry, files) {
-  if (networkOffline()) { updateChatComposer(entry); return; }
-  if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.uploads || !files.length) return;
-  if (entry.attachments.length + files.length > MAX_ATTACHMENTS) {
+async function uploadChatFiles(entry, files = []) {
+  if (!currentChat(entry) || !chatAttachmentsSupported(entry) || entry.sending || entry.uploads) return;
+  entry.uploadQueue ||= [];
+  if (entry.attachments.length + entry.uploadQueue.length + files.length > MAX_ATTACHMENTS) {
     entry.error = entry.inputError = `한 메시지에는 첨부 파일을 ${MAX_ATTACHMENTS}개까지 추가할 수 있습니다.`;
-    updateChatComposer(entry);
-    return;
+    updateChatComposer(entry); return;
   }
-  const authEpoch = state.authEpoch;
-  entry.uploads = files.length;
-  entry.error = "";
-  entry.notice = "";
-  const queue = files.map((file, index) => ({ key: `upload-${Date.now()}-${index}`, file, state: "waiting", progress: null }));
-  for (const item of queue) attachmentThumb(entry, item.key, item.file);
-  entry.uploadQueue = queue;
-  const unqueue = (item) => {
-    entry.uploadQueue = entry.uploadQueue.filter((value) => value !== item);
-  };
+  for (const file of files) {
+    const item = { key: `upload-${requestId()}`, file, state: "waiting", progress: null };
+    attachmentThumb(entry, item.key, file);
+    entry.uploadQueue.push(item);
+  }
+  if (!entry.uploadQueue.length) return;
+  const authEpoch = state.authEpoch, controller = new AbortController();
+  entry.uploadController = controller;
+  entry.uploads = entry.uploadQueue.length;
+  entry.error = entry.inputError = entry.notice = "";
   updateChatComposer(entry);
   try {
-    for (const item of queue) {
-      const file = item.file;
-      if (authEpoch !== state.authEpoch) { entry.uploads = 0; return; }
-      if (networkOffline()) {
-        entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-        entry.uploads = 0; updateChatComposer(entry); break;
-      }
-      try {
-        const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
-        if (file.size > limit) throw new Error(`${file.name || "파일"}: 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다.`);
-        item.state = "uploading";
-        item.progress = 0;
-        setUploadProgress(item.tile, item);
-        const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
-          "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
-          "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
-        (ratio) => {
-          item.progress = ratio;
-          setUploadProgress(item.tile, item);
-        });
-        assertAuthEpoch(authEpoch);
-        if (response.status === 401) { showLogin(); return; }
-        const data = response.data || {};
-        if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다.");
-        if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-        // The local preview now belongs to the uploaded attachment.
-        const thumb = entry.thumbs.get(item.key);
-        if (thumb) {
-          entry.thumbs.delete(item.key);
-          entry.thumbs.set(data.attachment.id, thumb);
-        }
-        unqueue(item);
-        entry.attachments.push(data.attachment);
-        entry.revision++;
-      } catch (err) {
-        if (authEpoch !== state.authEpoch || err.staleAuth) { entry.uploads = 0; return; }
-        unqueue(item);
-        entry.error = entry.inputError = err.message;
-        if (networkOffline()) {
-          entry.notice = `아직 올리지 못한 파일 ${entry.uploads}개가 있습니다. 다시 첨부해 주세요.`;
-          entry.error = entry.inputError = `${err.message} ${entry.notice}`;
-          break;
-        }
-      } finally { entry.uploads = Math.max(0, entry.uploads - 1); updateChatComposer(entry); }
+    while (entry.uploadQueue.length && !controller.signal.aborted) {
+      const item = entry.uploadQueue[0], file = item.file;
+      assertAuthEpoch(authEpoch);
+      if (networkOffline()) throw new Error("연결이 끊겼습니다. 선택한 파일을 다시 올리거나 취소해 주세요.");
+      const limit = entry.data.maxAttachmentBytes || 20 * 1024 * 1024;
+      if (!Number.isFinite(file.size) || file.size < 1 || file.size > limit)
+        throw new Error(`${file.name || "파일"}: 1바이트 이상, 최대 ${formatBytes(limit)}까지 첨부할 수 있습니다. 파일을 제거한 뒤 다시 선택해 주세요.`);
+      item.state = "uploading"; item.progress = 0;
+      updateChatComposer(entry);
+      const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+        "X-Chat-Source": encodeURIComponent(JSON.stringify(entry.source)),
+        "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) },
+      (ratio) => { item.progress = ratio; setUploadProgress(item.tile, item); }, { signal: controller.signal, authEpoch });
+      assertAuthEpoch(authEpoch);
+      if (controller.signal.aborted) break;
+      if (response.status === 401) { showLogin(); return; }
+      const data = response.data || {};
+      if (!response.ok || !data.attachment?.id) throw new Error(data.error || "첨부파일을 올리지 못했습니다. 다시 올려 주세요.");
+      if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
+      const thumb = entry.thumbs.get(item.key);
+      if (thumb) { entry.thumbs.delete(item.key); entry.thumbs.set(data.attachment.id, thumb); }
+      entry.uploadQueue.shift();
+      entry.attachments.push(data.attachment);
+      entry.uploads = entry.uploadQueue.length;
+      entry.revision++;
+      updateChatComposer(entry);
+    }
+  } catch (err) {
+    if (authEpoch !== state.authEpoch || err.staleAuth) return;
+    if (!controller.signal.aborted) {
+      entry.error = entry.inputError = err.message;
+      for (const item of entry.uploadQueue) item.state = "failed";
     }
   } finally {
-    entry.uploadQueue = entry.uploadQueue.filter((item) => !queue.includes(item));
+    if (entry.uploadController === controller) entry.uploadController = null;
+    entry.uploads = 0;
+    if (authEpoch === state.authEpoch) updateChatComposer(entry);
   }
-  entry.uploads = 0;
-  updateChatComposer(entry);
 }
 // ---------- 빠른 답장 ----------
 // Selecting a phrase inserts it in the draft and sends through the normal chat flow. This
@@ -10792,7 +10847,7 @@ function renderTerminalAttachments() {
   } else box.replaceChildren();
   const busy = !!entry?.uploads || !!entry?.sending || state.draftPaste?.id === state.terminal?.id;
   $("terminal-attachment-retry").hidden = !entry?.uploadQueue.length || busy;
-  $("terminal-attachment-cancel").hidden = !entry?.uploadQueue.length || busy;
+  $("terminal-attachment-cancel").hidden = !entry?.uploadQueue.length || !!entry?.sending || state.draftPaste?.id === state.terminal?.id;
   $("draft-attach").disabled = !state.authenticated || !state.terminalAlive || !!entry?.sending || !!state.draftPaste;
   for (const id of ["draft-paste", "draft-type"]) $(id).disabled = !state.connected || !!state.draftPaste ||
     !!entry?.uploads || !!entry?.uploadQueue.length;
@@ -10814,6 +10869,8 @@ async function uploadTerminalFiles(files = []) {
   }
   if (entry.uploads) { renderTerminalAttachments(); return; }
   if (!entry.uploadQueue.length) return;
+  const controller = new AbortController();
+  entry.uploadController = controller;
   entry.error = ""; entry.uploads = 1; renderTerminalAttachments();
   try {
     if (networkOffline()) throw new Error("오프라인입니다. 첨부는 남겨 두었습니다. 연결 후 다시 올려 주세요.");
@@ -10827,7 +10884,7 @@ async function uploadTerminalFiles(files = []) {
     if (!source || terminal.alive === false || terminal.closed) throw new Error("이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
     if (entry.source && chatKey(entry.source) !== chatKey(source)) throw new Error("터미널의 연결 세션이 바뀌었습니다. 이전 첨부를 제거한 뒤 다시 추가해 주세요.");
     entry.source = source;
-    while (entry.uploadQueue.length && retained()) {
+    while (entry.uploadQueue.length && retained() && !controller.signal.aborted) {
       const item = entry.uploadQueue[0], file = item.file;
       if (networkOffline()) throw new Error("연결이 끊겼습니다. 남은 첨부를 다시 올려 주세요.");
       if (!Number.isFinite(file.size) || file.size < 1 || file.size > 20 * 1024 * 1024)
@@ -10837,13 +10894,9 @@ async function uploadTerminalFiles(files = []) {
         "X-Chat-Source": encodeURIComponent(JSON.stringify(source)),
         "X-File-Name": encodeURIComponent(file.name || `clipboard-${Date.now()}.${file.type?.split("/")[1]?.replace("jpeg", "jpg") || "bin"}`) }, (ratio) => {
           item.progress = ratio; setUploadProgress(item.tile, item);
-        });
-      if (!retained()) return;
+        }, { signal: controller.signal, authEpoch });
+      if (!retained() || controller.signal.aborted) return;
       if (response.status === 401) { showLogin(); return; }
-      if (response.status === 403) {
-        await loadCapabilities(authEpoch, { refreshView: false });
-        throw new Error("연결 상태를 새로 확인했습니다. 첨부 다시 올리기를 눌러 주세요.");
-      }
       const attachment = response.data?.attachment;
       if (!response.ok || !validTerminalAttachment(attachment)) throw new Error(response.data?.error || "첨부 전송을 확인하지 못했습니다. 다시 올려 주세요.");
       const thumb = entry.thumbs.get(item.key);
@@ -10853,8 +10906,12 @@ async function uploadTerminalFiles(files = []) {
       persistTerminalDraft(entry.terminal);
     }
   } catch (err) {
-    if (retained()) entry.error = err.message || "첨부파일을 올리지 못했습니다. 다시 올려 주세요.";
+    if (retained() && !controller.signal.aborted) {
+      entry.error = err.message || "첨부파일을 올리지 못했습니다. 다시 올려 주세요.";
+      for (const item of entry.uploadQueue) item.state = "failed";
+    }
   } finally {
+    if (entry.uploadController === controller) entry.uploadController = null;
     entry.uploads = 0;
     if (retained()) renderTerminalAttachments();
   }
@@ -10886,6 +10943,7 @@ function pasteTerminalFiles(event) {
 }
 function clearTerminalAttachmentDraft(id) {
   const entry = terminalAttachmentDrafts.get(id);
+  entry?.uploadController?.abort();
   if (entry) for (const key of [...entry.thumbs.keys()]) revokeThumb(entry, key);
   terminalAttachmentDrafts.delete(id);
 }
@@ -11041,7 +11099,8 @@ function terminalMatchesDetail(terminal, s) {
     try { source = JSON.parse(info.sourceKey || "null"); } catch { return false; }
     if (typeof source?.cwd !== "string" || !source.cwd) return false;
   }
-  if ((source.cwd || null) !== (s.cwd || null)) return false;
+  if (sameClaudeConversation(source, s)) return true;
+  if ((source?.cwd || null) !== (s.cwd || null)) return false;
   return !!source && sameRecoverySource(source, s) &&
     (s.agent !== "claude" || !s.sessionId || source.sessionId === s.sessionId);
 }
@@ -13885,7 +13944,10 @@ function showLogin() {
   stopTerminalReader();
   stopChatPolling();
   // Object URLs of picked images are released with their drafts.
-  for (const entry of state.chats.values()) for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
+  for (const entry of state.chats.values()) {
+    entry.uploadController?.abort();
+    for (const key of [...(entry.thumbs?.keys() || [])]) revokeThumb(entry, key);
+  }
   state.chats.clear();
   state.quickRepliesShared = null; state.quickRepliesEditor = null; state.quickRepliesSaving = null; state.quickRepliesError = "";
   state.quickRepliesUnsaved = null;
@@ -14199,7 +14261,7 @@ function pageShown() {
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
     [...terminalAttachmentDrafts.values()].some((entry) => entry.attachments.length || entry.uploadQueue.length || entry.uploads) ||
-    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads);
+    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads || entry.uploadQueue?.length);
 }
 function warnDraftUnload(event) {
   if (state.discardOnReload) return;
@@ -14756,8 +14818,8 @@ window.addEventListener("DOMContentLoaded", () => {
   $("terminal-attachment-retry").addEventListener("click", () => uploadTerminalFiles());
   $("terminal-attachment-cancel").addEventListener("click", () => {
     const entry = terminalAttachmentEntry();
-    if (!entry || entry.uploads || entry.sending) return;
-    entry.uploadQueue = []; entry.error = ""; renderTerminalAttachments();
+    if (!entry || entry.sending) return;
+    cancelUploads(entry);
   });
   for (const [id, delta] of [
     ["terminal-font-down", -1],

@@ -638,3 +638,39 @@ class ContinuityTest(unittest.TestCase):
         self.assertIn('name@example.com', result['messages'][0]['text'], 'an email address is not a secret')
         self.assertNotIn('sk-proj', result['messages'][0]['text'])
         self.assertEqual((Path(self.temp.name) / 'conversations.json').stat().st_mode & 0o777, 0o600)
+
+
+class MovedClaudeWorkflowTest(unittest.TestCase):
+    setUp = WorkflowTest.setUp
+    tearDown = WorkflowTest.tearDown
+
+    def test_same_conversation_reuses_live_terminal_after_folder_move_on_mac_and_windows(self):
+        sid = '019aaaaa-0000-7000-8000-000000000009'
+        source = {'host': 'local', 'agent': 'claude', 'home': '.claude', 'id': sid,
+                  'sessionId': sid, 'cwd': '/tmp/project/worktree', 'kind': 'interactive',
+                  'phase': 'working', 'online': True}
+        native = {**source, 'cwd': '/tmp/project'}
+        self.flow.resolve_source = lambda *a, **kw: dict(source)
+        terminal = {'id': 'd' * 32, 'key': 'old-route', 'alive': True, 'nativeSource': native}
+        self.terms.records = [terminal]
+        self.flow.transfers.rpc = lambda *a, **kw: self.fail('must reuse the existing terminal')
+        for platform in ('windows', 'macos'):
+            with self.subTest(platform=platform):
+                self.board.hosts = [{**HOST, 'local': False, 'platform': platform}]
+                plan = self.flow.plan({'source': source, 'target': {'host': 'local', 'agent': 'claude', 'account': 'claude:default'}})
+                self.assertTrue(plan['allowed'], plan.get('reason'))
+                self.assertEqual(plan['mode'], 'reconnect')
+                result = self.flow.launch(plan['id'], 'reconnect-' + platform)
+                self.assertTrue(result['reused'])
+                self.assertEqual(result['terminal']['id'], terminal['id'])
+        self.assertFalse(self.terms.calls)
+
+    def test_folder_change_requires_same_proven_conversation_and_account(self):
+        sid = '019aaaaa-0000-7000-8000-000000000009'
+        native = {'host': 'local', 'agent': 'claude', 'home': '.claude', 'id': sid, 'cwd': '/tmp/old'}
+        changed = {**native, 'cwd': '/tmp/new', 'sessionId': sid}
+        self.assertTrue(server.Workflow.same_native(native, changed))
+        for update in ({'host': 'other'}, {'home': '.claude-other'}, {'sessionId': SOURCE['id']}, {'agent': 'codex'}):
+            self.assertFalse(server.Workflow.same_native(native, {**changed, **update}))
+        self.assertFalse(server.Workflow.same_native({**native, 'id': 'worker'}, {**native, 'id': 'worker', 'cwd': '/tmp/new'}))
+        self.assertFalse(server.Workflow.same_native({**REF, 'cwd': '/tmp/old'}, {**REF, 'cwd': '/tmp/new'}))

@@ -1000,6 +1000,15 @@ class ChatHttpTest(ChatTest):
         auth={'Authorization':'Bearer synthetic','X-CSRF-Token':self.httpd.csrf,
               'Content-Length':str(chat.MAX_FILE+1)}
         self.assertEqual(self.upload_request(auth,b'')[0],400)
+    def test_upload_expired_token_and_storage_refusal_remain_distinguishable(self):
+        code, body = self.upload_request({'Authorization': 'Bearer synthetic', 'X-CSRF-Token': 'old'})
+        self.assertEqual(code, 403)
+        self.assertEqual(json.loads(body)['code'], 'csrf_expired')
+        with patch.object(self.chat, 'upload', side_effect=ValueError('실제 작업 폴더를 확인하지 못했습니다.')):
+            code, body = self.upload_request({'Authorization': 'Bearer synthetic', 'X-CSRF-Token': self.httpd.csrf})
+        self.assertEqual(code, 400)
+        self.assertIn('작업 폴더', json.loads(body)['error'])
+        self.assertNotIn('20MiB', json.loads(body)['error'])
     def post(self, path, body):
         c=http.client.HTTPConnection('127.0.0.1',self.port,timeout=5)
         c.request('POST',path,json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer synthetic',
@@ -1115,6 +1124,47 @@ class ChatClaudeTest(unittest.TestCase):
 
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
+
+    def test_moved_claude_keeps_live_terminal_and_previous_attachments(self):
+        self.board.hosts = [{**HOST, 'platform': 'windows'}]
+        self.kind('interactive')
+        terminal = self.terminal()
+        file = self.chat.upload(CLAUDE_REF, 'before.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
+        moved = self.root / 'worktree'; moved.mkdir()
+        self.project = moved
+        self.row['cwd'] = str(moved)
+        self.board.poll(self.board.hosts[0]); self.chat._forget_state(CLAUDE_REF)
+        state = self.state()
+        self.assertTrue(state['capability']['supported'])
+        self.assertEqual(self.chat._board_terminal(self.row | {'host': 'local'})['id'], terminal['id'])
+        result = self.send(text='previous file', attachments=[file['id']])
+        self.assertEqual(result['status'], 'accepted')
+        self.assertIn(file['path'], self.terms.pastes[-1][1])
+        fresh = self.chat.upload(CLAUDE_REF, 'after.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
+        self.assertTrue(fresh['path'].startswith(str(moved.resolve())))
+        self.row['sessionId'] = '019aaaaa-0000-7000-8000-000000000009'
+        self.board.poll(self.board.hosts[0])
+        with self.assertRaises(ValueError):
+            self.chat._prepare_send({'source': CLAUDE_REF, 'requestId': 'other-session', 'text': '', 'attachments': [file['id']]})
+
+    def test_upload_uses_fresh_claude_folder_while_list_is_stale(self):
+        old = self.project
+        self.project = self.root / 'new-worktree'; self.project.mkdir()
+        file = self.chat.upload(CLAUDE_REF, 'fresh.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
+        self.assertTrue(file['path'].startswith(str(self.project.resolve())))
+        self.assertEqual(self.row['cwd'], str(old))
+
+    def test_legacy_attachment_without_transcript_keeps_only_its_original_folder(self):
+        file = self.chat.upload(CLAUDE_REF, 'legacy.txt', b'fixture')['attachment']
+        path = self.root / 'chat' / 'attachments' / (file['id'] + '.json')
+        record = json.loads(path.read_text()); record['source'].pop('sessionId')
+        path.write_text(json.dumps(record))
+        data = {'source': CLAUDE_REF, 'requestId': 'legacy-file', 'text': '', 'attachments': [file['id']]}
+        self.chat._prepare_send(data)
+        self.row['cwd'] = str(self.root / 'moved')
+        self.board.poll(HOST)
+        with self.assertRaises(ValueError):
+            self.chat._prepare_send(data)
 
     def test_only_a_conversation_read_from_a_live_host_lets_the_host_skip_claude_agents(self):
         seen, original = [], self.flow.transfers.rpc
