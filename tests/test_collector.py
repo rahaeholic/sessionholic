@@ -172,7 +172,11 @@ class SessionOriginTest(unittest.TestCase):
                  ([{**first, 'entrypoint': None}, later], None),
                  ([{**first, 'entrypoint': ['cli']}], None),
                  ([{**first, 'entrypoint': 'x' * 257}], None),
-                 ([{'type': 'queue-operation', 'content': 'x' * 65536}, later], None)]
+                 # An MCP-heavy session's opening record (100 KB on an agent view) no longer
+                 # hides its first request; past the head's 1 MiB it stays unknown.
+                 ([{'type': 'attachment', 'content': 'x' * 104000}, later], 'cli'),
+                 ([{**later, 'message': {'content': '긴 첫 요청 ' * 9000}}], 'cli'),
+                 ([{'type': 'attachment', 'content': 'x' * (1 << 20)}, later], None)]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / (sid + '.jsonl')
             for entries, expected in cases:
@@ -1777,6 +1781,28 @@ class InitialTitleTest(unittest.TestCase):
             with path.open('a') as stream:
                 stream.write(json.dumps({'type': 'custom-title', 'customTitle': '직접 정한 제목'}) + '\n')
             self.assertEqual(collector.claude_initial_titles(path)['manualNativeTitle'], '직접 정한 제목')
+
+    def test_first_claude_request_after_a_large_opening_record_on_both_platforms(self):
+        # An agent view with many MCP tools opens its transcript with one ~100 KB attachment;
+        # the request after it named the session "(제목 없음)" and hid it under 에이전트 세션.
+        import windows_collector
+        sid = '12345678-abcd-1234-abcd-123456789abc'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / (sid + '.jsonl')
+            rows = [{'type': 'custom-title', 'sessionId': sid, 'customTitle': '정한 제목'},
+                    {'type': 'attachment', 'sessionId': sid, 'attachment': {'content': 'x' * 104000}},
+                    {'type': 'user', 'sessionId': sid, 'entrypoint': 'cli', 'message': {'content': '<command-name>/model</command-name>'}},
+                    {'type': 'user', 'sessionId': sid, 'entrypoint': 'cli', 'message': {'content': '하네스 재사용 정리'}},
+                    {'type': 'assistant', 'sessionId': sid, 'message': {'content': 'y' * 70000}}]
+            path.write_text('\n'.join(json.dumps(row, ensure_ascii=False) for row in rows) + '\n')
+            for titles, entrypoint in ((collector.claude_initial_titles(path, read_manual=False), collector.claude_entrypoint(path, sid)),
+                                       (windows_collector._claude_initial_titles(path, entries=[]), windows_collector._claude_entrypoint(path, sid))):
+                self.assertEqual(titles['initialTitle'], '하네스 재사용 정리')
+                self.assertEqual(entrypoint, 'cli')
+            head = collector.claude_head(path)
+            self.assertEqual([row['type'] for row in head], ['custom-title', 'user', 'user'], 'the head ends at the first request')
+            row = collector.claude_row({'id': sid[:8], 'sessionId': sid, 'kind': 'background'}, {sid: path}, [])
+            self.assertEqual(collector.session_category(row), 'general')
 
     def test_codex_first_request_is_not_replaced_by_the_native_name_or_harness(self):
         thread = {'id': 'fixture', 'status': {'type': 'idle'}, 'preview': '첫 요청의 목적', 'name': '현재 자동 이름'}

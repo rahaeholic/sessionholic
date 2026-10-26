@@ -15094,6 +15094,29 @@ test('기록 연결 저장의 늦은 응답은 다른 터미널 화면을 갱신
   c.stopChatPolling();
 });
 
+test('Claude 에이전트 뷰 터미널은 그 뒤 같은 폴더에서 시작한 백그라운드 대화를 채팅 후보로 미리 고르고, 연결은 누를 때만 한다', async () => {
+  const { c, s, terminal, calls } = launcherRecoveryClient();
+  Object.assign(terminal, { program: 'claude-agents', programCwd: '/fixture/project', createdAt: 1000 });
+  delete terminal.nativeSource; delete terminal.linkConfidence;
+  const claude = (id, extra = {}) => ({ host: s.host, agent: 'claude', id, sessionId: id, kind: 'background',
+    cwd: '/fixture/project', startedAt: 1009, title: id, ...extra });
+  c.state.snapshot.hosts[0].data.claude = [claude('own'), claude('before-it', { startedAt: 900 }),
+    claude('other-folder', { cwd: '/fixture/other' }), claude('interactive', { kind: 'interactive', startedAt: 1 })];
+  const ids = Array.from(c.launcherChatCandidates(terminal), (item) => item.id);
+  assert.ok(ids.includes('own'), 'the conversation the agent view started (a background session)');
+  assert.ok(ids.includes('interactive'));
+  for (const id of ['before-it', 'other-folder']) assert.equal(ids.includes(id), false, id);
+  // A Claude terminal (not the agent view) still offers no background session.
+  assert.equal(c.launcherChatCandidates({ ...terminal, program: 'claude' }).some((item) => item.id === 'own'), false);
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
+  c.get('detail-mode-chat').events.click();
+  const view = c.state.launcherChatView;
+  const own = vm.runInContext('allSessions()', c.context).find((item) => item.id === 'own');
+  assert.equal(view.select.value, own.key, 'ready to connect');
+  assert.equal(calls.some((r) => r.url.endsWith('/conversation')), false, 'nothing is linked before 채팅 연결');
+  c.stopChatPolling();
+});
+
 test('선택한 터미널 기록은 다시 열어도 복원되고 조회 실패가 기존 답변을 지우지 않는다', async () => {
   const { c, terminal, selected } = launcherRecoveryClient();
   terminal.chatSource = selected;

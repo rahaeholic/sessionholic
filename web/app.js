@@ -11136,8 +11136,16 @@ function launcherChatViewCurrent(view) {
 function launcherChatCandidates(terminal) {
   const info = terminalInfo(terminal);
   return allSessions().filter((s) => s.host === info.host && s.id && !claudeWithoutId(s) && !sessionOneShot(s) &&
-    (!['codex', 'claude'].includes(info.program) || s.agent === info.program) && s.kind !== 'background' &&
+    (!['codex', 'claude'].includes(info.program) || s.agent === info.program) &&
+    (s.kind !== 'background' || agentViewSession(info, s)) &&
     (s.agent !== 'codex' || !s.source || ['cli', 'vscode'].includes(s.source)) && s.cwd);
+}
+// Claude's agent view (`claude agents`) runs each conversation it starts in the background:
+// one of its folder started since the terminal opened is its own.
+function agentViewSession(info, s) {
+  return info.program === 'claude-agents' && s.agent === 'claude' && s.kind === 'background' &&
+    (!info.programCwd || s.cwd === info.programCwd) && Number.isInteger(info.createdAt) &&
+    Number.isFinite(s.startedAt) && s.startedAt >= info.createdAt - 5;
 }
 function renderLauncherChat() {
   const terminal = launcherWorkspaceTerminal(), root = $("launcher-chat-waiting");
@@ -11168,7 +11176,10 @@ function renderLauncherChat() {
       option.value = s.key; return option;
     });
     view.select.replaceChildren(placeholder, ...options);
-    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : source && candidates.some((s) => s.key === chatKey(source)) ? chatKey(source) : "";
+    // The one conversation an agent view started is offered ready to connect (still a press).
+    const own = candidates.filter((s) => agentViewSession(terminalInfo(terminal), s));
+    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : source && candidates.some((s) => s.key === chatKey(source)) ? chatKey(source)
+      : own.length === 1 ? own[0].key : "";
     view.candidates = signature;
   }
   view.connect.disabled = view.saving === true;

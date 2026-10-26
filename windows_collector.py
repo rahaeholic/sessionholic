@@ -39,6 +39,11 @@ EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
 # titles again and again, so the newest of each and the last answer sit in the final kilobytes.
 CLAUDE_LABEL_TAIL = 64 * 1024
 CLAUDE_TITLES = (('custom-title', 'customTitle'), ('agent-name', 'agentName'), ('ai-title', 'aiTitle'))
+# As collector.claude_head: a transcript's head ends at its first request, past opening records
+# larger than CLAUDE_HEAD_RECORD (read unparsed), within CLAUDE_HEAD_BYTES.
+CLAUDE_HEAD_BYTES = 1 << 20
+CLAUDE_HEAD_RECORD = 64 * 1024
+CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 # As collector.recent_window: the newest MESSAGE_LIMIT questions and answers with every row
 # after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
@@ -1034,7 +1039,7 @@ class WindowsCollector:
                 except (OSError, ValueError):
                     pass
             if not cwd and path:
-                for entry in _head(path):
+                for entry in _claude_head(path):
                     if isinstance(entry.get('cwd'), str):
                         cwd = entry['cwd']
                         break
@@ -1200,9 +1205,33 @@ def _head(path):
     return _entries(raw.splitlines()[:30])
 
 
+def _claude_head(path):
+    """As collector.claude_head: the opening records up to the first main-thread request with
+    text of its own (one not starting with "<"), within CLAUDE_HEAD_BYTES."""
+    head, budget = [], CLAUDE_HEAD_BYTES
+    with path.open('rb') as stream:
+        while budget > 0:
+            line = stream.readline(budget)
+            if not line:
+                break
+            budget -= len(line)
+            if len(line) > CLAUDE_HEAD_RECORD and not CLAUDE_USER_RECORD.search(line):
+                continue
+            entry = next(iter(_entries([line])), None)
+            if entry is None:
+                continue
+            head.append(entry)
+            if (entry.get('type') == 'user'
+                    and not any(entry.get(flag) for flag in ('isMeta', 'isSidechain', 'isCompactSummary'))
+                    and any(m['role'] == 'user' and m['text'].strip() and not m['text'].lstrip().startswith('<')
+                            for m in _claude_messages([entry]))):
+                break
+    return head
+
+
 def _claude_entrypoint(path, session_id):
     """As collector.claude_entrypoint: only the original main-thread request counts."""
-    for entry in _head(path):
+    for entry in _claude_head(path):
         if (entry.get('type') == 'user' and entry.get('sessionId') == session_id
                 and not any(entry.get(flag) for flag in ('isMeta', 'isSidechain', 'isCompactSummary'))):
             return _metadata(entry.get('entrypoint'))
@@ -1294,7 +1323,7 @@ def _claude_label(path, metadata=None):
                   if entry.get('type') == kind and _metadata(entry.get(key))), '')
     if not title:
         # Expanded skills, compaction summaries and side threads are not the request.
-        asked = [entry for entry in _head(path)
+        asked = [entry for entry in _claude_head(path)
                  if not any(entry.get(flag) for flag in ('isMeta', 'isCompactSummary', 'isSidechain'))]
         title = next((message['text'] for message in _claude_messages(asked)
                       if message['role'] == 'user' and not message['text'].lstrip().startswith('<')), '')
@@ -1304,7 +1333,7 @@ def _claude_label(path, metadata=None):
 
 
 def _claude_initial_titles(path, entries=None):
-    head = _head(path)
+    head = _claude_head(path)
     asked = [e for e in head if not any(e.get(flag) for flag in ('isMeta', 'isCompactSummary', 'isSidechain'))]
     first = next((m['text'] for m in _claude_messages(asked) if m['role'] == 'user'
                   and not m['text'].lstrip().startswith('<')), '')
