@@ -7943,6 +7943,44 @@ test('the board text size is its own stored choice scaling the rem type scale, a
     assert.match(indexPage(), new RegExp(`id="${id}" class="switch" type="checkbox" role="switch"`), id);
 });
 
+test('분할 창·다른 탭은 다른 문서에서 바꾼 설정(글자 크기·테마·터미널 글꼴·입력·낭독기·빠른 답장)을 바로 따른다', async () => {
+  const requests = [];
+  const c = client(async (url) => { requests.push(url); return { ok: true, status: 200, json: async () => ({ ok: true, revision: 3, quickReplies: ['새 문구'] }) }; }, noChatTimers);
+  c.context.navigator = { onLine: true };
+  c.windowEvents.DOMContentLoaded();
+  c.state.authenticated = true;
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  const store = new Map();
+  c.context.localStorage = { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value) };
+  // Another document (the first pane, where 설정 is open) stored these; this pane only hears of them.
+  const stored = (name, value) => { store.set('sessionholic:ui:' + name, JSON.stringify(value)); c.windowEvents.storage({ key: 'sessionholic:ui:' + name }); };
+  stored('textSize', 'small');
+  assert.equal(root.attributes['data-text-size'], 'small'); assert.equal(c.state.textSize, 'small');
+  assert.equal(c.get('text-size-small').checked, true);
+  stored('theme', 'dark');
+  assert.equal(root.attributes['data-theme'], 'dark');
+  stored('fontSize', 18);
+  assert.equal(c.state.fontSize, 18);
+  stored('screenReaderMode', true);
+  assert.equal(c.state.screenReaderMode, true); assert.equal(c.get('terminal-accessibility').checked, true);
+  stored('directTerminalInput', false);
+  assert.equal(c.state.directTerminalInput, false); assert.equal(c.get('terminal-direct-input').checked, false);
+  stored('terminalDock', false);
+  assert.equal(c.state.terminalDock, false);
+  assert.equal([...store.keys()].filter((key) => key.startsWith('sessionholic:ui:')).length, 6, 'following never writes back');
+  // 빠른 답장: the board's shared list is read again.
+  c.windowEvents.storage({ key: 'sessionholic:quickReplies' }); await settle();
+  assert.ok(requests.includes('/api/preferences'));
+  assert.deepEqual(c.quickReplies(), ['새 문구']);
+  // Another board's (prefix) or an unrelated key changes nothing here.
+  store.set('other:ui:textSize', '"large"'); c.windowEvents.storage({ key: 'other:ui:textSize' });
+  c.windowEvents.storage({ key: 'sessionholic:draft:x' });
+  assert.equal(c.state.textSize, 'small');
+});
+
 test('theme-init applies a forced theme and text size before paint, keeps meta originals for auto, and survives blocked storage', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/theme-init.js'), 'utf8');
   const run = (stored, { throws = false, extra = {} } = {}) => {
