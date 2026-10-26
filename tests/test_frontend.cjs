@@ -8034,7 +8034,13 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   const android = 'Mozilla/5.0 (Linux; Android 15)';
   assert.deepEqual(run({}, { extra: device(android, 5, false, { coarse: true, screen: { width: 800, height: 1280 } }) }).attributes, { 'data-tablet': '' });
   assert.deepEqual(run({}, { extra: device(android, 5, false, { coarse: true, screen: { width: 412, height: 915 } }) }).attributes, {}, 'a phone');
+  // A split pane of a board wider than a phone keeps the board's type scale, not its own width's.
+  const pane = (innerWidth) => ({ frameElement: {}, top: { innerWidth } });
+  assert.deepEqual(run({}, { extra: pane(1440) }).attributes, { 'data-desktop-pane': '' });
+  assert.deepEqual(run({}, { extra: pane(700) }).attributes, {}, 'a phone-wide board: its panes follow the phone rules as p1 does');
+  assert.deepEqual(run({}, { extra: { frameElement: null, top: { innerWidth: 1440 } } }).attributes, {}, 'the board page itself');
   const css = styleSheet();
+  assert.match(css, /\*\/\n@media \(max-width: 700px\) \{\n  :root:where\(:not\(\[data-desktop-pane\]\)\) \{\n    --fs-large:/, 'the phone type scale skips a marked pane');
   assert.match(css, /:root\[data-ipad-app\] \{\s*--top-inset: max\(env\(safe-area-inset-top\), 36px\);/);
   assert.equal((css.match(/env\(safe-area-inset-top\)/g) || []).length, 2, 'every other top inset reads --top-inset');
   const html = indexPage();

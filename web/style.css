@@ -3148,14 +3148,18 @@ li[data-task] {
   .layout {
     grid-template-columns: 300px minmax(0, 1fr);
   }
-  :root {
+  :root:where(:not([data-desktop-pane])) {
     --detail-pad: 22px;
   }
 }
 
-/* Phone: one screen per step (list → detail → terminal) */
+/* Phone: one screen per step (list → detail → terminal)
+   A split pane is a page of its own, so its narrow width alone would match here
+   while the first pane, the board page, never does at the same width. On a board
+   wider than a phone it is marked [data-desktop-pane] (theme-init.js, workspace.js)
+   and keeps the board's type scale and spacing. :where() keeps each rule's specificity. */
 @media (max-width: 700px) {
-  :root {
+  :root:where(:not([data-desktop-pane])) {
     --fs-large: clamp(1.875rem, 1.6rem + 1.2vw, 2.125rem);
     --fs-title: 1.3125rem;
     --fs-body: 1rem;
@@ -3360,7 +3364,7 @@ li[data-task] {
     gap: 4px;
     padding-right: 6px;
   }
-  .terminal-title-group strong {
+  :where(:root:not([data-desktop-pane])) .terminal-title-group strong {
     font-size: 15px;
   }
   #terminal-back {
@@ -3369,7 +3373,7 @@ li[data-task] {
   .terminal-button.terminal-close {
     padding: 0 12px;
   }
-  .terminal-status-row {
+  :where(:root:not([data-desktop-pane])) .terminal-status-row {
     padding-left: 14px;
     padding-right: 4px;
     font-size: 13px;
@@ -7849,7 +7853,7 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 @media (max-width: 700px) {
   .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .detail-titles { grid-column: 1 / -1; grid-row: 2; }
   .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .chat-model-controls { grid-row: 3; }
-  .detail-title { -webkit-line-clamp: 2; font-size: 1.25rem; margin-bottom: 8px; }
+  :where(:root:not([data-desktop-pane])) .detail-title { -webkit-line-clamp: 2; font-size: 1.25rem; margin-bottom: 8px; }
   .detail-head { padding-top: 12px; padding-bottom: 12px; }
   .board-status-panel { right: 8px; }
 }
