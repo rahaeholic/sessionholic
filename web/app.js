@@ -395,6 +395,35 @@ function setTextSize(size) {
   // The composer and terminal measure text; let them follow the new size.
   updateViewport();
 }
+// A setting changed in another document of this board applies here too: each split pane is a
+// page of its own that read its settings when it opened, as is another tab. The browser tells
+// every document but the one that stored the change (a `storage` event; null: all cleared).
+function followStoredSettings(event) {
+  const key = event?.key ?? null, prefix = INSTANCE.storagePrefix + "ui:";
+  if (key === null || key === quickRepliesKey()) loadQuickReplyPreferences();
+  if (key !== null && !String(key).startsWith(prefix)) return;
+  const changed = (name) => key === null || key === prefix + name;
+  if (changed("theme")) applyTheme(prefs.get("theme", "auto"));
+  if (changed("textSize")) {
+    applyTextSize(prefs.get("textSize", "default"));
+    updateViewport();
+  }
+  if (changed("fontSize")) setTerminalFontSize(prefs.get("fontSize", TERMINAL_DEFAULT_FONT_SIZE), { persist: false });
+  if (changed("screenReaderMode")) {
+    state.screenReaderMode = prefs.get("screenReaderMode", false) === true;
+    if ($("terminal-accessibility")) $("terminal-accessibility").checked = state.screenReaderMode;
+    if (state.term) state.term.options.screenReaderMode = state.screenReaderMode;
+  }
+  if (changed("directTerminalInput")) {
+    state.directTerminalInput = prefs.get("directTerminalInput", null);
+    if ($("terminal-direct-input")) $("terminal-direct-input").checked = directTerminalInput();
+    configureTerminalKeyboard();
+  }
+  if (changed("draftRecovery") && $("draft-recovery")) $("draft-recovery").checked = draftRecoveryEnabled();
+  // The next terminal this document opens takes "크게"/"나란히" as the one where it was pressed.
+  if (changed("terminalDock")) state.terminalDock = prefs.get("terminalDock", true) !== false;
+  if (changed("edgeSwipe")) state.edgeSwipe = prefs.get("edgeSwipe", false) === true;
+}
 function updateThemeColor() {
   // Both media-specific metas take the forced color; "auto" restores them.
   const forced = boardCovered() ? THEME_COLORS.terminal
@@ -14797,6 +14826,7 @@ window.addEventListener("DOMContentLoaded", () => {
     prefs.set("screenReaderMode", state.screenReaderMode);
     if (state.term) state.term.options.screenReaderMode = state.screenReaderMode;
   });
+  window.addEventListener("storage", followStoredSettings);
   window.addEventListener("resize", updateViewport);
   window.addEventListener("beforeunload", warnDraftUnload);
   // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
