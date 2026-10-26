@@ -509,6 +509,7 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
   if (!shown && state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (!shown) state.launcherWorkspace = null;
   if (!shown) rememberConversationView();
+  if (!shown) closeConversationMenus();
   const changed = state.detailShown !== shown;
   state.detailShown = shown;
   const apply = () => {
@@ -3312,6 +3313,12 @@ function closeActionSheet({ restoreFocus = true } = {}) {
   state.actionTrigger = null;
   if (restoreFocus && trigger && trigger.isConnected !== false) trigger.focus?.({ preventScroll: true });
 }
+// Back to the list (a phone's Back): a conversation's own menus (빠른 답장, its ⋯) go with it.
+// A list card's menu stays.
+function closeConversationMenus() {
+  closeQuickReplies();
+  if ($("action-sheet")?.open && state.actionTrigger?.closest?.("#detail")) closeActionSheet({ restoreFocus: false });
+}
 
 // Original execution controls are separate from closing the board's attached terminal.
 function terminationRecord(s, value) {
@@ -4546,6 +4553,7 @@ function setReading(reading, { stickBottom = false } = {}) {
   const list = $("messages");
   const before = list?.getBoundingClientRect?.().top;
   pane.classList.toggle?.("is-reading", reading);
+  placeModeTabs(pane, reading);
   const chatInput = $("chat-input");
   if (chatInput && chatInput.placeholder !== "후속 메시지 없음") chatInput.placeholder = chatPlaceholder(false);
   if (list && typeof before === "number") {
@@ -4559,6 +4567,20 @@ function setReading(reading, { stickBottom = false } = {}) {
     list.lastScrollTop = list.scrollTop;
   }
   renderJump();
+}
+// 집중 모드: the 터미널/채팅 tabs join the folded header's line (style.css places them),
+// and shown bars give them back their own row under the header. A tab keeps its focus.
+function placeModeTabs(pane, reading) {
+  const head = $("detail-head"), tabs = $("detail-mode-tabs");
+  if (!head || !tabs || head.parentElement !== pane) return;
+  const inHead = tabs.parentElement === head;
+  if (inHead === reading) return;
+  const focused = tabs.contains?.(document.activeElement) ? document.activeElement : null;
+  if (reading) {
+    const actions = head.querySelector?.(".detail-head-actions");
+    if (actions) actions.before(tabs); else head.append(tabs);
+  } else head.after(tabs);
+  focused?.focus?.({ preventScroll: true });
 }
 // Typing on a phone folds the same chrome as reading mode (header to one
 // line, conversation bar, continue row and tool row), so the keyboard leaves
