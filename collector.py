@@ -631,24 +631,27 @@ def claude_snippet(path, size, metadata=None):
     return ""
 
 
-# A session with many tools (an MCP-heavy Claude agent view) opens its transcript with records
-# that alone pass 100 KB, so its first request can lie past any fixed head. Those records are
-# read past unparsed; the head ends at the first request (most within 35 KB), or this far in.
+# A transcript's head: its first 30 records within 64 KB, as before, and always as far as its
+# first request. A session with many tools (an MCP-heavy Claude agent view) opens with records
+# that alone pass 100 KB; those are read past unparsed up to the request (most lie within 35 KB),
+# within CLAUDE_HEAD_BYTES.
 CLAUDE_HEAD_BYTES = 1 << 20
 CLAUDE_HEAD_RECORD = 65536
+CLAUDE_HEAD_LINES = 30
 CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 
 
 def claude_head(path):
-    """A transcript's opening records up to its first main-thread request with text of its own
-    (one not starting with "<", a command or caveat), within CLAUDE_HEAD_BYTES."""
-    head, budget = [], CLAUDE_HEAD_BYTES
+    """A transcript's opening records: the first CLAUDE_HEAD_LINES within CLAUDE_HEAD_RECORD bytes,
+    extended up to its first main-thread request with text of its own (one not starting with "<",
+    a command or caveat) within CLAUDE_HEAD_BYTES."""
+    head, read, asked = [], 0, False
     with path.open("rb") as stream:
-        while budget > 0:
-            line = stream.readline(budget)
+        while read < CLAUDE_HEAD_BYTES and not (asked and (len(head) >= CLAUDE_HEAD_LINES or read >= CLAUDE_HEAD_RECORD)):
+            line = stream.readline(CLAUDE_HEAD_BYTES - read)
             if not line:
                 break
-            budget -= len(line)
+            read += len(line)
             if len(line) > CLAUDE_HEAD_RECORD and not CLAUDE_USER_RECORD.search(line):
                 continue
             try:
@@ -658,11 +661,10 @@ def claude_head(path):
             if not isinstance(entry, dict):
                 continue
             head.append(entry)
-            if (entry.get("type") == "user"
-                    and not any(entry.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary"))
-                    and any(m["role"] == "user" and m["text"].strip() and not m["text"].lstrip().startswith("<")
-                            for m in claude_messages([entry]))):
-                break
+            asked = asked or (entry.get("type") == "user"
+                              and not any(entry.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary"))
+                              and any(m["role"] == "user" and m["text"].strip() and not m["text"].lstrip().startswith("<")
+                                      for m in claude_messages([entry])))
     return head
 
 
