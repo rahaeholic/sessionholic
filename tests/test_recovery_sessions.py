@@ -98,6 +98,19 @@ class RecoverySessionsTest(unittest.TestCase):
         with self.assertRaises(recovery.RecoveryError):
             self.store.remember({**claude, "kind": "background"})
 
+    def test_a_claude_session_that_moved_folders_keeps_its_first_folder_and_can_be_ended(self):
+        # A Claude session's cwd follows its shell (into a worktree); ending it saves its locator
+        # first and was refused as a conflict, so 세션 종료 failed on every try.
+        claude = {**self.source, "agent": "claude", "home": ".claude", "id": "d8d67c5e", "kind": "background",
+                  "sessionId": "d8d67c5e-0710-4aec-b909-a641f745c3ed", "cwd": "/Users/fixture/Personal"}
+        first = self.store.remember(claude, self.terminal_id, "released")
+        moved = {**claude, "cwd": "/Users/fixture/Personal/repo/.claude/worktrees/task"}
+        ended = self.store.remember({**moved, "explicitTermination": True})
+        self.assertEqual(ended["source"]["cwd"], "/Users/fixture/Personal", 'its transcript and resume stay there')
+        self.assertEqual(ended["provenance"]["closure"], "explicit_termination")
+        self.assertEqual(ended["openedAt"], first["openedAt"])
+        self.assertEqual(self.store.get(claude)["provenance"]["closure"], "explicit_termination")
+
     def test_legacy_user_close_and_explicit_termination_are_distinct_and_sticky(self):
         legacy = self.store.remember(self.source, self.terminal_id, "user")
         self.assertEqual(legacy["provenance"]["closure"], "legacy_user_close")

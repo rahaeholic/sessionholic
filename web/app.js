@@ -3388,6 +3388,12 @@ function terminationCopy(result) {
   if (cleanup?.remotePending?.length) return "실행 종료는 확인했습니다. 실행 기기의 터미널 정리가 남았습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
   return "실행 종료는 확인했습니다. 터미널 또는 목록 정리가 남아 있습니다. 남은 정리만 다시 시도할 수 있습니다.";
 }
+// A refusal before the end was sent: the board's own reason, so a repeat that fails the same
+// way says why.
+function notStartedCopy(err) {
+  const reason = String(err?.message || "").trim();
+  return `종료 요청이 전달되지 않았습니다.${reason ? ` ${reason}` : ""} 상태를 갱신했습니다. 다시 종료할 수 있습니다.`;
+}
 async function terminateAndCleanup(context) {
   const pending = terminationRecord(context.s);
   const source = { ...context.source, ...(context.s.cwd ? { cwd: context.s.cwd } : {}) };
@@ -3583,7 +3589,7 @@ async function executeSessionAction(context, action) {
   } catch (err) {
     if (sessionControl === context && !err.staleAuth && !err.unauthorized)
       $("session-control-status").textContent = err.dispatchState === "not_started" && !err.terminationPending
-        ? "종료 요청이 전달되지 않았습니다. 상태를 갱신했습니다. 다시 종료할 수 있습니다."
+        ? notStartedCopy(err)
         : "처리 결과를 확인하지 못했습니다. 실행 상태를 다시 확인해 주세요. 요청을 자동으로 다시 보내지 않습니다.";
   } finally {
     if (sessionControl === context) {
@@ -6867,7 +6873,7 @@ async function endSessionRun(context) {
   } catch (err) {
     if (endSession === context && !err.staleAuth && !err.unauthorized)
       $("end-session-status").textContent = err.dispatchState === "not_started" && !err.terminationPending
-        ? "종료 요청이 전달되지 않았습니다. 상태를 갱신했습니다. 다시 종료할 수 있습니다."
+        ? notStartedCopy(err)
         : "종료 결과를 확인 중입니다. 창을 닫아도 서버에서 확인을 이어갑니다.";
   } finally {
     if (endSession === context) { endSessionBusy(context, false); scheduleTerminationRead(context); }

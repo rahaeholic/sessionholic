@@ -4942,6 +4942,20 @@ test('end keys ask to end a session only off a field and without a text selectio
   assert.equal(focused.slice(next).at(-1), 3, 'the next card takes the focus');
 });
 
+test('보내기 전에 거절된 종료는 보드가 알려 준 이유를 함께 보여 준다', async () => {
+  const preview = { targetProof: 'proof', capabilities: { terminate: { supported: true }, interrupt: { supported: false } } };
+  const { c, cards, press, requests } = keyboardBoard({ fetchImpl: async (url) => url === '/api/session/action'
+    ? { ok: false, status: 400, json: async () => ({ error: '기존 복귀 대상의 작업 폴더나 실행 방식이 바뀌었습니다.', dispatchState: 'not_started' }) }
+    : { ok: true, status: 200, json: async () => (url === '/api/session/preview' ? preview : {}) } });
+  c.context.document.body.append = () => {};
+  press(cards[2], 'Delete'); await settle();
+  await c.get('end-session-terminate').events.click(); await settle();
+  assert.equal(c.get('end-session-status').textContent,
+    '종료 요청이 전달되지 않았습니다. 기존 복귀 대상의 작업 폴더나 실행 방식이 바뀌었습니다. 상태를 갱신했습니다. 다시 종료할 수 있습니다.');
+  assert.equal(requests.filter((r) => r.url === '/api/session/action').length, 1, 'never sent again by itself');
+  assert.equal(c.get('end-session-dialog').open, true);
+});
+
 test('실행 종료 뒤 추정 터미널만 남으면 목록을 정리하고 종료 창을 닫으며 같은 종료를 반복하지 않는다', async () => {
   const preview = { targetProof: 'proof', capabilities: { terminate: { supported: true }, interrupt: { supported: false } } };
   const { c, cards, press, requests } = keyboardBoard({ fetchImpl: async url => ({ ok: true, status: 200, json: async () =>
