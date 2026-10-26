@@ -93,10 +93,26 @@ class PromptReceiptsTest(unittest.TestCase):
 
     def test_changed_terminal_native_conversation_is_rejected_before_reservation(self):
         for change in ({'sessionId': '019aaaaa-0000-7000-8000-000000000002'},
-                       {'cwd': '/another/project'}, {'host': 'another-host'}):
+                       {'home': '.claude-other'}, {'host': 'another-host'}):
             with self.subTest(change=change), self.assertRaises(receipts.PromptReceiptError) as raised:
                 self.reserve(terminal={**TERMINAL, 'nativeSource': {**SOURCE, **change}})
             self.assertEqual(raised.exception.status, 400)
+        self.assertFalse(self.ledger.path.exists())
+
+    def test_moved_claude_terminal_is_allowed_but_existing_receipt_binding_is_preserved(self):
+        moved = {**TERMINAL, 'nativeSource': {**SOURCE, 'cwd': '/another/project'}}
+        self.assertTrue(self.reserve(terminal=moved)['reserved'])
+        self.assertFalse(self.reserve(terminal=moved)['reserved'])
+        self.assertEqual(self.ledger.finish(SOURCE, RID, FINGERPRINT, 1, moved,
+                                          status='answered')['status'], 'answered')
+        with self.assertRaises(receipts.PromptReceiptError) as raised:
+            self.reserve(terminal=TERMINAL)
+        self.assertEqual(raised.exception.code, 'prompt_request_conflict')
+
+    def test_worker_identifier_alone_cannot_cross_folders(self):
+        source = {**SOURCE, 'sessionId': 'worker-1234'}
+        with self.assertRaises(receipts.PromptReceiptError):
+            self.reserve(source=source, terminal={**TERMINAL, 'nativeSource': {**source, 'cwd': '/another/project'}})
         self.assertFalse(self.ledger.path.exists())
 
     def test_claude_changed_conversation_and_cwd_have_distinct_keys(self):

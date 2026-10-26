@@ -2705,7 +2705,7 @@ test('a state read begun before sending cannot roll back new chat state and sche
   assert.match(textOf(c.get('messages')), /현재 읽기/); assert.doesNotMatch(textOf(c.get('messages')), /과거 읽기/);
 });
 
-test('an offline interruption stops remaining uploads and reports files that require explicit reattachment', async () => {
+test('an offline interruption preserves remaining files for an explicit retry', async () => {
   let requests = 0;
   const c = client(async () => {
     requests++; c.context.navigator.onLine = false;
@@ -2714,7 +2714,8 @@ test('an offline interruption stops remaining uploads and reports files that req
   const { entry } = selectChat(c); c.context.navigator = { onLine: true };
   await c.uploadChatFiles(entry, [{ name: 'first.png', size: 1 }, { name: 'second.png', size: 1 }, { name: 'third.png', size: 1 }]);
   assert.equal(requests, 1); assert.equal(entry.attachments.length, 1); assert.equal(entry.uploads, 0);
-  assert.match(entry.notice, /파일 2개.*다시 첨부/);
+  assert.equal(entry.uploadQueue.length, 2);
+  assert.match(entry.error, /다시 올리거나 취소/);
 });
 
 test('terminal settings dismiss outside and with Escape while controls inside retain the menu', () => {
@@ -7912,12 +7913,13 @@ test('picked images preview from memory with an upload ring, move to the uploade
   assert.deepEqual(revoked, []);
   byClass(done, 'chat-attachment-remove')[0].events.click();
   assert.deepEqual(revoked, ['blob:preview-1'], 'released with its tile');
-  // A failed upload releases its preview too, and locking releases whatever is left.
+  // A failed upload keeps its preview for a retry; locking releases every remaining one.
   const again = c.uploadChatFiles(entry, [{ name: '두번째.png', size: 10, type: 'image/png' }]);
   await settle();
   sent[1].listeners.error();
   await again; await settle();
-  assert.deepEqual(revoked, ['blob:preview-1', 'blob:preview-2']);
+  assert.deepEqual(revoked, ['blob:preview-1']);
+  assert.equal(entry.uploadQueue.length, 1);
   assert.match(entry.error, /첨부파일을 올리지 못했습니다/);
   c.attachmentThumb(entry, 'left-over', { name: 'x.png', type: 'image/png' });
   c.showLogin();
@@ -15349,17 +15351,16 @@ test('결과 불명인 터미널 첨부 전송은 새 화면에서 재전송 가
   assert.match(restored.get('draft-recovery-status').textContent, /자동 복원하지 않습니다/);
 });
 
-test('서버 재연결 뒤 첨부 403은 상태만 새로 읽고 명시적 재시도에 새 토큰을 사용한다', async () => {
+test('서버 재연결 뒤 첨부 토큰 만료는 한 번 갱신하고 거절된 파일을 이어 올린다', async () => {
   const uploads = []; let caps = 0;
   const c = terminalFilesClient(async (url, options) => {
     if (url === '/api/capabilities') { caps++; return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'new-fixture-token' }) }; }
     uploads.push(options.headers['X-CSRF-Token']);
-    return uploads.length === 1 ? { ok: false, status: 403, json: async () => ({ error: 'expired' }) } : fileReply();
+    return uploads.length === 1 ? { ok: false, status: 403, json: async () => ({ code: 'csrf_expired', error: 'expired' }) } : fileReply();
   });
   await c.uploadTerminalFiles([{ name: 'memo.txt', size: 9 }]);
-  assert.equal(uploads.length, 1); assert.equal(caps, 1);
-  assert.equal(c.terminalAttachmentEntry().uploadQueue.length, 1);
-  await c.uploadTerminalFiles();
+  assert.equal(uploads.length, 2); assert.equal(caps, 1);
+  assert.equal(c.terminalAttachmentEntry().uploadQueue.length, 0);
   assert.deepEqual(uploads, ['csrf-test', 'new-fixture-token']);
   assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
 });
@@ -16235,4 +16236,108 @@ test('조합 중 연속 선택은 마지막 선택만 적용하고 확정 실패
     assert.equal(c.state.selected, mode === 'latest' ? b.key : s.key);
     assert.equal(entry.pending, null);
   }
+});
+
+function stalledUploadClient(terminal = false) {
+  const timers = [], requests = [];
+  const c = terminal ? terminalFilesClient() : client(undefined, noChatTimers);
+  c.context.setTimeout = (callback, ms) => { const timer = { callback, ms }; timers.push(timer); return timer; };
+  c.context.clearTimeout = (timer) => { if (timer) timer.cleared = true; };
+  c.context.XMLHttpRequest = class {
+    constructor() { this.headers = {}; this.listeners = {}; this.upload = { addEventListener: (_, fn) => { this.progress = fn; } }; requests.push(this); }
+    open() {}
+    setRequestHeader(k, v) { this.headers[k] = v; }
+    addEventListener(k, fn) { this.listeners[k] = fn; }
+    send(file) { this.file = file; }
+    abort() { this.aborted = true; this.listeners.abort?.(); }
+    reply() { this.status = 200; this.responseText = JSON.stringify({ attachment: { id: 'b'.repeat(32), name: 'shot.png', size: 12, type: 'image/png', path: '/fixture/shot.png' } }); this.listeners.load(); }
+  };
+  return { c, timers, requests };
+}
+
+test('stalled chat uploads time out, retain the selected file, retry once on request, and remain cancellable', async () => {
+  const { c, timers, requests } = stalledUploadClient();
+  const { s, entry } = selectChat(c); wireTree(c, c.buildChatComposer(s));
+  const photo = { name: 'shot.png', size: 12, type: 'image/png' };
+  const pending = c.uploadChatFiles(entry, [photo]);
+  assert.equal(entry.uploads, 1); assert.equal(requests[0].timeout, 120000);
+  requests[0].progress({ lengthComputable: true, loaded: 12, total: 12 });
+  timers.find((t) => t.ms === 120000).callback(); await pending;
+  assert.equal(requests[0].aborted, true); assert.equal(entry.uploads, 0);
+  assert.equal(entry.uploadQueue[0].file, photo); assert.equal(entry.uploadQueue[0].state, 'failed');
+  assert.match(entry.error, /응답이 늦어/); assert.equal(c.get('chat-send').disabled, true);
+  const retry = c.uploadChatFiles(entry); requests[1].reply(); await retry;
+  assert.equal(entry.attachments.length, 1); assert.equal(entry.uploadQueue.length, 0); assert.equal(requests.length, 2);
+  const next = c.uploadChatFiles(entry, [photo]);
+  const tiles = byClass(c.get('chat-attachments'), 'chat-attachment');
+  byClass(tiles.at(-1), 'chat-attachment-remove')[0].events.click(); await next;
+  assert.equal(requests[2].aborted, true); assert.equal(entry.uploads, 0); assert.equal(entry.uploadQueue.length, 0);
+  assert.equal(entry.attachments.length, 1, 'cancelling keeps the already uploaded file');
+});
+
+test('terminal uploads use the same deadline and keep cancellation available while a request is stuck', async () => {
+  const { c, timers, requests } = stalledUploadClient(true);
+  const photo = { name: 'shot.png', size: 12, type: 'image/png' };
+  const pending = c.uploadTerminalFiles([photo]);
+  assert.equal(c.get('terminal-attachment-cancel').hidden, false);
+  timers.find((t) => t.ms === 120000).callback(); await pending;
+  const entry = c.terminalAttachmentEntry();
+  assert.equal(entry.uploads, 0); assert.equal(entry.uploadQueue.length, 1);
+  const retry = c.uploadTerminalFiles(); requests[1].reply(); await retry;
+  assert.equal(entry.attachments.length, 1); assert.equal(entry.uploadQueue.length, 0);
+  const next = c.uploadTerminalFiles([photo]);
+  vm.runInContext('cancelUploads(terminalAttachmentEntry())', c.context); await next;
+  assert.equal(requests[2].aborted, true); assert.equal(entry.uploads, 0); assert.equal(entry.uploadQueue.length, 0);
+});
+
+test('fetch upload fallback also bounds a missing response body and supports cancellation', async () => {
+  for (const cancel of [false, true]) {
+    const timers = [];
+    const c = client(async () => ({ status: 200, ok: true, json: () => new Promise(() => {}) }),
+      { setTimeout(fn, ms) { timers.push({ fn, ms }); return 1; }, clearTimeout() {} });
+    c.state.authenticated = true;
+    const controller = new AbortController();
+    const pending = c.sendUpload({ size: 12 }, {}, () => {}, { signal: controller.signal });
+    await settle();
+    if (cancel) controller.abort(); else timers.find((t) => t.ms === 120000).fn();
+    await assert.rejects(pending, cancel ? /취소/ : /응답이 늦어/);
+  }
+});
+
+test('upload refreshes only an explicit pre-write expired token once and preserves failures for retry', async () => {
+  for (const code of ['csrf_expired', 'permission_denied']) {
+    const requests = [];
+    const c = client(async (url, options) => {
+      requests.push([url, options?.headers?.['X-CSRF-Token']]);
+      if (url === '/api/capabilities') return { ok: true, status: 200, json: async () => ({ hosts: [], csrfToken: 'fresh-upload' }) };
+      if (options.headers['X-CSRF-Token'] !== 'fresh-upload') return { ok: false, status: 403, json: async () => ({ code, error: 'upload refused' }) };
+      return fileReply();
+    }, noChatTimers);
+    const { entry } = selectChat(c);
+    await c.uploadChatFiles(entry, [{ name: 'shot.png', size: 12, type: 'image/png' }]);
+    if (code === 'csrf_expired') {
+      assert.deepEqual(requests, [['/api/chat/upload', 'csrf-test'], ['/api/capabilities', undefined], ['/api/chat/upload', 'fresh-upload']]);
+      assert.equal(entry.attachments.length, 1); assert.equal(entry.uploadQueue.length, 0);
+    } else {
+      assert.equal(requests.length, 1); assert.equal(entry.attachments.length, 0); assert.equal(entry.uploadQueue.length, 1);
+    }
+  }
+});
+
+test('a proven Claude conversation keeps its terminal, draft and view when it moves to a worktree', () => {
+  const c = client(undefined, noChatTimers);
+  const sid = '019bbbbb-0000-7000-8000-000000000002';
+  const { s } = selectChat(c, { agent: 'claude', home: '.claude', id: sid });
+  s.sessionId = sid; s.cwd = '/fixture/old';
+  const entry = c.chatEntry(s); entry.text = 'keep draft';
+  const original = c.conversationIdentity(s);
+  c.context.fixtureSession = s;
+  c.context.fixtureTerminal = { alive: true, nativeSource: { ...c.sourceOf(s), cwd: s.cwd } };
+  s.cwd = '/fixture/new';
+  assert.equal(c.conversationIdentity(s), original); assert.equal(c.chatEntry(s), entry);
+  assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), true);
+  c.context.fixtureTerminal.linkConfidence = 'estimated';
+  assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
+  c.context.fixtureTerminal.linkConfidence = 'exact'; c.context.fixtureTerminal.nativeSource.home = '.claude-other';
+  assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
 });

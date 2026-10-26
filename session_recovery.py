@@ -33,6 +33,28 @@ CLOSURES = ("none", "connection", "legacy_user_close", "explicit_termination")
 REASONS = (None, "user", "released", "connection_ended", "view_closed")
 
 
+def same_claude_conversation(left, right):
+    """Match trusted session references, allowing a proven transcript to change cwd.
+
+    Worker names alone can be reused. Only a shared conversation UUID proves that
+    a different folder still belongs to the same conversation.
+    """
+    if (not isinstance(left, dict) or not isinstance(right, dict)
+            or left.get('agent') != 'claude' or right.get('agent') != 'claude'
+            or not left.get('host') or left['host'] != right.get('host')
+            or (left.get('home') or '.claude') != (right.get('home') or '.claude')):
+        return False
+    identifier = left.get('sessionId') or left.get('id')
+    if not identifier or identifier != (right.get('sessionId') or right.get('id')):
+        return False
+    if left.get('cwd') == right.get('cwd'):
+        return True
+    try:
+        return str(uuid.UUID(identifier)) == identifier
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 class RecoveryError(ValueError):
     """A locator could not safely be read or saved; an existing run is unaffected."""
     def __init__(self, message="원래 작업의 복귀 정보를 안전하게 읽거나 저장하지 못했습니다.",

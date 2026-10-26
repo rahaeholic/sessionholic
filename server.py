@@ -2443,9 +2443,8 @@ class Workflow:
             return False
         a, b = cls.identity(left), cls.identity(right)
         if a.get('agent') == b.get('agent') == 'claude':
-            a['home'], b['home'] = a.get('home') or '.claude', b.get('home') or '.claude'
-            if (left.get('sessionId') or right.get('sessionId')) and left.get('sessionId') != right.get('sessionId'):
-                return False
+            from session_recovery import same_claude_conversation
+            return same_claude_conversation(left, right)
         return a == b and left.get('cwd') == right.get('cwd')
 
     @classmethod
@@ -2560,8 +2559,6 @@ class Workflow:
             allowed, reason = False, "원본 기기의 연결을 확인한 뒤 다시 시도해 주세요."
         if not same and not cross_host and source.get("phase") in ("working", "needs_input"):
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
-        if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows:
-            allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
         windows_resumed = False
         route_key = hashlib.sha256(json.dumps([self.route_identity(source), target], sort_keys=True).encode()).hexdigest()
         existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
@@ -2573,6 +2570,8 @@ class Workflow:
                              if item.get("alive") and not item.get("closed") and item.get("linkConfidence") != "estimated"
                              and isinstance(item.get("nativeSource"), dict)
                              and self.same_native(item["nativeSource"], source)), None)
+        if same and source["agent"] == "claude" and source.get("kind") != "background" and not windows and not existing:
+            allowed, reason = False, "이 Claude 세션은 기존 터미널에서 실행 중입니다. 백그라운드 세션만 직접 연결할 수 있어요."
         if allowed and resume:
             preview = self.resume_preview(source)
             allowed, reason = preview["allowed"], preview.get("reason")
@@ -3991,7 +3990,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
             if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
-                return self.send_json(403, {"error": "화면을 새로 열고 다시 시도해 주세요."})
+                return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.", "code": "csrf_expired"})
+            upload_id, stage = secrets.token_hex(4), "validate"
+            def trace_upload(step):
+                # A short-lived diagnostic id, never a filename, session id or file bytes.
+                took = int((time.monotonic() - self.started) * 1000)
+                sys.stderr.write(f"{self.log_date_time_string()} attachment {upload_id} {step} {took}ms\n")
+            trace_upload("start")
             try:
                 from chat import MAX_FILE
                 length = int(self.headers.get("Content-Length") or 0)
@@ -4009,16 +4014,31 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.server.upload_gate.acquire(blocking=False):
                     raise RuntimeError("다른 파일을 전송 중입니다.")
                 try:
+                    stage = "receive"
+                    trace_upload(stage)
                     content = self.rfile.read(length)
                     if len(content) != length:
                         raise ValueError("파일을 끝까지 받지 못했습니다.")
-                    return self.send_json(200, self.server.chat.upload(source, unquote(raw_name), content))
+                    stage = "store"
+                    trace_upload(stage)
+                    result = self.server.chat.upload(source, unquote(raw_name), content)
+                    stage = "stored"
+                    trace_upload(stage)
+                    return self.send_json(200, result)
                 finally:
                     self.server.upload_gate.release()
-            except (ValueError, KeyError):
+            except ValueError as exc:
+                from launch import scrub_text
+                return self.send_json(400, {"error": scrub_text(str(exc))[:300] or "파일 또는 대상 정보를 확인해 주세요."})
+            except KeyError:
                 return self.send_json(400, {"error": "파일 또는 대상 정보가 올바르지 않습니다. 20MiB 이하 파일을 다시 선택해 주세요."})
-            except (RuntimeError, OSError):
+            except RuntimeError as exc:
+                from launch import scrub_text
+                return self.send_json(409, {"error": scrub_text(str(exc))[:300] or "기기 연결을 확인해 주세요."})
+            except OSError:
                 return self.send_json(409, {"error": "파일 전송을 확인하지 못했습니다. 기기 연결을 확인해 주세요."})
+            finally:
+                trace_upload("end:" + stage)
         try:
             data = self.json_body()
         except ValueError as exc:

@@ -888,14 +888,8 @@ class Chat:
                 or native.get('agent') != source.get('agent')):
             return False
         if source.get('agent') == 'claude':
-            if (native.get('home') or '.claude') != (source.get('home') or '.claude'):
-                return False
-            if native.get('cwd') != source.get('cwd'):
-                return False
-            if source.get('sessionId'):
-                return (native.get('sessionId') or native.get('id')) == source['sessionId']
-            ids = {source.get('id'), source.get('sessionId')} - {None}
-            return native.get('id') in ids or native.get('sessionId') in ids
+            from session_recovery import same_claude_conversation
+            return same_claude_conversation(native, source)
         if source.get('agent') == 'codex':
             return (source.get('id') is not None and native.get('id') == source.get('id')
                     and (native.get('home') or '') == (source.get('home') or ''))
@@ -1413,7 +1407,7 @@ class Chat:
             # Fresh native read supplies actual cwd; snapshot cwd cannot drift unnoticed.
             current = self.rpc(host, 'read', source)
             cwd = current.get('cwd')
-            if not cwd or cwd != source.get('cwd'):
+            if not cwd or cwd != source.get('cwd') and source.get('agent') != 'claude':
                 raise ValueError('실제 세션의 작업 폴더를 확인하지 못했습니다. 목록을 새로 읽어 주세요.')
             args = {'cwd': cwd, 'name': name, 'data': base64.b64encode(content).decode('ascii'),
                     'sha256': hashlib.sha256(content).hexdigest()}
@@ -1422,7 +1416,7 @@ class Chat:
                 args['source'] = self.identity(source)
             attachment = self.workflow.transfers.rpc(host, 'attachment', args, timeout=60)
             from server import private_json
-            record = {'source': self.identity(source), 'cwd': cwd, 'attachment': attachment}
+            record = {'source': self.watch_identity(source), 'cwd': cwd, 'attachment': attachment}
             private_json(self.root / 'attachments' / (attachment['id'] + '.json'), record)
             return {'attachment': {**attachment, 'type': attachment.get('mime', 'application/octet-stream')}}
         finally:
@@ -1448,7 +1442,13 @@ class Chat:
             if path.is_symlink() or not path.is_file():
                 raise ValueError('첨부 기록을 확인하지 못했습니다. 다시 선택해 주세요.')
             record = json.loads(path.read_text())
-            if record.get('source') != self.identity(source) or record.get('cwd') != source.get('cwd'):
+            same = record.get('source') == self.identity(source) and record.get('cwd') == source.get('cwd')
+            if source.get('agent') == 'claude':
+                from session_recovery import same_claude_conversation
+                # Older attachment records lack a transcript id: keep their original
+                # exact source+folder rule, but never extend them to a different folder.
+                same = same_claude_conversation({**(record.get('source') or {}), 'cwd': record.get('cwd')}, source) or same
+            if not same:
                 raise ValueError('다른 세션에 올린 파일은 이 메시지에 첨부할 수 없습니다.')
             item = record['attachment']
             manifest.append({'id': item['id'], 'name': item['name'], 'type': item['mime'],

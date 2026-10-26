@@ -193,7 +193,7 @@ class PromptReceiptsHttpTest(unittest.TestCase):
         self.assertEqual(len(self.terms.keys), 1)
 
     def test_changed_terminal_identity_is_refused_without_creating_a_reservation(self):
-        for changes in ({'sessionId': SESSION_B}, {'cwd': str(self.root / 'other')}, {'home': '.claude-other'}):
+        for changes in ({'sessionId': SESSION_B}, {'host': 'another-host'}, {'home': '.claude-other'}):
             with self.subTest(changes=changes):
                 self.terms.rows = [{'id': TERMINAL_ID, 'alive': True, 'closed': False,
                                     'nativeSource': {**self.source(), **changes}}]
@@ -202,6 +202,18 @@ class PromptReceiptsHttpTest(unittest.TestCase):
                 self.assertEqual(self.post()[1]['status'], 'not_found')
         self.assertEqual(self.terms.keys, [])
         self.assertEqual(self.terms.captures, [])
+
+    def test_same_transcript_in_another_folder_still_checks_the_current_question(self):
+        self.terms.rows[0]['nativeSource']['cwd'] = str(self.root / 'worktree')
+        self.terms.screens = [NEXT_MENU]
+        code, result = self.post('answer')
+        self.assertEqual((code, result['code']), (409, 'prompt_changed'))
+        self.assertEqual(self.terms.keys, [])
+        self.assertEqual(self.httpd.chat.prompt_receipts.lookup(self.source(), RID)['status'], 'not_found')
+        self.terms.screens = [MENU, NEXT_MENU]
+        code, result = self.post('answer')
+        self.assertEqual((code, result['status']), (200, 'answered'))
+        self.assertEqual(len(self.terms.keys), 1)
 
     def test_uncertain_key_transport_exception_never_turns_into_a_safe_resend(self):
         self.terms.screens = [MENU]

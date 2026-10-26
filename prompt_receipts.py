@@ -17,6 +17,7 @@ import stat
 import uuid
 
 import settings
+from session_recovery import same_claude_conversation
 
 MAX_RECORDS = 10000
 MAX_DATABASE_BYTES = 16 * 1024 * 1024
@@ -101,7 +102,7 @@ def _signature(source, fingerprint, number, terminal):
     if any(actual.get(key) != expected.get(key) for key in ('host', 'agent', 'home')):
         _invalid()
     if expected['agent'] == 'claude':
-        if any(actual.get(key) != expected.get(key) for key in ('sessionId', 'cwd')):
+        if not same_claude_conversation(actual, expected):
             _invalid()
     elif actual['id'] != expected['id']:
         _invalid()
@@ -110,7 +111,7 @@ def _signature(source, fingerprint, number, terminal):
     if not isinstance(cwd, str) or not cwd or len(cwd.encode()) > 4096 or any(ord(c) < 32 for c in cwd):
         _invalid()
     actual['cwd'] = cwd
-    if source.get('cwd') is not None and source['cwd'] != cwd:
+    if expected['agent'] != 'claude' and source.get('cwd') is not None and source['cwd'] != cwd:
         _invalid()
     return _digest([payload, terminal['id'], actual])
 
