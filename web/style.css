@@ -7611,14 +7611,20 @@ body.terminal-inline .terminal-header { min-height: 44px; }
 .conversation-history-notice strong { font-size: var(--fs-body); }
 .conversation-history-notice p { margin: 8px 0 0; color: var(--label-2); font-size: var(--fs-sub); }
 
-/* The list beside the conversation on a touch screen (an iPad), by the list's own width
-   (a split workspace narrows it on any screen). As wide as the PC's (an iPad held sideways
-   or a large one): the device chip ends the preview line (which gives way first), so more
-   sessions fit on its shorter screen while the status line keeps the agent and project.
-   Narrower (held upright, or beside split panes): titles may take two lines. The whole
-   card stays the tap target. */
+/* The list beside the conversation on a touch screen or a tablet (theme-init.js data-tablet:
+   an iPad, also one whose trackpad reports a fine pointer), by the list's own width (a split
+   workspace narrows it on any screen). As
+   wide as the PC's (an iPad held sideways or a large one): the device chip ends the preview
+   line (which gives way first), so more sessions fit on its shorter screen while the status
+   line keeps the agent and project. Narrower (held upright, or beside split panes): titles
+   may take two lines. The whole card stays the tap target. */
 @media (pointer: coarse) and (min-width: 701px) {
   .list-pane {
+    container: session-list / inline-size;
+  }
+}
+@media (min-width: 701px) {
+  :root[data-tablet] .list-pane {
     container: session-list / inline-size;
   }
   @container session-list (min-width: 300px) {
@@ -7645,6 +7651,52 @@ body.terminal-inline .terminal-header { min-height: 44px; }
   @container session-list (max-width: 299.98px) {
     .card-title {
       -webkit-line-clamp: 2;
+    }
+  }
+}
+
+/* A tablet held sideways: its short screen gives a conversation less of what it stacks
+   above and below. The top bar and the view tabs lose their spare padding. With the bars
+   shown (전체 보기) the 최근 대화 row steps aside (its actions are in the ⋯ menu, 맨 아래 is
+   the jump button) and the model controls share the header's first line. A wide
+   conversation's composer puts its buttons beside the input. */
+@media (orientation: landscape) and (min-width: 701px) and (min-height: 521px) {
+  :root[data-tablet] .top {
+    min-height: 44px;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+  :root[data-tablet] .detail-mode-tabs {
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+  :root[data-tablet] .detail-pane > .conversation-bar {
+    display: none;
+  }
+  @container conversation (min-width: 760px) {
+    :root[data-tablet] .detail-pane:not(.is-reading):not(.is-typing) .detail-head {
+      grid-template-columns: 44px minmax(0, 1fr) minmax(150px, 200px) auto;
+    }
+    :root[data-tablet] .detail-pane:not(.is-reading):not(.is-typing) .detail-head > .chat-model-controls {
+      grid-column: 3;
+      grid-row: 1;
+    }
+    :root[data-tablet] .detail-pane:not(.is-reading):not(.is-typing) .detail-head-actions {
+      grid-column: 4;
+    }
+  }
+  @container conversation (min-width: 640px) {
+    :root[data-tablet] .chat-composer .chat-main {
+      flex-wrap: nowrap;
+    }
+    :root[data-tablet] .chat-composer .chat-input {
+      flex: 1 1 auto;
+      width: auto;
+      order: 1;
+    }
+    :root[data-tablet] .chat-composer .chat-main > #chat-send {
+      order: 2;
+      margin-left: 0;
     }
   }
 }
