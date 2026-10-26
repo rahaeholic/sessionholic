@@ -631,17 +631,45 @@ def claude_snippet(path, size, metadata=None):
     return ""
 
 
-def claude_initial_titles(path, *, read_manual=True):
+# A transcript's head: its first 30 records within 64 KB, as before, and always as far as its
+# first request. A session with many tools (an MCP-heavy Claude agent view) opens with records
+# that alone pass 100 KB; those are read past unparsed up to the request (most lie within 35 KB),
+# within CLAUDE_HEAD_BYTES.
+CLAUDE_HEAD_BYTES = 1 << 20
+CLAUDE_HEAD_RECORD = 65536
+CLAUDE_HEAD_LINES = 30
+CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
+
+
+def claude_head(path):
+    """A transcript's opening records: the first CLAUDE_HEAD_LINES within CLAUDE_HEAD_RECORD bytes,
+    extended up to its first main-thread request with text of its own (one not starting with "<",
+    a command or caveat) within CLAUDE_HEAD_BYTES."""
+    head, read, asked = [], 0, False
     with path.open("rb") as stream:
-        raw = stream.read(65536)
-    head = []
-    for line in raw.splitlines()[:30]:
-        try:
-            entry = json.loads(line)
-            if isinstance(entry, dict):
-                head.append(entry)
-        except (ValueError, UnicodeError, RecursionError):
-            continue
+        while read < CLAUDE_HEAD_BYTES and not (asked and (len(head) >= CLAUDE_HEAD_LINES or read >= CLAUDE_HEAD_RECORD)):
+            line = stream.readline(CLAUDE_HEAD_BYTES - read)
+            if not line:
+                break
+            read += len(line)
+            if len(line) > CLAUDE_HEAD_RECORD and not CLAUDE_USER_RECORD.search(line):
+                continue
+            try:
+                entry = json.loads(line)
+            except (ValueError, UnicodeError, RecursionError):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            head.append(entry)
+            asked = asked or (entry.get("type") == "user"
+                              and not any(entry.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary"))
+                              and any(m["role"] == "user" and m["text"].strip() and not m["text"].lstrip().startswith("<")
+                                      for m in claude_messages([entry])))
+    return head
+
+
+def claude_initial_titles(path, *, read_manual=True):
+    head = claude_head(path)
     first = next((m["text"] for m in claude_messages(head) if m["role"] == "user"
                   and not m["text"].lstrip().startswith("<")), "")
     manual = next((e.get("customTitle") for e in reversed(head + (list(tail_entries(path, 65536)) if read_manual else []))
@@ -763,16 +791,10 @@ def claude_entrypoint(path, session_id):
     """Original main-thread launch mode, never a later resume or the prompt's text.
 
     As windows_collector._claude_entrypoint; that collector runs standalone on the PC.
-    Missing/oversized initial metadata stays unknown rather than implying a direct start.
+    Missing initial metadata stays unknown rather than implying a direct start.
     """
-    with path.open("rb") as stream:
-        raw = stream.read(65536)
-    for line in raw.splitlines()[:30]:
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if (isinstance(entry, dict) and entry.get("type") == "user" and entry.get("sessionId") == session_id
+    for entry in claude_head(path):
+        if (entry.get("type") == "user" and entry.get("sessionId") == session_id
                 and not any(entry.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary"))):
             return _metadata_text(entry.get("entrypoint"))
     return None
