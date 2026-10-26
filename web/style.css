@@ -7991,3 +7991,74 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 .terminal-attachment-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 6px 2px; color: var(--t-label-2); font-size: var(--fs-cap); }
 .terminal-attachment-actions button { min-height: 40px; border: 0; border-radius: 8px; background: var(--t-key); color: var(--t-label); }
 .draft-row .draft-attach { min-width: 40px; padding-inline: 8px; background: var(--t-key); color: var(--t-blue-text); font-size: 22px; }
+
+/* 집중 모드 on every screen: the conversation takes what the bars leave. The header is one
+   line holding the title, the 터미널/채팅 tabs (app.js placeModeTabs moves them in) and its
+   actions; the device and model lines, 작업 맥락 and, beside the list, the top bar wait for
+   전체 보기. A narrow conversation (a phone, an upright iPad) puts the title under the tabs
+   and leaves the app reload to 전체 보기; a wide one puts the composer's buttons beside its
+   input. A split workspace keeps its top bar (it switches the panes), and so do 목표. */
+#detail.is-reading .detail-head {
+  grid-template-columns: 44px minmax(0, 1fr) auto auto;
+  align-items: center;
+}
+#detail.is-reading .detail-titles > .detail-device,
+#detail.is-reading .detail-titles > .chat-model-summary {
+  display: none;
+}
+#detail.is-reading .detail-head > .detail-mode-tabs {
+  grid-column: 3;
+  grid-row: 1;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+#detail.is-reading .detail-head > .detail-head-actions {
+  grid-column: 4;
+}
+#detail.is-reading > .work-context {
+  display: none;
+}
+@container conversation (max-width: 600px) {
+  #detail.is-reading .detail-head {
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    column-gap: 6px;
+  }
+  #detail.is-reading .detail-head > .back {
+    grid-column: 1;
+    grid-row: 1;
+  }
+  #detail.is-reading .detail-head > .detail-mode-tabs {
+    grid-column: 2;
+  }
+  #detail.is-reading .detail-head .detail-mode-tab {
+    min-width: 0;
+    padding-inline: 12px;
+  }
+  #detail.is-reading .detail-head > .detail-titles {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+  #detail.is-reading .detail-head-actions > .detail-reload {
+    display: none;
+  }
+}
+@container conversation (min-width: 640px) {
+  #detail.is-reading .chat-composer .chat-main {
+    flex-wrap: nowrap;
+  }
+  #detail.is-reading .chat-composer .chat-input {
+    flex: 1 1 auto;
+    width: auto;
+    order: 1;
+  }
+  #detail.is-reading .chat-composer .chat-main > #chat-send {
+    order: 2;
+    margin-left: 0;
+  }
+}
+@media (min-width: 701px) {
+  body.show-detail:not(.workspace-split):not(.goals-active):has(#detail.is-reading) .top {
+    display: none;
+  }
+}

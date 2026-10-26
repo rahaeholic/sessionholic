@@ -6009,6 +6009,34 @@ test('Android back keeps one history step per phone screen while list and conver
   await settle();
 });
 
+test('휴대폰 뒤로 가기로 목록에 돌아가면 대화에서 연 빠른 답장 창은 닫히고 목록 카드 메뉴는 남는다', async () => {
+  const c = client(async () => ({ ok: true, status: 200, json: async () => ({}) }), noChatTimers);
+  c.context.navigator = { onLine: true };
+  c.windowEvents.DOMContentLoaded();
+  const { s, entry } = selectChat(c);
+  c.context.document.documentElement.dataset = {};
+  c.context.document.body.classList = classes();
+  c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' || query === '(pointer: coarse)' });
+  c.select(s.key);
+  const detail = c.get('detail'), input = c.get('chat-input'), quick = node(), sheet = c.get('action-sheet');
+  quick.closest = (selector) => (selector === '#detail' ? detail : null);
+  input.closest = quick.closest;
+  // The input has no focus: 빠른 답장 opens as a sheet over the screen.
+  c.openQuickReplies(entry, input, quick);
+  assert.equal(sheet.open, true);
+  c.backToList();
+  c.context.window.history.state = { sessionholic: true, view: 'list' };
+  c.windowEvents.popstate({ state: { sessionholic: true, view: 'list' } });
+  assert.equal(sheet.open, false, 'the list shows without the conversation\'s 빠른 답장');
+  assert.equal(c.state.actionTrigger, null);
+  // A card's long-press menu belongs to the list: hiding the conversation leaves it open.
+  const card = node(); card.closest = () => null;
+  vm.runInContext('openActionSheet', c.context)({ title: '카드', actions: [{ label: '대화 열기', run() {} }], trigger: card });
+  vm.runInContext('setDetailShown', c.context)(false);
+  assert.equal(sheet.open, true);
+  await settle();
+});
+
 // Edge swipes: an iPhone or iPad home-screen app (navigator.standalone) with a touch screen.
 // Timers run only when the test settles a released swipe; the clock moves with each step.
 function edgeClient({ standalone = true, coarse = true, phone = true, width = 390, media = {} } = {}) {
@@ -9505,6 +9533,54 @@ test('a tablet held sideways gives the conversation more height: slimmer bars, m
   // :root[data-tablet] outweighs the narrower-conversation header rules wherever they stand.
   for (const earlier of ['.chat-composer .chat-main > #chat-send {', '.detail-mode-tabs {', '.top {'])
     assert.ok(css.indexOf(block[0]) > css.indexOf(earlier), 'after ' + earlier);
+});
+
+test('집중 모드는 터미널/채팅 탭을 머리글 줄로 옮기고, 전체 보기는 머리글 아래 제자리로 돌려놓는다', () => {
+  const c = client(undefined, noChatTimers);
+  const pane = c.get('detail'), head = c.get('detail-head'), tabs = c.get('detail-mode-tabs'), actions = node(), tab = node();
+  pane.classList = classes();
+  const moves = [];
+  head.parentElement = pane; tabs.parentElement = pane;
+  head.querySelector = (selector) => (selector === '.detail-head-actions' ? actions : null);
+  actions.before = (item) => { item.parentElement = head; moves.push('before-actions'); };
+  head.after = (item) => { item.parentElement = pane; moves.push('after-head'); };
+  tabs.contains = (item) => item === tab;
+  c.context.document.activeElement = tab;
+  const setReading = vm.runInContext('setReading', c.context);
+  setReading(true);
+  assert.equal(pane.classList.contains('is-reading'), true);
+  assert.deepEqual(moves, ['before-actions'], 'the folded header holds the tabs before its actions');
+  assert.equal(tab.focusCount, 1, 'a focused tab keeps the focus');
+  setReading(true); assert.deepEqual(moves, ['before-actions'], 'no second move');
+  setReading(false);
+  assert.deepEqual(moves, ['before-actions', 'after-head'], '전체 보기: their own row under the header again');
+  // A header of another screen (not the conversation's) is never touched.
+  head.parentElement = node(); setReading(true); assert.equal(moves.length, 2);
+});
+
+test('집중 모드는 모든 화면에서 대화에 공간을 준다: 한 줄 머리글, 작업 맥락·상단 바 숨김, 넓은 대화의 한 줄 작성창', () => {
+  const css = styleSheet();
+  const start = css.indexOf('/* 집중 모드 on every screen');
+  assert.ok(start > 0);
+  const rules = css.slice(start);
+  assert.match(rules, /#detail\.is-reading \.detail-head \{\s*grid-template-columns: 44px minmax\(0, 1fr\) auto auto;/);
+  assert.match(rules, /#detail\.is-reading \.detail-titles > \.detail-device,\s*#detail\.is-reading \.detail-titles > \.chat-model-summary \{\s*display: none;/);
+  assert.match(rules, /#detail\.is-reading \.detail-head > \.detail-mode-tabs \{\s*grid-column: 3;\s*grid-row: 1;/);
+  assert.match(rules, /#detail\.is-reading \.detail-head > \.detail-head-actions \{\s*grid-column: 4;/);
+  assert.match(rules, /#detail\.is-reading > \.work-context \{\s*display: none;/);
+  assert.doesNotMatch(rules, /question-pin/, '내 질문 stays in 집중 모드');
+  const narrow = rules.match(/@container conversation \(max-width: 600px\) \{([\s\S]*?)\n\}/);
+  assert.ok(narrow, 'a phone or an upright iPad');
+  assert.match(narrow[1], /\.detail-head > \.detail-titles \{\s*grid-column: 1 \/ -1;\s*grid-row: 2;/, 'the title goes under the tabs');
+  assert.match(narrow[1], /\.detail-head-actions > \.detail-reload \{\s*display: none;/);
+  const wide = rules.match(/@container conversation \(min-width: 640px\) \{([\s\S]*?)\n\}/);
+  assert.ok(wide);
+  assert.match(wide[1], /\.chat-main \{\s*flex-wrap: nowrap;/);
+  assert.match(wide[1], /#chat-send \{\s*order: 2;\s*margin-left: 0;/);
+  assert.match(rules, /@media \(min-width: 701px\) \{\s*body\.show-detail:not\(\.workspace-split\):not\(\.goals-active\):has\(#detail\.is-reading\) \.top \{\s*display: none;/,
+    'beside the list only; split panes and 목표 keep the top bar');
+  // Only 집중 모드: 전체 보기 keeps every bar.
+  for (const selector of rules.match(/^[ \t]*[^@\s{}/*][^{}\n]*\{[ \t]*$/gm)) assert.match(selector, /#detail\.is-reading/, selector.trim());
 });
 
 test('a hardware keyboard: the folded composer shows the send key once one is known, Esc leaves the input, and 1-9 choose on a question card', async () => {
