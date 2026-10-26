@@ -9437,14 +9437,14 @@ test('a narrow iPad window keeps its header while typing on a hardware keyboard 
   assert.notEqual(phoneVars['--app-shift'], '55px');
 });
 
-test('wide touch screens read like a phone: 16px text, one reading column for bubbles, question card and composer, and a narrower list', () => {
+test('wide touch screens read like the PC: its text size and 820px column, a phone\'s margins, and a narrower list', () => {
   const css = styleSheet();
   const wide = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
   assert.ok(wide, 'a block for wide touch screens (phones held sideways excluded)');
-  assert.match(wide[1], /--fs-body: 1rem;/);
-  assert.match(wide[1], /--fs-sub: 0\.875rem;/);
-  // 42.5rem = 680px at 16px; a bubble's text is 680 - 28px padding = 652px, about 40 Hangul characters.
-  assert.match(wide[1], /--detail-pad: max\(16px, calc\(\(100% - 42\.5rem\) \/ 2\)\);/);
+  // An iPad keeps the PC's text size: no larger tablet text.
+  assert.doesNotMatch(wide[1], /--fs-(body|sub):/);
+  assert.match(wide[1], /--detail-pad: max\(16px, calc\(\(100% - 820px\) \/ 2\)\);/);
+  assert.match(cssBlock(css, ':root')['--detail-pad'], /calc\(\(100% - 820px\) \/ 2\)/, 'the same column as the PC');
   assert.match(wide[1], /\.chat-prompt \{\s*margin-inline: var\(--detail-pad\);/, 'the question card sits in the same column');
   const list = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) and \(max-width: 1023px\) and \(min-height: 521px\) \{([\s\S]*?)\n\}/);
   assert.ok(list);
@@ -9456,6 +9456,21 @@ test('wide touch screens read like a phone: 16px text, one reading column for bu
   // Phones keep their own values.
   const phone = cssBlock(css, '@media (max-width: 700px)');
   assert.equal(phone['--fs-body'], '1rem'); assert.equal(phone['--detail-pad'], '16px');
+});
+
+test('an iPad list as wide as the PC\'s fits more sessions; a narrower one (upright, split) keeps two-line titles', () => {
+  const css = styleSheet();
+  const block = css.match(/@media \(pointer: coarse\) and \(min-width: 701px\) \{\s*\.list-pane \{\s*container: session-list \/ inline-size;\s*\}([\s\S]*?)\n\}/);
+  assert.ok(block, 'touch screens beside the conversation measure the list itself');
+  // 300px inside the list's 16px margins: the PC's 340px list, not 300px (upright) or 240px (split).
+  const wide = block[1].match(/@container session-list \(min-width: 300px\) \{([\s\S]*?)\n  \}/);
+  assert.ok(wide);
+  assert.match(wide[1], /"snippet provenance chevron"/, 'the device chip ends the preview line');
+  assert.match(wide[1], /"meta meta chevron"/, 'agent, project and time keep the whole status line');
+  assert.match(wide[1], /\.card-provenance \{[^}]*flex-wrap: nowrap;[^}]*max-width: 9rem;/);
+  assert.doesNotMatch(wide[1], /line-clamp/, 'titles stay one line as on the PC');
+  assert.match(block[1], /@container session-list \(max-width: 299\.98px\) \{\s*\.card-title \{\s*-webkit-line-clamp: 2;/);
+  assert.ok(css.indexOf(block[0]) > css.indexOf('.card-provenance { grid-area: provenance;'), 'after the rules it refines');
 });
 
 test('a hardware keyboard: the folded composer shows the send key once one is known, Esc leaves the input, and 1-9 choose on a question card', async () => {
