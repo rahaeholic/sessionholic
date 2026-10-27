@@ -87,13 +87,14 @@ function fixture(saved = null, { mobile = false, search = "" } = {}) {
         add: (...keys) => { this.className = [...new Set([...this.className.split(" ").filter(Boolean), ...keys])].join(" "); },
         remove: (...keys) => { this.className = this.className.split(" ").filter((key) => !keys.includes(key)).join(" "); },
         toggle: (key, force) => { const add = force ?? !this.classList.contains(key); this.classList[add ? "add" : "remove"](key); return add; } };
-      if (tag === "iframe") { this.contentWindow = { focus: () => this.focusCount++ }; frames.push(this); }
+      if (tag === "iframe") { this.contentWindow = { focus: () => this.focusCount++ }; this.contentDocument = { documentElement: new Node("html") }; frames.push(this); }
     }
     append(...children) { for (const child of children) { child.remove(); child.parentNode = this; child.appendCount++; this.children.push(child); } }
     prepend(child) { child.remove(); child.parentNode = this; child.appendCount++; this.children.unshift(child); }
     replaceChildren(...children) { for (const child of this.children) child.parentNode = null; this.children = []; this.append(...children); }
     remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter((node) => node !== this); this.parentNode = null; }
     setAttribute(key, value) { this.attrs[key] = String(value); }
+    toggleAttribute(key, force) { if (force) this.attrs[key] = ""; else delete this.attrs[key]; return !!force; }
     addEventListener(key, fn) { if (!this.events.has(key)) this.events.set(key, []); this.events.get(key).push(fn); }
     removeEventListener(key, fn) { this.events.set(key, (this.events.get(key) || []).filter((item) => item !== fn)); }
     fire(key, event) { for (const fn of this.events.get(key) || []) fn(event); }
@@ -515,6 +516,16 @@ test("compact and maximized views preserve documents, passive panes remain unrea
   const event = combo("unused"); f.document.fire("window:beforeunload", event);
   assert.equal(event.prevented, true);
   assert.equal(event.returnValue, "");
+});
+
+test('split panes keep the board type scale while the board is wider than a phone', () => {
+  const f = fixture(); f.workspace.add({ key: 'session-b' }); const second = f.attach('p2');
+  const marked = () => 'data-desktop-pane' in second.frame.contentDocument.documentElement.attrs;
+  assert.equal(marked(), true);
+  f.window.innerWidth = 650; f.workspace.layout();
+  assert.equal(marked(), false, 'a phone-wide board: every pane follows the phone rules as p1 does');
+  f.window.innerWidth = 1440; f.workspace.layout();
+  assert.equal(marked(), true);
 });
 
 test('desktop splits preserve the chosen direction and ratios until explicit arrangement', () => {

@@ -251,6 +251,8 @@
         Object.assign(row.node.style, { left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` });
       } else for (const prop of ["left", "top", "width", "height"]) row.node.style[prop] = "";
       if (row.visible !== included) { row.visible = included; row.hooks?.visibility(included); }
+      // A pane's own narrow width must not pick the phone type scale p1 never gets (theme-init.js).
+      row.frame?.contentDocument?.documentElement?.toggleAttribute("data-desktop-pane", !compact);
       // No iframe reinsertion, select(), openTerminal() or editor replacement here.
     }
     $("workspace-dividers").replaceChildren();
