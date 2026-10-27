@@ -1371,8 +1371,11 @@ def _bot_request_text(text):
 
 # As collector.codex_user_text (this reader runs on its own): harness blocks in a Codex user turn.
 CODEX_HARNESS = (('# AGENTS.md instructions for ', '</INSTRUCTIONS>'),
+                 ('# AGENTS.md instructions\n', '</INSTRUCTIONS>'),
                  ('<environment_context>', '</environment_context>'),
-                 ('<user_instructions>', '</user_instructions>'))
+                 ('<user_instructions>', '</user_instructions>'),
+                 ('<heartbeat>', '</heartbeat>'),
+                 ('<external_codex_apps_open_page>', '</external_codex_apps_open_page>'))
 
 
 def _codex_user_text(text):
@@ -1452,17 +1455,52 @@ def _claude_messages(entries):
     return _recent_window(_claude_rows(entries))[0]
 
 
+# As collector.user_text (this reader runs on its own): lines Claude Code writes as the user.
+CLAUDE_REMINDER = re.compile(r'<system-reminder>.*?</system-reminder>', re.S)
+CLAUDE_COMMAND_NAME = re.compile(r'<command-name>([^<]{1,60})</command-name>')
+CLAUDE_BASH_INPUT = re.compile(r'<bash-input>(.*?)</bash-input>', re.S)
+
+
+def _claude_user_text(text):
+    """(role, text) for a Claude user line, or None to skip it; harness lines are not the person's words."""
+    if '<task-notification>' in text[:300]:
+        return 'system', '백그라운드 작업 알림'
+    match = CLAUDE_COMMAND_NAME.search(text)
+    if match:
+        return 'system', '명령 ' + match.group(1).strip()
+    stripped = text.lstrip()
+    if stripped.startswith(('<local-command', '<bash-stdout>', '<bash-stderr>')):
+        return None
+    if stripped.startswith('[Request interrupted by user'):
+        return 'system', '사용자가 중단함'
+    match = CLAUDE_BASH_INPUT.match(stripped)
+    if match:
+        return 'tool', '$ ' + _one_line(match.group(1), 160)
+    text = CLAUDE_REMINDER.sub('', text).strip()
+    return ('user', text) if text else None
+
+
 def _claude_rows(entries):
+    """As collector.claude_rows for text: expanded skills, side threads and compaction summaries
+    are not the conversation, and each text block is read on its own."""
     result = []
     for entry in entries:
         message = entry.get('message')
         role = entry.get('type')
-        if role not in ('user', 'assistant') or not isinstance(message, dict):
+        if (role not in ('user', 'assistant') or not isinstance(message, dict)
+                or entry.get('isMeta') or entry.get('isSidechain')):
+            continue
+        ts, uid = entry.get('timestamp'), entry.get('uuid')
+        if entry.get('isCompactSummary'):
+            result.append(_message('system', '이전 대화 요약으로 이어짐', ts, messageId=uid))
             continue
         content = message.get('content')
-        text = content if isinstance(content, str) else '\n'.join(block.get('text', '') for block in content or [] if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)) if isinstance(content, list) else ''
-        if text and not text.startswith(('<system-reminder>', '[Request interrupted by user')):
-            result.append(_message(role, text, entry.get('timestamp'), messageId=entry.get('uuid')))
+        texts = [content] if isinstance(content, str) else [block['text'] for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)] if isinstance(content, list) else []
+        for text in texts:
+            shown = text.strip() and (_claude_user_text(text) if role == 'user' else ('assistant', text))
+            if shown:
+                extra = {'toolKind': 'command'} if shown[0] == 'tool' else {}
+                result.append(_message(shown[0], shown[1], ts, messageId=uid, **extra))
     return result
 
 

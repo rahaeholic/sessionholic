@@ -339,6 +339,55 @@ class ClaudeFlagParserTest(unittest.TestCase):
                 kernel.CloseHandle.assert_called_once_with(456)
 
 
+class ClaudeHarnessLineTest(unittest.TestCase):
+    def test_harness_lines_are_notes_or_hidden_as_on_the_mac(self):
+        # PC Claude conversations showed expanded skills, compaction summaries, background task
+        # notices and /exit records as the person's own bubbles.
+        import collector
+        entries = [
+            {'type': 'user', 'isMeta': True, 'message': {'content': [
+                {'type': 'text', 'text': 'Base directory for this skill: C:\\skills\\handoff\n\n# Handoff'}]}},
+            {'type': 'user', 'isMeta': True, 'message': {'content': 'Another Claude session sent a message: <agent-message>합성</agent-message>'}},
+            {'type': 'user', 'isCompactSummary': True, 'timestamp': 1791334800,
+             'message': {'content': 'This session is being continued from a previous conversation that ran out of context.'}},
+            {'type': 'user', 'message': {'content': '<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>\n</task-notification>'}},
+            {'type': 'user', 'message': {'content': '<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>'}},
+            {'type': 'user', 'message': {'content': '<command-name>/exit</command-name>\n  <command-message>exit</command-message>\n  <command-args></command-args>'}},
+            {'type': 'user', 'message': {'content': '<local-command-stdout>Bye!</local-command-stdout>'}},
+            {'type': 'user', 'message': {'content': [{'type': 'text', 'text': '<system-reminder>숨김</system-reminder>'},
+                                                     {'type': 'text', 'text': '정산 확인해 줘\n\n<system-reminder>숨김</system-reminder>'}]}},
+            {'type': 'user', 'message': {'content': [{'type': 'text', 'text': '[Request interrupted by user]'}]}},
+            {'type': 'user', 'message': {'content': '<bash-input>git status</bash-input>'}},
+            {'type': 'user', 'message': {'content': '<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>'}},
+            {'type': 'assistant', 'isSidechain': True, 'message': {'content': [{'type': 'text', 'text': '하위 에이전트 답'}]}},
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '확인하겠습니다.'}]}},
+        ]
+        rows = wc._claude_messages(entries)
+        got = [(m['role'], m['text']) for m in rows]
+        self.assertEqual(got, [('system', '이전 대화 요약으로 이어짐'), ('system', '백그라운드 작업 알림'), ('system', '명령 /exit'),
+                               ('user', '정산 확인해 줘'), ('system', '사용자가 중단함'), ('tool', '$ git status'),
+                               ('assistant', '확인하겠습니다.')])
+        self.assertEqual(rows[5]['toolKind'], 'command')
+        self.assertEqual([(m['role'], m['text']) for m in collector.claude_messages(entries)], got)
+
+    def test_saved_codex_rollout_hides_the_global_agents_block(self):
+        # Codex 0.163+ writes the global AGENTS.md block with no folder; a saved PC
+        # conversation showed it as the first bubble.
+        import collector
+        bare = '# AGENTS.md instructions\n\n<INSTRUCTIONS>\n# 전역 지침\n</INSTRUCTIONS>'
+        env = '<environment_context>\n  <cwd>C:\\work</cwd>\n</environment_context>'
+        heartbeat = '<heartbeat>\n  <automation_id>automation</automation_id>\n  <instructions>\n상태 확인\n  </instructions>\n</heartbeat>'
+        entries = [{'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                       {'type': 'input_text', 'text': bare}, {'type': 'input_text', 'text': env}]}},
+                   {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                       {'type': 'input_text', 'text': heartbeat}]}},
+                   {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                       {'type': 'input_text', 'text': '재고 알려 줘'}]}}]
+        self.assertEqual([(m['role'], m['text']) for m in wc._rollout_messages(entries)], [('user', '재고 알려 줘')])
+        self.assertEqual([row['text'] for entry in entries for row in collector.saved_rollout_rows(entry)], ['재고 알려 줘'])
+        self.assertEqual(wc._codex_user_text('# AGENTS.md instructions를 고쳐 줘'), '# AGENTS.md instructions를 고쳐 줘')
+
+
 class WindowsCollectorTest(unittest.TestCase):
 
     def test_slack_request_preserves_quoted_trailer_indentation_and_body_length(self):

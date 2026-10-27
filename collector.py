@@ -162,10 +162,15 @@ def bot_request_text(text):
 
 
 # Blocks a harness writes into a Codex user turn, never the person's words: Codex's own AGENTS.md
-# and environment notes (a bot that starts Codex may pass them as the turn's input too).
+# and environment notes (a bot that starts Codex may pass them as the turn's input too), an
+# automation's scheduled heartbeat and the Codex app's page notice.
 CODEX_HARNESS = (("# AGENTS.md instructions for ", "</INSTRUCTIONS>"),
+                 # Codex 0.163+ also writes the global AGENTS.md block without a folder.
+                 ("# AGENTS.md instructions\n", "</INSTRUCTIONS>"),
                  ("<environment_context>", "</environment_context>"),
-                 ("<user_instructions>", "</user_instructions>"))
+                 ("<user_instructions>", "</user_instructions>"),
+                 ("<heartbeat>", "</heartbeat>"),
+                 ("<external_codex_apps_open_page>", "</external_codex_apps_open_page>"))
 
 
 def codex_user_text(text):
