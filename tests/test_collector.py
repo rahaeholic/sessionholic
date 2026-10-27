@@ -464,6 +464,19 @@ class MessageTest(unittest.TestCase):
         self.assertEqual([(m["role"], m["text"], m["ts"]) for m in collector.codex_messages([turn])],
                          [("user", "재고 알려 줘", 1000), ("user", "추가 지시", None), ("assistant", "답", 2000)])
         self.assertIsNone(collector.codex_user_text("# AGENTS.md instructions for /x\n<INSTRUCTIONS>\n끝나지 않음"))
+        # Codex 0.163+ writes the global block with no folder in the heading.
+        bare = "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n# 전역 지침\n</INSTRUCTIONS>"
+        self.assertIsNone(collector.codex_user_text(bare))
+        self.assertEqual(collector.codex_user_text(bare + "\n" + env + "\n\n재고 알려 줘"), "재고 알려 줘")
+        self.assertEqual(collector.codex_user_text("# AGENTS.md instructions를 고쳐 줘"), "# AGENTS.md instructions를 고쳐 줘")
+        # An automation's scheduled heartbeat and the Codex app's page notice are sent as user turns.
+        heartbeat = ("<heartbeat>\n  <automation_id>automation</automation_id>\n"
+                     "  <instructions>\n녹화 상태 확인\n  </instructions>\n</heartbeat>")
+        beat = {**turn, "items": [{"type": "userMessage", "content": [{"type": "text", "text": heartbeat}]},
+                                  {"type": "userMessage", "content": [{"type": "text", "text":
+                                      '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>'}]},
+                                  {"type": "agentMessage", "text": "정상 진행 중", "phase": "final_answer"}]}
+        self.assertEqual([(m["role"], m["text"]) for m in collector.codex_messages([beat])], [("assistant", "정상 진행 중")])
         self.assertEqual(collector.codex_user_text("AGENTS.md를 고쳐 줘"), "AGENTS.md를 고쳐 줘")
         self.assertEqual(collector.codex_user_text("  그대로 둔 공백  "), "  그대로 둔 공백  ")
 
