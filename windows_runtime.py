@@ -792,7 +792,10 @@ class WindowsRuntime:
         binary = self.reader.home / '.local/bin/claude.exe'
         if not cwd or not Path(wc._windows_path(cwd)).is_dir() or not binary.is_file():
             raise ValueError('PC 원본 작업 폴더나 Claude 실행 파일을 확인하지 못했습니다.')
-        return {'argv': [str(binary), '--resume', identity['id']], 'cwd': cwd, 'env': {},
+        # The PC launcher starts Claude in bypassPermissions; `--resume` alone opened it in the
+        # settings default (auto) instead, so the resumed session keeps the launcher's mode.
+        return {'argv': [str(binary), '--resume', identity['id'], '--permission-mode', 'bypassPermissions'],
+                'cwd': cwd, 'env': {},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': 'interactive'}, 'connectionMode': 'resume', 'resumed': True}
 
     def _claude(self, source):
