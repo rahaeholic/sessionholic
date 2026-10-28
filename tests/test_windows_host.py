@@ -377,7 +377,34 @@ class WindowsRoutingTest(unittest.TestCase):
         with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
                 patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
             self.flow.remote_attach(HOST, ROW)
-        rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True}, timeout=20)
+        rpc.assert_called_once_with(HOST, 'terminal_plan', {'source': ROW, 'prepare': True, 'takeover': True}, timeout=20)
+
+    def test_a_pc_run_is_replaced_only_while_no_board_terminal_shows_the_session(self):
+        spec = {'argv': ['fixture'], 'cwd': ROW['cwd'], 'connectionMode': 'resume'}
+        # This board's terminal of the session is open: the PC run stays, whatever it is.
+        self.terms.list = lambda: [{'alive': True, 'closed': False, 'nativeSource': dict(ROW)}]
+        with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
+                patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
+            self.flow.remote_attach(HOST, ROW)
+        self.assertIs(rpc.call_args.args[2]['takeover'], False)
+        # Closed or another session's terminals leave the session without one.
+        self.terms.list = lambda: [{'alive': False, 'closed': True, 'nativeSource': dict(ROW)},
+                                   {'alive': True, 'closed': False, 'nativeSource': {**ROW, 'id': 'other-session'}}]
+        with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
+                patch.object(self.flow.transfers, 'windows_terminal', return_value=['fixture-ssh']):
+            self.flow.remote_attach(HOST, ROW)
+        self.assertIs(rpc.call_args.args[2]['takeover'], True)
+
+    def test_a_plan_replacing_a_pc_run_left_without_its_terminal_asks_first(self):
+        spec = {'argv': ['fixture'], 'cwd': ROW['cwd'], 'resumed': True, 'replaces': True}
+        with patch.object(self.flow.transfers, 'rpc', return_value=spec) as rpc, \
+                patch.object(server.shutil, 'which', return_value='/fixture/tmux'):
+            result = self.flow.plan({'source': REF, 'target': {'host': HOST['name'], 'agent': 'codex', 'account': 'codex:.codex'}})
+        self.assertIs(rpc.call_args.args[2]['takeover'], True)
+        self.assertNotIn('prepare', rpc.call_args.args[2])
+        # A warning keeps the screen from opening it without a confirmation.
+        self.assertTrue(result['allowed'])
+        self.assertTrue(any('남아 있던' in warning for warning in result['warnings']))
 
     def test_a_pc_codex_terminal_carries_what_its_plan_says_of_permissions(self):
         spec = {'argv': ['fixture'], 'cwd': ROW['cwd'], 'connectionMode': 'attach', 'settle': True, 'restricted': True}

@@ -411,6 +411,14 @@ def _receipt(identity, request_id, thread):
             'reason': 'PC 수신 결과를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다.'}
 
 
+def _terminal_script(cwd, argv):
+    """The script Mini's board terminal runs on this PC for a plan (transfer.windows_terminal)."""
+    def quote(value):
+        return "'" + ''.join(c + c if c in "'‘’‚‛" else c for c in value) + "'"
+    return ("$ErrorActionPreference='Stop'; Set-Location -LiteralPath " + quote(cwd) + '; & '
+            + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE')
+
+
 def _terminate_windows(expected):
     """Pin one process handle, recheck creation time and executable, then terminate."""
     if os.name != 'nt':
@@ -778,10 +786,11 @@ class WindowsRuntime:
                 return True
         return False
 
-    def _claude_resume(self, source):
-        """A stored Claude conversation no PC process runs, continued in a board terminal."""
+    def _claude_resume(self, source, replacing=False):
+        """A stored Claude conversation no PC process runs, continued in a board terminal.
+        `replacing`: the run is the board's own and ends first (`_board_orphan`)."""
         identity = _identity(source)
-        if self._claude_running(identity['id']):
+        if not replacing and self._claude_running(identity['id']):
             raise ValueError('이 Claude 세션은 PC 터미널에서 실행 중입니다. 그 터미널에서 이어가세요.')
         path = self.reader._transcripts().get(identity['id'])
         if path is None:
@@ -797,6 +806,31 @@ class WindowsRuntime:
         return {'argv': [str(binary), '--resume', identity['id'], '--permission-mode', 'bypassPermissions'],
                 'cwd': cwd, 'env': {},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': 'interactive'}, 'connectionMode': 'resume', 'resumed': True}
+
+    def _board_orphan(self, observed, source):
+        """Whether an interactive Claude run is the board's own idle resume of this session:
+        its parent is the PowerShell the board's SSH terminal starts for it (`_terminal_script`).
+        When Mini restarts or the network drops, the PC's SSH server keeps that half-open session
+        and its run; no board terminal shows it any more."""
+        row, process = observed['row'], observed['process']
+        if row.get('kind') != 'interactive' or row.get('status') != 'idle':
+            return False
+        deadline = time.monotonic() + 3
+        parent = self.reader.parent_reader(deadline).get(process['pid'])
+        shell = self.reader.process_reader(parent) if type(parent) is int and parent > 0 else None
+        if (not shell or Path(wc._windows_path(shell.get('exe') or '')).name.casefold() != 'powershell.exe'
+                or not re.fullmatch(r'\d{17,20}', shell.get('start') or '') or int(shell['start']) > int(process['start'])):
+            return False
+        argv = self.reader.arguments_reader(shell, deadline)
+        if not isinstance(argv, list) or len(argv) != 4 or argv[1:3] != ['-NoProfile', '-EncodedCommand']:
+            return False
+        try:
+            script = base64.b64decode(argv[3], validate=True).decode('utf-16le')
+        except (ValueError, UnicodeError):
+            return False
+        spec = self._claude_resume(source, replacing=True)
+        # Today's launch, and one from before the launcher's permission mode was kept.
+        return script in (_terminal_script(spec['cwd'], spec['argv']), _terminal_script(spec['cwd'], spec['argv'][:3]))
 
     def _claude(self, source):
         identity = _identity(source)
@@ -1294,7 +1328,9 @@ class WindowsRuntime:
         self._save_settle(identity, observed, live, settings)
         return live
 
-    def terminal_plan(self, source, prepare=False):
+    def terminal_plan(self, source, prepare=False, takeover=False):
+        """`takeover`: the board has no live terminal of this session, so its own earlier
+        resume still running here (`_board_orphan`) is replaced when the terminal opens."""
         identity = _identity(source)
         settle = None
         if identity['agent'] == 'codex':
@@ -1319,7 +1355,14 @@ class WindowsRuntime:
                 return self._claude_resume(source)
             observed = self._claude(source)
             if observed['row'].get('kind') != 'bg':
-                raise ValueError('이 Claude 세션은 원래 대화형 터미널에서 실행 중입니다. 정확한 연결을 지원하는 background 세션만 열 수 있습니다.')
+                if not (takeover and self._board_orphan(observed, source)):
+                    raise ValueError('이 Claude 세션은 원래 대화형 터미널에서 실행 중입니다. 정확한 연결을 지원하는 background 세션만 열 수 있습니다.')
+                if not prepare:
+                    return {**self._claude_resume(source, replacing=True), 'replaces': True}
+                ended = self.terminate_process(observed['process'])
+                if ended.get('confirmed') is not True:
+                    raise ValueError('연결이 끊긴 채 남은 PC Claude 실행을 닫지 못했습니다. 잠시 뒤 다시 열어 주세요.')
+                return self._claude_resume(source)
             # The verified owner's registry record names its job. Closing the board terminal
             # ends only this attach client; the run keeps going.
             job = observed['row'].get('jobId')
@@ -1365,7 +1408,8 @@ def handle(request, data=None):
     if op == 'control_execute':
         return runtime.execute(args)
     if op == 'terminal_plan':
-        return runtime.terminal_plan(args.get('source'), prepare=args.get('prepare') is True)
+        return runtime.terminal_plan(args.get('source'), prepare=args.get('prepare') is True,
+                                     takeover=args.get('takeover') is True)
     if op == 'terminal_settle':
         return runtime.terminal_settle(args.get('source'))
     if op == 'resume_preview':

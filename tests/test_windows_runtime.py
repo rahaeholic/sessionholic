@@ -75,6 +75,12 @@ class FakeReader:
     def process_reader(self, pid):
         return copy.deepcopy(self.processes.get(pid))
 
+    def parent_reader(self, deadline):
+        return dict(getattr(self, 'parents', {}))
+
+    def arguments_reader(self, process, deadline):
+        return copy.deepcopy(getattr(self, 'arguments', {}).get(process['pid']))
+
     def _claude_executable(self, exe):
         return Path(exe).name == 'claude.exe' and Path(exe).is_file()
 
@@ -1188,6 +1194,82 @@ class WindowsRuntimeTest(unittest.TestCase):
         transcript.unlink()
         with self.assertRaisesRegex(ValueError, '기록'):
             self.runtime.terminal_plan(source)
+
+    def board_resume_left_running(self, legacy=False):
+        """A Claude run the board's SSH terminal started (`claude --resume`) whose terminal is gone."""
+        import transfer
+        source, row, registry = self.claude()
+        transcript = self.reader.claude_home / 'projects/fixture' / (source['id'] + '.jsonl')
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps({'type': 'user', 'cwd': str(self.reader.cwd), 'sessionId': source['id']}) + '\n')
+        self.reader.processes.pop(45)
+        spec = self.runtime.terminal_plan(source)
+        self.reader.processes[45] = {'pid': 45, 'start': row['procStart'], 'exe': str(self.home / '.local/bin/claude.exe')}
+        if legacy:  # launched before the board kept the launcher's permission mode
+            spec = {**spec, 'argv': spec['argv'][:3]}
+        # The command Mini's board terminal sends (transfer.windows_terminal), as the PC's PowerShell receives it.
+        script = transfer.windows_terminal_script(spec['cwd'], spec['argv'], spec['env'])
+        self.assertEqual(script, wr._terminal_script(spec['cwd'], spec['argv']))
+        shell = transfer.windows_encoded_command(script).split(' ')
+        self.assertEqual(shell[:3], ['powershell.exe', '-NoProfile', '-EncodedCommand'])
+        self.reader.processes[40] = {'pid': 40, 'start': '134362358929022990',
+                                     'exe': 'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'}
+        self.reader.parents = {45: 40}
+        self.reader.arguments = {40: ['C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'] + shell[1:]}
+        return source, row, registry
+
+    def test_the_boards_own_idle_resume_left_after_its_terminal_is_gone_is_replaced_on_open(self):
+        for legacy in (False, True):
+            self.kills.clear()
+            source, row, registry = self.board_resume_left_running(legacy)
+            # Without the board's word that no terminal of it is open, the run is never touched.
+            with self.assertRaisesRegex(ValueError, '대화형 터미널'):
+                self.runtime.terminal_plan(source)
+            # The plan says it replaces the run; only opening the terminal ends it.
+            plan = self.runtime.terminal_plan(source, takeover=True)
+            self.assertEqual((plan['replaces'], plan['resumed'], plan['argv'][1:3]), (True, True, ['--resume', source['id']]))
+            self.assertFalse(self.kills)
+            ended = self.reader.processes[45]
+            self.runtime.terminate_process = lambda process: (self.kills.append(process), self.reader.processes.pop(45),
+                                                              {'applied': True, 'confirmed': True})[-1]
+            opened = self.runtime.terminal_plan(source, prepare=True, takeover=True)
+            self.assertEqual(self.kills, [ended])
+            self.assertEqual(opened['argv'], [str(self.home / '.local/bin/claude.exe'), '--resume', source['id'],
+                                              '--permission-mode', 'bypassPermissions'])
+            self.assertNotIn('replaces', opened)
+            registry.unlink()
+
+    def test_only_the_boards_own_idle_resume_of_the_same_session_is_replaced(self):
+        cases = {
+            'busy': lambda row, path: path.write_text(json.dumps({**row, 'status': 'busy'})),
+            'another session': lambda row, path: self.reader.arguments[40].__setitem__(3, base64.b64encode(
+                base64.b64decode(self.reader.arguments[40][3]).decode('utf-16le').replace(row['sessionId'], str(uuid.uuid4()))
+                .encode('utf-16le')).decode()),
+            'another script': lambda row, path: self.reader.arguments[40].__setitem__(3, base64.b64encode(
+                "$ErrorActionPreference='Stop'; claude".encode('utf-16le')).decode()),
+            'a user shell': lambda row, path: self.reader.arguments.__setitem__(40, ['powershell.exe']),
+            'unreadable': lambda row, path: self.reader.arguments.pop(40),
+            'not powershell': lambda row, path: self.reader.processes[40].update(exe='C:\\Windows\\explorer.exe'),
+            'a newer parent': lambda row, path: self.reader.processes[40].update(start='134362358929099999'),
+            'no parent': lambda row, path: self.reader.parents.clear(),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                self.kills.clear()
+                source, row, registry = self.board_resume_left_running()
+                change(row, registry)
+                for prepare in (False, True):
+                    with self.assertRaisesRegex(ValueError, '대화형 터미널'):
+                        self.runtime.terminal_plan(source, prepare=prepare, takeover=True)
+                self.assertFalse(self.kills)
+                registry.unlink()
+        # An end the PC cannot confirm opens nothing.
+        self.kills.clear()
+        source, row, registry = self.board_resume_left_running()
+        self.runtime.terminate_process = lambda process: self.kills.append(process) or {'applied': True, 'confirmed': False}
+        with self.assertRaisesRegex(ValueError, '닫지 못했습니다'):
+            self.runtime.terminal_plan(source, prepare=True, takeover=True)
+        self.assertEqual(len(self.kills), 1)
 
     @unittest.skipIf(sys.platform == 'win32', 'non-Windows guard')
     def test_windows_process_termination_never_executes_on_non_windows(self):
