@@ -500,6 +500,21 @@ test("terminal list entries target the focused pane, and unlinked terminals cann
   assert.equal(f.preferences.get("workspace").panes.p3.terminalId, "c".repeat(32));
 });
 
+test("a 새 세션 terminal started from the primary pane opens there, as in the other panes, even with four panes open", () => {
+  const f = fixture(); f.workspace.add({ key: "session-b" }); f.attach("p2");
+  f.workspace.focus("p1");
+  const started = { id: "d".repeat(32), metadata: { mode: "new-session" } };
+  assert.equal(f.workspace.routeTerminal(started), false, "the primary pane opens its own launcher workspace");
+  assert.equal(f.frames.length, 1, "no pane is added for it");
+  f.workspace.add(null, "p1", "bottom"); f.workspace.add(null, "p2", "bottom");
+  assert.equal(f.frames.length, 3);
+  f.workspace.focus("p1");
+  assert.equal(f.workspace.routeTerminal(started), false, "four panes: still shown in the primary pane, not lost");
+  assert.ok(!f.calls.some(([name, message]) => name === "toast" && String(message).includes("최대 4개")));
+  // Any other unlinked terminal still keeps to a child document.
+  assert.equal(f.workspace.routeTerminal({ id: "e".repeat(32) }), true);
+});
+
 test("compact and maximized views preserve documents, passive panes remain unread, and reload checks all drafts", () => {
   const f = fixture(); f.workspace.add({ key: "session-b" }); const second = f.attach("p2");
   assert.equal(f.workspace.readingActive(), false);

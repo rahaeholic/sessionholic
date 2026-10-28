@@ -663,7 +663,8 @@ class BottomSheet {
       this.pressTarget = event.target || null;
     }
     if (this.drag) this.end({ pointerId: this.drag.id }, true);
-    if (!this.dialog.open || !(phoneLayout() || hasClass(this.dialog, "in-pane")) || (event.button || 0) > 0) return;
+    if (!this.dialog.open || !(phoneLayout() || hasClass(this.dialog, "in-pane")) || hasClass(this.dialog, "is-popover") ||
+        (event.button || 0) > 0) return;
     const zone = event.target?.closest?.(".sheet-handle, .dialog-top, h2");
     if (!zone || zone.parentElement !== this.dialog || event.target.closest("button, a, input, select, textarea")) return;
     const now = Date.now();
@@ -735,16 +736,24 @@ function sheet(id) {
 const WINDOW_SHEETS = new Set(["settings-dialog", "usage-dialog", "hardware-dialog", "filter-dialog",
   "terminals-dialog", "new-session-dialog", "shortcuts-dialog"]);
 function paneSheet(dialog) {
-  const area = $("detail"), press = state.pressOrigin;
+  const press = state.pressOrigin;
   const origin = (dialog.id === "action-sheet" && state.actionTrigger) ||
     (press && Date.now() - press.at < 1500 ? press.target : null) || document.activeElement;
-  const rect = hasClass(document.body, "workspace-split") && !WINDOW_SHEETS.has(dialog.id) &&
-    !hasClass(dialog, "is-popover") && $("workspace-primary")?.contains?.(origin) ? area?.getBoundingClientRect?.() : null;
-  const inPane = !!rect && rect.width > 0 && rect.width <= 700;
-  setClass(dialog, "in-pane", inPane);
-  setClass(area, "has-pane-sheet", inPane || !!document.querySelector?.("dialog.in-pane[open]"));
-  if (inPane) for (const [name, value] of [["left", rect.left], ["width", rect.width], ["height", rect.height],
-    ["bottom", (window.innerHeight || 0) - rect.bottom]]) dialog.style?.setProperty?.(`--pane-${name}`, `${Math.round(value)}px`);
+  const rect = !WINDOW_SHEETS.has(dialog.id) && !hasClass(dialog, "is-popover") ? firstPaneArea(origin) : null;
+  placeInPane(dialog, rect);
+  setClass($("detail"), "has-pane-sheet", !!rect || !!document.querySelector?.("dialog.in-pane[open]"));
+}
+// The first pane's conversation area when `origin` is in it and it is as narrow as the other
+// panes that show phone-width screens (the 700px rules); otherwise null (the window's own).
+function firstPaneArea(origin) {
+  const rect = hasClass(document.body, "workspace-split") && $("workspace-primary")?.contains?.(origin)
+    ? $("detail")?.getBoundingClientRect?.() : null;
+  return rect && rect.width > 0 && rect.width <= 700 ? rect : null;
+}
+function placeInPane(node, rect) {
+  setClass(node, "in-pane", !!rect);
+  if (rect) for (const [name, value] of [["left", rect.left], ["width", rect.width], ["height", rect.height],
+    ["bottom", (window.innerHeight || 0) - rect.bottom]]) node.style?.setProperty?.(`--pane-${name}`, `${Math.round(value)}px`);
 }
 // Closes a simple sheet and returns focus to the control that opened it.
 function closeSheet(id, returnFocus = null) {
@@ -1641,7 +1650,7 @@ function render() {
     );
     // A phone showed nothing but that conversation, and its back button went
     // with it: back to the list, saying why.
-    if (phoneLayout() && state.detailShown && !state.terminalVisible) {
+    if (mobileStartOnList() && state.detailShown && !state.terminalVisible) {
       toast("열어 둔 작업을 목록에서 더 이상 찾을 수 없어 목록으로 돌아왔습니다.");
       backToList();
     } else syncEvents();
@@ -3338,7 +3347,8 @@ function openActionSheet({ eyebrow = "", title = "", preview = "", actions = [],
   } catch {
     /* nothing selected */
   }
-  const popover = !!at && !phoneLayout();
+  // A split pane is phone-wide on a desktop: a right click's menu still opens at the pointer.
+  const popover = !!at && (!phoneLayout() || !!document.documentElement?.hasAttribute?.("data-desktop-pane"));
   setClass(dialog, "is-popover", popover);
   if (dialog.style) {
     const width = window.innerWidth || 0;
@@ -3747,7 +3757,7 @@ function select(key) {
   state.selectedBotRequest = bot ? botGroupKey(bot) : null;
   const listChanged = target && prepareSessionListFor(target);
   if (listChanged && state.selected === key) renderSessionList(allSessions(), state.snapshot?.serverTime || Date.now() / 1000);
-  const mobile = phoneLayout();
+  const mobile = mobileStartOnList();
   const entering = mobile && !state.detailShown;
   if (entering) navigateView("detail");
   if (state.selected === key) {
@@ -5119,7 +5129,7 @@ function persistAllDrafts() {
 }
 function chatVisible() {
   return window.SessionholicWorkspace?.visible() !== false && !document.hidden && !boardCovered() &&
-    (!state.inlineTerminal || !!state.inlineTerminal.key && state.inlineTerminal.key === state.selected) && (!phoneLayout() || state.detailShown);
+    (!state.inlineTerminal || !!state.inlineTerminal.key && state.inlineTerminal.key === state.selected) && (!mobileStartOnList() || state.detailShown);
 }
 function chatHostOffline(entry, session = selectedSession() || null) {
   return state.snapshot?.hosts?.find((host) => host.name === entry.source.host)?.ok === false ||
@@ -5338,6 +5348,8 @@ function renderDictationOverlay() {
   const session = state.dictation;
   overlay.hidden = !session;
   if (!session) return;
+  // In a split board the first pane's mic screen covers that pane, as the other panes' do.
+  placeInPane(overlay, firstPaneArea(session.field));
   const stop = $("dictation-overlay-stop");
   if (stop && !stop.dataset.bound) {
     // 보내지 않고 끝내기: as the mic pressed again (the last words land, then it parks or ends).
@@ -6721,7 +6733,8 @@ const LIST_PAGE = 5;
 // Back from a conversation: to the list on a phone layout, to its card beside the conversation.
 function keyboardBack() {
   state.inputFocusFor = null;
-  if (phoneLayout() && state.detailShown) backToList();
+  // A split pane as narrow as a phone has no list behind it: back there would stop its live updates.
+  if (mobileStartOnList() && state.detailShown) backToList();
   else if (state.dockSolo) backFromTerminal();
   else restoreSelectedCardFocus();
 }
