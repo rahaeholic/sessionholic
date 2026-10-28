@@ -1164,7 +1164,8 @@ class WindowsRuntimeTest(unittest.TestCase):
         transcript.parent.mkdir(parents=True, exist_ok=True)
         transcript.write_text(json.dumps({'type': 'user', 'cwd': str(self.reader.cwd), 'sessionId': source['id']}) + '\n')
         self.reader.processes.pop(45)  # its registry record stays
-        self.assertEqual(self.runtime.terminal_plan(source)['argv'][1:], ['--resume', source['id']])
+        self.assertEqual(self.runtime.terminal_plan(source)['argv'][1:],
+                         ['--resume', source['id'], '--permission-mode', 'bypassPermissions'])
 
     def test_a_stored_claude_conversation_no_pc_process_runs_resumes_in_a_board_terminal(self):
         source, row, registry = self.claude()
@@ -1177,7 +1178,9 @@ class WindowsRuntimeTest(unittest.TestCase):
         # The process ended (its record may stay): the conversation continues here.
         self.reader.processes.pop(45)
         plan = self.runtime.terminal_plan(source)
-        self.assertEqual(plan['argv'], [str(self.home / '.local/bin/claude.exe'), '--resume', source['id']])
+        # Resumed in the mode the PC launcher starts Claude in, not the settings default (auto).
+        self.assertEqual(plan['argv'], [str(self.home / '.local/bin/claude.exe'), '--resume', source['id'],
+                                        '--permission-mode', 'bypassPermissions'])
         self.assertEqual((plan['cwd'], plan['env'], plan['resumed']), (str(self.reader.cwd), {}, True))
         self.assertEqual(plan['nativeSource']['kind'], 'interactive')
         self.assertTrue(self.runtime.resume_preview(source)['allowed'])
