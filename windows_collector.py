@@ -360,7 +360,13 @@ def _claude_options(arguments):
 
 
 def _query_claude_flags(kernel, handle):
-    """Read one handle's bounded command line, returning only a few booleans.
+    """Read one handle's bounded command line, returning only a few booleans."""
+    arguments = _query_arguments(kernel, handle)
+    return _claude_options(arguments) if arguments else {}
+
+
+def _query_arguments(kernel, handle):
+    """One handle's bounded command line as argv, or None.
 
     ProcessCommandLineInformation is optional: unsupported Windows versions fail
     closed. No PEB/environment read or PowerShell/CIM fallback is performed.
@@ -373,19 +379,19 @@ def _query_claude_flags(kernel, handle):
     size = wintypes.ULONG()
     query(handle, 60, None, 0, ctypes.byref(size))
     if size.value < ctypes.sizeof(UnicodeString) or size.value > 65536:
-        return {}
+        return None
     buffer = ctypes.create_string_buffer(size.value)
     if query(handle, 60, buffer, len(buffer), ctypes.byref(size)) < 0:
-        return {}
+        return None
     value = UnicodeString.from_buffer(buffer)
     begin, end = ctypes.addressof(buffer), ctypes.addressof(buffer) + len(buffer)
     if (value.Length == 0 or value.Length % 2 or value.Length > value.MaximumLength
             or not value.Buffer or value.Buffer < begin + ctypes.sizeof(UnicodeString)
             or value.Buffer + value.Length > end):
-        return {}
+        return None
     command = ctypes.wstring_at(value.Buffer, value.Length // 2)
     if '\0' in command:
-        return {}
+        return None
     shell = ctypes.WinDLL('shell32')
     shell.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
     shell.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
@@ -394,28 +400,38 @@ def _query_claude_flags(kernel, handle):
     count = ctypes.c_int()
     arguments = shell.CommandLineToArgvW(command, ctypes.byref(count))
     try:
-        return _claude_options([arguments[i] for i in range(count.value)]) if arguments and 0 < count.value <= 256 else {}
+        return [arguments[i] for i in range(count.value)] if arguments and 0 < count.value <= 256 else None
     finally:
         if arguments:
             kernel.LocalFree(arguments)
 
 
 def _claude_flags(expected, deadline):
+    return _pinned_query(expected, deadline, _query_claude_flags, {})
+
+
+def _arguments(expected, deadline):
+    """A pinned process's argv, for a caller that compares it in place; never kept or reported."""
+    return _pinned_query(expected, deadline, _query_arguments, None)
+
+
+def _pinned_query(expected, deadline, query, empty):
+    """`query` of one process handle, answered only while it is still `expected`."""
     if os.name != 'nt' or not _same_process(expected, expected) or time.monotonic() >= deadline:
-        return {}
+        return empty
     kernel = _process_api()
     handle = kernel.OpenProcess(0x1000, False, expected['pid'])
     if not handle:
-        return {}
+        return empty
     try:
         if not _same_process(expected, _process_identity(kernel, handle, expected['pid'])):
-            return {}
-        flags = _query_claude_flags(kernel, handle)
+            return empty
+        value = query(kernel, handle)
         if time.monotonic() >= deadline or not _same_process(expected, _process_identity(kernel, handle, expected['pid'])):
-            return {}
-        return flags
+            return empty
+        return value
     except (OSError, ValueError, AttributeError):
-        return {}
+        return empty
     finally:
         kernel.CloseHandle(handle)
 
@@ -607,13 +623,15 @@ def _open_read_only(database, immutable=False):
 
 class WindowsCollector:
     def __init__(self, home=None, proxy_factory=Proxy, process_reader=_process, hostname=None,
-                 parent_reader=_parents, flags_reader=_claude_flags, owner_reader=_lock_owners):
+                 parent_reader=_parents, flags_reader=_claude_flags, owner_reader=_lock_owners,
+                 arguments_reader=_arguments):
         self.home = Path(home) if home is not None else Path.home()
         self.codex_home = self.home / '.codex'
         self.claude_home = self.home / '.claude'
         self.binary = self.home / 'AppData/Local/Programs/OpenAI/Codex/bin/codex.exe'
         self.proxy_factory, self.process_reader = proxy_factory, process_reader
         self.parent_reader, self.flags_reader = parent_reader, flags_reader
+        self.arguments_reader = arguments_reader
         self.owner_reader = owner_reader
         # Project servers that ran here and are gone, every server name and every server
         # process recorded (endpoints fills them on each snapshot).

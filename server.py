@@ -2578,8 +2578,10 @@ class Workflow:
         elif allowed and windows and not existing:
             # A PC conversation resumed in an open board terminal now runs there: that one is reopened.
             try:
-                spec = self.transfers.rpc(host, "terminal_plan", {"source": source}, timeout=12)
+                spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "takeover": self.windows_takeover(source)}, timeout=12)
                 windows_resumed = spec.get("resumed") is True
+                if spec.get("replaces") is True:
+                    warnings.append("보드 연결이 끊긴 채 PC에 남아 있던 이 대화의 실행을 닫고 같은 대화를 다시 엽니다. 대화 기록은 그대로 유지됩니다.")
             except (ValueError, RuntimeError, OSError) as exc:
                 allowed, reason = False, str(exc)
         config = settings.load()
@@ -2844,6 +2846,13 @@ class Workflow:
                 "nativeSource": native,
                 "connectionMode": "attach" if prepared.get("connectionMode") == "attach" else None}
 
+    def windows_takeover(self, source):
+        """Only this board knows whether a PC run still has its terminal: with none open for the
+        session, the PC may replace the board's own earlier resume it kept after the connection
+        was lost (windows_runtime terminal_plan)."""
+        return not any(item.get("alive") and not item.get("closed") and self.same_native(item.get("nativeSource"), source)
+                       for item in self.terminals.list())
+
     def settle_windows_terminal(self, host, source, terminal_id):
         """In the background: the PC keeps the permissions its plan recorded while the terminal's
         TUI joins (windows_runtime terminal_settle); the terminal's screen says what it found."""
@@ -2870,7 +2879,8 @@ class Workflow:
         # The owning helper resolves binaries and explicit environment settings.
         # No configuration values or credentials cross back into an SSH command.
         if host.get("platform") == "windows":
-            spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "prepare": True}, timeout=20)
+            spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "prepare": True,
+                                                               "takeover": self.windows_takeover(source)}, timeout=20)
             import collector
             return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
                     "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",

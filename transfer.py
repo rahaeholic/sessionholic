@@ -212,6 +212,16 @@ def windows_literal_argument(value):
     return '"' not in value and not (any(c.isspace() for c in value) and value.endswith('\\'))
 
 
+def windows_terminal_script(cwd, argv, env):
+    """What a PC board terminal runs; the PC recognises its own resume by it
+    (windows_runtime._terminal_script)."""
+    quote = ps_quote
+    script = "$ErrorActionPreference='Stop'; Set-Location -LiteralPath " + quote(cwd) + '; '
+    for key, value in env.items():
+        script += '$env:' + key + '=' + quote(value) + '; '
+    return script + '& ' + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE'
+
+
 def windows_encoded_command(script):
     return 'powershell.exe -NoProfile -EncodedCommand ' + base64.b64encode(script.encode('utf-16le')).decode('ascii')
 
@@ -443,12 +453,7 @@ class Transfers:
             raise ValueError('PC 터미널 연결 정보가 올바르지 않습니다.')
         if any(not windows_literal_argument(value) for value in argv[1:]):
             raise ValueError('PC 터미널 연결 정보가 올바르지 않습니다.')
-        quote = ps_quote
-        script = "$ErrorActionPreference='Stop'; Set-Location -LiteralPath " + quote(cwd) + '; '
-        for key, value in env.items():
-            script += '$env:' + key + '=' + quote(value) + '; '
-        script += '& ' + ' '.join(quote(value) for value in argv) + '; exit $LASTEXITCODE'
-        return self._windows_ssh(host, script)
+        return self._windows_ssh(host, windows_terminal_script(cwd, argv, env))
 
     def _windows_ssh(self, host, script):
         command = windows_encoded_command(script)
