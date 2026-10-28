@@ -23,6 +23,16 @@ body.workspace-split .workspace-pane { position: absolute; display: flex; flex-d
 body.workspace-split .workspace-pane-active { border-color: var(--accent); }
 body.workspace-split .workspace-pane-active > .workspace-pane-bar .workspace-pane-title { color: var(--accent); font-weight: 600; }
 body.workspace-split #workspace-primary > #detail { display: flex; position: relative; width: 100%; flex: 1; min-height: 0; }
+/* The first pane's sheets rise from its bottom edge, as the other panes' (documents of their own) do (app.js paneSheet). */
+dialog.plan-dialog.sheet.in-pane { position: fixed; inset: auto auto var(--pane-bottom) var(--pane-left); width: var(--pane-width); max-width: var(--pane-width); max-height: max(min(calc(var(--pane-height) - 24px), 460px), calc(var(--pane-height) * 0.62)); margin: 0; border-radius: 18px 18px 0 0; transform: translateY(var(--sheet-drag, 0px)); }
+dialog.plan-dialog.sheet.in-pane[data-detent="large"] { height: calc(var(--pane-height) - 16px); max-height: none; }
+dialog.plan-dialog.sheet.in-pane[open] { animation: sheet-in var(--dur-sheet) var(--ease-spring); }
+dialog.plan-dialog.sheet.in-pane::backdrop { background: transparent; }
+dialog.sheet.in-pane .sheet-handle { display: block; flex: none; position: relative; height: 20px; margin-bottom: -8px; cursor: grab; }
+dialog.sheet.in-pane .sheet-handle::before { content: ""; position: absolute; top: 7px; left: 50%; width: 36px; height: 5px; border-radius: 3px; background: var(--sheet-handle); transform: translateX(-50%); }
+dialog.sheet.in-pane.is-dragging { transition: none; animation: none; user-select: none; }
+body.workspace-split #detail.has-pane-sheet::after { content: ""; position: absolute; inset: 0; z-index: 30; background: var(--backdrop); }
+@media (prefers-reduced-motion: reduce) { dialog.plan-dialog.sheet.in-pane[open] { animation: none; } }
 .workspace-frame { display: block; flex: 1; width: 100%; min-height: 0; border: 0; background: var(--surface); }
 .workspace-pane-covered { visibility: hidden; pointer-events: none; }
 #workspace-dividers { position: absolute; inset: 0; pointer-events: none; z-index: 8; }

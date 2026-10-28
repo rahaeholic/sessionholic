@@ -618,11 +618,14 @@ class BottomSheet {
     dialog.addEventListener("close", () => {
       this.drag = null;
       dialog.classList?.remove("is-dragging");
+      // A close event comes late: a sheet opened again meanwhile keeps its pane dimmed.
+      setClass($("detail"), "has-pane-sheet", !!document.querySelector?.("dialog.in-pane[open]"));
     });
   }
   open({ detent = this.initial } = {}) {
     this.setDetent(detent);
     this.offset(0);
+    paneSheet(this.dialog);
     // A menu opened by a long press must not close on that finger's release:
     // only a press that starts on the open sheet's backdrop dismisses it.
     this.pressedSinceOpen = false;
@@ -660,7 +663,7 @@ class BottomSheet {
       this.pressTarget = event.target || null;
     }
     if (this.drag) this.end({ pointerId: this.drag.id }, true);
-    if (!this.dialog.open || !phoneLayout() || (event.button || 0) > 0) return;
+    if (!this.dialog.open || !(phoneLayout() || hasClass(this.dialog, "in-pane")) || (event.button || 0) > 0) return;
     const zone = event.target?.closest?.(".sheet-handle, .dialog-top, h2");
     if (!zone || zone.parentElement !== this.dialog || event.target.closest("button, a, input, select, textarea")) return;
     const now = Date.now();
@@ -725,6 +728,23 @@ const SHEETS = {
 };
 function sheet(id) {
   return BottomSheet.attach($(id), SHEETS[id]);
+}
+// A split board's other panes are documents of their own: at a pane's width (the 700px rules)
+// their sheets rise from the pane's bottom edge. The first pane is part of this window, so a
+// sheet opened from it does the same over it. The board's own sheets stay centered.
+const WINDOW_SHEETS = new Set(["settings-dialog", "usage-dialog", "hardware-dialog", "filter-dialog",
+  "terminals-dialog", "new-session-dialog", "shortcuts-dialog"]);
+function paneSheet(dialog) {
+  const area = $("detail"), press = state.pressOrigin;
+  const origin = (dialog.id === "action-sheet" && state.actionTrigger) ||
+    (press && Date.now() - press.at < 1500 ? press.target : null) || document.activeElement;
+  const rect = hasClass(document.body, "workspace-split") && !WINDOW_SHEETS.has(dialog.id) &&
+    !hasClass(dialog, "is-popover") && $("workspace-primary")?.contains?.(origin) ? area?.getBoundingClientRect?.() : null;
+  const inPane = !!rect && rect.width > 0 && rect.width <= 700;
+  setClass(dialog, "in-pane", inPane);
+  setClass(area, "has-pane-sheet", inPane || !!document.querySelector?.("dialog.in-pane[open]"));
+  if (inPane) for (const [name, value] of [["left", rect.left], ["width", rect.width], ["height", rect.height],
+    ["bottom", (window.innerHeight || 0) - rect.bottom]]) dialog.style?.setProperty?.(`--pane-${name}`, `${Math.round(value)}px`);
 }
 // Closes a simple sheet and returns focus to the control that opened it.
 function closeSheet(id, returnFocus = null) {
@@ -954,6 +974,9 @@ function setClass(node, name, on) {
   const names = String(node.className || "").split(/\s+/).filter(Boolean);
   if (names.includes(name) === !!on) return;
   node.className = (on ? [...names, name] : names.filter((item) => item !== name)).join(" ");
+}
+function hasClass(node, name) {
+  return !!node && String(node.className || "").split(/\s+/).includes(name);
 }
 function button(text, className, action) {
   const node = el("button", className, text);
@@ -14554,6 +14577,8 @@ window.addEventListener("DOMContentLoaded", () => {
     onChanged: render,
     onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
   document.addEventListener("pointerdown", closeChatToolsOutside);
+  // Where a sheet a press opens belongs (paneSheet); buttons a mouse clicks take no focus in Safari.
+  document.addEventListener("pointerdown", (event) => { state.pressOrigin = { target: event.target, at: Date.now() }; }, true);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
     // A committed edge swipe already slid the screens: the change shows at once and ends it.

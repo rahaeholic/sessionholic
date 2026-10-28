@@ -5146,6 +5146,55 @@ test('quick replies come from this browser\'s list and opening or cancelling nev
   assert.equal(c.get('action-list').children[0].disabled, true);
 });
 
+test('분할 화면 1번 창에서 연 빠른 답장과 시트는 다른 창처럼 그 창 아래에서 올라오고, 앱 전체 시트와 우클릭 메뉴는 그대로다', () => {
+  const c = client(undefined, noChatTimers);
+  const { entry } = selectChat(c);
+  const input = c.get('chat-input'), dialog = c.get('action-sheet'), detail = c.get('detail'), card = c.get('groups');
+  for (const id of ['action-sheet', 'settings-dialog', 'plan-dialog']) c.get(id).id = id;
+  const props = {};
+  dialog.style.setProperty = (name, value) => { props[name] = value; };
+  let width = 450;
+  const split = (on) => { c.context.document.body.className = on ? 'workspace-split' : ''; };
+  split(true);
+  c.get('workspace-primary').contains = (target) => target === input || target === detail;
+  detail.getBoundingClientRect = () => ({ left: 190, top: 130, width, height: 930, bottom: 1060 });
+  c.context.window.innerHeight = 1100;
+  const inPane = () => String(dialog.className || '').split(' ').includes('in-pane');
+  const dimmed = () => String(detail.className || '').split(' ').includes('has-pane-sheet');
+  c.openQuickReplies(entry, input, null);
+  assert.equal(dialog.open, true);
+  assert.equal(inPane(), true, 'a bottom sheet over the first pane, as the other panes show theirs');
+  assert.equal(dimmed(), true, 'only that pane is dimmed');
+  assert.deepEqual(Object.fromEntries(Object.entries(props).filter(([name]) => name.startsWith('--pane-'))),
+    { '--pane-left': '190px', '--pane-width': '450px', '--pane-height': '930px', '--pane-bottom': '40px' });
+  dialog.close(); dialog.events.close?.();
+  assert.equal(dimmed(), false);
+  // A pane as wide as a window shows the centered dialog its neighbours (documents that wide) show too.
+  width = 1100; c.openQuickReplies(entry, input, null);
+  assert.equal(inPane(), false); assert.equal(dimmed(), false);
+  dialog.close(); width = 450;
+  // Not split: the window's own centered dialog.
+  split(false); c.openQuickReplies(entry, input, null);
+  assert.equal(inPane(), false);
+  dialog.close(); split(true);
+  // A right click's menu stays where the pointer is.
+  c.openActionSheet({ title: '메뉴', actions: [{ label: '복사', run() {} }], at: { x: 300, y: 400 }, trigger: input });
+  assert.equal(inPane(), false);
+  dialog.close();
+  // Opened from outside the first pane (the list), or the board's own sheet: centered.
+  c.openActionSheet({ title: '카드', actions: [{ label: '고정', run() {} }], trigger: card });
+  assert.equal(inPane(), false);
+  dialog.close();
+  c.context.document.activeElement = input;
+  c.sheet('settings-dialog').open();
+  assert.equal(String(c.get('settings-dialog').className || '').includes('in-pane'), false);
+  // Any other sheet a press in the first pane opens is that pane's.
+  c.context.document.activeElement = null;
+  c.state.pressOrigin = { target: input, at: Date.now() };
+  c.sheet('plan-dialog').open();
+  assert.equal(String(c.get('plan-dialog').className || '').includes('in-pane'), true);
+});
+
 test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, 입력이 막히면 비활성이다', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);
