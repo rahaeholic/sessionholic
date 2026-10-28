@@ -11214,9 +11214,15 @@ function showLauncherChat(terminalId) {
   if (!terminal) return;
   state.launcherWorkspace.mode = "chat";
   if (state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
+  const started = agentViewConversation(terminal);
   if (launcherConversation(terminal)) {
     state.launcherWorkspace = null;
     openNativeChat(terminal);
+    chooseDetailMode("chat");
+  } else if (started) {
+    // Opened as a list choice would: its own chat, never linked to this terminal's input.
+    state.launcherWorkspace = null;
+    select(started.key);
     chooseDetailMode("chat");
   } else renderLauncherChat();
   renderDetailMode();
@@ -11235,11 +11241,23 @@ function launcherChatCandidates(terminal) {
     (s.agent !== 'codex' || !s.source || ['cli', 'vscode'].includes(s.source)) && s.cwd);
 }
 // Claude's agent view (`claude agents`) runs each conversation it starts in the background:
-// one of its folder started since the terminal opened is its own.
+// one of its folder (or a worktree below it) started since the terminal opened is its own.
 function agentViewSession(info, s) {
   return info.program === 'claude-agents' && s.agent === 'claude' && s.kind === 'background' &&
-    (!info.programCwd || s.cwd === info.programCwd) && Number.isInteger(info.createdAt) &&
+    (!info.programCwd || folderWithin(s.cwd, info.programCwd)) && Number.isInteger(info.createdAt) &&
     Number.isFinite(s.startedAt) && s.startedAt >= info.createdAt - 5;
+}
+function folderWithin(path, folder) {
+  const base = folder.replace(/[\\/]+$/, "");
+  return path === folder || typeof path === "string" && (path.startsWith(base + "/") || path.startsWith(base + "\\"));
+}
+// The one conversation an agent view started opens by itself on the chat tab, unless a record
+// was chosen for this terminal; two or more stay a choice.
+function agentViewConversation(terminal) {
+  const info = terminalInfo(terminal);
+  if (info.program !== 'claude-agents' || info.chatSource) return null;
+  const own = launcherChatCandidates(terminal).filter((s) => agentViewSession(info, s));
+  return own.length === 1 ? own[0] : null;
 }
 function renderLauncherChat() {
   const terminal = launcherWorkspaceTerminal(), root = $("launcher-chat-waiting");
@@ -11339,10 +11357,12 @@ async function readLauncherChat(view) {
 }
 function syncLauncherWorkspace() {
   const id = state.launcherWorkspace?.terminalId;
-  // A user already waiting on the chat tab follows only a verified native identity.
-  // Never redraw underneath terminal input or infer the conversation from its title/time.
+  // A user already waiting on the chat tab follows only a verified native identity, or the one
+  // conversation an agent view started. Never redraw underneath terminal input or infer the
+  // conversation from its title.
   if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.detailShown &&
-      launcherConversation(launcherWorkspaceTerminal())) showLauncherChat(id);
+      (launcherConversation(launcherWorkspaceTerminal()) ||
+       state.launcherWorkspace.mode === "chat" && agentViewConversation(launcherWorkspaceTerminal()))) showLauncherChat(id);
   else if (launcherWorkspaceCurrent(id) && !state.inlineTerminal && state.launcherWorkspace.mode === "chat") renderLauncherChat();
   else if (launcherWorkspaceCurrent(id) && state.inlineTerminal && launcherConversation(launcherWorkspaceTerminal())) {
     renderSessionComposerLink();
