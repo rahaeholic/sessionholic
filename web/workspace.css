@@ -31,7 +31,16 @@ dialog.plan-dialog.sheet.in-pane::backdrop { background: transparent; }
 dialog.sheet.in-pane .sheet-handle { display: block; flex: none; position: relative; height: 20px; margin-bottom: -8px; cursor: grab; }
 dialog.sheet.in-pane .sheet-handle::before { content: ""; position: absolute; top: 7px; left: 50%; width: 36px; height: 5px; border-radius: 3px; background: var(--sheet-handle); transform: translateX(-50%); }
 dialog.sheet.in-pane.is-dragging { transition: none; animation: none; user-select: none; }
+/* Inside them, the phone-width sheet layout the other panes get (style.css 700px rules, same weight). */
+:where(dialog.in-pane) .dialog-top { padding: 6px 4px 0 var(--sheet-pad); }
+:where(dialog.in-pane).plan-dialog h2 { font-size: 1.3125rem; }
+:where(dialog.in-pane) .dialog-actions { flex-direction: column-reverse; gap: 8px; padding: 16px var(--sheet-pad); }
+:where(dialog.in-pane).sheet > .dialog-body:last-child { padding-bottom: 16px; }
+:where(dialog.in-pane) .dialog-actions button { width: 100%; min-height: 50px; font-size: var(--fs-head); }
 body.workspace-split #detail.has-pane-sheet::after { content: ""; position: absolute; inset: 0; z-index: 30; background: var(--backdrop); }
+/* The first pane's mic screen covers that pane, sized as the other panes' (style.css .dictation-overlay). */
+.dictation-overlay.in-pane { inset: auto auto var(--pane-bottom) var(--pane-left); width: var(--pane-width); height: var(--pane-height); }
+.dictation-overlay.in-pane .dictation-text { font-size: clamp(1.5rem, calc(1.05rem + var(--pane-width) * 0.024), 2.5rem); max-height: calc(var(--pane-height) * 0.48); }
 @media (prefers-reduced-motion: reduce) { dialog.plan-dialog.sheet.in-pane[open] { animation: none; } }
 .workspace-frame { display: block; flex: 1; width: 100%; min-height: 0; border: 0; background: var(--surface); }
 .workspace-pane-covered { visibility: hidden; pointer-events: none; }

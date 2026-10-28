@@ -6328,13 +6328,21 @@ body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-scree
 .action-item:focus-visible {
   outline-offset: -3px;
 }
-.action-sheet.is-popover {
+/* `dialog.` outranks a phone-wide document's sheet rules (dialog.plan-dialog.sheet): a split
+   pane on a desktop opens a right click's menu at the pointer too (app.js openActionSheet). */
+dialog.action-sheet.is-popover {
   position: fixed;
+  inset: auto;
   width: 260px;
+  max-width: none;
   max-height: 70vh;
   margin: 0;
   border-radius: 14px;
+  transition: none;
   animation: popover-in var(--dur-fast) var(--ease-out);
+}
+.action-sheet.is-popover .sheet-handle {
+  display: none;
 }
 .action-sheet.is-popover::backdrop {
   background: transparent;
@@ -7317,7 +7325,7 @@ input.switch:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .terminal-return,
   .offline-banner,
-  .action-sheet.is-popover,
+  dialog.action-sheet.is-popover,
   .msg.is-outbox.is-sending .bubble,
   body:not(.show-detail) .connection-notice {
     animation: none;

@@ -5193,6 +5193,30 @@ test('분할 화면 1번 창에서 연 빠른 답장과 시트는 다른 창처�
   c.state.pressOrigin = { target: input, at: Date.now() };
   c.sheet('plan-dialog').open();
   assert.equal(String(c.get('plan-dialog').className || '').includes('in-pane'), true);
+  // The first pane's mic screen covers that pane only.
+  const overlay = c.get('dictation-overlay'), overlayProps = {};
+  overlay.style.setProperty = (name, value) => { overlayProps[name] = value; };
+  c.state.dictation = { field: input };
+  vm.runInContext('renderDictationOverlay()', c.context);
+  assert.equal(overlay.hidden, false);
+  assert.equal(String(overlay.className || '').split(' ').includes('in-pane'), true);
+  assert.equal(overlayProps['--pane-width'], '450px');
+  split(false); vm.runInContext('renderDictationOverlay()', c.context);
+  assert.equal(String(overlay.className || '').split(' ').includes('in-pane'), false, 'not split: the whole window');
+  c.state.dictation = null;
+});
+
+test('분할 창(휴대폰 폭의 데스크톱 창)에서 우클릭 메뉴는 1번 창처럼 커서 옆 팝오버로 뜨고, 휴대폰은 시트 그대로다', () => {
+  for (const desktopPane of [true, false]) {
+    const c = client(undefined, noChatTimers);
+    c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+    c.context.window.innerWidth = 450; c.context.window.innerHeight = 900;
+    c.context.document.documentElement.hasAttribute = (name) => desktopPane && name === 'data-desktop-pane';
+    const dialog = c.get('action-sheet');
+    c.openActionSheet({ title: '메시지', actions: [{ label: '복사', run() {} }], at: { x: 120, y: 300 } });
+    assert.equal(String(dialog.className || '').split(' ').includes('is-popover'), desktopPane);
+    assert.equal(dialog.style.left, desktopPane ? '120px' : '');
+  }
 });
 
 test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, 입력이 막히면 비활성이다', () => {
@@ -12958,6 +12982,31 @@ test('a mobile app icon launch shows the list, preserves drafts and live session
   c.navigateView('detail'); c.backToList();
   assert.equal(c.context.window.history.state.view, 'list');
   assert.equal(entries.length, length + 1);
+});
+
+test('휴대폰 폭의 분할 창에서 Esc·⌘[·←는 목록으로 돌아가지 않아 열린 대화의 실시간 갱신이 멈추지 않는다', () => {
+  for (const pane of [true, false]) {
+    const c = client(undefined, noChatTimers);
+    c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+    c.context.window.SessionholicWorkspace = { embedded: pane, init() {}, changed() {}, visible: () => true, managed: () => false,
+      readingActive: () => true, routeSession: () => false, showList() {} };
+    const entries = navigationStack(c);
+    const { s } = selectChat(c);
+    c.state.selected = null; c.state.detailShown = false;
+    c.select(s.key);
+    // A pane has no list behind its conversation: opening one adds no phone history entry.
+    assert.equal(entries.some((entry) => entry.view === 'detail'), !pane, pane ? 'pane' : 'phone');
+    assert.equal(c.state.detailShown, true);
+    vm.runInContext('keyboardBack()', c.context);
+    if (pane) {
+      assert.equal(c.state.detailShown, true, 'the pane keeps its conversation');
+      assert.equal(c.state.selected, s.key);
+      assert.equal(vm.runInContext('chatVisible()', c.context), true, 'and its live updates');
+      c.state.detailShown = false;
+      assert.equal(vm.runInContext('chatVisible()', c.context), true, 'a pane always shows its conversation');
+    } else assert.equal(c.context.window.history.state?.view, 'list', 'a phone goes back to its list');
+    c.stopChatPolling();
+  }
 });
 
 test('launch handling ignores foreign URLs, desktops and embedded panes but retains explicit session links', async () => {

@@ -517,6 +517,8 @@
       return true;
     }
     if (existing) focus(existing, false);
+    // A 새 세션 terminal opens in this pane's own workspace, as it does in the other panes.
+    if (!key && ({ ...terminal?.metadata, ...terminal }).mode === "new-session") return false;
     // An unlinked terminal has no trustworthy chat to pair with. Keep its
     // standalone screen inside a child document rather than covering all panes.
     if (!key) { add({ terminalId: terminal.id, mode: "terminal" }); return true; }
