@@ -12593,9 +12593,30 @@ function sendTerminalBytes(bytes) {
   renderTerminalScroll();
   sendInput(bytes).catch(() => {});
 }
+// The bar's slash commands, typed into the CLI's own input and run there.
+const TERMINAL_BAR_COMMANDS = { model: "/model", effort: "/effort" };
+// Typed as a person would, then a separate Enter once the CLI has read it (as the input bar's
+// send does), so a CLI that treats a fast burst as a paste still runs the command.
+async function sendTerminalCommand(text) {
+  if (state.composing || state.draftPaste) return;
+  const id = state.terminal?.id, epoch = state.inputEpoch;
+  state.terminalScrollLines = 0;
+  renderTerminalScroll();
+  try {
+    await sendInput(text);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    if (state.terminal?.id !== id || state.inputEpoch !== epoch) return;
+    await sendInput("\r");
+  } catch {}
+}
 // A key on the bar: its own bytes, or combined with the held modifiers (then released).
 function pressTerminalKey(name) {
   if (state.composing || state.draftPaste) return;
+  if (TERMINAL_BAR_COMMANDS[name]) {
+    // A held modifier means nothing to a command; it does not wait for a later key either.
+    clearTerminalMods();
+    return sendTerminalCommand(TERMINAL_BAR_COMMANDS[name]);
+  }
   if (name === "alt-left") {
     clearTerminalMods();
     sendTerminalBytes(terminalKeyBytes("ArrowLeft", { alt: true }, { windows: terminalOnWindows() }));

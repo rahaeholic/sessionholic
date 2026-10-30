@@ -2818,6 +2818,7 @@ li[data-task] {
   background-color: var(--t-canvas);
 }
 .terminal-tools {
+  container: terminal-tools / inline-size;
   flex: none;
   max-height: 52%;
   padding: 8px 8px max(8px, env(safe-area-inset-bottom));
@@ -2867,11 +2868,12 @@ li[data-task] {
    and a tall Enter, all within one thumb's reach. */
 .terminal-keys {
   display: grid;
-  grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.3fr);
-  grid-template-rows: repeat(2, 42px);
+  --key-row: 42px;
+  grid-template-columns: repeat(5, minmax(0, 1fr)) minmax(0, 1.6fr) repeat(4, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-rows: repeat(2, var(--key-row));
   grid-template-areas:
-    "ctrl k1 k2 k3 k4 meta cup up   word  enter"
-    "alt  k5 k6 k7 k8 pick left down right enter";
+    "ctrl k1 k2 k3 k4 cmd1 meta cup up   word  enter"
+    "alt  k5 k6 k7 k8 cmd2 pick left down right enter";
   gap: 5px;
   max-width: 680px;
 }
@@ -2902,6 +2904,29 @@ li[data-task] {
 .terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
 .terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
 .terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
+/* Slash commands the CLI runs at once: words, not glyphs, so the body font fits them. */
+.terminal-keys [data-key="model"] { grid-area: cmd1; }
+.terminal-keys [data-key="effort"] { grid-area: cmd2; }
+.terminal-keys .command-key {
+  margin-left: 4px;
+  font-family: var(--font);
+  font-size: 12px;
+}
+/* Narrower than a 412px phone (a docked or split terminal too): a column would wrap the other
+   keys' labels, so the commands take a short third row and those keys keep their width. */
+@container terminal-tools (max-width: 395.98px) {
+  .terminal-keys {
+    grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.3fr);
+    grid-template-rows: repeat(2, var(--key-row)) 30px;
+    grid-template-areas:
+      "ctrl k1 k2 k3 k4 meta cup up   word  enter"
+      "alt  k5 k6 k7 k8 pick left down right enter"
+      "cmd1 cmd1 cmd1 cmd1 cmd1 cmd2 cmd2 cmd2 cmd2 cmd2";
+  }
+  .terminal-keys .command-key {
+    margin-left: 0;
+  }
+}
 .terminal-keys [data-key="ctrl-up"] { grid-area: cup; }
 .terminal-keys [data-key="shift-left"] { grid-area: pick; }
 .terminal-keys [data-key="alt-left"] { grid-area: word; }
@@ -3568,7 +3593,7 @@ li[data-task] {
   .terminal-keys {
     flex: 1 1 380px;
     min-width: 0;
-    grid-template-rows: repeat(2, 36px);
+    --key-row: 36px;
   }
   .draft-panel {
     flex: 1 1 280px;
