@@ -168,6 +168,22 @@ class SessionControlsHTTPTest(unittest.TestCase):
         self.assertEqual(saved['source']['cwd'], '/fixture/first', 'its transcript and resume stay in the first folder')
         self.assertEqual(saved['provenance']['closure'], 'explicit_termination')
 
+    def test_a_claude_session_that_now_runs_another_kind_can_still_be_ended(self):
+        # Remembered as a background agent, then resumed in a terminal (interactive): the locator
+        # saved before dispatch was refused as a conflict (not started) on every try.
+        recoveries = self.httpd.workflow.recoveries
+        recoveries.remember({**self.claude, 'kind': 'background', 'sessionId': self.claude_sid,
+                             'cwd': self.claude_row['cwd']}, 'c' * 32, 'released')
+        self.linked_terminals([])
+        receipt = {'confirmed': True, 'requestedAt': int(time.time()), 'cleanupTerminals': []}
+        with patch.object(self.httpd.workflow.transfers, 'rpc', return_value=receipt), patch.object(self.board, 'request_refresh'):
+            response, result = self.request('/api/session/action', self.action(source=self.claude, action='terminate'))
+        self.assertEqual(response.status, 200, result)
+        self.assertTrue(result['cleanup']['complete'])
+        saved = recoveries.get({**self.claude, 'sessionId': self.claude_sid})
+        self.assertEqual(saved['source']['kind'], 'interactive')
+        self.assertEqual(saved['provenance']['closure'], 'explicit_termination')
+
     def test_unknown_termination_leaves_connections_and_list_untouched(self):
         closed = self.linked_terminals([self.terminal()])
         with patch.object(self.httpd.workflow.transfers, 'rpc', return_value={'confirmed': False, 'status': 'unconfirmed'}):

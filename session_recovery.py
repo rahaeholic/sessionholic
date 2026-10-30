@@ -314,9 +314,11 @@ class RecoverySessions:
                 # A Claude session's folder follows its shell (a worktree, a cd) while it stays the
                 # same session; its transcript, and so its resume, keep the folder first remembered.
                 native["cwd"] = prior["source"]["cwd"]
-            if prior and (prior["source"]["cwd"] != native["cwd"]
-                          or prior["source"].get("kind") != native.get("kind")):
-                raise RecoveryError("기존 복귀 대상의 작업 폴더나 실행 방식이 바뀌었습니다.", "recovery_session_conflict", 409)
+            # Only a Claude locator has a kind, and it changes as the board attaches to or resumes the
+            # same session (a background agent resumed in a terminal runs interactive): the latest is
+            # kept, and a recovery rechecks it on the host before it runs.
+            if prior and prior["source"]["cwd"] != native["cwd"]:
+                raise RecoveryError("기존 복귀 대상의 작업 폴더가 바뀌었습니다.", "recovery_session_conflict", 409)
             origin = copy.deepcopy(prior["provenance"]) if prior else {"kind": "terminal-native", "closure": "none"}
             if terminal_id is not None:
                 origin["terminalId"] = terminal_id

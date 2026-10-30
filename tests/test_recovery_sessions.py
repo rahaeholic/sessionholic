@@ -86,17 +86,25 @@ class RecoverySessionsTest(unittest.TestCase):
         self.assertTrue(self.store.forget(base))
         self.assertEqual(self.store.get(next_source)["source"]["sessionId"], next_source["sessionId"])
 
-    def test_changed_cwd_or_execution_kind_cannot_replace_a_saved_identity(self):
+    def test_changed_cwd_cannot_replace_a_saved_identity(self):
         first = self.remember()
         self.assertIsNone(self.store.get({**self.source, "cwd": "C:\\Other"}))
         with self.assertRaises(recovery.RecoveryError) as raised:
             self.remember(cwd="C:\\Other")
         self.assertEqual(raised.exception.status, 409)
         self.assertEqual(self.store.get(self.source), first)
-        claude = {**self.source, "agent": "claude", "home": ".claude", "kind": "interactive"}
-        self.store.remember(claude)
-        with self.assertRaises(recovery.RecoveryError):
-            self.store.remember({**claude, "kind": "background"})
+
+    def test_a_claude_session_whose_execution_kind_changed_keeps_its_record_and_can_be_ended(self):
+        # A background agent the board resumed in a terminal runs interactive: ending it saves its
+        # locator first, and that was refused as a conflict, so 세션 종료 failed on every try.
+        claude = {**self.source, "agent": "claude", "home": ".claude", "id": "7f7a8e31", "kind": "background",
+                  "sessionId": "7f7a8e31-c022-4e5a-8c71-56d5df0bc67c", "cwd": "C:\\Projects\\repo"}
+        first = self.store.remember(claude, self.terminal_id, "released")
+        ended = self.store.remember({**claude, "kind": "interactive", "explicitTermination": True})
+        self.assertEqual(ended["source"]["kind"], "interactive", "the way it runs now")
+        self.assertEqual(ended["provenance"]["closure"], "explicit_termination")
+        self.assertEqual(ended["openedAt"], first["openedAt"])
+        self.assertEqual(len(self.store.snapshot()["sessions"]), 1, "the same session, not a second record")
 
     def test_a_claude_session_that_moved_folders_keeps_its_first_folder_and_can_be_ended(self):
         # A Claude session's cwd follows its shell (into a worktree); ending it saves its locator
