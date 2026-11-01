@@ -8050,6 +8050,13 @@ test('the board text size is its own stored choice scaling the rem type scale, a
   c.windowEvents.DOMContentLoaded();
   c.get('text-size-small').events.change({ target: { checked: true } });
   assert.equal(root.attributes['data-text-size'], 'small');
+  for (const size of ['xsmall', 'xlarge']) {
+    c.get('text-size-' + size).events.change({ target: { checked: true } });
+    assert.equal(root.attributes['data-text-size'], size);
+    assert.equal(c.get('text-size-' + size).checked, true);
+    assert.equal(c.get('text-size-small').checked, false);
+    assert.deepEqual(writes.at(-1), ['sessionholic:ui:textSize', JSON.stringify(size)]);
+  }
   const css = styleSheet();
   assert.match(css, /:root\[data-text-size="large"\] \{\s*font-size: 112\.5%;/);
   assert.match(css, /:root\[data-text-size="small"\] \{\s*font-size: 93\.75%;/);
@@ -8121,6 +8128,8 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.deepEqual(run({ 'sessionholic:ui:theme': '"light"' }).metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
   const auto = run({ 'sessionholic:ui:theme': '"auto"', 'sessionholic:ui:textSize': '"default"' });
   assert.deepEqual(auto.attributes, {});
+  for (const size of ['xsmall', 'xlarge'])
+    assert.equal(run({ 'sessionholic:ui:textSize': JSON.stringify(size) }).attributes['data-text-size'], size);
   assert.equal(auto.metas[0].attributes['data-original'], undefined);
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
   assert.deepEqual(run({}, { throws: true }).attributes, {}, 'blocked storage keeps the device defaults');
@@ -12087,7 +12096,7 @@ test('the terminal input mic dictates into that terminal draft and stops for a p
   assert.equal(intervals.size, 0);
 });
 
-test('what was heard is joined in order; only Android\'s cumulative results replace the earlier words', () => {
+test('what was heard is joined in order; short cumulative results are Android-only', () => {
   const { c } = dictationClient();
   const results = (...texts) => texts.map((text) => [{ transcript: text }]);
   const android = { cumulative: true };
@@ -12106,6 +12115,55 @@ test('what was heard is joined in order; only Android\'s cumulative results repl
   assert.equal(c.dictationText(results('오늘', '오늘 날씨')), '오늘 날씨');
   c.context.navigator = { userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X) Safari/605.1.15' };
   assert.equal(c.dictationText(results('오늘', '오늘 날씨')), '오늘 오늘 날씨');
+});
+
+test('dictation revisions replace their own segment without poisoning later cumulative results', () => {
+  const { c } = dictationClient();
+  const results = (...texts) => texts.map(text => [{ transcript: text }]);
+  const first = '검토할 자료를 전부 모아 내일 오전까지 핵심 내용을 정리해 주세요';
+  const revised = '검토할 자료를 전부 모아서 내일 오전까지 핵심 내용을 정리해 주세요';
+  for (const cumulative of [true, false]) {
+    const join = (...texts) => c.dictationText(results(...texts), { cumulative });
+    assert.equal(join(first, revised, ...Array(40).fill(revised), revised + ' 그리고 확인해 주세요'), revised + ' 그리고 확인해 주세요');
+    assert.equal(join('안녕하세요', first, revised, revised), '안녕하세요 ' + revised, 'an unrelated earlier segment remains');
+    assert.equal(join(first, first.slice(0, -7), first.slice(0, -7)), first.slice(0, -7).trim(), 'recognition may retract its ending');
+    assert.equal(join(first, '별개 문장을 이어 말합니다'), first + ' 별개 문장을 이어 말합니다');
+    assert.equal(join('네', '네 알겠습니다'), cumulative ? '네 알겠습니다' : '네 네 알겠습니다');
+    assert.equal(join('안 됩니다', '안 되나요'), '안 됩니다 안 되나요', 'a short shared opening is not enough');
+  }
+  assert.equal(c.dictationText(results('오늘 날씨', '오늘 날씨가 좋아요', '오늘 날씨가 좋아요'), { cumulative: true }), '오늘 날씨가 좋아요');
+});
+
+test('a mismatching hypothesis cannot multiply every following result in a long dictation', () => {
+  const { c } = dictationClient();
+  const old = '가'.repeat(70), next = '나'.repeat(65);
+  const results = [old, ...Array(40).fill(next)].map(text => [{ transcript: text }]);
+  for (const cumulative of [true, false]) {
+    assert.equal(c.dictationText(results, { cumulative }), old + ' ' + next, 'keep unrelated text once each, rather than growing on every report');
+  }
+});
+
+test('long overlapping recognition revisions never append the previous final to the draft', () => {
+  const first = '검토할 자료를 전부 모아 내일 오전까지 핵심 내용을 정리해 주세요';
+  const revised = '검토할 자료를 전부 모아서 내일 오전까지 핵심 내용을 정리해 주세요';
+  for (const userAgent of ['Mozilla/5.0 (Linux; Android 15)', 'Mozilla/5.0 (iPad; CPU OS 27_0 like Mac OS X) AppleWebKit/605.1.15']) {
+    const { c, recognitions, FakeRecognition, calls } = dictationClient();
+    c.context.webkitSpeechRecognition = FakeRecognition;
+    c.context.navigator = { userAgent, onLine: true };
+    const { s, entry } = selectChat(c); entry.text = '앞 뒤';
+    const form = c.buildChatComposer(s), input = findId(form, 'chat-input');
+    input.selectionStart = input.selectionEnd = 2;
+    findId(form, 'chat-mic').events.click();
+    const rec = recognitions.at(-1); rec.onstart();
+    const fin = text => Object.assign([{ transcript: text }], { isFinal: true });
+    rec.onresult({ results: [fin(first)], resultIndex: 0 });
+    rec.onresult({ results: [[{ transcript: revised }]], resultIndex: 0 });
+    assert.equal(input.value, '앞 ' + revised + ' 뒤', userAgent);
+    rec.onresult({ results: [fin(revised), ...Array.from({ length: 20 }, () => fin(revised))], resultIndex: 1 });
+    assert.equal(input.value, '앞 ' + revised + ' 뒤', 'the draft and its untouched prefix/suffix stay bounded');
+    assert.equal(entry.text, input.value);
+    assert.equal(calls.filter(url => url === '/api/chat/send').length, 0);
+  }
 });
 
 // --- Terminal beside the conversation (wide screens) --------------------------
