@@ -4143,6 +4143,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, result)
             if path == "/api/chat/warm":
                 return self.send_json(200, self.server.chat.warm(data))
+            if path == "/api/chat/connect":
+                return self.send_json(200, self.server.chat.connect(data))
             if path == "/api/chat/send":
                 result = self.server.chat.send(data)
                 self.follow_closely(data)

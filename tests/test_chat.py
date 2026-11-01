@@ -277,6 +277,57 @@ class ChatTest(unittest.TestCase):
         self.flow.transfers.rpc=rpc
         self.chat=chat.Chat(self.board,self.flow,self.root)
     def tearDown(self): self.temp.cleanup()
+    def test_connect_locks_do_not_mix_codex_accounts_or_agents(self):
+        lock = self.chat._claude_lock_for(REF)
+        self.assertIs(lock, self.chat._claude_lock_for(dict(REF)))
+        self.assertIsNot(lock, self.chat._claude_lock_for({**REF, 'home': '.codex-other'}))
+        self.assertIsNot(lock, self.chat._claude_lock_for({**REF, 'agent': 'claude'}))
+    def test_connect_resumes_only_the_same_codex_account_and_never_sends_input(self):
+        self.source['phase'] = 'closed'; self.board.poll(HOST)
+        row = {'id': CODEX_TERMINAL_ID, 'nativeSource': dict(self.source), 'alive': True}
+        with patch.object(self.chat, 'rpc', side_effect=[
+                {'phase': 'closed', 'capabilities': {'canSend': False}},
+                {'phase': 'idle', 'capabilities': {'canSend': True}}]) as rpc, \
+             patch.object(self.flow, 'plan', return_value={'id': 'reconnect-plan', 'allowed': True}) as plan, \
+             patch.object(self.flow, 'launch', return_value={'terminal': row}) as launch:
+            result = self.chat.connect({'source': REF, 'requestId': 'connect-0001'})
+        self.assertEqual(plan.call_args.args[0], {'source': REF, 'target': {
+            'host': 'local', 'agent': 'codex', 'account': 'codex:.codex'}, 'resume': True})
+        self.assertEqual(result['terminalId'], CODEX_TERMINAL_ID)
+        self.assertTrue(result['connected'])
+        self.assertEqual([call.args[1] for call in rpc.call_args_list], ['capabilities', 'capabilities'])
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(self.calls, [])
+
+    def test_connect_reuses_a_ready_codex_runtime_and_refuses_native_blocked_states(self):
+        with patch.object(self.chat, 'rpc', return_value={'capabilities': {'canSend': True}}), \
+             patch.object(self.flow, 'plan', side_effect=AssertionError('already connected')):
+            self.assertTrue(self.chat.connect({'source': REF, 'requestId': 'connect-0001'})['connected'])
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'needs_input', 'capabilities': {'canSend': False}}), \
+             patch.object(self.flow, 'plan', side_effect=AssertionError('never bypass approval')):
+            with self.assertRaises(ValueError): self.chat.connect({'source': REF, 'requestId': 'connect-0002'})
+
+    def test_connect_keeps_resume_policy_and_never_receives_message_content(self):
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'closed', 'capabilities': {'canSend': False}}), \
+             patch.object(self.flow, 'plan', return_value={'allowed': False, 'reason': '웹보드에서 종료한 세션입니다.'}), \
+             patch.object(self.flow, 'launch', side_effect=AssertionError('must not launch')):
+            with self.assertRaisesRegex(ValueError, '종료한 세션'):
+                self.chat.connect({'source': REF, 'requestId': 'connect-0001'})
+        with patch.object(self.chat, 'source', side_effect=AssertionError('validate before resolving')):
+            for extra in ({'text': 'do not send'}, {'target': {'host': 'another'}}, {'attachments': ['file']}):
+                with self.assertRaises(ValueError):
+                    self.chat.connect({'source': REF, 'requestId': 'connect-0001', **extra})
+
+    def test_connect_waits_for_codex_readiness_without_sending_or_relaunching(self):
+        row = {'id': CODEX_TERMINAL_ID, 'nativeSource': dict(self.source), 'alive': True}
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'closed', 'capabilities': {'canSend': False}}) as rpc, \
+             patch.object(self.flow, 'plan', return_value={'id': 'p', 'allowed': True}), \
+             patch.object(self.flow, 'launch', return_value={'terminal': row}) as launch, \
+             patch.object(chat, 'CLAUDE_READY_SECONDS', 0):
+            with self.assertRaisesRegex(ValueError, '아직 입력할 수 없습니다'):
+                self.chat.connect({'source': REF, 'requestId': 'connect-0001'})
+        self.assertEqual(launch.call_count, 1)
+        self.assertTrue(all(call.args[1] == 'capabilities' for call in rpc.call_args_list))
     def test_runtime_metadata_is_explicit_and_independent_of_readonly(self):
         for readonly, known in ((False, True), (True, False)):
             with self.subTest(readonly=readonly), patch.object(self.chat, 'rpc', return_value={
@@ -957,6 +1008,22 @@ class StateShareTest(unittest.TestCase):
 
 
 class ChatHttpTest(ChatTest):
+    def test_connect_route_requires_auth_csrf_origin_and_has_no_message_body(self):
+        calls = []
+        self.chat.connect = lambda data: calls.append(data) or {'connected': True}
+        def request(headers):
+            client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+            client.request('POST', '/api/chat/connect', json.dumps(payload), {'Content-Type': 'application/json', **headers})
+            response = client.getresponse(); response.read(); client.close(); return response.status
+        payload = {'source': REF, 'requestId': 'connect-0001'}
+        self.assertEqual(request({}), 401)
+        auth = {'Authorization': 'Bearer synthetic'}
+        self.assertEqual(request(auth), 403)
+        auth['X-CSRF-Token'] = self.httpd.csrf
+        self.assertEqual(request({**auth, 'Origin': 'https://evil.example'}), 403)
+        self.assertEqual(calls, [])
+        self.assertEqual(request(auth), 200)
+        self.assertEqual(calls, [payload])
     def test_command_route_requires_auth_csrf_origin_and_preserves_authoritative_source(self):
         calls = []
         self.chat.command = lambda data: calls.append(data) or {'status': 'configured'}
@@ -1296,6 +1363,25 @@ class ChatClaudeTest(unittest.TestCase):
             self.assertTrue(self.chat._settled(TERMINAL_ID))
             self.assertGreaterEqual(time.monotonic() - started, 1.4)
 
+    def test_chat_connect_serializes_claude_attach_and_never_pastes(self):
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def attach(*args):
+            entered.set(); self.assertTrue(release.wait(3)); return self.terminal()
+        with patch.object(self.chat, '_open_claude_terminal', side_effect=attach) as opened:
+            first = threading.Thread(target=lambda: results.append(self.chat.connect({'source': CLAUDE_REF, 'requestId': 'connect-0001'})))
+            second = threading.Thread(target=lambda: results.append(self.chat.connect({'source': CLAUDE_REF, 'requestId': 'connect-0002'})))
+            first.start(); self.assertTrue(entered.wait(3)); second.start(); release.set()
+            first.join(3); second.join(3)
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result['terminalId'] == TERMINAL_ID for result in results))
+        self.assertEqual((self.terms.pastes, self.records()), ([], []))
+        self.chat.unsettled.add(TERMINAL_ID)
+        with patch.object(self.chat, '_settled', return_value=False), self.assertRaisesRegex(ValueError, chat.CLAUDE_NOT_READY):
+            self.chat.connect({'source': CLAUDE_REF, 'requestId': 'connect-0003'})
+        self.assertEqual(self.terms.pastes, [])
+
     def test_starting_a_message_opens_a_background_sessions_attach_once(self):
         opened, gate = [], threading.Event()
         def attach(ref, source, request_id):
@@ -1629,14 +1715,14 @@ class ChatClaudeTest(unittest.TestCase):
                 result = self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0001'})
             self.assertEqual(plan.call_args.args[0]['target'], {'host': HOST['name'], 'agent': 'claude', 'account': 'claude:default'})
             self.assertEqual(result['prompt']['terminalId'], TERMINAL_ID)
-            # An interactive PC conversation still opens only from its terminal button (a resume).
+            # Sending also resumes a stored PC conversation, through the same checked plan.
             self.terms.rows = []
             self.kind('interactive')
-            with patch.object(self.chat, '_open_claude_terminal', side_effect=AssertionError('a send never resumes a PC conversation')):
-                with self.assertRaises(chat.SendRejected) as caught:
-                    self.send(rid='request-0006', text='대화형')
-            self.assertEqual((str(caught.exception), caught.exception.code), (chat.CLAUDE_WINDOWS_OPEN, 'terminal_required'))
-            self.assertEqual(len(self.terms.pastes), 2)
+            self.terms.screen = ''
+            with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
+                self.assertEqual(self.send(rid='request-0006', text='대화형')['status'], 'accepted')
+            self.assertEqual(opened[-1], (CLAUDE_REF['id'], 'interactive', 'request-0006'))
+            self.assertEqual(len(self.terms.pastes), 3)
         finally:
             self.board.hosts[0].pop('platform')
 
@@ -1649,10 +1735,10 @@ class ChatClaudeTest(unittest.TestCase):
             self.assertEqual(state['capability'], {'supported': False, 'attachments': True,
                                                    'reason': chat.CLAUDE_WINDOWS_OPEN, 'action': 'open_terminal'})
             self.assertFalse(state['promptOpenable'])
-            with patch.object(self.flow, 'plan', side_effect=AssertionError('a send never opens a PC terminal')):
+            with patch.object(self.flow, 'plan', return_value={'allowed': False, 'reason': '원본 PC에서 실행 중입니다.'}):
                 with self.assertRaises(chat.SendRejected) as caught:
                     self.send()
-            self.assertEqual((str(caught.exception), caught.exception.code), (chat.CLAUDE_WINDOWS_OPEN, 'terminal_required'))
+            self.assertEqual((str(caught.exception), caught.exception.code), ('원본 PC에서 실행 중입니다.', 'terminal_unavailable'))
             self.assertEqual((self.terms.pastes, self.records()), ([], []))
             # Resumed in a board terminal: the text is pasted there, like a Mac session.
             self.terminal(kind='interactive')

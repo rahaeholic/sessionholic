@@ -1058,7 +1058,7 @@ function beginAuthEpoch() {
 // and the server refused before doing anything. Reads, and requests it
 // deduplicates by requestId, are sent once more with a fresh token. A chat send
 // never is: it waits for a new press (sendChat).
-const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/plan", "/api/launch",
+const CSRF_RETRY = new Set(["/api/chat/state", "/api/chat/prompt", "/api/chat/connect", "/api/plan", "/api/launch",
   "/api/new-session", "/api/app-server", "/api/refresh", "/api/usage/refresh", "/api/hardware/refresh", "/api/cli-status/refresh",
   "/api/push/subscribe", "/api/push/unsubscribe", "/api/session/seen", "/api/session/tidy", "/api/session/remove",
   "/api/session/opened", "/api/chat/warm", "/api/diagnostics/dictation"]);
@@ -1083,7 +1083,7 @@ const API_TIMEOUT_MS = { GET: 30000, POST: 45000 };
 // Each is longer than the server's own bound for that route.
 const API_PATH_TIMEOUT_MS = {
   "/api/capabilities": 90000, "/api/read": 45000, "/api/bot-requests/conversation": 90000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
-  "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000,
+  "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000, "/api/chat/connect": 660000,
 };
 const API_TIMEOUT_MESSAGE = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
 // Where the server may already have acted: say so instead of inviting a blind retry.
@@ -5199,7 +5199,14 @@ function chatSupported(entry, selected = selectedSession() || null) {
   return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !chatHostOffline(entry, selected) && entry.data?.capability?.supported === true &&
     chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
-// The server's capability says sending needs a board terminal the user opens.
+function chatCanConnect(entry, selected = selectedSession() || null) {
+  return !botRequestForNative(entry.source) && !chatOneShot(entry, selected) && !chatHostOffline(entry, selected) &&
+    !chatReadUnavailable(entry) && (terminalRequired(entry, selected) || chatRecovery(entry, selected)?.action === "resume_session");
+}
+function chatCanSend(entry, selected = selectedSession() || null) {
+  return chatSupported(entry, selected) || chatCanConnect(entry, selected);
+}
+// The server's capability says sending needs this conversation's board terminal.
 function terminalRequired(entry, selected = selectedSession() || null) {
   return !chatOneShot(entry, selected) && entry.data?.capability?.action === "open_terminal" && chatKey(entry.data.route || {}) === chatKey(entry.source);
 }
@@ -7044,18 +7051,17 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   updateModelControls(entry, selected);
   const supported = chatSupported(entry, selected);
+  const connectable = chatCanConnect(entry, selected);
   const oneShot = chatOneShot(entry, selected);
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed" && !receiptSuperseded(entry));
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
   setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
   const offline = networkOffline();
-  const blocked = offline || !supported || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.uploadQueue?.length || !!entry.commandBusy;
-  // No board terminal yet (Claude background): the draft can be written now and
-  // sent once the user opened the terminal from the gate.
+  const blocked = offline || !(supported || connectable) || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.uploadQueue?.length || !!entry.commandBusy;
   const recovery = chatRecovery(entry, selected);
-  const gateOn = !supported && !recovery && terminalRequired(entry, selected);
-  $("chat-recovery").hidden = !chatRecoveryVisible(entry, recovery);
+  const gateOn = !supported && !connectable && !recovery && terminalRequired(entry, selected);
+  $("chat-recovery").hidden = !chatRecoveryVisible(entry, connectable ? null : recovery);
   $("chat-recovery-text").textContent = recovery?.reason || (recovery?.action === "resume_session" ? "대화 기록과 초안을 유지하고 같은 세션을 다시 엽니다." : "");
   $("chat-recover").textContent = entry.recovering ? "연결 확인 중…" : recovery?.action === "refresh_host" ? "기기 연결 다시 확인" : "세션 다시 열기";
   $("chat-recover").disabled = offline || !!entry.recovering || state.launchBusy;
@@ -7082,7 +7088,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   for (const id of ["chat-quick", "chat-quick-inline", "chat-delegate"])
     if ($(id)) $(id).disabled = blocked || input.disabled || input.readOnly || entry.composing;
   renderDictation();
-  $("chat-send").textContent = entry.sending ? "전송 중" : "보내기";
+  $("chat-send").textContent = entry.connecting ? "연결 중…" : entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
   $("chat-key-hint").hidden = oneShot || !!entry.expanded || !keyboardPresent();
   $("chat-check").disabled = offline || entry.checking;
@@ -7106,7 +7112,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   const dictating = state.dictation?.field === input;
-  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
+  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.connecting ? "같은 대화에 연결하고 있습니다…" : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported && connectable ? receiptNotice(entry) || "보내면 이 대화를 다시 연결합니다." : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
   $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
   $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry, selected) || entry.error || entry.receipt?.status === "unknown")));
@@ -7497,7 +7503,7 @@ function draftIsPending(entry) {
 function openDelegation(s, entry) {
   const identity = conversationIdentity(s), epoch = state.authEpoch;
   const ready = () => currentChat(entry) && conversationIdentity(selectedSession()) === identity &&
-    state.authenticated && epoch === state.authEpoch && !networkOffline() && chatSupported(entry) &&
+    state.authenticated && epoch === state.authEpoch && !networkOffline() && chatCanSend(entry) &&
     !entry.pending && !entry.sending && !entry.uploads && !entry.composing && !entry.commandBusy;
   if (!ready() || !window.SessionholicDelegation) return;
   let dialog = $("delegation-dialog");
@@ -7558,7 +7564,7 @@ async function sendChat(entry, message = null) {
   if (!message && currentChat(entry) && /^\/[a-z]+(?:\s|$)/.test(text.trim())) {
     return runSlashCommand(entry, text.trim(), attachments);
   }
-  if (!currentChat(entry) || !chatSupported(entry) || entry.composing || entry.sending || chatPendingBlocks(entry, text, attachments) || entry.uploads || (!message && entry.uploadQueue?.length) ||
+  if (!currentChat(entry) || !chatCanSend(entry) || entry.composing || entry.sending || chatPendingBlocks(entry, text, attachments) || entry.uploads || (!message && entry.uploadQueue?.length) ||
       (!text.trim() && !attachments.length)) return;
   if (new TextEncoder().encode(text).length > 32768 || attachments.length > MAX_ATTACHMENTS) {
     entry.error = entry.inputError = `메시지는 32KiB, 첨부는 ${MAX_ATTACHMENTS}개까지 보낼 수 있습니다. 초안은 유지됩니다.`;
@@ -7587,6 +7593,7 @@ async function sendChat(entry, message = null) {
   entry.pending = pending;
   entry.stateEpoch++;
   entry.sending = true;
+  entry.connecting = !chatSupported(entry) && chatCanConnect(entry);
   entry.error = "";
   entry.notice = "";
   // The bubble shows at once, translucent, and becomes the real message
@@ -7598,8 +7605,22 @@ async function sendChat(entry, message = null) {
   updateChatComposer(entry);
   refreshConversationView(entry, true);
   // Whether the message may be in the transcript now (내 질문 is read again a while after).
-  let sent = false;
+  let sent = false, dispatched = false;
   try {
+    if (entry.connecting) {
+      const connection = await api("/api/chat/connect", { method: "POST", body: {
+        source: pending.source, requestId: pending.requestId,
+      }, authEpoch });
+      assertAuthEpoch(authEpoch);
+      if (!state.authenticated || state.chats.get(chatKey(pending.source)) !== entry || connection.connected !== true)
+        throw new Error("대화 연결을 확인하지 못했습니다.");
+      if (networkOffline()) throw new Error("기기 연결이 끊겼습니다.");
+      entry.connecting = false;
+      if (connection.terminalId) refreshTerminals();
+      updateChatComposer(entry);
+      refreshConversationView(entry);
+    }
+    dispatched = true;
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
     }, authEpoch });
@@ -7614,7 +7635,7 @@ async function sendChat(entry, message = null) {
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
       haptic("error");
-      if (err.dispatchState === "not_started") {
+      if (!dispatched || err.dispatchState === "not_started") {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -7647,6 +7668,7 @@ async function sendChat(entry, message = null) {
   } finally {
     entry.stateEpoch++;
     entry.sending = false;
+    entry.connecting = false;
     if (entry.receipt?.requestId === pending.requestId) markOutbox(entry, pending.requestId, entry.receipt);
     else if (entry.pending?.requestId === pending.requestId) markOutbox(entry, pending.requestId, { status: "unknown" });
     updateChatComposer(entry);
@@ -7662,7 +7684,7 @@ async function sendChat(entry, message = null) {
 // Memory only, per conversation. "sending" until the server answers; then
 // "sent" (accepted or queued), "uncertain" (no answer: that message cannot be
 // duplicated) or "failed" (never started: the draft or retry bubble retains it).
-const OUTBOX_LABELS = { sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
+const OUTBOX_LABELS = { connecting: "연결 중…", sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
   queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
 const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
 const OUTBOX_MAX_MS = 15 * 60 * 1000;
@@ -7919,7 +7941,8 @@ function outboxRows(list, entry) {
       row.deliveryStatus = status;
       list.outboxNodes.set(item.requestId, row);
     }
-    const name = item.state === "sent" && item.status === "queued" ? "queued" : item.state;
+    const name = entry.connecting && entry.pending?.requestId === item.requestId ? "connecting"
+      : item.state === "sent" && item.status === "queued" ? "queued" : item.state;
     const className = `msg user is-outbox is-${item.state}`;
     if (row.className !== className) row.className = className;
     const revision = `${name}|${item.reason}`;
@@ -8193,7 +8216,7 @@ function saveSharedQuickReplies() {
 }
 function openQuickReplies(entry, input, trigger) {
   const ready = () => currentChat(entry) && input === $("chat-input") && !input.disabled && !input.readOnly &&
-    !networkOffline() && chatSupported(entry) && !entry.composing && !entry.sending && !entry.pending &&
+    !networkOffline() && chatCanSend(entry) && !entry.composing && !entry.sending && !entry.pending &&
     !entry.uploads && !entry.commandBusy;
   if (!ready()) return;
   const choose = (text) => {
