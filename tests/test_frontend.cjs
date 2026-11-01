@@ -8528,49 +8528,51 @@ test('bars brought back fold on a deliberate scroll, and revisiting preserves fo
   assert.equal(list.unread || 0, 0);
 });
 
-test('a Claude conversation without a board terminal offers "터미널 열기" and never opens one by itself', async () => {
-  const requests = [];
+test('a disconnected Claude chat connects on send, stays in chat, and sends its captured draft once', async () => {
+  const calls = []; let finishConnect, finishSend;
   const c = client(async (url, options) => {
-    requests.push({ url, body: options?.body ? JSON.parse(options.body) : null });
-    return { ok: true, status: 200, json: async () => ({ allowed: true, id: 'plan-1', mode: 'attach' }) };
+    const body = JSON.parse(options.body); calls.push({ url, body });
+    if (url === '/api/chat/connect') return new Promise(resolve => { finishConnect = resolve; });
+    if (url === '/api/chat/send') return new Promise(resolve => { finishSend = resolve; });
+    throw new Error('unexpected request ' + url);
   }, noChatTimers);
+  vm.runInContext('refreshTerminals = async () => {}; loadChatState = async () => {}; queueQuestionsRefresh = () => {};', c.context);
   const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
-  c.drawDetail(s);
-  await settle();
-  requests.length = 0;
   entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: false, attachments: true,
-    reason: '보내려면 먼저 터미널을 여세요.', action: 'open_terminal' } };
-  entry.text = '먼저 써 둔 초안';
-  c.updateChatComposer(entry);
-  assert.equal(c.get('chat-terminal-gate').hidden, false);
-  assert.equal(c.get('chat-terminal-gate-text').textContent, '보내려면 먼저 터미널을 여세요.');
-  assert.equal(c.get('chat-open-terminal').textContent, '터미널 열기');
-  assert.equal(c.get('chat-status').textContent, '', 'the gate says it; the status line stays for errors');
-  assert.equal(c.get('chat-input').disabled, false, 'a draft can be written before opening the terminal');
-  assert.equal(c.get('chat-send').disabled, true, 'but not sent');
-  await c.sendChat(entry);
-  assert.deepEqual(requests, [], 'nothing is sent and no terminal is opened in the background');
-  c.get('chat-open-terminal').events.click();
-  await settle();
-  assert.equal(requests[0].url, '/api/plan', 'the button reuses the reviewed plan sheet');
-  assert.deepEqual(requests[0].body.target, { host: 'workstation', agent: 'claude', account: 'claude:default' });
-  // Returning to the same session's own terminal (attach) opens it right after the plan,
-  // as "터미널·승인" always did: only because the user pressed the button.
-  assert.deepEqual(requests.map((request) => request.url).slice(0, 2), ['/api/plan', '/api/launch']);
-  // With the terminal open the composer sends as before.
-  entry.data = { ...entry.data, capability: { supported: true, attachments: true, reason: null } };
-  c.updateChatComposer(entry);
+    action: 'open_terminal' } };
+  entry.text = '먼저 써 둔 초안'; entry.attachments = [{ id: 'file-1', name: '첨부.txt' }];
+  c.buildChatComposer(s); c.updateChatComposer(entry);
   assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.equal(c.get('chat-status').textContent, '보내면 이 대화를 다시 연결합니다.');
   assert.equal(c.get('chat-send').disabled, false);
-  // An interactive session (no attach possible) gets no button.
+  assert.deepEqual(calls, [], 'opening and drafting do not launch a terminal');
+  const beforeView = c.state.view, beforeMode = c.state.detailModes.get(s.key);
+  const sending = c.sendChat(entry); await c.sendChat(entry);
+  assert.equal(calls.length, 1); assert.equal(calls[0].url, '/api/chat/connect');
+  assert.deepEqual(Object.keys(calls[0].body).sort(), ['requestId', 'source']);
+  assert.equal(c.get('chat-send').textContent, '연결 중…');
+  assert.equal(c.get('chat-input').disabled, false);
+  assert.equal(entry.outbox.length, 1);
+  entry.text = '다음 초안'; entry.attachments = [{ id: 'file-2', name: '다음.txt' }]; entry.revision++;
+  finishConnect({ ok: true, status: 200, json: async () => ({ connected: true, terminalId: 'terminal-1' }) });
+  await settle();
+  assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect', '/api/chat/send']);
+  assert.equal(c.get('chat-send').textContent, '전송 중');
+  assert.equal(calls[1].body.requestId, calls[0].body.requestId);
+  assert.equal(calls[1].body.text, '먼저 써 둔 초안');
+  assert.deepEqual(calls[1].body.attachments, ['file-1']);
+  finishSend({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: calls[1].body.requestId, confirmed: true } }) });
+  await sending;
+  assert.equal(entry.text, '다음 초안'); assert.equal(entry.attachments[0].id, 'file-2');
+  assert.equal(c.state.view, beforeView); assert.equal(c.state.detailModes.get(s.key), beforeMode);
+  assert.equal(entry.pending, null);
+  assert.equal(entry.connecting, false);
   entry.data = { ...entry.data, capability: { supported: false, attachments: true, reason: '보드 밖 터미널' } };
   c.updateChatComposer(entry);
-  assert.equal(c.get('chat-terminal-gate').hidden, true);
-  assert.equal(c.get('chat-input').disabled, false);
-  assert.equal(c.get('chat-status').textContent, '보드 밖 터미널');
+  assert.equal(c.get('chat-send').disabled, true, 'unsupported external sessions keep their policy');
 });
 
-test('a send refused because the terminal closed keeps the draft and offers the button', async () => {
+test('a send refused because the terminal closed keeps the draft and makes the next send reconnect', async () => {
   let reads = 0;
   let c;
   c = client(async (url, options) => {
@@ -8593,12 +8595,12 @@ test('a send refused because the terminal closed keeps the draft and offers the 
   // Even when the next read fails, the refusal's code already offers the button.
   assert.equal(entry.data.capability.action, 'open_terminal');
   c.updateChatComposer(entry);
-  assert.equal(c.get('chat-terminal-gate').hidden, false);
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
   // The next good read says the same, and the status line adds that nothing was sent.
   entry.error = '';
   await c.loadChatState(s, false);
-  assert.equal(c.get('chat-terminal-gate').hidden, false);
-  assert.equal(c.get('chat-status').textContent, '메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.');
+  assert.equal(c.get('chat-terminal-gate').hidden, true);
+  assert.match(c.get('chat-status').textContent, /메시지는 전송되지 않았습니다\. 초안과 첨부는 유지됩니다\./);
 });
 
 test('snapshot events are read together after 300ms and never reload capabilities', async () => {
@@ -11137,33 +11139,84 @@ test('잠금은 분류 선택과 시작 주체 조건을 일반 세션으로 초
 });
 
 
-test('closed-session recovery stays explicit, keeps its draft, and plans the same source exactly once', async () => {
-  const calls = []; let resolvePlan;
+test('a recoverable closed Codex session connects from send without a separate plan sheet', async () => {
+  const calls = [];
   const c = client(async (url, options) => {
-    calls.push({ url, body: JSON.parse(options.body) });
-    return new Promise((resolve) => { resolvePlan = resolve; });
+    const body = JSON.parse(options.body); calls.push({ url, body });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/connect' ? { connected: true }
+      : { status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } } };
   }, noChatTimers);
+  vm.runInContext('refreshTerminals = async () => {}; loadChatState = async () => {}; queueQuestionsRefresh = () => {};', c.context);
   const { s, entry } = selectChat(c);
   s.nativeSource = true; s.phase = 'closed'; entry.text = '이어갈 초안';
   entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false, action: 'resume_session' },
     recovery: { supported: true, action: 'resume_session', closedByBoard: false } };
   c.buildChatComposer(s); c.updateChatComposer(entry);
-  assert.equal(c.get('chat-recovery').hidden, false);
-  assert.equal(c.get('chat-recover').textContent, '세션 다시 열기');
-  assert.equal(c.get('chat-input').disabled, false); assert.equal(c.get('chat-send').disabled, true);
-  assert.equal(calls.length, 0, 'reading a closed session never starts a terminal or model turn');
+  assert.equal(c.get('chat-recovery').hidden, true);
+  assert.equal(c.get('chat-send').disabled, false);
+  assert.equal(calls.length, 0, 'reading and drafting never resume a session');
   c.state.route = { host: 'other-device', agent: 'claude', account: 'other-account' };
-  const pending = c.get('chat-recover').events.click();
-  await c.get('chat-recover').events.click();
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].url, '/api/plan');
-  assert.deepEqual(calls[0].body, { source: { host: s.host, agent: s.agent, home: s.home, id: s.id },
-    target: { host: s.host, agent: s.agent, account: 'codex:' + s.home }, resume: true });
-  resolvePlan({ ok: true, status: 200, json: async () => ({ allowed: true, mode: 'resume', id: 'resume-plan', warnings: [] }) });
-  await pending;
-  assert.equal(calls.length, 1, 'launch still requires the user confirmation');
-  assert.equal(c.get('plan-launch').textContent, '세션 다시 열기');
-  assert.equal(entry.text, '이어갈 초안');
+  await c.sendChat(entry);
+  assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect', '/api/chat/send']);
+  assert.deepEqual(calls[0].body.source, JSON.parse(JSON.stringify(entry.source)));
+  assert.deepEqual(calls[1].body.source, calls[0].body.source);
+  assert.equal(calls[1].body.requestId, calls[0].body.requestId);
+  assert.equal(entry.text, '');
+});
+
+test('connection failure preserves attachments and a lost send response is never replayed', async () => {
+  for (const failedStage of ['connect', 'send']) {
+    const calls = [];
+    const c = client(async (url, options) => {
+      const body = JSON.parse(options.body); calls.push({ url, body });
+      if (url === '/api/chat/' + failedStage) throw new Error('connection lost');
+      return { ok: true, status: 200, json: async () => ({ connected: true }) };
+    }, noChatTimers);
+    vm.runInContext('refreshTerminals = async () => {}; loadChatState = async () => {}; queueQuestionsRefresh = () => {};', c.context);
+    const { s, entry } = selectChat(c);
+    entry.data = { route: c.sourceOf(s), phase: 'closed', capability: { supported: false },
+      recovery: { supported: true, action: 'resume_session' } };
+    entry.text = '보존할 초안'; entry.attachments = [{ id: 'file-1', name: '첨부.txt' }];
+    c.buildChatComposer(s);
+    await c.sendChat(entry);
+    assert.equal(entry.text, '보존할 초안'); assert.equal(entry.attachments[0].id, 'file-1');
+    assert.equal(entry.connecting, false); assert.equal(entry.sending, false);
+    if (failedStage === 'connect') {
+      assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect']);
+      assert.equal(entry.receipt.status, 'failed'); assert.equal(entry.receipt.dispatchState, 'not_started');
+      assert.equal(entry.pending, null); assert.equal(c.get('chat-send').disabled, false);
+    } else {
+      assert.equal(entry.receipt.status, 'unknown'); assert.ok(entry.pending);
+      await c.sendChat(entry);
+      assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect', '/api/chat/send']);
+    }
+  }
+});
+
+test('connecting keeps the captured conversation across navigation and stops before send on auth change', async () => {
+  for (const change of ['navigation', 'authentication']) {
+    const calls = []; let finish;
+    const c = client(async (url, options) => {
+      const body = JSON.parse(options.body); calls.push({ url, body });
+      if (url === '/api/chat/connect') return new Promise(resolve => { finish = resolve; });
+      return { ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } }) };
+    }, noChatTimers);
+    vm.runInContext('refreshTerminals = async () => {}; loadChatState = async () => {}; queueQuestionsRefresh = () => {};', c.context);
+    const { s, entry } = selectChat(c);
+    entry.text = '원래 대화에 보낼 내용';
+    entry.data = { route: c.sourceOf(s), capability: { supported: false }, recovery: { supported: true, action: 'resume_session' } };
+    c.buildChatComposer(s);
+    const sending = c.sendChat(entry);
+    if (change === 'navigation') c.state.selected = 'another-session';
+    else c.beginAuthEpoch();
+    finish({ ok: true, status: 200, json: async () => ({ connected: true }) });
+    await sending;
+    if (change === 'navigation') {
+      assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect', '/api/chat/send']);
+      assert.deepEqual(calls[1].body.source, JSON.parse(JSON.stringify(entry.source)));
+      assert.equal(c.state.selected, 'another-session');
+    } else assert.deepEqual(calls.map(call => call.url), ['/api/chat/connect']);
+  }
 });
 
 test('board-terminated or mismatched-route recovery cannot open a session', async () => {

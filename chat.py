@@ -22,7 +22,7 @@ CLAUDE_BLOCKED = ('Claude 터미널에 승인·선택 메뉴가 떠 있어 보�
 # A PC Claude conversation takes input through the board terminal it was resumed in
 # (windows_runtime._claude_resume), which opens only while no PC process runs it. A running
 # PC background session is attached like a Mac one (windows_runtime.terminal_plan).
-CLAUDE_WINDOWS_OPEN = ('보내려면 먼저 터미널을 열어 이 대화를 이어 주세요. 그 PC에서 아직 실행 중이면 '
+CLAUDE_WINDOWS_OPEN = ('보내면 같은 대화의 터미널을 연결합니다. 그 PC의 다른 터미널에서 아직 실행 중이면 '
                        '그 PC의 터미널에서 입력해 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
@@ -918,7 +918,7 @@ class Chat:
         if source.get('kind') == 'background':
             return True, None, None
         if windows:
-            # Its terminal button resumes it there (or says it still runs on the PC).
+            # Chat connects it on send (or reports why the PC cannot resume it).
             return False, CLAUDE_WINDOWS_OPEN, 'open_terminal'
         # An interactive session cannot be attached (launch.build_launch), so no button is offered.
         return False, CLAUDE_EXTERNAL, None
@@ -973,7 +973,9 @@ class Chat:
         """The input lock of one conversation, made on first use. A listed row (agent id and
         sessionId) and a launched terminal's source (id = sessionId) of the same conversation
         share it, as they share its terminal (_same_native)."""
-        key = json.dumps([source.get('host'), 'claude', source.get('sessionId') or source.get('id')])
+        key = json.dumps([source.get('host'), source.get('agent'),
+                          source.get('home') if source.get('agent') == 'codex' else None,
+                          source.get('sessionId') or source.get('id')])
         with self.lock:
             return self.claude_locks.setdefault(key, threading.Lock())
 
@@ -1141,6 +1143,64 @@ class Chat:
                 break
         return seen
 
+    def connect(self, data):
+        """Prepare this conversation for a send; this endpoint never receives or types input."""
+        if not isinstance(data, dict) or set(data) != {'source', 'requestId'}:
+            raise ValueError('연결할 세션과 요청 식별자가 필요합니다.')
+        request_id = data['requestId']
+        if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
+            raise ValueError('연결 요청 식별자가 올바르지 않습니다.')
+        source, host = self.source(data['source'])
+        self._direct_session(source)
+        # Share Claude's warm/send lock; Codex uses the same per-source serialization.
+        turn = self._claude_lock_for(source)
+        if not turn.acquire(timeout=30):
+            raise ValueError('이 세션의 연결을 준비하고 있습니다. 잠시 뒤 다시 보내 주세요.')
+        try:
+            terminal = self._board_terminal(source)
+            if source['agent'] == 'claude':
+                if terminal is None:
+                    terminal = self._open_claude_terminal(data['source'], source, request_id)
+                elif terminal['id'] in self.unsettled and not self._settled(terminal['id']):
+                    raise ValueError(CLAUDE_NOT_READY)
+                self.unsettled.discard(terminal['id'])
+            else:
+                try:
+                    current = self.rpc(host, 'capabilities', source)
+                except (RuntimeError, OSError, ValueError):
+                    if source.get('phase') not in ('closed', 'notLoaded') and source.get('appServer') != 'off':
+                        raise
+                    current = {}
+                if current.get('capabilities', {}).get('canSend'):
+                    return {'connected': True, 'source': self.identity(source)}
+                if current and current.get('phase') not in ('closed', 'notLoaded'):
+                    raise ValueError(current.get('capabilities', {}).get('reason') or '현재 세션에서 입력을 받을 수 없습니다.')
+                plan = self.workflow.plan({'source': data['source'], 'target': {
+                    'host': source['host'], 'agent': source['agent'], 'account': 'codex:' + source['home']},
+                    'resume': True})
+                if not plan.get('allowed'):
+                    raise ValueError(plan.get('reason') or '이 세션을 다시 연결할 수 없습니다.')
+                launch_id = 'chat_connect_' + hashlib.sha256(request_id.encode()).hexdigest()[:40]
+                terminal = self.workflow.launch(plan['id'], launch_id)['terminal']
+                # A TUI can exist before its native server accepts input. Only read while waiting.
+                deadline = time.monotonic() + CLAUDE_READY_SECONDS
+                while True:
+                    try:
+                        ready = self.rpc(host, 'capabilities', source).get('capabilities', {}).get('canSend')
+                    except (RuntimeError, OSError, ValueError):
+                        ready = False
+                    if ready:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError('연결은 열었지만 아직 입력할 수 없습니다. 잠시 뒤 다시 보내 주세요.')
+                    time.sleep(0.25)
+            if not self._same_native(terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource'), source):
+                raise ValueError('같은 대화의 터미널인지 확인하지 못했습니다.')
+            self._forget_state(source)
+            return {'connected': True, 'source': self.identity(source), 'terminalId': terminal['id']}
+        finally:
+            turn.release()
+
     def warm(self, data):
         """Its user began a message to a Claude background session with no board terminal: its
         attach opens now, as the send would, so the send then pastes at once. Nothing is typed;
@@ -1299,7 +1359,7 @@ class Chat:
             except (RuntimeError, OSError):
                 raise SendRejected('Claude 세션 상태를 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
             timing.mark('capabilities')
-            if current.get('phase') == 'done' and source.get('kind') != 'background':
+            if current.get('phase') == 'done' and source.get('kind') != 'background' and not windows:
                 raise SendRejected(CLAUDE_EXTERNAL, 409)
             try:
                 terminal = self._board_terminal(source)
@@ -1307,12 +1367,9 @@ class Chat:
                 raise SendRejected('보드 터미널 상태를 확인하지 못해 보내지 않았습니다. 잠시 뒤 다시 시도해 주세요.', 409) from None
             timing.mark('terminal')
             if terminal is None:
-                if windows and source.get('kind') != 'background':
-                    # Resuming a stored PC conversation starts a process: only its terminal button does.
-                    raise SendRejected(CLAUDE_WINDOWS_OPEN, 409, code='terminal_required')
-                if source.get('kind') != 'background':
+                if source.get('kind') != 'background' and not windows:
                     raise SendRejected(CLAUDE_EXTERNAL, 409)
-                # The user pressed 보내기: attach this exact background session first. A failure
+                # The user pressed 보내기: connect this exact conversation first. A failure
                 # here is before any reservation or paste, so the draft stays for a later send.
                 try:
                     terminal = self._open_claude_terminal(ref, source, request_id)
