@@ -37,7 +37,7 @@
     }
   }
   var size = read("textSize");
-  if (size === "small" || size === "large") root.setAttribute("data-text-size", size);
+  if (["xsmall", "small", "large", "xlarge"].includes(size)) root.setAttribute("data-text-size", size);
   // A split pane (/pane, framed only by this board) of a board wider than a phone keeps the
   // board's type scale instead of the phone one its own narrow width would pick (style.css,
   // the phone rules). workspace.js keeps it in step when the board window is resized.

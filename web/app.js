@@ -162,7 +162,7 @@ const prefs = {
   },
 };
 const THEMES = ["auto", "light", "dark"];
-const TEXT_SIZES = ["small", "default", "large"];
+const TEXT_SIZES = ["xsmall", "small", "default", "large", "xlarge"];
 const state = {
   snapshot: null,
   capabilities: null,
@@ -5290,18 +5290,35 @@ function dictationErrorText(code, message = "") {
   const words = (Object.hasOwn(DICTATION_REFUSALS, message) && DICTATION_REFUSALS[message]) || DICTATION_ERRORS[code];
   return `${words || "음성 입력을 마치지 못했습니다. 다시 눌러 주세요."} (${code})`;
 }
-// What was heard so far: the results in order, final and still changing. Android's Chrome
-// may give each result everything heard before it; there (only) a result that repeats all
-// the earlier words (spacing and punctuation aside) up to a word boundary replaces them.
+// Some recognizers append cumulative hypotheses as finals, even when correcting an earlier
+// word. Keep the last segment separately: one correction must not make every later report
+// compare against an already duplicated whole and append the same utterance again.
 function dictationText(results, { cumulative = dictationCumulative() } = {}) {
-  let text = "";
+  let text = "", tail = "";
   for (const result of Array.from(results || [])) {
     const part = String(result?.[0]?.transcript || "").replace(/\s+/g, " ").trim();
     if (!part) continue;
-    if (cumulative && text && dictationRepeats(text, part)) text = part;
+    if (dictationRevision(text, part, cumulative)) text = part;
+    else if (tail !== text && dictationRevision(tail, part, cumulative)) text = text.slice(0, -tail.length) + part;
     else text = text ? `${text} ${part}` : part;
+    tail = part;
   }
   return text;
+}
+// Android also reports short cumulative prefixes. Elsewhere require a long shared opening
+// so ordinary short repetitions ("네", "네 알겠습니다") remain separate. For a correction,
+// compare the shared opening and ending; Korean endings need not stop at a word boundary.
+// These are hypotheses, not semantic deduplication: unrelated segments always stay.
+function dictationRevision(text, part, cumulative = dictationCumulative()) {
+  if (!text || !part) return false;
+  if (cumulative && dictationRepeats(text, part)) return true;
+  const clean = value => value.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  const a = clean(text), b = clean(part), size = Math.min(a.length, b.length);
+  let head = 0, tail = 0;
+  while (head < size && a[head] === b[head]) head++;
+  if (head < (cumulative ? 4 : 8) || (!cumulative && size < 12)) return false;
+  while (tail < size - head && a[a.length - 1 - tail] === b[b.length - 1 - tail]) tail++;
+  return head >= size * 0.8 || head + tail >= size * 0.9;
 }
 function dictationRepeats(text, part) {
   const word = (c) => /[\p{L}\p{N}]/u.test(c);
@@ -5729,7 +5746,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     // Final results never change and keep their places while the list grows (results still
     // changing may merge or drop). A list whose earlier finals are gone or say something
     // else started over (WebKit after a pause): the words those finals wrote stay, and the
-    // new list follows them, unless it already holds them (Android repeats what it heard).
+    // new list follows them, unless it repeats or revises the same utterance.
     const finals = [];
     for (const result of list) {
       if (!result?.isFinal) break;
@@ -5737,7 +5754,7 @@ function startDictation(field, { report, active, releaseKeyboard = false }) {
     }
     const same = (a, b) => dictationRepeats(a, b) && dictationRepeats(b, a);
     const kept = session.finals.every((text, i) => i < finals.length && same(text, finals[i]));
-    const repeats = dictationCumulative() && dictationRepeats(session.finalText, String(list[0]?.[0]?.transcript || ""));
+    const repeats = dictationRevision(session.finalText, dictationText(list));
     if (!kept && session.finalText && !repeats) {
       session.prefix += (session.prefix && !/\s$/.test(session.prefix) ? " " : "") + session.finalText;
     }

@@ -5689,11 +5689,17 @@ body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-scree
 
 /* Board text size (settings sheet). The type scale is in rem, so the root
    size scales every board text token; the terminal keeps its own size. */
+:root[data-text-size="xsmall"] {
+  font-size: 87.5%;
+}
 :root[data-text-size="small"] {
   font-size: 93.75%;
 }
 :root[data-text-size="large"] {
   font-size: 112.5%;
+}
+:root[data-text-size="xlarge"] {
+  font-size: 125%;
 }
 
 /* --- Top bar and the large title ------------------------------------------ */
@@ -6417,20 +6423,30 @@ dialog.action-sheet.is-popover {
 .settings-section {
   margin-top: 18px;
 }
+.text-size-picker {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
 .text-size-option {
   gap: 0;
   padding: 6px 0;
   line-height: 1.2;
+  font-size: var(--fs-cap);
 }
 .text-size-sample {
   font-size: 1.125rem;
   font-weight: 700;
+}
+.text-size-sample.xsmall {
+  font-size: 0.8125rem;
 }
 .text-size-sample.small {
   font-size: 0.9375rem;
 }
 .text-size-sample.large {
   font-size: 1.375rem;
+}
+.text-size-sample.xlarge {
+  font-size: 1.5625rem;
 }
 .push-actions {
   display: flex;
