@@ -15181,6 +15181,24 @@ test('관측 응답의 명시적인 이유 삭제는 구 snapshot 문구를 복�
   assert.equal(listed().runtimeReason, '새로 확인한 이유');
 });
 
+test('에이전트에 전달된 긴 요청은 접고 일반 세션의 내 메시지는 그대로 보인다', () => {
+  const c = client(undefined, noChatTimers);
+  const { s } = selectChat(c, { initiator: 'agent' });
+  c.drawDetail(s); wireTree(c, c.get('detail'));
+  const text = '지침 '.repeat(300) + '실제 작업';
+  c.renderMessages(s, [{ role: 'user', text }], '', true);
+  let row = c.get('messages').conversationRows[0];
+  assert.match(textOf(row.row), /전달된 요청/);
+  assert.equal(row.bubble.children[0].tagName, 'DETAILS');
+  assert.match(row.bubble.children[1].textContent, /실제 작업/);
+  assert.equal(row.bubble.children[0].children[1].textContent, text);
+  const direct = { ...s, initiator: 'human', id: 'direct', key: s.key + '-direct' };
+  c.drawDetail(direct); wireTree(c, c.get('detail'));
+  c.renderMessages(direct, [{ role: 'user', text }], '', true);
+  row = c.get('messages').conversationRows[0];
+  assert.equal(row.bubble.textContent, text);
+});
+
 test('복귀한 Claude 기본 계정 별칭은 목록·다른 대화를 거쳐 재선택해도 같은 entry·초안·스크롤로 돌아온다', () => {
   const c = client(undefined, noChatTimers), helpers = loadContextModules(c);
   const { s } = selectChat(c, { agent: 'claude', home: '.claude', id: 'recovered-worker' });

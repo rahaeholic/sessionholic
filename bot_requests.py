@@ -931,7 +931,9 @@ class BotRequests:
                 if (not isinstance(text, str) or len(text) > BODY_LIMIT
                         or message.get("role") not in ("user", "assistant")):
                     raise SourceError("봇 대화 형식이 올바르지 않습니다.")
-                rows.append(_message(message["role"], text, message.get("ts"), message.get("size")))
+                shown = _message(message["role"], text, message.get("ts"), message.get("size"))
+                if shown is not None:
+                    rows.append(shown)
             found[item["id"]] = {"messages": rows, "more": item.get("more") is True}
         return found
 
@@ -941,7 +943,18 @@ def _message(role, text, ts, size):
     a Slack request's envelope unwrapped, then cut to the board's length. The board only."""
     import collector
     ts = ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0 else None
-    row = collector.text_row(role, text, ts)
+    if role == "user":
+        unwrapped = collector.codex_user_text(text)
+        if unwrapped is not None:
+            text_for_row = unwrapped
+        elif (not isinstance(size, int) or size <= len(text)) and collector.codex_user_text(
+                text + "\n__sessionholic_end_marker__") == "__sessionholic_end_marker__":
+            return None  # A complete turn made entirely of known harness blocks.
+        else:
+            text_for_row = text  # An incomplete or unrecognized record must remain visible.
+    else:
+        text_for_row = text
+    row = collector.text_row(role, text_for_row, ts)
     row.pop("bodyHash", None)
     if isinstance(size, int) and not isinstance(size, bool) and size > len(text):
         # The reader cut it before the envelope came off: its full length is not this text's.

@@ -100,7 +100,7 @@ function client(fetchImpl = () => { throw new Error("Unexpected request"); }, { 
     sessionCategoryOf, sessionCategoryKeydown, renderSessionCategories, render, poll, capabilitiesRevision,
     sourceOf, allSessions, matches, manageSession, select, chatEntry, chatSupported, currentChat, sendChat,
     chatRecovery, chatAttachmentsSupported, openChatTerminal, preparePlan,
-    beginAuthEpoch, showLogin, lock, manualRefresh, backToList })`, context);
+    beginAuthEpoch, showLogin, lock, manualRefresh, backToList, renderBotConversation, renderDeliveredText })`, context);
   Object.assign(exposed.state, { authenticated: true, csrf: "fixture-csrf", capabilities: { hosts: [] },
     snapshot: { serverTime: now / 1000, hosts: [] } });
   return { ...exposed, context, get, calls, windowEvents, history, timers,
@@ -127,6 +127,37 @@ function addSessions(c, rows) {
   for (const row of rows) c.state.nativeSessions.set(row.key, row);
 }
 function botCalls(c) { return c.calls.filter((call) => call.url.startsWith("/api/bot-requests")); }
+
+test("긴 전달문은 앞뒤를 미리 보고 원문을 펼칠 수 있으며 잘린 기록을 전체처럼 보이지 않는다", () => {
+  const c = client(), container = node();
+  const text = "시작 " + "가".repeat(800) + " 실제 요청";
+  c.renderDeliveredText(container, text);
+  const [details] = container.children;
+  assert.equal(details.tagName, "DETAILS");
+  assert.match(container.children[1].textContent, /중간 생략.*실제 요청/s);
+  assert.equal(details.children[1].textContent, text);
+  const truncated = node(); c.renderDeliveredText(truncated, text, true);
+  assert.doesNotMatch(truncated.children[1].textContent, /실제 요청/);
+  const short = node(); c.renderDeliveredText(short, "짧은 요청");
+  assert.equal(short.textContent, "짧은 요청");
+});
+
+test("봇 대화 첫 읽기는 최신으로 이동하고 갱신할 때 읽던 위치를 지킨다", () => {
+  const c = client(), row = conversationRequest(), key = c.botRequestKey(row);
+  const box = c.get("bot-conversation"); box.dataset.conversationKey = key;
+  const pane = { scrollTop: 0, scrollHeight: 2000, clientHeight: 500 };
+  box.closest = () => pane;
+  const group = { key, latest: row };
+  c.state.botConversations.set(key, { data: { segments: [{ messages: [{ role: "user", text: "요청" }] }] } });
+  c.renderBotConversation(group);
+  assert.equal(pane.scrollTop, 2000);
+  pane.scrollTop = 400;
+  c.renderBotConversation(group);
+  assert.equal(pane.scrollTop, 400);
+  pane.scrollTop = 1500;
+  c.renderBotConversation(group);
+  assert.equal(pane.scrollTop, 2000);
+});
 
 test("봇 목록은 120초 후 poll에서 자동 갱신하고 진행 중 요청을 공유한다", async () => {
   const pending = deferred();

@@ -2120,6 +2120,9 @@ li[data-task] {
   background: var(--accent-fill);
   color: var(--on-accent);
 }
+.delivered-prompt-toggle { cursor: pointer; font-weight: 650; margin-bottom: 8px; }
+.delivered-prompt-preview, .delivered-prompt-full { white-space: pre-wrap; overflow-wrap: anywhere; }
+.delivered-prompt[open] + .delivered-prompt-preview { display: none; }
 .msg.system {
   align-items: center;
   text-align: center;

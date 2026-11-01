@@ -2262,6 +2262,11 @@ function drawBotRequest(group) {
   const stale = group.requests.some(botRequestStale);
   const revision = JSON.stringify([group.requests, stale]);
   if (pane.dataset.botRevision === revision && pane.querySelector?.(".bot-request-detail")) return;
+  const oldConversation = pane.querySelector?.(".bot-conversation");
+  const oldDetail = pane.querySelector?.(".bot-request-detail");
+  const sameConversation = oldConversation?.dataset.conversationKey === group.key;
+  const oldTop = sameConversation ? oldDetail?.scrollTop || 0 : 0;
+  const wasAtEnd = sameConversation && oldDetail && oldDetail.scrollHeight - oldTop - oldDetail.clientHeight < 80;
   pane.replaceChildren(); pane.dataset.key = ""; pane.dataset.botRevision = revision;
   pane.classList.remove("is-reading", "is-typing"); state.chromeVisible = true;
   const head = el("div", "detail-head bot-detail-head");
@@ -2284,6 +2289,10 @@ function drawBotRequest(group) {
     const conversation = el("section", "bot-conversation"); conversation.id = "bot-conversation";
     conversation.setAttribute("aria-label", "봇 대화 기록");
     conversation.dataset.conversationKey = group.key;
+    if (sameConversation) {
+      conversation.conversationShown = oldConversation.conversationShown;
+      conversation.pendingScroll = { top: oldTop, atEnd: wasAtEnd };
+    }
     detail.append(conversation);
   }
   pane.append(head, detail);
@@ -2337,6 +2346,12 @@ function renderBotConversation(group) {
   const { key, latest: request } = group, box = $("bot-conversation");
   if (!box || box.dataset.conversationKey !== key) return;
   const entry = state.botConversations.get(key);
+  const pane = box.closest?.(".bot-request-detail");
+  const firstRead = !!entry?.data && !box.conversationShown;
+  const atEnd = box.pendingScroll?.atEnd ?? (pane && pane.scrollHeight - pane.scrollTop - pane.clientHeight < 80);
+  const oldTop = box.pendingScroll?.top ?? (pane?.scrollTop || 0);
+  const opened = [...box.querySelectorAll("details.delivered-prompt")]
+    .filter((item) => item.open).map((item) => item.textContent);
   const segments = entry?.data?.segments || [];
   const nodes = [el("h2", "bot-conversation-title", "대화 기록")];
   if (entry?.promise && !entry.data) nodes.push(el("p", "bot-conversation-status", "대화를 불러오고 있습니다…"));
@@ -2356,7 +2371,21 @@ function renderBotConversation(group) {
   }
   if (entry?.data && !segments.length) nodes.push(el("p", "group-empty", "이 요청에서 읽을 수 있는 대화가 없습니다."));
   box.replaceChildren(...nodes);
+  for (const item of box.querySelectorAll("details.delivered-prompt"))
+    if (opened.includes(item.textContent)) item.open = true;
   box.setAttribute("aria-busy", String(!!entry?.promise));
+  if (entry?.data) {
+    box.conversationShown = true;
+    box.pendingScroll = null;
+    if (pane) {
+      const scroll = () => {
+        if (box.isConnected === false) return;
+        pane.scrollTop = firstRead || atEnd ? pane.scrollHeight : oldTop;
+      };
+      scroll();
+      if (firstRead && typeof requestAnimationFrame === "function") requestAnimationFrame(scroll);
+    }
+  }
 }
 function botConversationBreak(segment) {
   const when = botTimestamp(segment.firstAt);
@@ -2377,6 +2406,7 @@ function botMessageRow(message, request) {
   const bubble = el("div", "bubble");
   if (role === "assistant" && typeof MessageFormat !== "undefined")
     MessageFormat.render(bubble, text, { onCopy: (value) => copyText(value, "코드를 복사했습니다.") });
+  else if (role === "user") renderDeliveredText(bubble, text, message.truncated === true);
   else bubble.textContent = text;
   row.append(label, bubble);
   if (message.truncated === true) {
@@ -8839,6 +8869,20 @@ function userMessageParts(message) {
   if (chips.length && OUTBOX_ATTACHMENT_ONLY.has(body.trim())) body = "";
   return { body, attachments: chips };
 }
+// Long machine-delivered prompts often contain instructions around the task.
+// Keep the exact text available without guessing which parts are the task.
+function renderDeliveredText(container, text, truncated = false) {
+  const chars = Array.from(text || "");
+  if (chars.length <= 700) { container.textContent = text || ""; return; }
+  const details = el("details", "delivered-prompt");
+  const summary = el("summary", "delivered-prompt-toggle", "긴 전달 내용 · 펼치기");
+  const preview = el("div", "delivered-prompt-preview", truncated
+    ? chars.slice(0, 400).join("") + "…"
+    : chars.slice(0, 200).join("") + "\n\n… 중간 생략 …\n\n" + chars.slice(-400).join(""));
+  const full = el("div", "delivered-prompt-full", text);
+  details.append(summary, full);
+  container.append(details, preview);
+}
 function cancelHistorySearch() {
   const search = state.historySearch;
   search.run++; search.controller?.abort(); search.controller = null;
@@ -8975,7 +9019,10 @@ function longMessageControls(s, entry, item) {
       MessageFormat.render(item.bubble, message.text || "", { onCopy: (text) => copyText(text, "코드를 복사했습니다.") });
     else if (item.role === "user") {
       const shown = userMessageParts(message);
-      if (shown.attachments.length) {
+      if (item.delivered && !visible) {
+        if (shown.body) renderDeliveredText(item.bubble, shown.body, message.truncated === true);
+        if (shown.attachments.length) item.bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
+      } else if (shown.attachments.length) {
         if (shown.body) item.bubble.append(el("span", "msg-body", shown.body));
         item.bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
       } else item.bubble.textContent = shown.body;
@@ -9388,12 +9435,13 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     const retained = index < overlap ? previous[shift + index] : available.get(key)?.shift();
     if (retained) { longMessageControls(s, entry, retained); return retained; }
     const role = ["user", "assistant", "tool", "system"].includes(message.role) ? message.role : "system";
+    const delivered = role === "user" && ["agent", "bot"].includes(sessionCategoryOf(s));
     // A tool record is one line of its group (toolGroupNode), not a row of its own.
     if (role === "tool") return { key, message, row: toolItemNode(message), role, truncated: false, kind: toolKindOf(message) };
     const row = el("article", `msg ${role}`);
     if (role !== "system") {
       const label = el("div", "msg-label");
-      label.append(el("strong", null, role === "user" ? "나" : AGENTS[s.agent] || "에이전트"));
+      label.append(el("strong", null, role === "user" ? delivered ? "전달된 요청" : "나" : AGENTS[s.agent] || "에이전트"));
       if (message.ts) label.append(el("span", null, clock(message.ts)));
       row.append(label);
       row.msgLabel = label;
@@ -9406,7 +9454,10 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     } else if (role === "user") {
       // The board's own "첨부 파일: <경로>" lines become chips, never paths.
       const shown = userMessageParts(message);
-      if (shown.attachments.length) {
+      if (delivered) {
+        if (shown.body) renderDeliveredText(bubble, shown.body, message.truncated === true);
+        if (shown.attachments.length) bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
+      } else if (shown.attachments.length) {
         if (shown.body) bubble.append(el("span", "msg-body", shown.body));
         bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
       } else bubble.textContent = shown.body;
@@ -9422,7 +9473,7 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     }
     // Copy, code copy, selection and the terminal live in a menu: long press
     // on touch, right click or this button (shown on hover) with a mouse.
-    const item = { key, message, row, bubble, role, truncated, truncatedNote: row.truncatedNote };
+    const item = { key, message, row, bubble, role, delivered, truncated, truncatedNote: row.truncatedNote };
     row.messageItem = item;
     if (role !== "system" && !options.readOnly) {
       const more = button("", "msg-more", () => openMessageMenu(row));
