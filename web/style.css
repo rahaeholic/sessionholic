@@ -2123,6 +2123,8 @@ li[data-task] {
 .delivered-prompt-toggle { cursor: pointer; font-weight: 650; margin-bottom: 8px; }
 .delivered-prompt-preview, .delivered-prompt-full { white-space: pre-wrap; overflow-wrap: anywhere; }
 .delivered-prompt[open] + .delivered-prompt-preview { display: none; }
+.delivered-prompt-first-note { font-size: var(--fs-cap); }
+.delivered-prompt-first[open] + .delivered-prompt-first-note { display: none; }
 .msg.system {
   align-items: center;
   text-align: center;

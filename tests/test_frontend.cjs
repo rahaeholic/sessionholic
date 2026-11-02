@@ -15199,6 +15199,25 @@ test('에이전트에 전달된 긴 요청은 접고 일반 세션의 내 메시
   assert.equal(row.bubble.textContent, text);
 });
 
+test('봇 세션은 긴 최초 요청만 기본으로 접고 앞부분이 잘린 기록은 최초라고 추정하지 않는다', () => {
+  const c = client(undefined, noChatTimers), helpers = loadContextModules(c);
+  const { s } = selectChat(c);
+  Object.assign(s, { botOrigin: 'slack', source: 'exec' });
+  c.drawDetail(s); wireTree(c, c.get('detail'));
+  const text = '지침 '.repeat(300) + '요청';
+  const messages = [{ role: 'user', text }, { role: 'assistant', text: '응답' }, { role: 'user', text }];
+  helpers.rememberConversation(s, messages);
+  c.renderMessages(s, messages, '', true);
+  let rows = c.get('messages').conversationRows;
+  assert.match(rows[0].bubble.children[0].className, /delivered-prompt-first/);
+  assert.equal(rows[0].bubble.children[0].children[1].textContent, text);
+  assert.equal(rows[2].bubble.children[1].className, 'delivered-prompt-preview');
+  helpers.rememberConversation(s, messages, { olderOmitted: true });
+  c.renderMessages(s, messages);
+  rows = c.get('messages').conversationRows;
+  assert.equal(rows[0].bubble.children[1].className, 'delivered-prompt-preview');
+});
+
 test('복귀한 Claude 기본 계정 별칭은 목록·다른 대화를 거쳐 재선택해도 같은 entry·초안·스크롤로 돌아온다', () => {
   const c = client(undefined, noChatTimers), helpers = loadContextModules(c);
   const { s } = selectChat(c, { agent: 'claude', home: '.claude', id: 'recovered-worker' });

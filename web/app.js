@@ -2366,7 +2366,8 @@ function renderBotConversation(group) {
     if (segments.length > 1) nodes.push(botConversationBreak(segment));
     if (segment.error) nodes.push(el("p", "bot-source-notice", segment.error));
     if (segment.more) nodes.push(el("p", "conversation-window-notice", "이 대화의 앞부분 일부는 여기에 나오지 않습니다."));
-    for (const message of segment.messages) nodes.push(botMessageRow(message, request));
+    segment.messages.forEach((message, index) => nodes.push(botMessageRow(message, request,
+      { first: index === 0 && !segment.more })));
     if (!segment.error && !segment.messages.length) nodes.push(el("p", "group-empty", "저장된 대화를 찾지 못했습니다."));
   }
   if (entry?.data && !segments.length) nodes.push(el("p", "group-empty", "이 요청에서 읽을 수 있는 대화가 없습니다."));
@@ -2396,7 +2397,7 @@ function botConversationBreak(segment) {
   return line;
 }
 // One message, in the same bubbles as a session's conversation; nothing here sends or acts.
-function botMessageRow(message, request) {
+function botMessageRow(message, request, { first = false } = {}) {
   const role = message?.role === "user" ? "user" : "assistant";
   const text = typeof message?.text === "string" ? message.text : "";
   const row = el("article", `msg ${role}`);
@@ -2406,7 +2407,7 @@ function botMessageRow(message, request) {
   const bubble = el("div", "bubble");
   if (role === "assistant" && typeof MessageFormat !== "undefined")
     MessageFormat.render(bubble, text, { onCopy: (value) => copyText(value, "코드를 복사했습니다.") });
-  else if (role === "user") renderDeliveredText(bubble, text, message.truncated === true);
+  else if (role === "user") renderDeliveredText(bubble, text, message.truncated === true, { first });
   else bubble.textContent = text;
   row.append(label, bubble);
   if (message.truncated === true) {
@@ -8871,16 +8872,20 @@ function userMessageParts(message) {
 }
 // Long machine-delivered prompts often contain instructions around the task.
 // Keep the exact text available without guessing which parts are the task.
-function renderDeliveredText(container, text, truncated = false) {
+function renderDeliveredText(container, text, truncated = false, { first = false } = {}) {
   const chars = Array.from(text || "");
   if (chars.length <= 700) { container.textContent = text || ""; return; }
-  const details = el("details", "delivered-prompt");
-  const summary = el("summary", "delivered-prompt-toggle", "긴 전달 내용 · 펼치기");
+  const details = el("details", `delivered-prompt${first ? " delivered-prompt-first" : ""}`);
+  const summary = el("summary", "delivered-prompt-toggle", first ? "긴 첫 요청 · 원문 펼치기" : "긴 전달 내용 · 펼치기");
+  const full = el("div", "delivered-prompt-full", text);
+  details.append(summary, full);
+  if (first) {
+    container.append(details, el("div", "delivered-prompt-first-note", "봇의 실행 지시가 포함될 수 있습니다."));
+    return;
+  }
   const preview = el("div", "delivered-prompt-preview", truncated
     ? chars.slice(0, 400).join("") + "…"
     : chars.slice(0, 200).join("") + "\n\n… 중간 생략 …\n\n" + chars.slice(-400).join(""));
-  const full = el("div", "delivered-prompt-full", text);
-  details.append(summary, full);
   container.append(details, preview);
 }
 function cancelHistorySearch() {
@@ -9020,7 +9025,7 @@ function longMessageControls(s, entry, item) {
     else if (item.role === "user") {
       const shown = userMessageParts(message);
       if (item.delivered && !visible) {
-        if (shown.body) renderDeliveredText(item.bubble, shown.body, message.truncated === true);
+        if (shown.body) renderDeliveredText(item.bubble, shown.body, message.truncated === true, { first: item.firstBotPrompt });
         if (shown.attachments.length) item.bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
       } else if (shown.attachments.length) {
         if (shown.body) item.bubble.append(el("span", "msg-body", shown.body));
@@ -9409,8 +9414,10 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
   const previousKeys = new Set(previous.map((item) => item.key));
   const oldWarningHeight = list.conversationError && [...list.children].includes(list.conversationError)
     ? list.conversationError.offsetHeight || 0 : 0;
-  const keys = messages.map((message) => JSON.stringify([message.role, message.text, message.ts || null,
-    attachmentMetadata(message.attachments), message.truncated === true, message.bodyHash || null]));
+  const firstBotPrompt = sessionCategoryOf(s) === "bot" && !conversationOlderOmitted(s, entry);
+  const keys = messages.map((message, index) => JSON.stringify([message.role, message.text, message.ts || null,
+    attachmentMetadata(message.attachments), message.truncated === true, message.bodyHash || null,
+    firstBotPrompt && index === 0 && message.role === "user"]));
   // The server's window drops whole rows at its start (a question or answer
   // with the rows after it, any number at once): the rows on
   // screen are first lined up with the new ones where they overlap most, so
@@ -9455,7 +9462,8 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
       // The board's own "첨부 파일: <경로>" lines become chips, never paths.
       const shown = userMessageParts(message);
       if (delivered) {
-        if (shown.body) renderDeliveredText(bubble, shown.body, message.truncated === true);
+        if (shown.body) renderDeliveredText(bubble, shown.body, message.truncated === true,
+          { first: firstBotPrompt && index === 0 });
         if (shown.attachments.length) bubble.append(attachmentGroup(shown.attachments, `첨부 ${shown.attachments.length}개`, { showCaption: false }));
       } else if (shown.attachments.length) {
         if (shown.body) bubble.append(el("span", "msg-body", shown.body));
@@ -9473,7 +9481,8 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     }
     // Copy, code copy, selection and the terminal live in a menu: long press
     // on touch, right click or this button (shown on hover) with a mouse.
-    const item = { key, message, row, bubble, role, delivered, truncated, truncatedNote: row.truncatedNote };
+    const item = { key, message, row, bubble, role, delivered, firstBotPrompt: firstBotPrompt && index === 0,
+      truncated, truncatedNote: row.truncatedNote };
     row.messageItem = item;
     if (role !== "system" && !options.readOnly) {
       const more = button("", "msg-more", () => openMessageMenu(row));

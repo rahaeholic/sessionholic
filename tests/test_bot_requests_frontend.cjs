@@ -142,6 +142,25 @@ test("긴 전달문은 앞뒤를 미리 보고 원문을 펼칠 수 있으며 �
   assert.equal(short.textContent, "짧은 요청");
 });
 
+test("봇 대화의 긴 첫 요청은 원문을 접고 다음 요청은 그대로 미리 보여 준다", () => {
+  const c = client(), row = conversationRequest(), key = c.botRequestKey(row);
+  const box = c.get("bot-conversation"); box.dataset.conversationKey = key;
+  const initial = "초기 지시 ".repeat(140) + "첫 요청 원문";
+  const next = "후속 요청 ".repeat(140) + "후속 끝";
+  const segment = { more: false, messages: [
+    { role: "user", text: initial }, { role: "assistant", text: "응답" }, { role: "user", text: next }] };
+  c.state.botConversations.set(key, { data: { segments: [segment] } });
+  c.renderBotConversation({ key, latest: row });
+  const rows = byClass(box, "msg"), firstBubble = byClass(rows[0], "bubble")[0];
+  assert.match(firstBubble.children[0].children[0].textContent, /긴 첫 요청/);
+  assert.equal(firstBubble.children[0].children[1].textContent, initial);
+  assert.match(firstBubble.children[1].textContent, /실행 지시/);
+  assert.equal(byClass(rows[2], "delivered-prompt-preview").length, 1);
+  segment.more = true;
+  c.renderBotConversation({ key, latest: row });
+  assert.equal(byClass(box, "delivered-prompt-first").length, 0, "앞부분이 없는 대화의 첫 화면은 최초 메시지라고 추정하지 않는다");
+});
+
 test("봇 대화 첫 읽기는 최신으로 이동하고 갱신할 때 읽던 위치를 지킨다", () => {
   const c = client(), row = conversationRequest(), key = c.botRequestKey(row);
   const box = c.get("bot-conversation"); box.dataset.conversationKey = key;
