@@ -1083,12 +1083,12 @@ const API_TIMEOUT_MS = { GET: 30000, POST: 45000 };
 // Each is longer than the server's own bound for that route.
 const API_PATH_TIMEOUT_MS = {
   "/api/capabilities": 90000, "/api/read": 45000, "/api/bot-requests/conversation": 90000, "/api/chat/send": 90000, "/api/chat/prompt": 60000,
-  "/api/plan": 120000, "/api/new-session": 120000, "/api/app-server": 200000, "/api/launch": 660000, "/api/chat/connect": 660000,
+  "/api/plan": 120000, "/api/new-session": 120000, "/api/chat/profile-session": 180000, "/api/app-server": 200000, "/api/launch": 660000, "/api/chat/connect": 660000,
 };
 const API_TIMEOUT_MESSAGE = "응답이 늦어 기다리기를 멈췄습니다. 연결을 확인한 뒤 다시 시도해 주세요.";
 // Where the server may already have acted: say so instead of inviting a blind retry.
 const API_TIMEOUT_STARTED = "응답이 늦어 기다리기를 멈췄습니다. 이미 시작됐거나 전달됐을 수 있으니 목록과 터미널을 확인한 뒤 다시 시도해 주세요.";
-const API_STARTED_PATHS = new Set(["/api/launch", "/api/new-session", "/api/app-server", "/api/chat/prompt"]);
+const API_STARTED_PATHS = new Set(["/api/launch", "/api/new-session", "/api/app-server", "/api/chat/prompt", "/api/chat/profile-session", "/api/batch/start"]);
 function apiPathname(path) {
   return String(path).split("?")[0];
 }
@@ -1560,7 +1560,9 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   );
 }
 
+let cardRelationIndex = null;
 function renderSessionList(sessions, now) {
+  cardRelationIndex = window.SessionholicRelations?.buildRelationIndex(sessions) || null;
   setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
   renderRecoveries();
   if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
@@ -2807,11 +2809,12 @@ function card(s) {
   const unread = el("span", "card-unread");
   unread.setAttribute("aria-hidden", "true");
   unread.hidden = true;
-  meta.append(unread, badge, terminal, agent, execution, project, stale, removed, time);
+  const attention = el("span", "card-attention"); attention.hidden = true;
+  meta.append(unread, badge, attention, terminal, agent, execution, project, stale, removed, time);
   const chevron = el("span", "card-chevron");
   chevron.setAttribute("aria-hidden", "true");
   node.append(title, snippet, provenance, goals, meta, chevron);
-  node.cardParts = { title, snippet, badge, terminal, agent, execution, project, stale, removed, time, initiator, host, goals, unread };
+  node.cardParts = { title, snippet, badge, attention, terminal, agent, execution, project, stale, removed, time, initiator, host, goals, unread };
   node.cardRow = row;
   row.append(action, node);
   row.card = node;
@@ -2833,12 +2836,13 @@ function updateCard(node, s, now, folderHint = "") {
   const [label, tone] = BADGES[s.runtimeKnown === false ? "unknown" : s.phase] || ["상태 확인 필요", "gray"];
   const time = ago(s.updatedAt, now);
   const unread = sessionUnread(s, now);
+  const attention = cardAttention(s);
   const selectedKey = window.SessionholicWorkspace?.managed() ? window.SessionholicWorkspace.activeSessionKey() : state.selected;
   node.className = `card${selectedKey === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(selectedKey === s.key));
   node.cardLabel = [unread ? "읽지 않음" : "", "프로젝트: " + project, "작업: " + title,
     preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
-    label, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
+    label, attention, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
     s.stale ? "마지막 확인 기준" : "", sessionRemoved(s) ? "목록에서 지움" : ""].filter(Boolean).join(". ");
   markCardTerminal(node, s);
   node.title = `${project}\n${title}\nShift+클릭: 새 창에서 보기`;
@@ -2846,6 +2850,7 @@ function updateCard(node, s, now, folderHint = "") {
   write(p.title, (sessionPinned(s) ? "★ " : "") + title); p.title.title = title;
   write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
   write(p.badge, label); p.badge.className = `badge ${tone}`;
+  if (p.attention) { write(p.attention, attention); p.attention.hidden = !attention; }
   write(p.agent, agent); p.agent.className = `card-agent ${s.agent}`;
   write(p.project, place); p.project.title = place;
   write(p.time, time);
@@ -2859,6 +2864,21 @@ function updateCard(node, s, now, folderHint = "") {
   p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
   if (p.removed) p.removed.hidden = !sessionRemoved(s);
   if (p.unread) { p.unread.hidden = !unread; p.unread.title = unread ? "아직 열어 보지 않은 결과" : ""; }
+}
+function cardAttention(s, relationIndex = cardRelationIndex) {
+  const entry = state.chats.get(chatKey(sourceOf(s)));
+  if (entry?.data?.prompt && entry?.promptRequest && ["unknown", "unconfirmed", "not_found"].includes(entry.promptRequest.status)) return "선택 전달 확인";
+  if (entry?.pending && !entry.sending) return "전송 확인";
+  if (s.stale || s.runtimeKnown === false) return "연결·상태 확인";
+  const data = entry?.data && chatKey(entry.data.route || {}) === chatKey(sourceOf(s)) ? entry.data : null;
+  if (data?.stale) return "최신 상태 확인";
+  if (s.phase === "needs_input" || data?.phase === "needs_input")
+    return data?.prompt ? "질문·승인 확인" : "원본에서 답변 확인";
+  if (data?.recovery?.action === "refresh_host") return "연결 확인";
+  const relations = relationIndex && window.SessionholicRelations?.relationsFor(relationIndex, s);
+  if (!relations?.ambiguous && relations?.session && relations.children.some(({ status, session }) =>
+    status === "linked" && !session.stale && session.runtimeKnown !== false && session.phase === "needs_input")) return "하위 작업 답변 필요";
+  return "";
 }
 // ---------- 읽음 표시 ----------
 // A session that answered (답 필요) or just stopped (최근 끝남) after it was last opened on
@@ -3202,9 +3222,12 @@ function cardActions(s) {
   const actions = [
     { label: "대화 열기", run: () => select(s.key) },
     { label: "새 창에서 보기", run: () => openSessionWindow(s) },
+    { label: "같은 일에 묶기", run: () => openWorkGroup(s) },
     { label: sessionPinned(s) ? "★ 상단 고정 해제" : "☆ 상단 고정 (즐겨찾기)", run: () => pinSession(s) },
     { label: "세션 관리", run: () => manageSession(s) },
   ];
+  if (state.selected === s.key && $("messages")?.conversationSource === chatKey(sourceOf(s)))
+    actions.splice(1, 0, { label: "결과물·검증 보기", run: () => openResults(s, chatEntry(s)) });
   if (window.SessionholicWorkspace)
     actions.splice(2, 0, { label: "분할창에서 보기", run: () => window.SessionholicWorkspace.add({ key: s.key, mode: "chat" }) });
   if (window.SessionholicLabels?.eligible?.(s)) actions.push({ label: "제목 수정", run: () => window.SessionholicLabels.open(s, document.activeElement) });
@@ -4221,6 +4244,11 @@ function childResultPanel(parent, child, openRelated) {
       const output = el("div"), answer = projection.lastResult;
       output.append(el("p", "session-child-status", `조회 상태 · ${BADGES[result.runtimeKnown === false ? "unknown" : result.phase]?.[0] || "확인 필요"}`));
       output.append(el("p", null, answer?.text || "최근 요청 뒤 저장된 답변이 아직 없습니다."));
+      const evidence = window.SessionholicContext?.collectEvidence(result.messages) || [];
+      for (const item of evidence.slice(0, 5)) {
+        for (const artifact of item.artifacts) output.append(el("p", "session-child-status", `답변에 명시된 ${artifact.type === "link" ? "링크" : "파일"} · ${artifact.target}`));
+        if (item.verification) output.append(el("p", "session-child-status", `답변의 검증 기록 · ${item.verification}`));
+      }
       if (answer?.ts) output.append(el("small", null, `답변 기록 시각 · ${new Date(answer.ts * 1000).toLocaleString("ko-KR")}`));
       output.append(el("small", null, `불러온 대화에서 발췌 · 작업 완료 여부는 원문에서 확인하세요.${projection.scope.stale ? " 최신 내용 미확인." : ""}`));
       output.append(button("원문 대화 열기", "work-context-origin", () => { if (valid()) openRelated(child); }));
@@ -4983,6 +5011,7 @@ function networkOffline() {
   return state.offline || globalThis.navigator?.onLine === false;
 }
 const DRAFT_PREFIX = INSTANCE.storagePrefix + "draft:v1:";
+const BATCH_PREFIX = INSTANCE.storagePrefix + "batch:v1:";
 const MAX_ATTACHMENTS = 32;
 const terminalAttachmentDrafts = new Map();
 const DRAFT_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -4997,6 +5026,10 @@ function draftStorageKey(kind, identity) { return DRAFT_PREFIX + encodeURICompon
 function clearSavedDrafts() {
   state.draftSavedShapes.clear();
   for (const key of savedDraftKeys()) { try { localStorage.removeItem(key); } catch { /* unavailable storage */ } }
+  try {
+    const keys = Array.from({ length: Math.min(localStorage.length || 0, 10000) }, (_, index) => localStorage.key(index));
+    for (const key of keys) if (typeof key === "string" && key.startsWith(BATCH_PREFIX)) localStorage.removeItem(key);
+  } catch { /* unavailable storage */ }
 }
 function draftStorageNotice(text) {
   if ($("draft-recovery-status")) $("draft-recovery-status").textContent = text;
@@ -5022,7 +5055,7 @@ function readSavedDraft(key) {
         row.unconfirmed !== undefined && (!Array.isArray(row.unconfirmed) || row.unconfirmed.length > 19 ||
           row.unconfirmed.some((pending) => !validSavedPending(pending))) ||
         row.commandRequest && (typeof row.commandRequest.requestId !== "string" || row.commandRequest.requestId.length > 128 ||
-          !['model', 'effort', 'compact'].includes(row.commandRequest.command) ||
+          !['model', 'effort', 'compact', 'fork'].includes(row.commandRequest.command) ||
           !['pending', 'unknown', 'applied'].includes(row.commandRequest.status) ||
           row.commandRequest.value !== null && (typeof row.commandRequest.value !== "string" || row.commandRequest.value.length > 128)) ||
         row.promptRequest && (typeof row.promptRequest.requestId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/.test(row.promptRequest.requestId) ||
@@ -5043,7 +5076,8 @@ function writeSavedDraft(key, row) {
     const shape = savedDraftShape(row), previousShape = state.draftSavedShapes.get(key);
     // Status polling in an idle tab must never overwrite another tab's newer edits.
     if (previousShape === shape && localStorage.getItem(key) !== null) return true;
-    if (!row.text && !row.attachments.length && !row.pending && !row.unconfirmed?.length && !row.promptRequest) {
+    if (!row.text && !row.attachments.length && !row.pending && !row.unconfirmed?.length && !row.promptRequest &&
+        !(row.commandRequest?.command === 'fork' && row.commandRequest.status !== 'applied')) {
       const prior = readSavedDraft(key);
       if (!prior || previousShape === savedDraftShape(prior)) localStorage.removeItem(key);
       state.draftSavedShapes.set(key, shape); return true;
@@ -6160,8 +6194,13 @@ async function openChatSettings(entry, kind) {
       panel.replaceChildren(el("p", "", error.message), button("닫기", "quiet", close));
   }
 }
-async function executeChatCommand(entry, command, value = null) {
-  if (!currentChat(entry) || !chatSupported(entry) || entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.composing) return false;
+async function executeChatCommand(entry, command, value = null, { returnResult = false } = {}) {
+  const canForkClaude = command === "fork" && entry.source.agent === "claude" && chatReadSupported(entry) && !chatHostOffline(entry, selectedSession());
+  if (!currentChat(entry) || !(chatSupported(entry) || canForkClaude) || entry.commandBusy || entry.sending || entry.pending || entry.uploads || entry.composing) return false;
+  if (entry.commandRequest?.command === 'fork' && entry.commandRequest.status !== 'applied' &&
+      (command !== 'fork' || entry.commandRequest.value !== value)) {
+    entry.error = entry.inputError = '확인 중인 대화 분기 결과를 먼저 확인해 주세요.'; updateChatComposer(entry); return false;
+  }
   stopDictation({ abort: true, park: true, field: $("chat-input") });
   closeQuickReplies();
   entry.stateEpoch++;
@@ -6184,7 +6223,7 @@ async function executeChatCommand(entry, command, value = null) {
     }
     commandRequest.status = "applied";
     if (currentChat(entry)) loadChatState(selectedSession(), true);
-    return true;
+    return returnResult ? result : true;
   } catch (error) {
     if (error.dispatchState === "not_started") entry.commandRequest = null; else commandRequest.status = "unknown";
     if (epoch === state.authEpoch && !error.unauthorized && !error.staleAuth) { entry.error = entry.inputError = error.message; entry.notice = ""; }
@@ -6513,11 +6552,41 @@ function buildChatComposer(s) {
     if (editorCurrent()) { tools.open = false; openDelegation(s, entry); }
   });
   delegate.id = "chat-delegate";
-  toolsActions.append(quick, delegate, clipboard, check, native, closeTerm, manage);
+  const reference = button("대화 참조", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openReferencePicker(s, entry, input); }
+  });
+  reference.id = "chat-reference";
+  const results = button("결과물·검증", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openResults(s, entry); }
+  });
+  results.id = "chat-results";
+  results.textContent = "결과물";
+  const capabilities = button("이 대화에서 가능한 기능", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openChatCapabilities(s, entry); }
+  });
+  const taskPlan = button("목표를 작업으로 나누기", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openTaskPlan(s, entry, input); }
+  });
+  const fork = button("대화 분기", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openConversationFork(s, entry); }
+  });
+  fork.id = "chat-fork"; fork.hidden = !["codex", "claude"].includes(s.agent);
+  const profile = button("모델·작업 프로필", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openConversationProfiles(s, entry); }
+  });
+  profile.id = "chat-profiles";
+  const batch = button("여러 대화에 작업 보내기", "secondary", () => {
+    if (editorCurrent()) { tools.open = false; openBatchWork(s, entry); }
+  });
+  batch.id = "chat-batch";
+  const more = el("details", "chat-more-actions");
+  more.id = "chat-more";
+  more.append(el("summary", null, "더 많은 기능"), taskPlan, batch, fork, profile, delegate, clipboard, check, native, closeTerm, manage, capabilities);
+  toolsActions.append(reference, quick, more);
   for (const action of [quick, clipboard, check, native, closeTerm])
     action.addEventListener("pointerdown", (event) => event.preventDefault());
   tools.append(toolsActions);
-  actions.append(attach, expand, terminal, keyHint, tools);
+  actions.append(attach, expand, terminal, results, keyHint, tools);
   // Primary actions stay below the full-width editor, including in focus mode.
   // The keyboard stays on the input: the press never takes focus.
   const quickInline = button("", "chat-quick-inline", (event) => {
@@ -6536,7 +6605,15 @@ function buildChatComposer(s) {
   attachInline.setAttribute("aria-label", "사진 또는 파일 첨부");
   attachInline.title = "사진 또는 파일 첨부";
   attachInline.addEventListener("pointerdown", (event) => event.preventDefault());
-  main.append(input, attachInline, mic, quickInline, send);
+  const referenceInline = button("@", "chat-reference-inline", () => {
+    if (editorCurrent()) openReferencePicker(s, entry, input);
+  });
+  referenceInline.id = "chat-reference-inline";
+  referenceInline.setAttribute("aria-label", "다른 대화 참조");
+  referenceInline.setAttribute("aria-haspopup", "dialog");
+  referenceInline.title = "다른 대화 참조";
+  referenceInline.addEventListener("pointerdown", (event) => event.preventDefault());
+  main.append(input, attachInline, mic, quickInline, referenceInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -7118,6 +7195,8 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-mic").disabled = !dictationListening(input) && (input.disabled || input.readOnly || entry.composing);
   for (const id of ["chat-quick", "chat-quick-inline", "chat-delegate"])
     if ($(id)) $(id).disabled = blocked || input.disabled || input.readOnly || entry.composing;
+  for (const id of ["chat-reference", "chat-reference-inline"])
+    if ($(id)) $(id).disabled = input.disabled || input.readOnly || entry.composing || draftIsPending(entry);
   renderDictation();
   $("chat-send").textContent = entry.connecting ? "연결 중…" : entry.sending ? "전송 중" : "보내기";
   $("chat-send").setAttribute("aria-label", "메시지 보내기");
@@ -7134,7 +7213,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-terminal-close").hidden = !openTerminalRow;
   if (openTerminalRow) $("chat-terminal-close").textContent = terminalCloseCopy(openTerminalRow).action;
   const phase = entry.data?.phase;
-  const phaseCopy = phase === "working" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.data?.terminalConnection?.connected && supported ? "터미널에 연결됨 · 실행 상태는 터미널에서 확인하세요." : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
+  const phaseCopy = phase === "working" ? (entry.source.agent === "codex" ? "작업 중 · 지금 보내도 CLI가 이어서 반영합니다." : "작업 중 · 전달 시점은 연결된 에이전트와 터미널 상태에 따릅니다.") : phase === "needs_input" ? (entry.data?.prompt ? "답변·승인 필요 · 위 카드에서 답해 주세요." : "답변·승인 필요 · 터미널에서 처리해 주세요.") : entry.data?.terminalConnection?.connected && supported ? "터미널에 연결됨 · 실행 상태는 터미널에서 확인하세요." : entry.expanded ? "위의 실제 세션에 메시지를 전달합니다." : "";
   const budgetNote = state.chatPollCount >= CHAT_POLL_MAX ? CHAT_CHECKS_PAUSED : "";
   // The gate itself says what to do; the status line only adds that a refused
   // message was not sent.
@@ -7529,8 +7608,963 @@ function draftIsPending(entry) {
   return !!pending && entry.text === pending.text && entry.attachments.length === pending.attachments.length &&
     entry.attachments.every((item, index) => item.id === pending.attachments[index]);
 }
+function openBatchWork(s, entry) {
+  if (!currentChat(entry) || conversationIdentity(selectedSession()) !== conversationIdentity(s)) return;
+  const identity = conversationIdentity(s), epoch = state.authEpoch;
+  // Preserve an unfinished plan created by an older version; never silently resend it.
+  try {
+    if (localStorage.getItem(BATCH_PREFIX + encodeURIComponent(identity))) return openLegacyBatchWork(s, entry);
+  } catch { /* the server keeps new plans independently of local storage */ }
+  let dialog = $("batch-work-dialog");
+  if (!dialog) { dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "batch-work-dialog"; dialog.setAttribute("aria-labelledby", "batch-work-title"); document.body.append(dialog); }
+  dialog.id = "batch-work-dialog";
+  dialog.replaceChildren();
+  const nonce = dialog.batchNonce = (dialog.batchNonce || 0) + 1;
+  const valid = () => dialog.open && dialog.batchNonce === nonce && state.authenticated && epoch === state.authEpoch && currentChat(entry) && conversationIdentity(selectedSession()) === identity;
+  const top = el("div", "dialog-top"), title = el("h2", null, "여러 대화에 작업 보내기"); title.id = "batch-work-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), editor = el("div", "batch-editor"), preview = el("div", "batch-preview");
+  const note = el("p", "work-context-scope"); note.id = "batch-work-note"; note.setAttribute("role", "status");
+  editor.id = "batch-work-editor"; preview.id = "batch-work-preview";
+  const fields = []; let record = null, busy = false, reviewing = false;
+  const rows = () => allSessions().filter((row) => ["codex", "claude"].includes(row.agent) && row.id && row.cwd && !botRequestForNative(sourceOf(row)) && !row.stale);
+  const targetFor = (task) => {
+    const matches = rows().filter((row) => chatKey(sourceOf(row)) === chatKey(task.source));
+    const target = matches.length === 1 ? matches[0] : null;
+    return target && conversationIdentity(target) === task.identity && target.cwd === task.source.cwd ? target : null;
+  };
+  const newField = () => {
+    const wrapper = el("div", "batch-task"), target = el("select"), text = el("textarea");
+    target.setAttribute("aria-label", "작업을 보낼 대화"); text.setAttribute("aria-label", "보낼 작업 내용");
+    text.placeholder = "이 대화에 맡길 일을 적어 주세요"; text.rows = 3; text.maxLength = 8000;
+    const first = el("option", null, "대화 선택"); first.value = ""; target.append(first);
+    for (const row of rows()) {
+      const option = el("option", null, [row.title || "제목 없는 대화", row.hostLabel || row.host, AGENTS[row.agent] || row.agent].filter(Boolean).join(" · "));
+      option.value = conversationIdentity(row); target.append(option);
+    }
+    const remove = button("이 작업 지우기", "quiet", () => { if (fields.length <= 2) return; const index = fields.findIndex((field) => field.wrapper === wrapper); if (index >= 0) fields.splice(index, 1); wrapper.remove(); });
+    wrapper.append(target, text, remove); editor.append(wrapper); fields.push({ wrapper, target, text });
+  };
+  const labels = { ready: "전송 전", sending: "전송 중", accepted: "전달됨 · 응답 확인 전", answered: "응답 종료 · 결과 확인 필요", interrupted: "응답 중단 또는 실패 · 원문 확인", unknown: "전송 결과 확인 필요", rejected: "전송 거절됨", skipped: "확인 후 건너뜀" };
+  const request = async (path, extra = {}) => {
+    const result = await api(path, { method: "POST", body: { source: entry.source, ...extra }, authEpoch: epoch, csrfRetry: false });
+    if (valid()) record = result.record || null;
+    return result;
+  };
+  const control = async (action, requestId) => {
+    if (!valid() || busy) return;
+    busy = true; draw(); let failure = "";
+    try { await request("/api/batch/control", { action, ...(requestId ? { requestId } : {}) }); }
+    catch (error) { failure = error.message || "실행 상태를 확인하지 못했습니다."; }
+    finally { busy = false; if (valid()) { draw(); if (failure) note.textContent = failure; poll(); } }
+  };
+  const draw = () => {
+    const editing = !record, active = !!record?.running;
+    editor.hidden = !editing; preview.hidden = editing; add.hidden = review.hidden = !editing;
+    begin.hidden = !reviewing; back.hidden = !reviewing;
+    const unresolved = record?.tasks.some((task) => ["unknown", "sending"].includes(task.status));
+    const ready = record?.tasks.some((task) => task.status === "ready");
+    resume.hidden = editing || reviewing || active || !ready || unresolved;
+    stop.hidden = editing || reviewing || !active;
+    check.hidden = editing || reviewing || active || !record?.tasks.some((task) => ["unknown", "accepted"].includes(task.status));
+    clear.hidden = editing || reviewing || active || unresolved;
+    for (const item of [add, review, begin, back, resume, check, stop, clear]) item.disabled = busy;
+    if (record) {
+      preview.replaceChildren(...record.tasks.map((task) => {
+        const section = el("section", "batch-task");
+        section.append(el("strong", null, task.title), el("small", "work-context-scope", `${task.source.host} · ${task.source.agent} · ${task.source.cwd}`), el("p", "batch-task-text", task.text));
+        if (!reviewing) {
+          section.append(el("p", "work-context-scope", `${labels[task.status] || "상태 확인 필요"}${task.reason ? ` · ${task.reason}` : ""}`));
+          const open = button("대화 열기", "work-context-origin", () => { const target = targetFor(task); if (valid() && target) { closeSheet(dialog.id); select(target.key); } });
+          section.append(open);
+          if (task.status === "unknown" && !active) section.append(button("원문 확인 후 이 건 건너뛰기", "work-context-origin", () => control("skip", task.requestId)));
+        }
+        return section;
+      }));
+    }
+    note.textContent = reviewing ? "대상과 내용을 확인한 뒤 시작하세요. 서버가 쉬고 있는 대화에 차례로 전송합니다." :
+      editing ? "각 대화에 맡길 내용을 적어 주세요. 시작하면 작업 내용과 전송 상태가 서버에 저장되며 브라우저를 닫아도 계속됩니다." :
+      active ? "서버가 작업을 전달하고 있습니다. 브라우저를 닫아도 계속되며 중단을 누르면 남은 전송을 멈춥니다." :
+      unresolved ? "확인되지 않은 전송이 있어 나머지를 멈췄습니다. 결과를 확인해 주세요." :
+      ready ? "남은 작업은 직접 재개할 때 보냅니다." : "전달 결과입니다. 실제 작업의 진행과 완료는 각 대화에서 확인하세요.";
+  };
+  const add = button("작업 추가", "secondary", () => { if (fields.length < 8) newField(); else note.textContent = "한 번에 8개까지 보낼 수 있습니다."; }); add.id = "batch-work-add";
+  const review = button("실행 내용 확인", "secondary", () => {
+    if (!valid()) return;
+    const tasks = [], seen = new Set();
+    for (const field of fields) {
+      const matches = rows().filter((row) => conversationIdentity(row) === field.target.value), target = matches.length === 1 ? matches[0] : null;
+      const text = String(field.text.value || "").trim();
+      if (!target || !text || new TextEncoder().encode(text).length > 8000 || seen.has(field.target.value)) { note.textContent = "서로 다른 대화와 8KiB 이하의 작업 내용을 각각 선택해 주세요."; return; }
+      seen.add(field.target.value); tasks.push({ identity: field.target.value, source: { ...sourceOf(target), cwd: target.cwd }, title: target.title || "제목 없는 대화", text, requestId: requestId(), status: "ready" });
+    }
+    record = { id: requestId(), tasks }; reviewing = true; draw();
+  }); review.id = "batch-work-review";
+  const begin = button("모두 시작", "primary", async () => {
+    if (!valid() || busy || !record || !reviewing) return;
+    for (const task of record.tasks) {
+      const target = targetFor(task), local = target && state.chats.get(chatKey(sourceOf(target)));
+      if (!target || (local && (local.pending || local.sending || local.commandBusy || local.uploads || local.uploadQueue?.length || local.outbox?.length || local.composing || local.checking))) {
+        note.textContent = target ? "대상 대화에서 다른 입력이 진행 중입니다." : "대상 대화나 작업 폴더가 바뀌었습니다."; return;
+      }
+    }
+    busy = true; draw(); let failure = "";
+    try { await request("/api/batch/start", { record }); reviewing = false; }
+    catch (error) { failure = error.message || "시작 여부를 확인하지 못했습니다. 창을 다시 열어 확인하세요."; }
+    finally { busy = false; if (valid()) { draw(); if (failure) note.textContent = failure; poll(); } }
+  }); begin.id = "batch-work-start";
+  const back = button("수정하기", "quiet", () => { record = null; reviewing = false; draw(); }); back.id = "batch-work-back";
+  const resume = button("남은 작업 시작", "primary", () => control("resume")); resume.id = "batch-work-resume";
+  const stop = button("남은 전송 중단", "secondary", () => control("stop")); stop.id = "batch-work-stop";
+  const check = button("전송·응답 상태 확인", "secondary", async () => {
+    if (!valid() || busy) return; busy = true; draw(); let failure = "";
+    try { await request("/api/batch/check"); }
+    catch (error) { failure = error.message || "전송 결과를 확인하지 못했습니다."; }
+    finally { busy = false; if (valid()) { draw(); if (failure) note.textContent = failure; } }
+  }); check.id = "batch-work-check";
+  const clear = button("기록 지우고 새로 작성", "quiet", () => control("clear")); clear.id = "batch-work-clear";
+  body.append(note, editor, preview, add, review, begin, back, resume, check, stop, clear); dialog.append(top, body);
+  newField(); newField(); sheet(dialog.id).open();
+  const poll = () => {
+    if (!valid() || !(record?.running || record?.tasks.some((task) => task.status === "sending"))) return;
+    setTimeout(async () => {
+      if (!valid() || busy || !(record?.running || record?.tasks.some((task) => task.status === "sending"))) return;
+      try { await request("/api/batch/get"); if (valid()) { draw(); poll(); } }
+      catch { if (valid()) note.textContent = "서버의 실행 상태를 확인하지 못했습니다. 다시 열어 확인해 주세요."; }
+    }, 2000);
+  };
+  busy = true; draw();
+  request("/api/batch/get").then(() => { busy = false; if (valid()) { draw(); poll(); } })
+    .catch((error) => { busy = true; if (valid()) note.textContent = error.message || "서버의 실행 기록을 확인하지 못했습니다."; });
+}
+function openLegacyBatchWork(s, entry) {
+  if (!currentChat(entry) || conversationIdentity(selectedSession()) !== conversationIdentity(s)) return;
+  const identity = conversationIdentity(s), epoch = state.authEpoch, key = BATCH_PREFIX + encodeURIComponent(identity);
+  let dialog = $("batch-work-dialog");
+  if (!dialog) { dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "batch-work-dialog"; dialog.setAttribute("aria-labelledby", "batch-work-title"); document.body.append(dialog); }
+  dialog.id = "batch-work-dialog"; dialog.replaceChildren();
+  const nonce = dialog.batchNonce = (dialog.batchNonce || 0) + 1;
+  const valid = () => dialog.open && dialog.batchNonce === nonce && state.authenticated && epoch === state.authEpoch && currentChat(entry) &&
+    conversationIdentity(selectedSession()) === identity;
+  const top = el("div", "dialog-top"), title = el("h2", null, "여러 대화에 작업 보내기"); title.id = "batch-work-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), editor = el("div", "batch-editor"), preview = el("div", "batch-preview");
+  const note = el("p", "work-context-scope"); note.id = "batch-work-note"; note.setAttribute("role", "status");
+  editor.id = "batch-work-editor"; preview.id = "batch-work-preview";
+  const fields = []; let record = null, running = false, stopRequested = false;
+  const withLock = async (action) => {
+    if (!globalThis.navigator?.locks?.request) { note.textContent = "이 브라우저에서는 여러 창의 동시 실행을 확인할 수 없어 시작하지 않았습니다."; return; }
+    try {
+      return await navigator.locks.request(BATCH_PREFIX + "execution", { ifAvailable: true }, async (lock) => {
+        if (!lock) { if (valid()) note.textContent = "다른 창에서 작업을 전달 중입니다. 끝난 뒤 다시 확인해 주세요."; return; }
+        if (valid()) return action();
+      });
+    } catch { if (valid()) note.textContent = "동시 실행 상태를 확인하지 못했습니다. 각 대화의 결과를 확인해 주세요."; }
+  };
+  const rows = () => allSessions().filter((row) => ["codex", "claude"].includes(row.agent) && row.id && row.cwd &&
+    !botRequestForNative(sourceOf(row)) && !row.stale);
+  const read = () => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw || raw.length > 100000) return null;
+      const value = JSON.parse(raw), statuses = ["ready", "sending", "accepted", "answered", "interrupted", "unknown", "rejected", "skipped"];
+      if (value?.version !== 1 || value.owner !== identity || !/^[A-Za-z0-9_-]{8,100}$/.test(value.id || "") || !Number.isInteger(value.revision) || value.revision < 1 ||
+          !Number.isFinite(value.at) || value.at > Date.now() + 60000 || Date.now() - value.at > DRAFT_TTL ||
+          !Array.isArray(value.tasks) || value.tasks.length < 2 || value.tasks.length > 8 ||
+          value.tasks.some((item) => !item || typeof item.identity !== "string" || !item.source ||
+            typeof item.source.cwd !== "string" || typeof item.title !== "string" || typeof item.text !== "string" ||
+            !item.text.trim() || new TextEncoder().encode(item.text).length > 8000 ||
+            !/^[A-Za-z0-9_-]{8,100}$/.test(item.requestId || "") || !statuses.includes(item.status)) ||
+          new Set(value.tasks.map((task) => task.requestId)).size !== value.tasks.length ||
+          new Set(value.tasks.map((task) => task.identity)).size !== value.tasks.length) return null;
+      return value;
+    } catch { return null; }
+  };
+  const save = () => {
+    if (!state.authenticated || epoch !== state.authEpoch || !draftRecoveryEnabled()) return false;
+    try {
+      const raw = localStorage.getItem(key), existing = read();
+      if (raw && !existing) return false;
+      if (existing && (existing.id !== record.id || existing.revision !== record.revision) || !existing && record.revision !== 0) return false;
+      const next = { ...record, at: Date.now(), revision: record.revision + 1 };
+      localStorage.setItem(key, JSON.stringify(next));
+      const check = read();
+      if (!check || check.id !== next.id || check.revision !== next.revision) return false;
+      record = next; return true;
+    } catch { return false; }
+  };
+  const targetFor = (task) => {
+    const matches = rows().filter((row) => chatKey(sourceOf(row)) === chatKey(task.source));
+    const target = matches.length === 1 ? matches[0] : null;
+    return target && conversationIdentity(target) === task.identity && target.cwd === task.source.cwd &&
+      JSON.stringify(sourceOf(target)) === JSON.stringify(Object.fromEntries(Object.entries(task.source).filter(([name]) => name !== "cwd"))) ? target : null;
+  };
+  const newField = () => {
+    const wrapper = el("div", "batch-task"), target = el("select"), text = el("textarea");
+    target.setAttribute("aria-label", "작업을 보낼 대화"); text.setAttribute("aria-label", "보낼 작업 내용");
+    text.placeholder = "이 대화에 맡길 일을 적어 주세요"; text.rows = 3; text.maxLength = 8000;
+    const first = el("option", null, "대화 선택"); first.value = ""; target.append(first);
+    for (const row of rows()) {
+      const option = el("option", null, [row.title || "제목 없는 대화", row.hostLabel || row.host, AGENTS[row.agent] || row.agent].filter(Boolean).join(" · "));
+      option.value = conversationIdentity(row); target.append(option);
+    }
+    const remove = button("이 작업 지우기", "quiet", () => {
+      if (fields.length <= 2) return;
+      const index = fields.findIndex((field) => field.wrapper === wrapper); if (index >= 0) fields.splice(index, 1);
+      wrapper.remove();
+    });
+    wrapper.append(target, text, remove); editor.append(wrapper); fields.push({ wrapper, target, text });
+  };
+  const showEditor = () => {
+    editor.hidden = false; preview.hidden = true; add.hidden = review.hidden = false;
+    begin.hidden = back.hidden = resume.hidden = check.hidden = stop.hidden = clear.hidden = true;
+    note.textContent = "각 대화에 맡길 내용을 적어 주세요. 쉬고 있는 대화에만 보냅니다. 같은 폴더에서 동시 수정은 충돌할 수 있으며, 잠그면 이 기기의 실행 기록이 지워집니다.";
+  };
+  const statusText = { ready: "전송 전", sending: "전송 중", accepted: "전달됨 · 응답 확인 전", answered: "응답 종료 · 결과 확인 필요",
+    interrupted: "응답 중단 또는 실패 · 원문 확인", unknown: "전송 결과 확인 필요", rejected: "전송 거절됨", skipped: "확인 후 건너뜀 · 실제 전송 여부 별도 확인" };
+  const showRecord = (reviewing = false) => {
+    editor.hidden = true; preview.hidden = false; add.hidden = review.hidden = true;
+    preview.replaceChildren(...record.tasks.map((task) => {
+      const section = el("section", "batch-task");
+      section.append(el("strong", null, task.title), el("small", "work-context-scope", `${task.source.host} · ${task.source.agent} · ${task.source.cwd}`),
+        el("p", "batch-task-text", task.text));
+      if (!reviewing) {
+        section.append(el("p", "work-context-scope", `${statusText[task.status] || "상태 확인 필요"}${task.reason ? ` · ${task.reason}` : ""}`));
+        const open = button("대화 열기", "work-context-origin", () => {
+          const target = targetFor(task); if (!valid() || !target) return;
+          closeSheet(dialog.id); select(target.key);
+        });
+        open.disabled = running; section.append(open);
+        if (task.status === "unknown") {
+          const skip = button("원문 확인 후 이 건 건너뛰기", "work-context-origin", () => withLock(() => {
+            if (!valid() || running || task.status !== "unknown") return;
+            task.status = "skipped";
+            if (!save()) { task.status = "unknown"; note.textContent = "기록을 저장하지 못했습니다. 다시 확인해 주세요."; return; }
+            showRecord();
+          }));
+          skip.disabled = running; section.append(skip);
+        }
+      }
+      return section;
+    }));
+    const unknown = record.tasks.some((task) => ["unknown", "sending"].includes(task.status));
+    const ready = record.tasks.some((task) => task.status === "ready");
+    begin.hidden = !reviewing; back.hidden = !reviewing;
+    resume.hidden = reviewing || !ready || unknown || running;
+    check.hidden = reviewing || running || !record.tasks.some((task) => ["unknown", "sending", "accepted"].includes(task.status));
+    stop.hidden = reviewing || !running;
+    clear.hidden = reviewing || running || unknown;
+    note.textContent = reviewing ? "대상과 내용을 확인한 뒤 시작하세요. 쉬고 있는 대화에 순서대로 보내며 각 대화는 받은 뒤 작업합니다." :
+      running ? "작업을 전달하고 있습니다. 창을 닫거나 중단하면 아직 보내지 않은 작업부터 멈춥니다." :
+      unknown ? "확인되지 않은 전송이 있어 나머지를 멈췄습니다. 결과를 확인해 주세요." :
+      ready ? "남은 작업은 직접 재개할 때 보냅니다." : "전달 결과입니다. 실제 작업의 진행과 완료는 각 대화에서 확인하세요.";
+  };
+  const run = async () => {
+    if (!valid() || running || !record || record.tasks.some((task) => ["unknown", "sending"].includes(task.status))) return;
+    running = true; stopRequested = false; showRecord();
+    for (let index = 0; index < record.tasks.length; index++) {
+      if (!valid() || stopRequested) break;
+      let task = record.tasks[index];
+      if (task.status !== "ready") continue;
+      const target = targetFor(task), local = target && state.chats.get(chatKey(sourceOf(target)));
+      if (!target || (local && (local.pending || local.sending || local.commandBusy || local.uploads ||
+          local.uploadQueue?.length || local.outbox?.length || local.composing || local.checking))) {
+        task.status = "rejected"; task.reason = target ? "대상 대화에서 다른 입력이 진행 중입니다." : "대상 대화나 작업 폴더가 바뀌었습니다."; save(); break;
+      }
+      task.status = "sending";
+      if (!save()) { task.status = "ready"; note.textContent = "실행 기록을 저장하지 못해 전송하지 않았습니다."; break; }
+      task = record.tasks[index]; showRecord();
+      try {
+        const result = await api("/api/chat/send", { method: "POST", authEpoch: epoch, csrfRetry: false,
+          body: { source: task.source, requestId: task.requestId, text: task.text, attachments: [], requireIdle: true } });
+        if (!valid()) return;
+        task.status = ["accepted", "queued", "completed"].includes(result.status) && result.receipt?.confirmed === true ? "accepted" :
+          result.status === "failed" ? (result.receipt?.confirmed === true ? "interrupted" : "rejected") : "unknown";
+        task.reason = result.receipt?.reason || "";
+      } catch (error) {
+        if (!valid()) return;
+        task.status = error.dispatchState === "not_started" ? "rejected" : "unknown";
+        task.reason = error.message || "전송 결과를 확인하지 못했습니다.";
+      }
+      if (!save()) { task.status = "unknown"; note.textContent = "전송 결과를 저장하지 못했습니다. 각 대화에서 확인해 주세요."; break; }
+      showRecord();
+      if (task.status !== "accepted") break;
+    }
+    running = false; if (valid()) showRecord();
+  };
+  const add = button("작업 추가", "secondary", () => { if (fields.length < 8) newField(); else note.textContent = "한 번에 8개까지 보낼 수 있습니다."; });
+  add.id = "batch-work-add";
+  const review = button("실행 내용 확인", "secondary", () => {
+    if (!valid()) return;
+    const tasks = [], seen = new Set();
+    for (const field of fields) {
+      const matches = rows().filter((row) => conversationIdentity(row) === field.target.value), target = matches.length === 1 ? matches[0] : null;
+      const text = String(field.text.value || "").trim();
+      if (!target || !text || new TextEncoder().encode(text).length > 8000 || seen.has(field.target.value)) {
+        note.textContent = "서로 다른 대화와 8KiB 이하의 작업 내용을 각각 선택해 주세요."; return;
+      }
+      seen.add(field.target.value);
+      tasks.push({ identity: field.target.value, source: { ...sourceOf(target), cwd: target.cwd },
+        title: target.title || "제목 없는 대화", text, requestId: requestId(), status: "ready" });
+    }
+    record = { version: 1, owner: identity, id: requestId(), revision: 0, at: Date.now(), tasks };
+    showRecord(true);
+  });
+  review.id = "batch-work-review";
+  const begin = button("모두 시작", "primary", () => withLock(() => {
+    if (!valid() || running || !record || !draftRecoveryEnabled()) { note.textContent = "초안 보관을 켠 뒤 시작해 주세요."; return; }
+    if (!save()) { note.textContent = "실행 기록을 저장하지 못해 시작하지 않았습니다."; return; }
+    return run();
+  }));
+  begin.id = "batch-work-start";
+  const back = button("수정하기", "quiet", showEditor); back.id = "batch-work-back";
+  const resume = button("남은 작업 시작", "primary", () => withLock(run)); resume.id = "batch-work-resume";
+  const stop = button("남은 전송 중단", "secondary", () => { stopRequested = true; note.textContent = "현재 전송을 확인한 뒤 남은 작업을 멈춥니다."; });
+  stop.id = "batch-work-stop";
+  const check = button("전송·응답 상태 확인", "secondary", () => withLock(async () => {
+    if (!valid() || running || !record) return;
+    running = true; check.disabled = true; note.textContent = "전송 결과를 확인하고 있습니다…";
+    for (let index = 0; index < record.tasks.length; index++) {
+      const task = record.tasks[index];
+      if (!["unknown", "sending", "accepted"].includes(task.status)) continue;
+      if (!targetFor(task)) continue;
+      try {
+        const result = await api("/api/chat/state", { method: "POST", body: { source: task.source, requestId: task.requestId }, authEpoch: epoch });
+        if (!valid()) return;
+        const receipt = (result.receipts || []).find((item) => item.requestId === task.requestId);
+        if (receipt?.confirmed === true && receipt.status === "completed") task.status = "answered";
+        else if (receipt?.confirmed === true && ["interrupted", "failed"].includes(receipt.status)) task.status = "interrupted";
+        else if (receipt?.confirmed === true && ["accepted", "queued"].includes(receipt.status)) task.status = "accepted";
+      } catch { if (!valid()) return; }
+      if (!save()) break;
+    }
+    running = false; check.disabled = false; if (valid()) showRecord();
+  }));
+  check.id = "batch-work-check";
+  const clear = button("기록 지우고 새로 작성", "quiet", () => withLock(() => {
+    if (!valid() || running || record?.tasks.some((task) => ["unknown", "sending"].includes(task.status))) return;
+    try { localStorage.removeItem(key); } catch { note.textContent = "기록을 지우지 못했습니다."; return; }
+    record = null; showEditor();
+  }));
+  clear.id = "batch-work-clear";
+  body.append(note, editor, preview, add, review, begin, back, resume, check, stop, clear); dialog.append(top, body);
+  newField(); newField();
+  record = read();
+  if (record) {
+    for (const task of record.tasks) if (task.status === "sending") task.status = "unknown";
+    showRecord();
+  } else {
+    let hasInvalidRecord = false;
+    try { hasInvalidRecord = !!localStorage.getItem(key); } catch { /* no saved record */ }
+    if (hasInvalidRecord) {
+      editor.hidden = preview.hidden = add.hidden = review.hidden = begin.hidden = back.hidden = resume.hidden = check.hidden = stop.hidden = true;
+      clear.hidden = false;
+      note.textContent = "저장된 실행 기록을 읽지 못했습니다. 각 대화의 결과를 확인한 뒤 기록을 지울 수 있습니다.";
+    } else showEditor();
+  }
+  sheet(dialog.id).open();
+}
+function openConversationProfiles(s, entry) {
+  if (!currentChat(entry) || conversationIdentity(selectedSession()) !== conversationIdentity(s)) return;
+  const identity = conversationIdentity(s), epoch = state.authEpoch, cwd = s.cwd;
+  let dialog = $("conversation-profiles-dialog");
+  if (!dialog) { dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "conversation-profiles-dialog"; dialog.setAttribute("aria-labelledby", "conversation-profiles-title"); document.body.append(dialog); }
+  dialog.id = "conversation-profiles-dialog"; dialog.replaceChildren();
+  const nonce = dialog.profileNonce = (dialog.profileNonce || 0) + 1;
+  const valid = () => dialog.open && dialog.profileNonce === nonce && state.authenticated && state.authEpoch === epoch && currentChat(entry) &&
+    conversationIdentity(selectedSession()) === identity && selectedSession()?.cwd === cwd;
+  const top = el("div", "dialog-top"), title = el("h2", null, "모델·작업 프로필"); title.id = "conversation-profiles-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), saved = el("select"), name = el("input"), model = el("select"), effort = el("select");
+  saved.id = "conversation-profile-list"; saved.setAttribute("aria-label", "저장한 프로필");
+  name.id = "conversation-profile-name"; name.maxLength = 80; name.placeholder = "프로필 이름"; name.setAttribute("aria-label", "프로필 이름");
+  model.id = "conversation-profile-model"; model.setAttribute("aria-label", "모델");
+  effort.id = "conversation-profile-effort"; effort.setAttribute("aria-label", "에포트");
+  const note = el("p", "work-context-scope"); note.id = "conversation-profile-note"; note.setAttribute("role", "status");
+  const rawProfiles = prefs.get("conversationProfiles", []);
+  let profiles = Array.isArray(rawProfiles) ? rawProfiles.filter((row) => row && typeof row.name === "string" && row.name.length <= 80 &&
+    typeof row.host === "string" && typeof row.agent === "string" && typeof row.cwd === "string" &&
+    typeof row.model === "string" && typeof row.effort === "string").slice(0, 50) : [];
+  let models = [], busy = false, startRequest = null;
+  const accountHome = s.home || (s.agent === "claude" ? ".claude" : "");
+  const inScope = (row) => row.host === s.host && row.agent === s.agent && row.cwd === cwd && (!row.home || row.home === accountHome);
+  const scoped = () => profiles.filter(inScope);
+  const drawProfiles = (selectedName = "") => {
+    const first = el("option", null, "새 프로필"); first.value = "";
+    saved.replaceChildren(first, ...scoped().map((row) => { const option = el("option", null, row.name); option.value = row.name; return option; }));
+    saved.value = selectedName;
+  };
+  const drawEfforts = (chosen = "") => {
+    const found = models.find((row) => row.model === model.value), items = found?.efforts || [];
+    effort.replaceChildren(...items.map((value) => { const option = el("option", null, value); option.value = value; return option; }));
+    effort.value = items.includes(chosen) ? chosen : items.includes(found?.defaultEffort) ? found.defaultEffort : items[0] || "";
+  };
+  const save = button("프로필 저장", "secondary", () => {
+    if (!valid() || busy || !cwd) return;
+    const label = name.value.trim(), found = models.find((row) => row.model === model.value);
+    if (!label || !found?.efforts?.includes(effort.value)) { note.textContent = "이름과 지원되는 모델·에포트를 선택해 주세요."; return; }
+    if (profiles.some((row) => row.name === label && inScope(row))) {
+      note.textContent = "같은 이름이 있습니다. 기존 프로필을 삭제한 뒤 저장해 주세요."; return;
+    }
+    if (profiles.length >= 50) { note.textContent = "프로필은 50개까지 저장할 수 있습니다."; return; }
+    const next = [...profiles, { name: label, host: s.host, agent: s.agent, home: accountHome, cwd, model: model.value, effort: effort.value }];
+    prefs.set("conversationProfiles", next);
+    const stored = prefs.get("conversationProfiles", []);
+    if (!Array.isArray(stored) || !stored.some((row) => row.name === label && inScope(row))) {
+      note.textContent = "이 브라우저에 프로필을 저장하지 못했습니다."; return;
+    }
+    profiles = next; drawProfiles(label); note.textContent = "이 브라우저에 저장했습니다. 적용을 누르면 다음 입력부터 사용합니다.";
+  });
+  save.id = "conversation-profile-save"; save.disabled = true;
+  const remove = button("선택한 프로필 삭제", "quiet", () => {
+    if (!valid() || busy || !saved.value) return;
+    const label = saved.value, next = profiles.filter((row) => !(row.name === label && inScope(row)));
+    prefs.set("conversationProfiles", next);
+    const stored = prefs.get("conversationProfiles", []);
+    if (!Array.isArray(stored) || stored.some((row) => row.name === label && inScope(row))) {
+      note.textContent = "이 브라우저의 프로필을 삭제하지 못했습니다."; return;
+    }
+    profiles = next; drawProfiles(); note.textContent = "이 브라우저의 프로필을 삭제했습니다.";
+  });
+  remove.id = "conversation-profile-delete";
+  const apply = button("현재 대화에 적용", "primary", async () => {
+    if (!valid() || busy || !cwd) return;
+    const found = models.find((row) => row.model === model.value), chosenModel = model.value, chosenEffort = effort.value;
+    if (!found?.efforts?.includes(chosenEffort)) { note.textContent = "지원되는 모델과 에포트를 선택해 주세요."; return; }
+    busy = true; apply.disabled = save.disabled = true; note.textContent = "모델 설정을 적용하고 있습니다…";
+    const modelApplied = await executeChatCommand(entry, "model", chosenModel);
+    if (!valid()) return;
+    if (!modelApplied) { note.textContent = entry.error || "모델 설정을 적용하지 못했습니다."; busy = false; apply.disabled = save.disabled = false; return; }
+    const effortApplied = await executeChatCommand(entry, "effort", chosenEffort);
+    if (!valid()) return;
+    note.textContent = effortApplied ? "다음 메시지부터 선택한 모델과 에포트를 사용합니다." : `모델은 적용했지만 에포트는 확인하지 못했습니다. ${entry.error || "다시 확인해 주세요."}`;
+    busy = false; apply.disabled = save.disabled = false;
+  });
+  apply.id = "conversation-profile-apply"; apply.disabled = true;
+  const prompt = el("textarea"); prompt.id = "conversation-profile-prompt"; prompt.rows = 3; prompt.maxLength = 8000;
+  prompt.placeholder = "새 대화에서 시작할 작업"; prompt.setAttribute("aria-label", "새 대화에서 시작할 작업");
+  const start = button("이 설정으로 새 대화 시작", "secondary", async () => {
+    if (!valid() || busy || !cwd) return;
+    const chosenModel = model.value, chosenEffort = effort.value, text = String(prompt.value || "").trim();
+    if (!models.find((row) => row.model === chosenModel)?.efforts?.includes(chosenEffort) || !text || new TextEncoder().encode(text).length > 8000) {
+      note.textContent = "지원되는 모델·에포트와 새 대화에서 시작할 작업을 입력해 주세요."; return;
+    }
+    const signature = JSON.stringify([chosenModel, chosenEffort, text]);
+    if (startRequest && startRequest.signature !== signature) { note.textContent = "이전 실행의 결과를 먼저 확인해 주세요."; return; }
+    if (!startRequest) startRequest = { requestId: requestId(), signature };
+    busy = true; start.disabled = save.disabled = apply.disabled = true;
+    note.textContent = "새 대화를 시작하고 있습니다…";
+    try {
+      const result = await api("/api/chat/profile-session", { method: "POST", authEpoch: epoch, csrfRetry: false,
+        body: { source: entry.source, model: chosenModel, effort: chosenEffort, prompt: text, requestId: startRequest.requestId } });
+      if (!valid()) return;
+      if (result.status === "opened" && result.terminal) {
+        note.textContent = result.initialDelivery === "unknown" ? "터미널을 열었지만 첫 작업의 전달 여부는 확인되지 않았습니다. 터미널에서 확인해 주세요." : "새 대화 터미널을 열었습니다. 첫 작업의 진행 상태를 확인하세요.";
+        start.hidden = true;
+        const open = button("새 대화 터미널 열기", "primary", () => { closeSheet(dialog.id); openTerminal(result.terminal); });
+        body.append(open); refreshTerminals();
+      } else {
+        if (result.requestId) startRequest.requestId = result.requestId;
+        clearUnknown.hidden = false;
+        note.textContent = result.reason || "시작 여부를 확인하지 못했습니다. 터미널과 작업 목록을 확인해 주세요.";
+      }
+    } catch (error) {
+      if (error.dispatchState === "not_started") startRequest = null;
+      else clearUnknown.hidden = false;
+      if (valid()) note.textContent = error.message || "시작 여부를 확인하지 못했습니다. 터미널과 작업 목록을 확인해 주세요.";
+    }
+    finally { busy = false; if (valid()) { start.disabled = save.disabled = apply.disabled = false; } }
+  });
+  start.id = "conversation-profile-start"; start.disabled = true;
+  const clearUnknown = button("목록 확인 후 미확인 요청 정리", "quiet", async () => {
+    if (!valid() || busy || !startRequest) return;
+    busy = true; clearUnknown.disabled = true;
+    try {
+      await api("/api/chat/profile-clear", { method: "POST", authEpoch: epoch, csrfRetry: false,
+        body: { source: entry.source, requestId: startRequest.requestId } });
+      if (valid()) { startRequest = null; clearUnknown.hidden = true; note.textContent = "요청을 정리했습니다. 실제 시작 여부는 확인한 터미널과 작업 목록을 기준으로 해 주세요."; }
+    } catch (error) { if (valid()) note.textContent = error.message || "요청을 정리하지 못했습니다."; }
+    finally { busy = false; clearUnknown.disabled = false; }
+  });
+  clearUnknown.id = "conversation-profile-clear"; clearUnknown.hidden = true;
+  model.addEventListener("change", () => drawEfforts());
+  saved.addEventListener("change", () => {
+    const row = scoped().find((item) => item.name === saved.value);
+    if (!row) { name.value = ""; return; }
+    name.value = row.name;
+    if (!models.some((item) => item.model === row.model)) { note.textContent = "이 계정에서 저장된 모델을 확인하지 못했습니다."; return; }
+    model.value = row.model; drawEfforts(row.effort);
+    if (effort.value !== row.effort) note.textContent = "저장한 에포트를 지원하지 않아 선택지를 다시 확인해 주세요.";
+    else note.textContent = "적용하면 이 대화의 다음 메시지부터 사용합니다.";
+  });
+  body.append(el("p", "work-context-scope", `${s.hostLabel || s.host} · ${AGENTS[s.agent] || s.agent} · ${sessionAccountLabel(s)} · ${cwd || "작업 폴더 확인 필요"}. 프로필은 이 브라우저에 저장합니다.`), saved, name, model, effort, note, save, apply, remove,
+    el("p", "work-context-scope", "새 대화는 위 기기·계정·폴더와 설정으로 열고 입력한 작업을 바로 시작합니다."), prompt, start, clearUnknown);
+  dialog.append(top, body); sheet(dialog.id).open(); drawProfiles();
+  if (!cwd) { note.textContent = "작업 폴더를 확인한 뒤 사용해 주세요."; return; }
+  note.textContent = "현재 계정의 모델 선택지를 확인하고 있습니다…";
+  api("/api/chat/command", { method: "POST", body: { source: entry.source, command: "models" }, authEpoch: epoch }).then((result) => {
+    if (!valid()) return;
+    models = (Array.isArray(result.models) ? result.models : []).filter((row) => row && typeof row.model === "string" && Array.isArray(row.efforts) && row.efforts.length);
+    model.replaceChildren(...models.map((row) => { const option = el("option", null, row.label || row.model); option.value = row.model; return option; }));
+    const current = result.next?.model ? result.next : result.current || {};
+    model.value = models.some((row) => row.model === current.model) ? current.model : models[0]?.model || "";
+    drawEfforts(current.effort); save.disabled = apply.disabled = start.disabled = !models.length;
+    note.textContent = models.length ? "선택한 모델과 에포트를 저장하거나 현재 대화에 적용하세요." : "지원되는 모델·에포트를 확인하지 못했습니다.";
+  }).catch((error) => { if (valid()) note.textContent = error.message || "모델을 확인하지 못했습니다."; });
+}
+function openConversationFork(s, entry) {
+  if (!["codex", "claude"].includes(s.agent) || !currentChat(entry) || conversationIdentity(selectedSession()) !== conversationIdentity(s)) return;
+  const identity = conversationIdentity(s), epoch = state.authEpoch;
+  let dialog = $("conversation-fork-dialog");
+  if (!dialog) { dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "conversation-fork-dialog"; dialog.setAttribute("aria-labelledby", "conversation-fork-title"); document.body.append(dialog); }
+  dialog.id = "conversation-fork-dialog"; dialog.replaceChildren();
+  const nonce = dialog.forkNonce = (dialog.forkNonce || 0) + 1;
+  const valid = () => dialog.open && dialog.forkNonce === nonce && state.authenticated && epoch === state.authEpoch && currentChat(entry) &&
+    conversationIdentity(selectedSession()) === identity;
+  const top = el("div", "dialog-top"), title = el("h2", null, "대화 분기"); title.id = "conversation-fork-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), points = el("select"), note = el("p", "work-context-scope");
+  points.id = "conversation-fork-point"; points.setAttribute("aria-label", "분기할 대화 지점");
+  const latest = el("option", null, "현재까지의 대화"); latest.value = ""; points.append(latest);
+  const completed = new Set((entry.data?.turns || []).filter((turn) => turn.status === "completed" && typeof turn.id === "string").map((turn) => turn.id));
+  const messages = entry.conversation?.identity === identity && entry.conversation.authEpoch === epoch ? entry.conversation.messages : [];
+  const shown = new Set();
+  for (const message of s.agent === "codex" ? [...messages].reverse() : []) {
+    if (message.role !== "assistant" || !completed.has(message.turnId) || shown.has(message.turnId)) continue;
+    shown.add(message.turnId);
+    const label = String(message.text || "완료된 답변").replace(/\s+/g, " ").slice(0, 100);
+    const option = el("option", null, `이 답변까지 · ${label}`); option.value = message.turnId; points.append(option);
+    if (shown.size >= 20) break;
+  }
+  const pending = entry.commandRequest?.command === "fork" && entry.commandRequest.status !== "applied" ? entry.commandRequest : null;
+  if (pending?.value && !shown.has(pending.value)) { const option = el("option", null, "이전 분기 요청 지점"); option.value = pending.value; points.append(option); }
+  points.value = pending?.value || ""; points.disabled = !!pending;
+  points.hidden = s.agent === "claude";
+  note.id = "conversation-fork-note"; note.setAttribute("role", "status");
+  note.textContent = pending ? "이전에 요청한 분기의 결과를 확인합니다." : s.agent === "claude"
+    ? "현재까지의 대화를 같은 기기의 새 터미널에서 엽니다. 첫 메시지 뒤 새 대화가 저장되며 파일은 복사되지 않습니다."
+    : "같은 기기와 작업 폴더에서 선택한 대화까지 복제합니다. 파일은 복사되지 않으며 원본 작업이 끝나 있어야 합니다.";
+  const clearUnknown = button("목록 확인 후 요청 정리", "quiet", () => {
+    if (!valid() || entry.commandBusy || entry.commandRequest?.command !== "fork" || entry.commandRequest.status !== "unknown") return;
+    entry.commandRequest = null; entry.error = entry.inputError = ""; entry.notice = "";
+    persistChatDraft(entry); closeSheet(dialog.id);
+    toast("분기 요청을 정리했습니다. 실제 생성 여부는 세션 목록에서 확인해 주세요.");
+  });
+  clearUnknown.id = "conversation-fork-clear"; clearUnknown.hidden = !pending;
+  const submit = button(pending ? "분기 결과 확인" : "분기 만들기", "primary", async () => {
+    if (!valid() || submit.disabled) return;
+    const value = points.value || null;
+    submit.disabled = true; note.textContent = "분기 결과를 확인하고 있습니다…";
+    const result = await executeChatCommand(entry, "fork", value, { returnResult: true });
+    if (!valid()) return;
+    if (result?.status === "opened" && result.terminal) {
+      note.textContent = result.reason || "분기 터미널을 열었습니다.";
+      submit.hidden = true; clearUnknown.hidden = true;
+      const open = button("분기 터미널 열기", "primary", () => { closeSheet(dialog.id); openTerminal(result.terminal); });
+      body.append(open);
+    } else if (result?.status === "created" && result.id) {
+      note.textContent = `새 대화를 만들었습니다. 세션 목록을 새로고침해 확인하세요. (${result.id})`;
+      submit.hidden = true; clearUnknown.hidden = true; points.disabled = true;
+    } else {
+      note.textContent = entry.error || "분기 결과를 확인하지 못했습니다.";
+      if (entry.commandRequest?.command === "fork" && entry.commandRequest.status === "unknown") {
+        points.disabled = true; submit.textContent = "분기 결과 확인"; clearUnknown.hidden = false;
+      }
+      submit.disabled = false;
+    }
+  });
+  submit.id = "conversation-fork-submit";
+  body.append(el("p", null, `${s.title || "현재 대화"} · ${s.hostLabel || s.host} · ${sessionAccountLabel(s)}`), points, note, submit, clearUnknown);
+  dialog.append(top, body); sheet(dialog.id).open();
+}
+function openChatCapabilities(s, entry) {
+  if (!currentChat(entry) || conversationIdentity(selectedSession()) !== conversationIdentity(s)) return;
+  const data = entry.data, exact = data && chatKey(data.route || {}) === chatKey(entry.source);
+  const lines = !exact ? ["현재 대화의 기능을 아직 확인하지 못했습니다."] : [
+    `대화 읽기: ${chatReadSupported(entry) ? "확인됨" : "확인 필요"}`,
+    `메시지 전송: ${chatSupported(entry, s) ? "가능" : chatCanConnect(entry, s) ? "연결 후 가능" : "현재 확인 필요"}`,
+    `첨부: ${data.capability?.attachments === true ? "지원 확인" : data.capability?.attachments === false ? "지원하지 않음" : "확인 필요"}`,
+    `연결 상태: ${s.stale || data.stale || networkOffline() ? "최신 상태 확인 필요" : "현재 상태 기준"}`,
+    "대화 분기: Codex는 완료된 지점, Claude는 현재까지의 대화를 분기할 수 있습니다.",
+  ];
+  openActionSheet({ title: "이 대화에서 가능한 기능", preview: lines.join("\n"), actions: [{ label: "닫기", run: () => {} }] });
+}
+function openTaskPlan(s, entry, input) {
+  if (!currentChat(entry) || entry.composing || draftIsPending(entry) || input.disabled || input.readOnly) return;
+  const identity = conversationIdentity(s), epoch = state.authEpoch, editor = entry.editorEpoch, revision = entry.revision;
+  let dialog = $("task-plan-dialog");
+  if (!dialog) { dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "task-plan-dialog"; dialog.setAttribute("aria-labelledby", "task-plan-title"); document.body.append(dialog); }
+  dialog.id = "task-plan-dialog"; dialog.replaceChildren();
+  const valid = () => dialog.open && state.authenticated && epoch === state.authEpoch && currentChat(entry) &&
+    conversationIdentity(selectedSession()) === identity && entry.editorEpoch === editor && entry.revision === revision &&
+    $("chat-input") === input && !input.disabled && !input.readOnly && !entry.composing && !draftIsPending(entry);
+  const top = el("div", "dialog-top"), title = el("h2", null, "목표를 작업으로 나누기");
+  title.id = "task-plan-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), goal = el("textarea"), preview = el("pre", "reference-preview");
+  goal.id = "task-plan-goal"; goal.rows = 4; goal.maxLength = 4000; goal.setAttribute("aria-label", "나눌 목표");
+  preview.id = "task-plan-preview";
+  const notice = el("p", "work-context-scope", "이 대화에 작업 제안을 요청할 초안을 만듭니다. 제안을 검토한 뒤 각 대상 대화에서 참조해 수동으로 전달하세요.");
+  const build = () => String(goal.value || "").trim() ? `다음 목표를 실행 가능한 작업으로 나누어 제안해 주세요. 각 작업의 목적, 필요한 맥락, 의존 관계와 완료 기준을 적고, 병렬 수행 가능 여부와 미확인 사항을 구분해 주세요. 제안을 검토하기 전에는 다른 에이전트를 실행하거나 작업을 보내지 마세요.\n\n목표:\n${goal.value.trim()}` : "";
+  const add = button("초안에 넣기", "primary", () => {
+    const text = build();
+    if (!valid() || !text) { notice.textContent = "목표와 현재 초안 상태를 다시 확인해 주세요."; return; }
+    const start = input.selectionStart ?? input.value.length, end = input.selectionEnd ?? start;
+    const before = input.value.slice(0, start), after = input.value.slice(end);
+    const addition = `${before && !before.endsWith("\n") ? "\n\n" : ""}${text}${after && !after.startsWith("\n") ? "\n\n" : ""}`;
+    if (new TextEncoder().encode(before + addition + after).length > 32768) { notice.textContent = "초안은 32KiB를 넘을 수 없습니다."; return; }
+    closeSheet(dialog.id); insertChatText(entry, input, addition, { warm: false });
+  });
+  add.id = "task-plan-add"; add.disabled = true;
+  goal.addEventListener("input", () => { preview.textContent = build(); add.disabled = !preview.textContent; });
+  body.append(notice, goal, preview, add); dialog.append(top, body); sheet(dialog.id).open(); goal.focus?.({ preventScroll: true });
+}
+function openResults(s, entry) {
+  const context = window.SessionholicContext, list = $("messages"), identity = conversationIdentity(s), epoch = state.authEpoch;
+  if (!context || !currentChat(entry) || list?.conversationSource !== chatKey(entry.source)) return;
+  const messages = (list.conversationRows || []).map((item) => item.message);
+  const items = context.collectEvidence(messages);
+  let dialog = $("results-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog results-dialog"); dialog.id = "results-dialog";
+    dialog.setAttribute("aria-labelledby", "results-title"); document.body.append(dialog);
+  }
+  dialog.id = "results-dialog"; dialog.replaceChildren();
+  const valid = () => state.authenticated && epoch === state.authEpoch && currentChat(entry) &&
+    conversationIdentity(selectedSession()) === identity && $("messages")?.conversationSource === chatKey(entry.source);
+  const top = el("div", "dialog-top"), title = el("h2", null, "결과물·검증"); title.id = "results-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id, "detail-session-menu")));
+  const body = el("div", "results-body");
+  const scope = entry.conversation?.identity === identity && entry.conversation.authEpoch === epoch ? entry.conversation : {};
+  body.append(el("p", "work-context-scope", `불러온 대화의 답변에서 발췌했습니다. 파일 존재와 검증 성공은 별도 확인이 필요합니다.${scope.olderOmitted ? " 이전 대화 일부 제외." : ""}${scope.stale || s.stale ? " 최신 내용 미확인." : ""}`));
+  if (!items.length) body.append(el("p", "work-context-empty", "불러온 답변에 명시된 결과물이나 검증 기록이 없습니다."));
+  for (const item of items) {
+    const section = el("section", "results-item"), message = messages[item.index];
+    section.append(el("strong", null, item.excerpt.ts ? `답변 · ${new Date(item.excerpt.ts * 1000).toLocaleString("ko-KR")}` : `답변 ${item.index + 1}`));
+    for (const artifact of item.artifacts) {
+      if (artifact.type === "link") {
+        const link = el("a", "work-context-origin", artifact.label); link.href = artifact.target;
+        link.target = "_blank"; link.rel = "noopener noreferrer"; section.append(link);
+      } else section.append(el("span", "results-file", artifact.label));
+      section.append(button("이 결과를 초안에 참조", "work-context-origin", () => {
+        const input = $("chat-input");
+        if (!valid() || !input || input.disabled || input.readOnly || entry.composing || draftIsPending(entry)) return;
+        const ref = context.referenceText({ title: s.title, host: s.hostLabel || s.host,
+          agent: AGENTS[s.agent] || s.agent, account: sessionAccountLabel(s) },
+        { label: "답변에 명시된 결과물", text: artifact.target }, { stale: !!scope.stale || !!s.stale });
+        const start = input.selectionStart ?? input.value.length, end = input.selectionEnd ?? start;
+        const before = input.value.slice(0, start), after = input.value.slice(end);
+        const text = `${before && !before.endsWith("\n") ? "\n\n" : ""}${ref}${after && !after.startsWith("\n") ? "\n\n" : ""}`;
+        if (new TextEncoder().encode(before + text + after).length > 32768) { toast("초안과 참조를 합쳐 32KiB를 넘을 수 없습니다."); return; }
+        closeSheet(dialog.id); insertChatText(entry, input, text, { warm: false });
+      }));
+    }
+    if (item.verification) section.append(el("p", "work-context-verification", `답변의 검증 기록\n${item.verification}`));
+    section.append(button("원문 위치", "work-context-origin", () => {
+      if (!valid()) return;
+      closeSheet(dialog.id); openContextExcerpt(s, entry, item.excerpt, message);
+    }));
+    body.append(section);
+  }
+  dialog.append(top, body); sheet(dialog.id).open();
+}
+// Use the board's existing revisioned goal store; grouping never starts a session.
+function openWorkGroup(s) {
+  if (!s || !state.authenticated || !["codex", "claude"].includes(s.agent)) return;
+  const epoch = state.authEpoch, identity = conversationIdentity(s);
+  let dialog = $("work-group-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog work-group-dialog"); dialog.id = "work-group-dialog";
+    dialog.setAttribute("aria-labelledby", "work-group-title"); document.body.append(dialog);
+  }
+  dialog.id = "work-group-dialog";
+  const nonce = dialog.groupNonce = (dialog.groupNonce || 0) + 1;
+  const valid = () => dialog.open && dialog.groupNonce === nonce && state.authenticated && state.authEpoch === epoch &&
+    allSessions().filter((row) => conversationIdentity(row) === identity).length === 1;
+  dialog.replaceChildren();
+  const top = el("div", "dialog-top"), title = el("h2", null, "같은 일에 묶기"); title.id = "work-group-title";
+  top.append(title, button("닫기", "text-button", () => closeSheet(dialog.id)));
+  const body = el("div", "reference-body"), picker = el("select"), name = el("input"), list = el("div", "reference-list");
+  picker.id = "work-group-picker"; picker.setAttribute("aria-label", "작업 선택");
+  name.id = "work-group-name"; name.placeholder = "새 작업 이름"; name.maxLength = 160; name.setAttribute("aria-label", "새 작업 이름");
+  list.id = "work-group-sessions";
+  const note = el("p", "work-context-scope", "세션을 연결할 뿐 새 실행을 시작하거나 메시지를 보내지 않습니다.");
+  note.id = "work-group-note"; note.setAttribute("role", "status");
+  const details = el("details", "reference-handoff"), fields = el("div", "reference-body"), values = {};
+  details.append(el("summary", null, "작업 내용과 확인 기록"));
+  for (const [key, label, limit] of [["current", "현재 상황", 2000], ["next", "다음 할 일·나눈 작업", 2000],
+    ["completionCriteria", "완료 조건", 8000], ["evidence", "직접 확인한 근거", 8000], ["waitingReason", "대기 이유", 2000]]) {
+    const wrapper = el("label", "delegation-field"), field = el("textarea");
+    field.id = `work-group-${key}`; field.rows = 2; field.maxLength = limit;
+    wrapper.append(el("span", null, label), field); fields.append(wrapper); values[key] = field;
+  }
+  const status = el("select"); status.id = "work-group-status"; status.setAttribute("aria-label", "작업 상태");
+  for (const [value, label] of [["todo", "할 일"], ["in_progress", "진행 중"], ["waiting", "대기"], ["review", "확인 필요"], ["done", "직접 확인 후 완료"]]) {
+    const option = el("option", null, label); option.value = value; status.append(option);
+  }
+  fields.append(status, el("p", "work-context-scope", "답변과 검증 기록은 자동으로 완료 처리하지 않습니다. 완료는 조건과 직접 확인한 근거를 적고 선택하세요."));
+  details.append(fields);
+  const refOf = (row) => ({ host: row.host, agent: row.agent, id: row.id || row.sessionId,
+    home: row.home || (row.agent === "claude" ? ".claude" : ".codex") });
+  const keyOf = (ref) => JSON.stringify([ref.host, ref.agent, ref.home || (ref.agent === "claude" ? ".claude" : ".codex"), ref.id]);
+  const selected = new Map([[keyOf(refOf(s)), { ref: refOf(s), identity }]]);
+  let goals = [], busy = false, uncertain = false;
+  const groupResults = el("details", "group-results"), groupResultList = el("div", "group-results-list");
+  const groupResultNote = el("p", "work-context-scope", "연결된 대화의 답변에서 결과물과 검증 기록을 찾아 보여줍니다.");
+  groupResultNote.setAttribute("role", "status"); groupResultList.id = "group-results-list";
+  let groupResultRun = 0;
+  const loadGroupResults = button("연결된 대화의 결과 불러오기", "secondary", async () => {
+    const goal = goals.find((item) => item.id === picker.value), run = ++groupResultRun;
+    if (!valid() || !goal) return;
+    const current = () => valid() && run === groupResultRun && picker.value === goal.id;
+    groupResultList.replaceChildren(); loadGroupResults.disabled = true;
+    for (const ref of goal.sessions) {
+      if (!current()) return;
+      const matches = allSessions().filter((row) => keyOf(refOf(row)) === keyOf(ref));
+      const target = matches.length === 1 ? matches[0] : null;
+      const section = el("section", "results-item");
+      section.append(el("strong", null, target?.title || `${ref.host} · ${ref.agent} · ${ref.id}`));
+      groupResultList.append(section);
+      if (!target || target.agent === "claude" && target.id && target.sessionId && target.id !== target.sessionId) {
+        section.append(el("p", "work-context-scope", "대화 식별을 확인하지 못해 결과를 읽지 않았습니다.")); continue;
+      }
+      const targetIdentity = conversationIdentity(target), currentTarget = () => {
+        const latest = allSessions().filter((row) => keyOf(refOf(row)) === keyOf(ref));
+        return current() && latest.length === 1 && conversationIdentity(latest[0]) === targetIdentity;
+      };
+      section.append(el("small", "work-context-scope", [target.hostLabel || target.host, AGENTS[target.agent] || target.agent, sessionAccountLabel(target)].filter(Boolean).join(" · ")));
+      groupResultNote.textContent = `${target.title || "연결된 대화"}의 결과를 읽는 중…`;
+      try {
+        if (networkOffline()) throw new Error("연결이 끊겨 결과를 읽지 못했습니다.");
+        const source = sourceOf(target), params = new URLSearchParams({ ...source, id: target.agent === "claude" ? target.sessionId || target.id : target.id });
+        const data = await api(`/api/read?${params}`, { authEpoch: epoch });
+        if (!current()) return;
+        if (!currentTarget()) { section.append(el("p", "work-context-scope", "대화 식별이 바뀌어 결과를 표시하지 않았습니다.")); continue; }
+        if (data.error || !Array.isArray(data.messages)) throw new Error(data.error || "대화를 읽지 못했습니다.");
+        const results = window.SessionholicContext?.collectEvidence(data.messages) || [];
+        section.append(el("p", "work-context-scope", `답변에서 발췌 · 파일 존재와 검증 성공은 별도 확인${data.stale || target.stale ? " · 최신 내용 미확인" : ""}${data.olderOmitted ? " · 이전 대화 일부 제외" : ""}`));
+        if (!results.length) section.append(el("p", "work-context-empty", "읽은 답변에 결과물이나 검증 기록이 없습니다."));
+        for (const item of results) {
+          if (item.excerpt.ts) section.append(el("small", "work-context-scope", `답변 · ${new Date(item.excerpt.ts * 1000).toLocaleString("ko-KR")}`));
+          for (const artifact of item.artifacts) {
+            if (artifact.type === "link") {
+              const link = el("a", "work-context-origin", artifact.label); link.href = artifact.target; link.target = "_blank"; link.rel = "noopener noreferrer"; section.append(link);
+            } else section.append(el("span", "results-file", artifact.label));
+          }
+          if (item.verification) section.append(el("p", "work-context-verification", `답변의 검증 기록\n${item.verification}`));
+        }
+        section.append(button("원문 대화 열기", "work-context-origin", () => {
+          if (!currentTarget()) return;
+          closeSheet(dialog.id); select(target.key);
+        }));
+      } catch (error) {
+        if (!current()) return;
+        section.append(el("p", "work-context-scope", error.message || "결과를 읽지 못했습니다."));
+      }
+    }
+    if (current()) { groupResultNote.textContent = "각 대화의 답변에서 발췌했습니다. 작업 완료 여부는 원문에서 확인하세요."; loadGroupResults.disabled = false; loadGroupResults.textContent = "결과 다시 불러오기"; }
+  });
+  loadGroupResults.id = "group-results-load";
+  groupResults.append(el("summary", null, "연결된 대화의 결과물·검증"), groupResultNote, loadGroupResults, groupResultList);
+  const save = button("묶기", "primary", async () => {
+    if (!valid() || busy || uncertain) return;
+    const goal = goals.find((item) => item.id === picker.value), titleText = String(name.value || "").trim();
+    if (!goal && !titleText) { note.textContent = "새 작업 이름을 입력해 주세요."; return; }
+    if (status.value === "done" && (!values.completionCriteria.value.trim() || !values.evidence.value.trim())) {
+      note.textContent = "완료 조건과 직접 확인한 근거를 입력해 주세요."; return;
+    }
+    if (status.value === "waiting" && !values.waitingReason.value.trim()) { note.textContent = "대기 이유를 입력해 주세요."; return; }
+    const refs = new Map((goal?.sessions || []).map((ref) => [keyOf(ref), ref]));
+    for (const [key, item] of selected) refs.set(key, refs.get(key) || item.ref);
+    if (refs.size < 2) { note.textContent = "함께 묶을 다른 세션을 하나 이상 선택해 주세요."; return; }
+    if (refs.size > 64) { note.textContent = "한 작업에는 세션을 64개까지 연결할 수 있습니다."; return; }
+    for (const [key, item] of selected) {
+      const rows = allSessions().filter((row) => keyOf(refOf(row)) === key);
+      if (rows.length !== 1 || conversationIdentity(rows[0]) !== item.identity ||
+          (rows[0].agent === "claude" && rows[0].id && rows[0].sessionId && rows[0].id !== rows[0].sessionId)) {
+        note.textContent = "선택한 세션의 식별자가 바뀌었거나 중복됩니다. 다시 열어 확인해 주세요."; return;
+      }
+    }
+    busy = true; save.disabled = true; note.textContent = "작업 연결을 저장하고 있습니다…";
+    const payload = { ...(goal ? { revision: goal.revision } : { title: titleText }), sessions: [...refs.values()],
+      status: status.value || "todo", ...Object.fromEntries(Object.entries(values).map(([key, field]) => [key, field.value.trim()])),
+      actor: { type: "user", label: "사용자" }, reason: goal ? "같은 일에 세션 연결" : "같은 일에 세션 묶기" };
+    try {
+      const result = await api(goal ? `/api/goals/${encodeURIComponent(goal.id)}` : "/api/goals", { method: "POST", body: payload, authEpoch: epoch, csrfRetry: false });
+      if (!valid()) return;
+      if (!result?.goal?.id) throw new Error("저장 결과를 확인하지 못했습니다.");
+      closeSheet(dialog.id); toast("세션을 같은 일에 묶었습니다.");
+    } catch (error) {
+      if (!valid()) return;
+      uncertain = !error.status || error.status >= 500;
+      note.textContent = uncertain ? "저장 결과를 확인하지 못했습니다. 다시 열어 기존 작업 목록을 확인해 주세요." : error.message || "작업을 저장하지 못했습니다.";
+    } finally { busy = false; if (valid()) save.disabled = uncertain; }
+  });
+  save.id = "work-group-save"; save.disabled = true;
+  const drawSessions = () => {
+    const goal = goals.find((item) => item.id === picker.value);
+    groupResultRun++; groupResults.hidden = !goal; groupResultList.replaceChildren(); loadGroupResults.disabled = false;
+    groupResultNote.textContent = "연결된 대화의 답변에서 결과물과 검증 기록을 찾아 보여줍니다.";
+    name.hidden = !!goal;
+    for (const [key, field] of Object.entries(values)) field.value = goal?.[key] || "";
+    status.value = goal?.status || "todo";
+    list.replaceChildren();
+    for (const row of allSessions().filter((item) => ["codex", "claude"].includes(item.agent) && !botRequestForNative(sourceOf(item))).slice(0, 100)) {
+      const ref = refOf(row), key = keyOf(ref), label = el("label", "work-group-option"), check = el("input");
+      check.type = "checkbox"; check.checked = selected.has(key) || !!goal?.sessions?.some((item) => keyOf(item) === key);
+      check.disabled = key === keyOf(refOf(s)) || !!goal?.sessions?.some((item) => keyOf(item) === key);
+      check.addEventListener("change", () => { if (check.checked) selected.set(key, { ref, identity: conversationIdentity(row) }); else selected.delete(key); });
+      const copy = el("span"); copy.append(el("strong", null, row.title || "제목 없는 대화"),
+        el("small", null, [row.hostLabel || row.host, AGENTS[row.agent] || row.agent, sessionAccountLabel(row)].filter(Boolean).join(" · ")));
+      label.append(check, copy); list.append(label);
+    }
+  };
+  picker.addEventListener("change", drawSessions);
+  groupResults.hidden = true;
+  body.append(note, picker, name, list, groupResults, details, save); dialog.append(top, body); sheet(dialog.id).open();
+  api("/api/goals", { authEpoch: epoch }).then((data) => {
+    if (!valid()) return;
+    if (!Array.isArray(data.goals)) throw new Error("작업 목록을 확인하지 못했습니다.");
+    goals = data.goals.filter((item) => item && !item.archived && typeof item.id === "string" && Array.isArray(item.sessions));
+    const first = el("option", null, "새 작업 만들기"); first.value = "";
+    picker.replaceChildren(first, ...goals.map((goal) => { const option = el("option", null, goal.title); option.value = goal.id; return option; }));
+    picker.value = ""; drawSessions(); save.disabled = false;
+  }).catch((error) => { if (valid()) note.textContent = error.message || "작업 목록을 읽지 못했습니다."; });
+}
 // Sends the editor's draft, or `message` ({ text, attachments }) when a
 // bubble resends what it showed; the editor is then left as it is.
+// A reference copies only an explicitly selected excerpt into the current draft.
+// It does not create, send to, or reconnect either conversation.
+function openReferencePicker(s, entry, input) {
+  const context = window.SessionholicContext;
+  if (!context || !currentChat(entry) || entry.composing || draftIsPending(entry) || input.disabled || input.readOnly) return;
+  const owner = conversationIdentity(s), epoch = state.authEpoch, editorEpoch = entry.editorEpoch, revision = entry.revision;
+  let dialog = $("reference-dialog");
+  if (!dialog) {
+    dialog = el("dialog", "plan-dialog reference-dialog"); dialog.id = "reference-dialog";
+    dialog.setAttribute("aria-labelledby", "reference-title"); document.body.append(dialog);
+  }
+  dialog.id = "reference-dialog";
+  const nonce = dialog.referenceNonce = (dialog.referenceNonce || 0) + 1;
+  const valid = () => dialog.referenceNonce === nonce && dialog.open && state.authenticated && epoch === state.authEpoch &&
+    entry.editorEpoch === editorEpoch && entry.revision === revision && !entry.composing && !draftIsPending(entry) &&
+    currentChat(entry) && conversationIdentity(selectedSession()) === owner && $("chat-input") === input && !input.disabled && !input.readOnly;
+  dialog.replaceChildren();
+  const top = el("div", "dialog-top"), title = el("h2", null, "대화 참조"); title.id = "reference-title";
+  const back = button("뒤로", "text-button", () => {
+    if (!valid()) return;
+    if (step === 2) { readRun++; selectedText = ""; choices.replaceChildren(); setStep(1); }
+    else if (step === 3) setStep(2);
+    note.focus?.({ preventScroll: true });
+  });
+  back.id = "reference-back";
+  top.append(back, title, button("닫기", "text-button", () => closeSheet(dialog.id, "chat-reference-inline")));
+  const body = el("div", "reference-body"), search = el("input");
+  search.id = "reference-search"; search.type = "search"; search.placeholder = "대화·기기·프로젝트 검색";
+  search.setAttribute("aria-label", "참조할 대화 검색");
+  const list = el("div", "reference-list"), choices = el("div", "reference-choices"), preview = el("pre", "reference-preview");
+  list.id = "reference-sessions"; choices.id = "reference-choices"; preview.id = "reference-preview";
+  const note = el("p", "work-context-scope");
+  note.id = "reference-note"; note.setAttribute("role", "status"); note.tabIndex = -1;
+  const handoff = el("details", "reference-handoff"), fields = el("div", "reference-body");
+  handoff.append(el("summary", null, "인계·작업 계획 덧붙이기"));
+  const handoffFields = [["목표", "reference-goal"], ["현재 상황", "reference-current"], ["다음 할 일", "reference-next"], ["완료 기준", "reference-criteria"]].map(([label, id]) => {
+    const wrapper = el("label", "delegation-field"), field = el("textarea");
+    field.id = id; field.rows = 2; field.maxLength = 2000; wrapper.append(el("span", null, label), field); fields.append(wrapper); return [label, field];
+  });
+  fields.append(el("p", "work-context-scope", "받을 대화에서 열어 작성하세요. 업무를 나누어 적고 이 대화에 수동으로 전달할 수 있습니다. 새 대화에서 사용하면 원본 복제가 아닌 발췌 인계입니다."));
+  handoff.append(fields);
+  const prepared = () => {
+    const extra = handoffFields.map(([label, field]) => [label, String(field.value || "").trim()]).filter(([, value]) => value);
+    return [selectedText, extra.length ? `[인계]\n${extra.map(([label, value]) => `${label}: ${value}`).join("\n")}\n[/인계]` : ""].filter(Boolean).join("\n\n");
+  };
+  const add = button("초안에 넣기", "primary", () => {
+    if (!valid() || !selectedText || !selectedCurrent()) { note.textContent = "대화 또는 초안이 바뀌었습니다. 다시 열어 확인해 주세요."; return; }
+    const before = input.value.slice(0, input.selectionStart ?? input.value.length);
+    const after = input.value.slice(input.selectionEnd ?? input.value.length);
+    const text = `${before && !before.endsWith("\n") ? "\n\n" : ""}${prepared()}${after && !after.startsWith("\n") ? "\n\n" : ""}`;
+    if (new TextEncoder().encode(before + text + after).length > 32768) { note.textContent = "초안과 참조를 합쳐 32KiB를 넘을 수 없습니다."; return; }
+    closeSheet(dialog.id);
+    insertChatText(entry, input, text, { warm: false });
+    input.focus?.({ preventScroll: true });
+  });
+  add.id = "reference-add"; add.disabled = true;
+  let selectedText = "", readRun = 0, selectedCurrent = () => false, step = 1, sourceNote = "";
+  const setStep = (next) => {
+    step = next;
+    back.hidden = next === 1;
+    search.hidden = list.hidden = next !== 1;
+    choices.hidden = next !== 2;
+    preview.hidden = handoff.hidden = add.hidden = next !== 3;
+    note.textContent = next === 1 ? "1/3 · 가져올 대화를 선택하세요." : next === 2
+      ? (sourceNote || "2/3 · 가져올 내용을 선택하세요.")
+      : "3/3 · 입력창에 넣을 내용입니다. 보낼 때까지 수정할 수 있습니다.";
+  };
+  for (const [, field] of handoffFields) field.addEventListener("input", () => { preview.textContent = prepared(); });
+  const listSessions = () => {
+    const query = String(search.value || "").trim().toLocaleLowerCase();
+    const sessions = allSessions().filter((row) => ["codex", "claude"].includes(row.agent) &&
+      !botRequestForNative(sourceOf(row)) && [row.title, row.hostLabel, row.host, row.project, row.agent, sessionAccountLabel(row)]
+        .some((value) => String(value || "").toLocaleLowerCase().includes(query)))
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, 50);
+    list.replaceChildren(...sessions.map((target) => {
+      const option = button("", "reference-session", () => readTarget(target));
+      option.append(el("strong", null, target.title || "제목 없는 대화"),
+        el("small", null, [target.hostLabel || target.host, AGENTS[target.agent] || target.agent, sessionAccountLabel(target)].filter(Boolean).join(" · ")));
+      return option;
+    }));
+    if (!sessions.length) list.append(el("p", "work-context-scope", "조건에 맞는 대화가 없습니다."));
+  };
+  const readTarget = async (target) => {
+    if (!valid()) return;
+    const targetIdentity = conversationIdentity(target), run = ++readRun;
+    const targetCurrent = () => valid() && run === readRun && allSessions().filter((row) => conversationIdentity(row) === targetIdentity).length === 1;
+    selectedText = ""; add.disabled = true; preview.textContent = ""; choices.replaceChildren();
+    sourceNote = ""; setStep(2);
+    note.textContent = "선택한 대화를 읽는 중…";
+    note.focus?.({ preventScroll: true });
+    try {
+      const cached = state.chats.get(chatKey(sourceOf(target)))?.conversation;
+      let data;
+      if (networkOffline()) {
+        if (!cached || cached.authEpoch !== epoch || cached.identity !== targetIdentity) throw new Error("오프라인에서 저장된 대화를 찾지 못했습니다.");
+        data = { ...cached, stale: true };
+      } else {
+        const source = sourceOf(target);
+        const params = new URLSearchParams({ ...source, id: target.agent === "claude" ? target.sessionId || target.id : target.id });
+        data = await api(`/api/read?${params}`, { authEpoch: epoch });
+      }
+      if (!targetCurrent()) return;
+      if (data.error || !Array.isArray(data.messages)) throw new Error(data.error || "대화를 읽지 못했습니다.");
+      const scope = { olderOmitted: data.olderOmitted === true, stale: !!data.stale || !!target.stale || networkOffline() };
+      const options = context.referenceChoices(data.messages, scope);
+      sourceNote = `2/3 · ${target.title || "제목 없는 대화"} · 가져올 내용을 선택하세요.${scope.stale ? " 최신 내용 미확인." : ""}${scope.olderOmitted ? " 이전 대화 일부 제외." : ""}`;
+      note.textContent = sourceNote;
+      if (!options.length) { choices.append(el("p", "work-context-scope", "참조할 대화 내용이 없습니다.")); return; }
+      for (const option of options) {
+        const row = button("", "reference-choice", () => {
+          if (!targetCurrent()) return;
+          selectedText = context.referenceText({ title: target.title, host: target.hostLabel || target.host,
+            agent: AGENTS[target.agent] || target.agent, account: sessionAccountLabel(target) }, option, scope);
+          selectedCurrent = targetCurrent;
+          preview.textContent = prepared(); add.disabled = !selectedText; setStep(3); note.focus?.({ preventScroll: true });
+        });
+        row.append(el("strong", null, option.label), el("span", null, Array.from(option.text).slice(0, 100).join("")));
+        choices.append(row);
+      }
+    } catch (error) {
+      if (targetCurrent()) note.textContent = error.message || "대화를 읽지 못했습니다.";
+    }
+  };
+  search.addEventListener("input", () => {
+    readRun++; selectedText = ""; add.disabled = true; preview.textContent = ""; choices.replaceChildren();
+    note.textContent = "1/3 · 가져올 대화를 선택하세요.";
+    listSessions();
+  });
+  body.append(note, search, list, choices, preview, handoff, add); dialog.append(top, body);
+  setStep(1); listSessions(); sheet(dialog.id).open();
+  if (!mobileDevice()) search.focus?.({ preventScroll: true });
+}
 function openDelegation(s, entry) {
   const identity = conversationIdentity(s), epoch = state.authEpoch;
   const ready = () => currentChat(entry) && conversationIdentity(selectedSession()) === identity &&
@@ -8513,9 +9547,9 @@ function warmChat(entry) {
     // The send opens it then, as before.
   });
 }
-function insertChatText(entry, input, text) {
+function insertChatText(entry, input, text, { warm = true } = {}) {
   if (!text || !currentChat(entry) || input.disabled || input.readOnly) return;
-  warmChat(entry);
+  if (warm) warmChat(entry);
   const start = input.selectionStart ?? input.value.length;
   const end = input.selectionEnd ?? start;
   input.value = input.value.slice(0, start) + text + input.value.slice(end);
@@ -9417,7 +10451,7 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
   const firstBotPrompt = sessionCategoryOf(s) === "bot" && !conversationOlderOmitted(s, entry);
   const keys = messages.map((message, index) => JSON.stringify([message.role, message.text, message.ts || null,
     attachmentMetadata(message.attachments), message.truncated === true, message.bodyHash || null,
-    firstBotPrompt && index === 0 && message.role === "user"]));
+    message.model || null, message.effort || null, firstBotPrompt && index === 0 && message.role === "user"]));
   // The server's window drops whole rows at its start (a question or answer
   // with the rows after it, any number at once): the rows on
   // screen are first lined up with the new ones where they overlap most, so
@@ -9449,6 +10483,10 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     if (role !== "system") {
       const label = el("div", "msg-label");
       label.append(el("strong", null, role === "user" ? delivered ? "전달된 요청" : "나" : AGENTS[s.agent] || "에이전트"));
+      if (role === "assistant") {
+        row.modelLabel = el("span", "msg-model");
+        label.append(row.modelLabel);
+      }
       if (message.ts) label.append(el("span", null, clock(message.ts)));
       row.append(label);
       row.msgLabel = label;
@@ -9496,6 +10534,20 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     return item;
   });
   groupMessageRows(rows);
+  // Only the newest answer can show the separately observed session settings; older
+  // answers use their own recorded metadata and never inherit the current model.
+  let latest = rows.length - 1;
+  while (latest >= 0 && rows[latest].role !== "assistant") latest--;
+  while (latest > 0 && sameSpeaker(rows[latest - 1], rows[latest])) latest--;
+  rows.forEach((item, index) => {
+    if (!item.row.modelLabel) return;
+    const recorded = [item.message.model, item.message.effort].filter((value) => typeof value === "string" && value);
+    const settings = index === latest && !recorded.length ? entry?.data?.modelSettings : null;
+    const observed = [settings?.model, settings?.effort].filter((value) => typeof value === "string" && value);
+    const parts = recorded.length ? recorded : observed;
+    const prefix = recorded.length ? "" : settings?.observed === "last_response" ? "최근 응답 " : "현재 ";
+    item.row.modelLabel.textContent = parts.length ? `(${prefix}${parts.join(" · ")})` : "";
+  });
   const desired = toolGroupRows(list, rows);
   const preview = historyPreviewRow(s, entry);
   if (preview) desired.unshift(preview);
@@ -9662,6 +10714,8 @@ function rowBox(list, row) {
 const GROUP_GAP_SECONDS = 300;
 function sameSpeaker(a, b) {
   if (!a || !b || a.role !== b.role || !["user", "assistant"].includes(a.role)) return false;
+  if (a.role === "assistant" && ["model", "effort"].some((key) =>
+    (a.message?.[key] || "") !== (b.message?.[key] || ""))) return false;
   const first = a.message?.ts;
   const next = b.message?.ts;
   // A timed row after untimed ones (Codex's final answer after its progress
@@ -13353,6 +14407,46 @@ function newSessionHostMeta(host) {
   const preset = host.platform === "windows" ? null : NEW_SESSION_PRESETS.find((item) => item.id && item.id === newSessionPreset());
   return `${status.label || "새 세션"} 실행` + (preset ? ` · ${preset.label}` : "");
 }
+function renderNewSessionProfiles() {
+  const box = $("new-session-profiles");
+  if (!box) return;
+  const saved = prefs.get("launchProfiles", []);
+  const profiles = Array.isArray(saved) ? saved.filter((row) => row && typeof row.name === "string" && row.name.length <= 80 &&
+    typeof row.host === "string" && NEW_SESSION_PRESETS.some((preset) => preset.id === row.preset)).slice(0, 12) : [];
+  const list = el("div", "launch-profile-list"), name = el("input"), host = el("select");
+  name.placeholder = "설정 이름"; name.maxLength = 80; name.setAttribute("aria-label", "설정 이름");
+  host.setAttribute("aria-label", "기기");
+  for (const item of newSessionHosts()) { const option = el("option", null, item.label || item.name); option.value = item.name; host.append(option); }
+  const notice = el("p", "plan-preserve"); notice.setAttribute("role", "status");
+  for (const profile of profiles) {
+    const row = el("div", "launch-profile-row");
+    const preset = NEW_SESSION_PRESETS.find((item) => item.id === profile.preset);
+    const apply = button(`${profile.name} · ${profile.host} · ${preset.label}`, "secondary", () => {
+      if (state.newSessionBusy) return;
+      const device = newSessionHosts().find((item) => item.name === profile.host);
+      if (!device) { notice.textContent = "저장한 기기를 현재 목록에서 찾지 못했습니다."; return; }
+      state.newSessionPreset = profile.preset; prefs.set("newSessionPreset", profile.preset);
+      renderNewSessionPresets(); renderNewSessionHosts();
+      notice.textContent = `${device.label || device.name} 기기의 실행 버튼을 눌러 시작하세요.${device.platform === "windows" ? " PC는 기기 설정 그대로 엽니다." : ""}`;
+      [...($("new-session-hosts")?.children || [])].find((node) => node.dataset?.host === device.name)?.focus?.({ preventScroll: true });
+    });
+    const remove = button("삭제", "quiet", () => {
+      prefs.set("launchProfiles", profiles.filter((item) => item !== profile)); renderNewSessionProfiles();
+    });
+    remove.setAttribute("aria-label", `${profile.name} 설정 삭제`); row.append(apply, remove); list.append(row);
+  }
+  const save = button("현재 실행 설정 저장", "secondary", () => {
+    const label = name.value.trim(), device = newSessionHosts().find((item) => item.name === host.value);
+    if (!label || !device) { notice.textContent = "이름과 기기를 선택해 주세요."; return; }
+    if (profiles.some((item) => item.name === label)) { notice.textContent = "같은 이름이 있습니다. 삭제한 뒤 다시 저장해 주세요."; return; }
+    if (profiles.length >= 12) { notice.textContent = "설정은 12개까지 저장할 수 있습니다."; return; }
+    const next = [...profiles, { name: label, host: device.name, preset: newSessionPreset() }];
+    prefs.set("launchProfiles", next);
+    if (!prefs.get("launchProfiles", []).some((item) => item.name === label)) { notice.textContent = "이 브라우저에 설정을 저장하지 못했습니다."; return; }
+    renderNewSessionProfiles();
+  });
+  box.replaceChildren(list, name, host, save, notice);
+}
 function renderNewSessionHosts() {
   const list = $("new-session-hosts");
   list.replaceChildren();
@@ -13394,6 +14488,7 @@ function openNewSession() {
   $("new-session-error").hidden = true;
   renderNewSessionPresets();
   renderNewSessionHosts();
+  renderNewSessionProfiles();
   sheet("new-session-dialog").open();
 }
 function closeNewSession() {
@@ -14152,6 +15247,7 @@ function showLogin() {
   state.capabilitiesBoot = null;
   state.refreshDeadline = 0;
   state.snapshot = null;
+  cardRelationIndex = null;
   state.snapshotVersion = null;
   state.eventsSnapshotVersion = null;
   state.serverBoot = null;
@@ -14187,7 +15283,11 @@ function showLogin() {
   $("login").hidden = false;
   if ($("plan-dialog").open) $("plan-dialog").close();
   if ($("settings-dialog").open) $("settings-dialog").close();
-  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet", "questions-dialog", "delegation-dialog"]) if ($(id)?.open) $(id).close();
+  for (const id of ["usage-dialog", "hardware-dialog", "filter-dialog", "terminals-dialog", "new-session-dialog", "action-sheet", "questions-dialog", "delegation-dialog", "reference-dialog", "results-dialog", "work-group-dialog", "task-plan-dialog", "conversation-fork-dialog", "conversation-profiles-dialog", "batch-work-dialog"]) {
+    const dialog = $(id);
+    if (dialog?.open) dialog.close();
+    if (["reference-dialog", "results-dialog", "work-group-dialog", "task-plan-dialog", "conversation-fork-dialog", "conversation-profiles-dialog", "batch-work-dialog"].includes(id)) dialog?.replaceChildren();
+  }
   renderConnectivity();
   updateThemeColor();
   $("login-token").focus();
@@ -14265,6 +15365,9 @@ function renderKeyboardRoom() {
   document.documentElement.style?.setProperty?.("--kb-inset", `${covered}px`);
   const classes = document.body?.classList;
   const changed = !!classes?.contains?.("keyboard-beside") !== beside;
+  // A trackpad can make an iPad's primary pointer fine even with its keyboard open.
+  const ipadKeyboard = document.documentElement.hasAttribute?.("data-ipad") && editingText() && keyboardOpen();
+  classes?.[open || ipadKeyboard ? "add" : "remove"]("keyboard-open");
   classes?.[typing ? "add" : "remove"]("keyboard-typing");
   classes?.[beside ? "add" : "remove"]("keyboard-beside");
   document.documentElement.style?.setProperty?.("--layout-height", `${Math.round(state.viewportTall || window.innerHeight || 0)}px`);

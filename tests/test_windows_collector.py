@@ -340,6 +340,18 @@ class ClaudeFlagParserTest(unittest.TestCase):
 
 
 class ClaudeHarnessLineTest(unittest.TestCase):
+    def test_recorded_response_model_settings_match_mac_reader(self):
+        import collector
+        entries = [{'type': 'assistant', 'effort': 'ultra', 'message': {'model': 'claude-opus-4-6', 'content': '답'}},
+                   {'type': 'assistant', 'message': {'content': '미확인'}}]
+        for reader in (wc._claude_messages, collector.claude_messages):
+            rows = reader(entries)
+            self.assertEqual((rows[0]['model'], rows[0]['effort']), ('claude-opus-4-6', 'ultra'))
+            self.assertNotIn('model', rows[1])
+        turn = {'model': 'gpt-example', 'reasoningEffort': 'xhigh', 'items': [{'type': 'agentMessage', 'text': '답'}]}
+        for rows in (wc._codex_rows([turn]), collector.codex_rows([turn])):
+            self.assertEqual((rows[0]['model'], rows[0]['effort']), ('gpt-example', 'xhigh'))
+
     def test_harness_lines_are_notes_or_hidden_as_on_the_mac(self):
         # PC Claude conversations showed expanded skills, compaction summaries, background task
         # notices and /exit records as the person's own bubbles.

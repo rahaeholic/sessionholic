@@ -84,6 +84,8 @@ def _codex_command(client, identity, args, thread, home):
     command = args.get('command')
     if command == 'models':
         return {'models': _models(client), 'current': model_settings(thread), 'next': _preferences(identity, home)}
+    if command == 'fork':
+        return _codex_fork(client, identity, args, thread, home)
     if command not in ('model', 'effort', 'compact'):
         raise ValueError('현재 세션에서 이 명령을 사용할 수 없습니다.')
     if (args.get('source') or {}).get('cwd') not in (None, thread.get('cwd')):
@@ -138,6 +140,49 @@ def _codex_command(client, identity, args, thread, home):
                 result = {'status': 'rejected', 'reason': '이 CLI에서 요약 요청을 거절했습니다.'}
             except (OSError, TimeoutError, collector.RpcError):
                 return unknown
+        receipt.save({'digest': digest, 'result': result})
+        return result
+
+
+def _codex_fork(client, identity, args, thread, home):
+    """Fork only the checked source and a confirmed completed turn, with a durable receipt."""
+    request_id = _request(args.get('requestId'))
+    turn_id = args.get('value')
+    if turn_id is not None and (not isinstance(turn_id, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', turn_id)):
+        return {'status': 'rejected', 'reason': '분기할 대화 지점을 확인해 주세요.'}
+    cwd = (args.get('source') or {}).get('cwd')
+    if not isinstance(cwd, str) or not cwd or cwd != thread.get('cwd'):
+        return {'status': 'rejected', 'reason': '원본 대화의 작업 폴더가 바뀌었습니다. 다시 확인해 주세요.'}
+    digest = hashlib.sha256(json.dumps(['fork', turn_id], sort_keys=True).encode()).hexdigest()
+    with _Ledger(identity, 'command-' + request_id, home) as receipt:
+        prior = receipt.read()
+        if prior:
+            if prior.get('digest') != digest:
+                raise ValueError('같은 명령 ID에 다른 값을 사용할 수 없습니다.')
+            return prior['result']
+        if _remote(thread.get('source')) or _remote(thread.get('threadSource')) or _state(thread)['phase'] != 'idle':
+            return {'status': 'rejected', 'reason': '원본 작업이 완전히 멈춘 뒤 분기해 주세요.'}
+        if turn_id is not None and not any(t.get('id') == turn_id and t.get('status') == 'completed' for t in thread['turns']):
+            return {'status': 'rejected', 'reason': '완료된 원본 대화 지점을 확인하지 못했습니다.'}
+        unknown = {'status': 'unknown', 'reason': '분기 생성 여부를 확인하지 못했습니다. 자동으로 다시 만들지 않습니다.'}
+        receipt.save({'digest': digest, 'result': unknown})
+        try:
+            params = {'threadId': identity['id'], 'deferGoalContinuation': True}
+            if turn_id is not None:
+                params['lastTurnId'] = turn_id
+            answer = client.call('thread/fork', params)
+            fork = answer.get('thread') if isinstance(answer, dict) else None
+            if not isinstance(fork, dict):
+                return unknown
+            new_id = str(uuid.UUID(str(fork.get('id'))))
+            if new_id == identity['id'] or fork.get('forkedFromId') not in (None, identity['id']) or fork.get('cwd') != cwd:
+                return unknown
+            result = {'status': 'created', 'id': new_id, 'source': identity, 'cwd': cwd,
+                      'reason': '원본 대화에서 새 세션을 만들었습니다.'}
+        except NativeRejected:
+            result = {'status': 'rejected', 'reason': '이 기기의 Codex가 안전한 분기 요청을 지원하지 않거나 거절했습니다.'}
+        except (OSError, TimeoutError, collector.RpcError, ValueError, TypeError):
+            return unknown
         receipt.save({'digest': digest, 'result': result})
         return result
 
@@ -519,6 +564,8 @@ class _Ledger:
 
 def _send(client, identity, args, thread, home):
     request_id = _request(args.get("requestId"))
+    if type(args.get("requireIdle", False)) is not bool:
+        raise ValueError("작업 상태 조건을 확인해 주세요.")
     snapshot_cwd = (args.get("source") or {}).get("cwd")
     if snapshot_cwd is not None and snapshot_cwd != thread.get("cwd"):
         raise ValueError("실제 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.")
@@ -564,6 +611,10 @@ def _send(client, identity, args, thread, home):
             # An unknown result remains read-only even when native history lags.
             saved = prior.get("receipt") or {}
             return saved if saved.get("confirmed") or saved.get("delivery") == "rejected" else before
+        if args.get("requireIdle") is True:
+            thread = _thread(client, identity)
+            if _state(thread)['phase'] != 'idle' or snapshot_cwd is not None and snapshot_cwd != thread.get('cwd'):
+                return {**before, "delivery": "rejected", "reason": "해당 대화가 작업 중이거나 작업 폴더가 바뀌어 보내지 않았습니다."}
         capabilities = _capabilities(thread)
         if not capabilities["canSend"]:
             return {**before, "delivery": "rejected", "reason": capabilities["reason"], "fallback": FALLBACK}

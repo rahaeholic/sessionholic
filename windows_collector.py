@@ -1463,7 +1463,10 @@ def _codex_rows(turns):
                         row['attachments'] = attached
                     result.append(row)
             elif item.get('type') == 'agentMessage' and item.get('text'):
-                result.append(_message('assistant', item['text'], turn.get('completedAt'), phase=item.get('phase'), **metadata))
+                settings = _model_settings({'model': item.get('model') or turn.get('model'),
+                                            'reasoningEffort': item.get('reasoningEffort') or turn.get('reasoningEffort')})
+                result.append(_message('assistant', item['text'], turn.get('completedAt'), phase=item.get('phase'),
+                                       **{key: value for key, value in settings.items() if value}, **metadata))
             elif item.get('type') == 'commandExecution':
                 result.append(_message('tool', '$ ' + _text(item.get('command'), 160), toolKind='command', **metadata))
     return result
@@ -1518,6 +1521,10 @@ def _claude_rows(entries):
             shown = text.strip() and (_claude_user_text(text) if role == 'user' else ('assistant', text))
             if shown:
                 extra = {'toolKind': 'command'} if shown[0] == 'tool' else {}
+                if shown[0] == 'assistant':
+                    settings = _model_settings({'model': message.get('model'),
+                                                'reasoningEffort': entry.get('effort') or entry.get('perTurnEffort')})
+                    extra.update({key: value for key, value in settings.items() if value})
                 result.append(_message(shown[0], shown[1], ts, messageId=uid, **extra))
     return result
 

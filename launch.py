@@ -162,6 +162,66 @@ def recover_saved_session(source, home=None):
                        "canRead": True, "runtimeReason": "저장된 대화입니다. 현재 실행 상태는 확인되지 않았습니다."}}
 
 
+def build_claude_fork(source, fork_id, home=None):
+    """Open a native fork of one verified transcript without sending a prompt."""
+    if not isinstance(source, dict) or source.get('agent') != 'claude':
+        raise ValueError('분기할 Claude 대화를 확인해 주세요.')
+    try:
+        fork_id = str(uuid.UUID(str(fork_id)))
+        original = str(uuid.UUID(str(source.get('sessionId') or source.get('id'))))
+    except (ValueError, AttributeError):
+        raise ValueError('Claude 대화 식별자를 확인해 주세요.') from None
+    if fork_id == original:
+        raise ValueError('원본과 다른 분기 식별자가 필요합니다.')
+    recover_saved_session(source, home)
+    home = _home(home)
+    cwd = Path(source.get('cwd') or '')
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise ValueError('원본 작업 폴더를 확인하지 못했습니다.')
+    profile = next((row for row in discover_profiles(home) if row['id'] == 'claude:default'), None)
+    if not profile or not profile.get('available'):
+        raise ValueError((profile or {}).get('reason') or 'Claude 계정을 확인해 주세요.')
+    binary = _binary('claude', home)
+    if not binary:
+        raise ValueError('이 기기에 Claude CLI가 없습니다.')
+    environment = source_environment(source, home)
+    return {'argv': [binary, '--resume', original, '--fork-session', '--session-id', fork_id],
+            'cwd': str(cwd.resolve()), 'env': _environment(home, 'claude', '.claude', environment)}
+
+
+def build_profile_launch(source, model, effort, prompt, home=None):
+    """Build a new session on a verified source's account and project."""
+    if not isinstance(source, dict) or source.get('agent') not in ('codex', 'claude'):
+        raise ValueError('원본 기기와 계정을 확인해 주세요.')
+    if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}', model):
+        raise ValueError('모델을 확인해 주세요.')
+    if effort not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+        raise ValueError('에포트를 확인해 주세요.')
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 8000:
+        raise ValueError('새 세션에서 시작할 작업을 8KiB 이하로 입력해 주세요.')
+    recover_saved_session(source, home)
+    home = _home(home)
+    agent = source['agent']
+    key = source.get('home') if agent == 'codex' else '.claude'
+    profile_id = 'codex:' + key if agent == 'codex' and isinstance(key, str) else 'claude:default'
+    profile = next((row for row in discover_profiles(home) if row['id'] == profile_id and row['agent'] == agent), None)
+    if not profile or not profile.get('available'):
+        raise ValueError((profile or {}).get('reason') or '원래 계정을 확인해 주세요.')
+    if agent == 'claude' and model not in ('opus', 'sonnet', 'haiku'):
+        raise ValueError('현재 Claude 계정의 모델을 선택해 주세요.')
+    if agent == 'claude' and effort not in ('low', 'medium', 'high', 'xhigh', 'max'):
+        raise ValueError('Claude에서 지원하는 에포트를 선택해 주세요.')
+    cwd = Path(source.get('cwd') or '')
+    if not cwd.is_absolute() or not cwd.is_dir():
+        raise ValueError('원래 작업 폴더를 확인해 주세요.')
+    binary = _binary(agent, home)
+    if not binary:
+        raise ValueError('이 기기에 에이전트 CLI가 없습니다.')
+    env = _environment(home, agent, key, source_environment(source, home))
+    return ({'argv': [binary, prompt], 'cwd': str(cwd.resolve()), 'env': env, 'mode': 'profile',
+             'model': model, 'effort': effort}, profile)
+
+
 def resume_preview(source, home=None):
     """Validate an explicit same-session recovery without starting a native process."""
     from session_control import SessionControl

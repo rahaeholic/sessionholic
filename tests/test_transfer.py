@@ -1149,6 +1149,20 @@ class RemoteHandoffHome(unittest.TestCase):
 
 
 class StageHandoffTest(RemoteHandoffHome):
+    def test_profile_stages_only_once_and_keeps_launch_private(self):
+        source = {**CLAUDE_SOURCE, 'cwd': str(self.work)}
+        request = {'source': source, 'model': 'sonnet', 'effort': 'high', 'prompt': 'synthetic task', 'requestId': 'profile-request-1'}
+        spec = {'mode': 'profile', 'argv': [str(self.home / '.local/bin/claude'), 'synthetic task'],
+                'cwd': str(self.work), 'env': {}, 'nativeSource': {'host': 'air', 'agent': 'claude',
+                    'home': '.claude', 'id': NATIVE_ID, 'sessionId': NATIVE_ID, 'kind': 'interactive', 'cwd': str(self.work)}}
+        with patch('launch.build_profile_launch', return_value=(spec, {'agent': 'claude', 'home': '.claude'})), \
+             patch('managed_launch.bind', return_value=spec), patch('managed_launch.ensure_app_server'):
+            result = transfer_worker.rpc({'op': 'stage_profile', 'args': request})
+            self.assertEqual(result['nativeSource']['id'], NATIVE_ID)
+            path = transfer_worker.handoff_root() / transfer_worker.handoff_token(request['requestId']) / 'launch.json'
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(path.read_text())['argv'][-1], 'synthetic task')
+            with self.assertRaises(ValueError): transfer_worker.rpc({'op': 'stage_profile', 'args': request})
     def test_stage_writes_private_launch_and_binds_the_first_input_once(self):
         result = self.stage()
         token = transfer_worker.handoff_token('request-0001')

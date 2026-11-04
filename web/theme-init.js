@@ -51,6 +51,7 @@
   var nav = window.navigator || {};
   var agent = String(nav.userAgent || "");
   var ipad = /iPad/.test(agent) || (/Macintosh/.test(agent) && (nav.maxTouchPoints || 0) > 1);
+  if (ipad) root.setAttribute("data-ipad", "");
   var standalone = nav.standalone === true ||
     !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
   if (ipad && standalone) root.setAttribute("data-ipad-app", "");

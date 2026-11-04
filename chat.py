@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 import time
+import uuid
 
 import instance
 from attachments import MAX_ATTACHMENTS
@@ -232,12 +233,13 @@ TURN_RUNNING = re.compile(r'esc to (?:interrupt|cancel)|\(\d+[smh](?:\s*\d+[smh]
 SGR = re.compile(r'\x1b\[([0-9;]*)m')
 
 
-def _typed_after_prompt(line):
+def _typed_after_prompt(line, *, details=False):
     """Whether a prompt line (with its SGR codes) shows typed text after its prompt mark. An empty
     prompt's placeholder is drawn dim (Codex) or grey (Claude), and Claude's cursor cell in
     reverse video; typed text is drawn in the plain colour."""
     dim = grey = reverse = False
     seen_mark = False
+    placeholder = typed = False
     position = 0
     for match in list(SGR.finditer(line)) + [None]:
         text = line[position:match.start() if match else len(line)]
@@ -245,8 +247,11 @@ def _typed_after_prompt(line):
             if not seen_mark:
                 seen_mark = char in '❯›>'
                 continue
-            if not char.isspace() and not (dim or grey or reverse):
-                return True
+            if not char.isspace() and not reverse:
+                if dim or grey:
+                    placeholder = True
+                else:
+                    typed = True
         if match is None:
             break
         position = match.end()
@@ -281,6 +286,26 @@ def _typed_after_prompt(line):
             elif 30 <= code <= 37 or code in (39,) or 91 <= code <= 97:
                 grey = False
             index += 1
+    return (typed, placeholder) if details else typed
+
+
+def empty_claude_input(styled):
+    """Accept an empty box or a styled placeholder, never an existing draft."""
+    plain = SGR.sub('', str(styled or ''))
+    if not input_ready(plain):
+        return False
+    text = input_text(plain)
+    if text is None:
+        return False
+    if not text:
+        return True
+    rows = styled.replace('\r', '').split('\n')[-INPUT_TAIL:]
+    for row in reversed(rows):
+        line = SGR.sub('', row)
+        if INPUT_PROMPT.match(line):
+            prompt_text = INPUT_PROMPT.sub('', line, count=1).strip()
+            typed, placeholder = _typed_after_prompt(row, details=True)
+            return text == prompt_text and placeholder and not typed
     return False
 
 
@@ -1339,7 +1364,7 @@ class Chat:
             return False
         return True
 
-    def _send_claude(self, ref, source, host, request_id, text, ids, manifest, timing=None):
+    def _send_claude(self, ref, source, host, request_id, text, ids, manifest, timing=None, require_idle=False):
         windows = host.get('platform') == 'windows'
         timing = timing or SendTiming('claude', self.clock)
         turn = self._claude_lock_for(source)
@@ -1359,6 +1384,8 @@ class Chat:
             except (RuntimeError, OSError):
                 raise SendRejected('Claude 세션 상태를 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
             timing.mark('capabilities')
+            if require_idle and current.get('phase') != 'idle':
+                raise SendRejected('해당 대화가 작업 중이거나 상태를 확인하지 못해 보내지 않았습니다.', 409)
             if current.get('phase') == 'done' and source.get('kind') != 'background' and not windows:
                 raise SendRejected(CLAUDE_EXTERNAL, 409)
             try:
@@ -1393,6 +1420,12 @@ class Chat:
             # Enter would confirm the highlighted choice of an open menu.
             if parse_menu(screen):
                 raise SendRejected(CLAUDE_BLOCKED, 409)
+            if require_idle:
+                try:
+                    if self.rpc(host, 'capabilities', source).get('phase') != 'idle':
+                        raise SendRejected('해당 대화의 상태가 바뀌어 보내지 않았습니다.', 409)
+                except (RuntimeError, OSError):
+                    raise SendRejected('해당 대화의 상태를 확인하지 못해 보내지 않았습니다.', 409) from None
             # A run its host keeps, while this terminal attaches again: keys typed now are dropped.
             hold = terminal.get('holdName')
             if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():
@@ -1481,6 +1514,11 @@ class Chat:
 
     def _prepare_send(self, data):
         source, host = self.source(data.get('source'))
+        if type(data.get('requireIdle', False)) is not bool:
+            raise ValueError('작업 상태 조건을 확인해 주세요.')
+        expected_cwd = (data.get('source') or {}).get('cwd')
+        if expected_cwd is not None and (not isinstance(expected_cwd, str) or expected_cwd != source.get('cwd')):
+            raise ValueError('선택한 세션의 작업 폴더가 바뀌었습니다. 다시 확인해 주세요.')
         request_id, text = data.get('requestId'), data.get('text', '')
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise ValueError('메시지 요청 식별자가 필요합니다.')
@@ -1528,13 +1566,15 @@ class Chat:
             reason = str(exc) if isinstance(exc, (ValueError, RuntimeError)) else '메시지와 첨부 정보를 다시 확인해 주세요.'
             raise SendRejected(reason, 409 if isinstance(exc, RuntimeError) else 400) from None
         timing.mark('prepare')
+        require_idle = data.get('requireIdle', False)
         if source.get('agent') == 'claude':
-            result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest, timing)
+            result = self._send_claude(data.get('source'), source, host, request_id, text, ids, manifest, timing, require_idle)
         else:
             from transfer import WorkerError
             try:
                 result = self.rpc(host, 'send', source, requestId=request_id,
-                                  input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids)
+                                  input=[{'type': 'text', 'text': text}] if text.strip() else [], attachmentIds=ids,
+                                  **({'requireIdle': True} if require_idle else {}))
             except WorkerError as exc:
                 # The helper finished and reported a refusal; native_chat keeps every
                 # failure after turn/start inside its receipt, so nothing was sent.
@@ -1557,7 +1597,7 @@ class Chat:
     def command(self, data):
         """Finite, authenticated controls; slash text never becomes an agent prompt."""
         if (not isinstance(data, dict) or set(data) - {'source', 'command', 'value', 'requestId'}
-                or data.get('command') not in ('models', 'model', 'effort', 'compact')):
+                or data.get('command') not in ('models', 'model', 'effort', 'compact', 'fork')):
             raise ValueError('지원하는 채팅 명령을 선택해 주세요.')
         source, host = self.source(data.get('source'))
         self._direct_session(source)
@@ -1575,11 +1615,179 @@ class Chat:
             raise ValueError('명령 요청 식별자가 올바르지 않습니다.')
         if source['agent'] == 'codex':
             result = self.rpc(host, 'command', source, command=command, value=value, requestId=request_id)
+        elif command == 'fork':
+            result = self._claude_fork(source, host, value, request_id)
         else:
             result = self._claude_command(source, host, command, value, request_id, data['source'])
         self._forget_state(source)
         self.board.request_refresh(source['host'], force=True)
         return result
+
+    def new_profile_session(self, data):
+        """Open a new session after the user supplies its first task explicitly."""
+        if not isinstance(data, dict) or set(data) != {'source', 'model', 'effort', 'prompt', 'requestId'}:
+            raise ValueError('새 세션 실행 정보를 확인해 주세요.')
+        source, host = self.source(data['source'])
+        self._direct_session(source)
+        rid, model, effort, prompt = (data[key] for key in ('requestId', 'model', 'effort', 'prompt'))
+        if not isinstance(rid, str) or not REQUEST.fullmatch(rid):
+            raise ValueError('실행 요청 식별자가 올바르지 않습니다.')
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 8000:
+            raise ValueError('첫 작업을 8KiB 이하로 입력해 주세요.')
+        if host.get('platform') == 'windows' and source.get('agent') == 'claude':
+            from transfer import windows_literal_argument
+            if len(prompt) > 4096 or any(ord(c) < 32 for c in prompt) or not windows_literal_argument(prompt):
+                raise ValueError('PC Claude 첫 작업은 한 줄로 입력하고 큰따옴표를 제외해 주세요.')
+        lock = self._claude_lock_for(source)
+        if not lock.acquire(timeout=1): raise ValueError(PROMPT_BUSY)
+        try:
+            record_id = 'profile-' + rid
+            digest = hashlib.sha256(json.dumps([model, effort, prompt, source.get('cwd')], ensure_ascii=False).encode()).hexdigest()
+            prior = self._claude_read_record(source, record_id)
+            if prior:
+                if prior.get('digest') != digest: raise ValueError('같은 실행 ID에 다른 내용을 사용할 수 없습니다.')
+                active = self._claude_read_record(source, 'profile-active')
+                if prior['result'].get('status') == 'opened' and active and active.get('requestId') == rid and active.get('status') == 'unknown':
+                    from server import private_json
+                    private_json(self._claude_record_path(source, 'profile-active'), {'status': 'opened', 'requestId': rid})
+                return {**prior['result'], 'requestId': rid}
+            active = self._claude_read_record(source, 'profile-active')
+            if active and active.get('status') == 'unknown':
+                return {'status': 'unknown', 'requestId': active['requestId'],
+                        'reason': '이전 실행의 결과가 확인되지 않았습니다. 터미널과 작업 목록을 확인해 주세요.'}
+            catalog = self.command({'source': data['source'], 'command': 'models'})
+            selected = next((row for row in catalog.get('models', []) if row.get('model') == model), None)
+            if not selected or effort not in selected.get('efforts', []):
+                raise ValueError('이 계정에서 지원하는 모델과 에포트를 선택해 주세요.')
+            identity = {key: source[key] for key in ('host', 'agent', 'id', 'sessionId', 'home', 'cwd', 'kind') if source.get(key) is not None}
+            terminals, transfers = self.workflow.terminals, self.workflow.transfers
+            key_hash = hashlib.sha256((json.dumps(self.identity(source), sort_keys=True) + rid).encode()).hexdigest()
+            key = 'profile:' + key_hash
+            unknown = {'status': 'unknown', 'reason': '새 세션의 시작 여부를 확인하지 못했습니다. 작업과 터미널 목록을 확인해 주세요.'}
+            from server import private_json
+            path = self._claude_record_path(source, record_id)
+            active_path = self._claude_record_path(source, 'profile-active')
+            with terminals.reserve(key):
+                private_json(path, {'digest': digest, 'result': unknown})
+                private_json(active_path, {'status': 'unknown', 'requestId': rid})
+                try:
+                    if host.get('local'):
+                        from launch import build_profile_launch
+                        from managed_launch import bind, mark_attached
+                        spec, profile = build_profile_launch(identity, model, effort, prompt)
+                        spec = bind(spec, profile, source['host'], receipt_path=self.root / 'profile-launches' / (key_hash + '.json'))
+                    elif host.get('platform') == 'windows':
+                        import collector
+                        prepared = transfers.rpc(host, 'stage_profile', {'source': identity, 'model': model,
+                            'effort': effort, 'prompt': prompt, 'requestId': 'profile-' + key_hash[:32]}, timeout=90)
+                        if prepared.get('status') != 'prepared': return {**unknown, 'requestId': rid}
+                        native = prepared.get('nativeSource')
+                        if (not isinstance(native, dict) or native.get('host') != source['host']
+                                or native.get('agent') != source['agent'] or native.get('cwd') != source['cwd']):
+                            return {**unknown, 'requestId': rid}
+                        spec = {'argv': transfers.windows_terminal(host, prepared), 'cwd': str(Path.home()),
+                                'env': collector.tool_env(), 'nativeSource': native, 'connectionMode': 'attach',
+                                'initialDelivery': 'accepted' if source['agent'] == 'codex' else None}
+                    else:
+                        import collector
+                        remote_id = 'profile-' + key_hash[:32]
+                        prepared = transfers.rpc(host, 'stage_profile', {'source': identity, 'model': model,
+                            'effort': effort, 'prompt': prompt, 'requestId': remote_id}, timeout=120)
+                        from transfer_worker import handoff_token
+                        if prepared.get('token') != handoff_token(remote_id): return {**unknown, 'requestId': rid}
+                        argv, hold = transfers.terminal(host, ['-I', transfers.runtime_paths[host['name']], 'handoff', prepared['token']])
+                        spec = {'argv': argv, 'cwd': str(Path.home()), 'env': collector.tool_env(), 'holdName': hold,
+                                'nativeSource': prepared.get('nativeSource'), 'connectionMode': prepared.get('connectionMode'),
+                                'initialDelivery': prepared.get('initialDelivery')}
+                    metadata = {'title': '새 작업 · ' + model + ' · ' + effort, 'host': source['host'],
+                                'agent': source['agent'], 'mode': spec.get('connectionMode') or 'profile'}
+                    if spec.get('nativeSource'): metadata['nativeSource'] = spec['nativeSource']
+                    if spec.get('holdName'): metadata['holdName'] = spec['holdName']
+                    terminal = terminals.create(key, spec['argv'], spec['cwd'], spec['env'], metadata)
+                    if host.get('local') and spec.get('nativeReceiptPath'):
+                        mark_attached(spec, terminal['id'])
+                    result = {'status': 'opened', 'terminal': terminal, 'nativeSource': spec.get('nativeSource'),
+                              'initialDelivery': spec.get('initialDelivery')}
+                    private_json(path, {'digest': digest, 'result': result})
+                    private_json(active_path, {'status': 'opened', 'requestId': rid})
+                    return {**result, 'requestId': rid}
+                except (OSError, ValueError, RuntimeError, KeyError):
+                    return {**unknown, 'requestId': rid}
+        finally:
+            lock.release()
+
+    def clear_profile_unknown(self, data):
+        if not isinstance(data, dict) or set(data) != {'source', 'requestId'}:
+            raise ValueError('확인할 실행을 선택해 주세요.')
+        source, _ = self.source(data['source'], sending=False)
+        rid = data['requestId']
+        if not isinstance(rid, str) or not REQUEST.fullmatch(rid):
+            raise ValueError('실행 요청 식별자가 올바르지 않습니다.')
+        lock = self._claude_lock_for(source)
+        if not lock.acquire(timeout=1): raise ValueError(PROMPT_BUSY)
+        try:
+            active = self._claude_read_record(source, 'profile-active')
+            if not active or active.get('requestId') != rid or active.get('status') != 'unknown':
+                raise ValueError('확인 중인 실행이 바뀌었습니다. 새로고침해 주세요.')
+            prior = self._claude_read_record(source, 'profile-' + rid)
+            if prior and prior.get('result', {}).get('status') == 'opened':
+                raise ValueError('터미널이 열린 것으로 확인됐습니다. 같은 요청으로 결과를 다시 확인해 주세요.')
+            from server import private_json
+            private_json(self._claude_record_path(source, 'profile-active'), {'status': 'cleared', 'requestId': rid})
+            return {'ok': True}
+        finally:
+            lock.release()
+
+    def _claude_fork(self, source, host, value, request_id):
+        if value is not None:
+            raise ValueError('Claude 분기는 현재까지의 대화만 지원합니다.')
+        lock = self._claude_lock_for(source)
+        if not lock.acquire(timeout=1): raise ValueError(PROMPT_BUSY)
+        try:
+            record_id = 'command-' + request_id
+            path = self._claude_record_path(source, record_id)
+            digest = hashlib.sha256(json.dumps(['fork', None]).encode()).hexdigest()
+            prior = self._claude_read_record(source, record_id)
+            if prior:
+                if prior.get('digest') != digest: raise ValueError('같은 명령 ID에 다른 값을 사용할 수 없습니다.')
+                return prior['result']
+            current = self.rpc(host, 'capabilities', source)
+            if current.get('phase') != 'idle': raise ValueError('원본 대화의 작업이 끝난 뒤 분기해 주세요.')
+            fork_id = str(uuid.uuid4())
+            identity = {key: source[key] for key in ('host', 'agent', 'id', 'sessionId', 'home', 'cwd', 'kind') if source.get(key) is not None}
+            transfers, terminals = self.workflow.transfers, self.workflow.terminals
+            if host.get('local'):
+                from launch import build_claude_fork
+                spec = build_claude_fork(identity, fork_id)
+            elif host.get('platform') == 'windows':
+                import collector
+                remote = transfers.rpc(host, 'claude_fork_plan', {'source': identity, 'forkId': fork_id}, timeout=15)
+                spec = {'argv': transfers.windows_terminal(host, remote), 'cwd': str(Path.home()), 'env': collector.tool_env()}
+            else:
+                import collector
+                transfers.rpc(host, 'claude_fork_plan', {'source': identity, 'forkId': fork_id}, timeout=15)
+                runtime = transfers.runtime_paths[host['name']]
+                argv, hold = transfers.terminal(host, ['-I', runtime, 'claude-fork', json.dumps(identity, ensure_ascii=True), fork_id])
+                spec = {'argv': argv, 'cwd': str(Path.home()), 'env': collector.tool_env(), 'holdName': hold}
+            key = 'claude-fork:' + hashlib.sha256((json.dumps(self.identity(source), sort_keys=True) + request_id).encode()).hexdigest()
+            unknown = {'status': 'unknown', 'reason': '분기 터미널을 열었는지 확인하지 못했습니다. 터미널 목록을 확인해 주세요.'}
+            with terminals.reserve(key):
+                from server import private_json
+                private_json(path, {'digest': digest, 'result': unknown, 'forkId': fork_id})
+                metadata = {'title': (source.get('title') or 'Claude 대화') + ' · 분기', 'host': source['host'],
+                            'agent': 'claude', 'mode': 'fork', 'forkRequestId': request_id, 'forkId': fork_id}
+                if spec.get('holdName'): metadata['holdName'] = spec['holdName']
+                try:
+                    terminal = terminals.create(key, spec['argv'], spec['cwd'], spec['env'], metadata)
+                except (OSError, ValueError, RuntimeError):
+                    return unknown
+                result = {'status': 'opened', 'id': fork_id, 'terminalId': terminal['id'], 'terminal': terminal,
+                          'reason': '분기 터미널을 열었습니다. 첫 입력 뒤 새 대화가 저장됩니다.'}
+                try: private_json(path, {'digest': digest, 'result': result, 'forkId': fork_id})
+                except OSError: return unknown
+                return result
+        finally:
+            lock.release()
 
     def _claude_command(self, source, host, command, value, request_id, ref):
         if command == 'model' and value not in ('opus', 'sonnet', 'haiku'):
@@ -1602,10 +1810,11 @@ class Chat:
             if terminal is None and source.get('kind') == 'background':
                 terminal = self._open_claude_terminal(ref, source, request_id)
             if terminal is None: raise ValueError(CLAUDE_EXTERNAL)
-            screen = self.workflow.terminals.capture(terminal['id'])
+            styled = self.workflow.terminals.capture(terminal['id'], styled=True)
+            screen = SGR.sub('', styled)
             if parse_menu(screen): raise ValueError(CLAUDE_BLOCKED)
             # Refuse a loading, reconnecting or nonempty editor; no keys clear existing input.
-            if not input_ready(screen) or input_text(screen):
+            if not empty_claude_input(styled):
                 raise ValueError('Claude 입력창이 비어 있고 준비된 상태에서 다시 시도해 주세요.')
             hold = terminal.get('holdName')
             if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():

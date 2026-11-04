@@ -1410,6 +1410,36 @@ function selectChat(c, { home = '.codex-example', id = 'native-session', agent =
 
 const noChatTimers = { setTimeout: () => 1, clearTimeout() {} };
 
+test('assistant labels show recorded model settings, and current settings only on the latest answer', () => {
+  const c = client(undefined, noChatTimers);
+  const { s, entry } = selectChat(c);
+  const messages = [
+    { role: 'assistant', text: '이전 답', model: 'old-model', effort: 'low' },
+    { role: 'user', text: '질문' },
+    { role: 'assistant', text: '새 답' },
+  ];
+  entry.data.modelSettings = { model: 'current-model', effort: 'high', next: { model: 'future-model' } };
+  c.renderMessages(s, messages);
+  let rows = c.get('messages').conversationRows;
+  assert.equal(rows[0].row.modelLabel.textContent, '(old-model · low)');
+  assert.equal(rows[2].row.modelLabel.textContent, '(현재 current-model · high)');
+  const oldRow = rows[0].row, latestRow = rows[2].row;
+  entry.data.modelSettings = { model: 'changed-model', effort: 'xhigh' };
+  c.renderMessages(s, messages);
+  rows = c.get('messages').conversationRows;
+  assert.equal(rows[0].row, oldRow);
+  assert.equal(rows[2].row, latestRow);
+  assert.equal(rows[0].row.modelLabel.textContent, '(old-model · low)');
+  assert.equal(rows[2].row.modelLabel.textContent, '(현재 changed-model · xhigh)');
+  entry.data.modelSettings = {};
+  c.renderMessages(s, messages);
+  assert.equal(rows[2].row.modelLabel.textContent, '');
+});
+
+test('iPad editor reserves bottom gesture space only while the screen keyboard is closed', () => {
+  assert.match(styleSheet(), /:root\[data-ipad\] body:not\(\.keyboard-open\) \.chat-composer \{\s*padding-bottom: max\(48px, env\(safe-area-inset-bottom\)\);/);
+});
+
 test('즐겨찾기는 오래된 대화도 상단에 한 번만 표시하며 지우기와 검색 조건을 지킨다', () => {
   const c = client(undefined, noChatTimers);
   const { s } = selectChat(c);
@@ -2234,6 +2264,17 @@ test('chat tools close on selection before clipboard access and dismiss outside 
   tools.open = true;
   findId(composer, 'chat-native-open').events.click();
   assert.equal(tools.open, false);
+});
+
+test('자주 쓰는 참조와 결과물은 찾기 쉽고 나머지 도구는 접어 둔다', () => {
+  const c = client(undefined, noChatTimers), { s } = selectChat(c), composer = c.buildChatComposer(s);
+  const toolbar = byClass(composer, 'chat-toolbar')[0], tools = findId(composer, 'chat-tools');
+  assert.ok(toolbar.children.includes(findId(composer, 'chat-results')));
+  assert.ok(byClass(tools, 'chat-tools-actions')[0].children.includes(findId(composer, 'chat-reference')));
+  const more = findId(composer, 'chat-more');
+  assert.equal(more.tagName, 'DETAILS'); assert.ok(!more.open);
+  assert.ok(more.children.includes(findId(composer, 'chat-delegate')));
+  assert.ok(more.children.includes(findId(composer, 'chat-clipboard')));
 });
 
 test('clipboard tool preserves active Korean composition and never inserts text into its marked range', async () => {
@@ -3832,7 +3873,7 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(byClass(card, 'card-title')[0].textContent, title.trim());
   assert.equal(byClass(card, 'card-snippet')[0].hidden, true);
   const meta = byClass(card, 'card-meta')[0];
-  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['card-unread', 'badge', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'removed-tag', 'card-time']);
+  assert.deepEqual(meta.children.map((child) => child.className.split(' ')[0]), ['card-unread', 'badge', 'card-attention', 'terminal-mark', 'card-agent', 'card-execution', 'card-project', 'stale-tag', 'removed-tag', 'card-time']);
   assert.equal(byClass(card, 'card-unread')[0].hidden, true, 'no read marks kept yet: nothing is unread');
   assert.equal(byClass(card, 'card-execution')[0].hidden, true, '일반 대화에는 일회성 실행 표식을 표시하지 않는다');
   assert.equal(byClass(card, 'card-terminal')[0].hidden, true, '"터미널 열림" only with a live board terminal');
@@ -5255,7 +5296,7 @@ test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, �
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -7813,7 +7854,7 @@ test('a swipe offers 터미널 열기, or 연결 닫기 when the session has a b
   c.cancelTerminalClose();
   c.openCardMenu(row);
   assert.deepEqual(c.get('action-list').children.map((item) => item.textContent),
-    ['대화 열기', '새 창에서 보기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '터미널 닫기', '실행 종료하고 정리', '목록에서 지우기']);
+    ['대화 열기', '새 창에서 보기', '같은 일에 묶기', '☆ 상단 고정 (즐겨찾기)', '세션 관리', '터미널로 돌아가기', '터미널 닫기', '실행 종료하고 정리', '목록에서 지우기']);
   // A vertical drag is a scroll: no swipe, no menu.
   groups.events.pointerdown({ target, pointerId: 4, pointerType: 'touch', clientX: 300, clientY: 100 });
   groups.events.pointermove({ target, pointerId: 4, clientX: 296, clientY: 130, cancelable: true, preventDefault() {} });
@@ -7972,7 +8013,7 @@ test('Claude\'s approximate start shows "··· 작업 중" without a time or a 
   c.renderMessages(s, [{ role: 'user', text: '시작해 주세요' }, { role: 'assistant', text: '끝났습니다' }]);
   assert.equal(list.children.includes(row), false);
   vm.runInContext('updateChatComposer([...state.chats.values()][0])', c.context);
-  assert.equal(c.get('chat-status').textContent, '작업 중 · 지금 보내도 CLI가 이어서 반영합니다.', 'the session state stays in the status line');
+  assert.equal(c.get('chat-status').textContent, '작업 중 · 전달 시점은 연결된 에이전트와 터미널 상태에 따릅니다.', 'the session state stays in the status line');
 });
 
 test('picked images preview from memory with an upload ring, move to the uploaded file, and are released when removed', async () => {
@@ -8139,9 +8180,9 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
     navigator: { userAgent, maxTouchPoints }, screen,
     matchMedia: (query) => ({ matches: standalone && query === '(display-mode: standalone)' || coarse && query === '(pointer: coarse)' }) });
   const ipadOS = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15';
-  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad-app': '', 'data-tablet': '' });
-  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad-app': '', 'data-tablet': '' });
-  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, { 'data-tablet': '' }, 'the same iPad in a Safari tab');
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, true) }).attributes, { 'data-ipad': '', 'data-ipad-app': '', 'data-tablet': '' });
+  assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)', 5, true) }).attributes, { 'data-ipad': '', 'data-ipad-app': '', 'data-tablet': '' });
+  assert.deepEqual(run({}, { extra: device(ipadOS, 5, false) }).attributes, { 'data-ipad': '', 'data-tablet': '' }, 'the same iPad in a Safari tab');
   assert.deepEqual(run({}, { extra: device('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)', 5, true, { coarse: true, screen: { width: 393, height: 852 } }) }).attributes, {});
   assert.deepEqual(run({}, { extra: device(ipadOS, 0, true) }).attributes, {}, 'a Mac browser has no touch points');
   const android = 'Mozilla/5.0 (Linux; Android 15)';
@@ -8797,8 +8838,8 @@ test('B5: a timed final answer after untimed progress notes shows its own name a
     { role: 'assistant', text: '조금 더', ts: null }, { role: 'assistant', text: '최종 답', ts: 2500 }]);
   const rows = c.get('messages').children;
   assert.deepEqual(rows.map((row) => row.msgLabel?.hidden ?? null), [false, false, true, false]);
-  assert.equal(rows[1].msgLabel.children.length, 1, 'no time on a progress note');
-  assert.equal(rows[3].msgLabel.children.length, 2, 'the final answer shows when the turn completed');
+  assert.equal(rows[1].msgLabel.children.length, 2, 'progress has a name and model slot but no time');
+  assert.equal(rows[3].msgLabel.children.length, 3, 'the final answer shows when the turn completed');
 });
 
 test('B8: Claude summary and interruption notes render as system lines, not "나" bubbles', () => {
@@ -9733,7 +9774,7 @@ test('집중 모드는 터미널/채팅 탭을 머리글 줄로 옮기고, 전�
   head.parentElement = node(); setReading(true); assert.equal(moves.length, 2);
 });
 
-test('집중 모드는 모든 화면에서 대화에 공간을 준다: 한 줄 머리글, 작업 맥락·상단 바 숨김, 넓은 대화의 한 줄 작성창', () => {
+test('집중 모드는 대화에 공간을 주면서 기기·사용량을 열 수 있다', () => {
   const css = styleSheet();
   const start = css.indexOf('/* 집중 모드 on every screen');
   assert.ok(start > 0);
@@ -9752,8 +9793,10 @@ test('집중 모드는 모든 화면에서 대화에 공간을 준다: 한 줄 �
   assert.ok(wide);
   assert.match(wide[1], /\.chat-main \{\s*flex-wrap: nowrap;/);
   assert.match(wide[1], /#chat-send \{\s*order: 2;\s*margin-left: 0;/);
-  assert.match(rules, /@media \(min-width: 701px\) \{\s*body\.show-detail:not\(\.workspace-split\):not\(\.goals-active\):has\(#detail\.is-reading\) \.top \{\s*display: none;/,
-    'beside the list only; split panes and 목표 keep the top bar');
+  assert.doesNotMatch(css, /body\.show-detail\s+\.top\s*\{\s*display:\s*none/,
+    'the global bar stays visible in the full view on phones');
+  assert.doesNotMatch(rules, /:has\(#detail\.is-reading\)\s+\.top/,
+    'focus mode keeps the same global bar and controls as the full view');
   // Only 집중 모드: 전체 보기 keeps every bar.
   for (const selector of rules.match(/^[ \t]*[^@\s{}/*][^{}\n]*\{[ \t]*$/gm)) assert.match(selector, /#detail\.is-reading/, selector.trim());
 });
@@ -12442,10 +12485,12 @@ test("typing with an iPad's on-screen keyboard folds the top bar; beside a docke
   c.context.document.activeElement = field(true);
   c.updateViewport();
   assert.equal(classes.has("keyboard-typing"), false);
+  assert.equal(classes.has("keyboard-open"), false);
   // Keyboard up while typing on the board: the top bar folds; no terminal, nothing beside.
   keyboard(420);
   c.updateViewport();
   assert.equal(classes.has("keyboard-typing"), true);
+  assert.equal(classes.has("keyboard-open"), true);
   assert.equal(classes.has("keyboard-beside"), false);
   // Docked: typing on the board leaves the terminal its full (layout) height.
   c.context.document.activeElement = null;
@@ -12468,12 +12513,23 @@ test("typing with an iPad's on-screen keyboard folds the top bar; beside a docke
   keyboard(820);
   c.updateViewport();
   assert.equal(classes.has("keyboard-typing"), false);
+  assert.equal(classes.has("keyboard-open"), false);
   // Phones keep their own folding (is-typing), unchanged.
   c.context.window.matchMedia = (query) => ({ matches: query === "(pointer: coarse)" || query === "(max-width: 700px)" });
   c.context.document.activeElement = field(true);
   keyboard(420);
   c.updateViewport();
   assert.equal(classes.has("keyboard-typing"), false);
+  assert.equal(classes.has("keyboard-open"), true, 'a narrow iPad also removes the bottom spacer');
+  // A connected iPad trackpad can make the primary pointer fine.
+  c.context.document.documentElement.hasAttribute = (name) => name === 'data-ipad';
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.updateViewport();
+  assert.equal(classes.has("keyboard-open"), true);
+  keyboard(820);
+  c.context.document.activeElement = null;
+  c.updateViewport();
+  assert.equal(classes.has("keyboard-open"), false);
 });
 
 test('an Android keyboard rewriting the draft as it lets go does not end the listening, and its words land', async () => {
@@ -14983,6 +15039,511 @@ function loadContextModules(c) {
   return vm.runInContext('({renderSessionRelations,renderWorkContext,rememberConversation,detailRevision})', c.context);
 }
 
+test('대화 참조는 검색 결과 전체를 최근 활동순으로 정렬한 뒤 50개를 보여준다', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  loadContextModules(c); c.buildChatComposer(s);
+  const rows = c.state.snapshot.hosts[0].data.codex;
+  for (let i = 1; i <= 55; i++) rows.push({ ...s, id: `recent-${i}`, key: `recent-${i}`, title: `대화 ${i}`, updatedAt: i });
+  rows.push({ ...s, id: 'missing-time', key: 'missing-time', title: '시간 미확인' });
+  vm.runInContext('openReferencePicker', c.context)(s, entry, c.get('chat-input'));
+  let options = byClass(c.get('reference-sessions'), 'reference-session');
+  assert.equal(options.length, 50);
+  assert.equal(options[0].children[0].textContent, '대화 55');
+  assert.equal(options[49].children[0].textContent, '대화 6');
+  const search = c.get('reference-search'); search.value = '대화 5'; search.events.input();
+  options = byClass(c.get('reference-sessions'), 'reference-session');
+  assert.deepEqual(options.map((option) => option.children[0].textContent), ['대화 55', '대화 54', '대화 53', '대화 52', '대화 51', '대화 50', '대화 5']);
+});
+
+test('대화 참조는 선택한 원본만 읽고 미리 본 발췌를 현재 초안에만 넣는다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, method: options.method });
+    return { ok: true, status: 200, json: async () => ({ messages: [
+      { role: 'user', text: '원본 질문' }, { role: 'assistant', text: '원본 결과' },
+    ], olderOmitted: true }) };
+  }, noChatTimers);
+  c.context.navigator = { onLine: true };
+  const { s, entry } = selectChat(c); loadContextModules(c);
+  const target = { ...s, id: 'source-two', key: s.key.replace(s.id, 'source-two'), title: '참조할 작업' };
+  c.state.snapshot.hosts[0].data.codex.push(target);
+  c.buildChatComposer(s); const input = c.get('chat-input');
+  input.value = entry.text = '기존 초안'; input.selectionStart = input.selectionEnd = input.value.length;
+  const { openReferencePicker } = vm.runInContext('({openReferencePicker})', c.context);
+  openReferencePicker(s, entry, input);
+  assert.equal(calls.length, 0);
+  assert.equal(c.get('reference-dialog').open, true);
+  assert.equal(c.get('reference-sessions').hidden, false);
+  assert.equal(c.get('reference-choices').hidden, true);
+  assert.equal(c.get('reference-preview').hidden, true);
+  const sessions = byClass(c.get('reference-sessions'), 'reference-session');
+  await sessions[1].events.click();
+  assert.equal(c.get('reference-sessions').hidden, true);
+  assert.equal(c.get('reference-choices').hidden, false);
+  assert.equal(calls.length, 1); assert.equal(calls[0].method, 'GET');
+  assert.match(calls[0].url, /id=source-two/);
+  byClass(c.get('reference-choices'), 'reference-choice')[1].events.click();
+  assert.equal(c.get('reference-choices').hidden, true);
+  assert.equal(c.get('reference-preview').hidden, false);
+  c.get('reference-back').events.click();
+  assert.equal(c.get('reference-choices').hidden, false);
+  byClass(c.get('reference-choices'), 'reference-choice')[1].events.click();
+  assert.match(c.get('reference-preview').textContent, /원본 결과/);
+  c.get('reference-goal').value = '완료할 목표'; c.get('reference-goal').events.input();
+  assert.match(c.get('reference-preview').textContent, /목표: 완료할 목표/);
+  c.get('reference-add').events.click();
+  assert.match(entry.text, /^기존 초안\n\n\[참조:/);
+  assert.match(entry.text, /> 원본 결과/);
+  assert.match(entry.text, /이전 대화 일부 제외/);
+  assert.match(entry.text, /목표: 완료할 목표/);
+  assert.doesNotMatch(entry.text, /원본 질문/);
+  assert.equal(calls.length, 1, 'inserting does not send or warm a terminal');
+});
+
+test('대화 참조에서 뒤로 가면 늦은 읽기 결과를 보여주지 않고 초안을 보존한다', async () => {
+  let finish;
+  const c = client(() => new Promise((resolve) => { finish = resolve; }), noChatTimers);
+  c.context.navigator = { onLine: true };
+  const { s, entry } = selectChat(c); loadContextModules(c); c.buildChatComposer(s);
+  const input = c.get('chat-input'); input.value = entry.text = '보존할 초안';
+  vm.runInContext('openReferencePicker', c.context)(s, entry, input);
+  const pending = byClass(c.get('reference-sessions'), 'reference-session')[0].events.click();
+  assert.equal(c.get('reference-choices').hidden, false);
+  c.get('reference-back').events.click();
+  finish({ ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: '늦은 내용' }] }) });
+  await pending;
+  assert.equal(c.get('reference-sessions').hidden, false);
+  assert.equal(c.get('reference-choices').children.length, 0);
+  assert.equal(entry.text, '보존할 초안');
+});
+
+test('대화 참조의 늦은 응답은 다른 선택이나 바뀐 초안에 들어가지 않는다', async () => {
+  let finish;
+  const c = client(() => new Promise((resolve) => { finish = resolve; }), noChatTimers);
+  c.context.navigator = { onLine: true };
+  const { s, entry } = selectChat(c); loadContextModules(c); c.buildChatComposer(s);
+  const input = c.get('chat-input'); input.value = entry.text = '초안';
+  const { openReferencePicker } = vm.runInContext('({openReferencePicker})', c.context);
+  openReferencePicker(s, entry, input);
+  const pending = byClass(c.get('reference-sessions'), 'reference-session')[0].events.click();
+  entry.revision++;
+  finish({ ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: '늦은 결과' }] }) });
+  await pending;
+  assert.equal(byClass(c.get('reference-choices'), 'reference-choice').length, 0);
+  assert.equal(entry.text, '초안');
+});
+
+test('결과물 참조는 명시된 경로만 기존 초안에 더하고 파일을 읽거나 보내지 않는다', () => {
+  const calls = [];
+  const c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const { s, entry } = selectChat(c); loadContextModules(c); c.buildChatComposer(s);
+  c.renderMessages(s, [{ role: 'assistant', text: '결과: `docs/result.md`\n\n검증: 테스트 실행' }]);
+  const input = c.get('chat-input'); input.value = entry.text = '기존 초안'; input.selectionStart = input.selectionEnd = input.value.length;
+  vm.runInContext('openResults', c.context)(s, entry);
+  assert.match(textOf(c.get('results-dialog')), /파일 존재와 검증 성공은 별도 확인/);
+  byClass(c.get('results-dialog'), 'work-context-origin').find((item) => item.textContent === '이 결과를 초안에 참조').events.click();
+  assert.match(entry.text, /기존 초안/); assert.match(entry.text, /> docs\/result.md/);
+  assert.deepEqual(calls, []);
+});
+
+test('이름 붙인 실행 설정은 현재 브라우저에만 저장하고 선택할 때 실행하지 않는다', () => {
+  const calls = [], storage = new Map();
+  const c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.localStorage = { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) };
+  c.state.capabilities = { hosts: [{ name: 'workstation', label: 'Workstation', platform: 'mac', online: true, newSession: { available: true } }] };
+  c.state.newSessionPreset = 'max'; c.state.terminals = [];
+  vm.runInContext('renderNewSessionProfiles', c.context)();
+  let box = c.get('new-session-profiles');
+  box.children[1].value = '검토'; box.children[2].value = 'workstation'; box.children[3].events.click();
+  box = c.get('new-session-profiles'); assert.equal(box.children[0].children.length, 1);
+  c.state.newSessionPreset = ''; box.children[0].children[0].children[0].events.click();
+  assert.equal(c.state.newSessionPreset, 'max'); assert.deepEqual(calls, []);
+  const record = [...storage.values()].find((value) => value.includes('workstation'));
+  assert.deepEqual(JSON.parse(record), [{ name: '검토', host: 'workstation', preset: 'max' }]);
+});
+
+test('대화 프로필은 기기·에이전트·작업 폴더에 묶여 저장되고 명시 적용할 때만 설정을 바꾼다', async () => {
+  const calls = [], storage = new Map();
+  const c = client(async (url, options) => {
+    const body = options.body && JSON.parse(options.body); calls.push({ url, body });
+    const result = url === '/api/chat/command' && body.command === 'models'
+      ? { models: [{ model: 'example-model', label: 'Example', efforts: ['low', 'high'], defaultEffort: 'low' }], current: { model: 'example-model', effort: 'low' } }
+      : url === '/api/chat/command' ? { status: 'configured', next: { model: 'example-model', effort: body.command === 'effort' ? body.value : 'low' } }
+      : { route: c.sourceOf(s), phase: 'idle', capability: { supported: true }, messages: [] };
+    return { ok: true, status: 200, json: async () => result };
+  }, noChatTimers);
+  c.context.localStorage = { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/project'; c.buildChatComposer(s);
+  vm.runInContext('openConversationProfiles', c.context)(s, entry); await settle();
+  assert.deepEqual(calls.map((call) => call.body?.command), ['models']);
+  c.get('conversation-profile-name').value = '개발'; c.get('conversation-profile-effort').value = 'high';
+  c.get('conversation-profile-save').events.click();
+  const row = JSON.parse([...storage.entries()].find(([key]) => key.endsWith('ui:conversationProfiles'))[1])[0];
+  assert.deepEqual(row, { name: '개발', host: s.host, agent: s.agent, home: s.home, cwd: s.cwd, model: 'example-model', effort: 'high' });
+  assert.equal(calls.length, 1);
+  await c.get('conversation-profile-apply').events.click();
+  assert.deepEqual(calls.filter((call) => call.url === '/api/chat/command').map((call) => [call.body.command, call.body.value]),
+    [['models', undefined], ['model', 'example-model'], ['effort', 'high']]);
+  assert.equal(calls.some((call) => call.url === '/api/chat/send'), false);
+});
+
+test('대화 프로필은 명시한 첫 작업과 설정으로 새 대화를 한 번 시작한다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    const body = options.body && JSON.parse(options.body); calls.push({ url, body });
+    const result = url === '/api/chat/command' ? { models: [{ model: 'example-model', efforts: ['high'] }], current: {} }
+      : url === '/api/chat/profile-session' ? { status: 'opened', terminal: { id: 'fixture-terminal' }, initialDelivery: 'accepted' }
+      : {};
+    return { ok: true, status: 200, json: async () => result };
+  }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/project'; c.buildChatComposer(s);
+  vm.runInContext('openConversationProfiles', c.context)(s, entry); await settle();
+  c.get('conversation-profile-prompt').value = '검토할 첫 작업';
+  await c.get('conversation-profile-start').events.click();
+  const request = calls.find((call) => call.url === '/api/chat/profile-session');
+  assert.equal(request.body.prompt, '검토할 첫 작업');
+  assert.equal(request.body.model, 'example-model'); assert.equal(request.body.effort, 'high');
+  assert.match(c.get('conversation-profile-note').textContent, /첫 작업의 진행 상태/);
+  assert.equal(calls.some((call) => call.url === '/api/chat/send'), false);
+});
+
+test('목표 분해는 제안 요청만 초안에 넣고 작업을 자동 실행하지 않는다', () => {
+  const calls = [];
+  const c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  const input = c.get('chat-input'); input.value = entry.text = '이전 초안'; input.selectionStart = input.selectionEnd = input.value.length;
+  vm.runInContext('openTaskPlan', c.context)(s, entry, input);
+  assert.equal(c.get('task-plan-add').disabled, true);
+  c.get('task-plan-goal').value = '목표 달성'; c.get('task-plan-goal').events.input();
+  assert.match(c.get('task-plan-preview').textContent, /제안을 검토하기 전에는/);
+  c.get('task-plan-add').events.click();
+  assert.match(entry.text, /이전 초안/); assert.match(entry.text, /목표 달성/); assert.deepEqual(calls, []);
+});
+
+test('대화 분기는 선택한 완료 지점으로 한 번 요청하고 기존 초안을 보존한다', async () => {
+  const calls = [], childId = '00000000-0000-4000-8000-000000000002';
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/command'
+      ? { status: 'created', id: childId } : { route: c.sourceOf(s), phase: 'idle', capability: { supported: true }, messages: [] } };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); loadContextModules(c); c.buildChatComposer(s);
+  entry.text = '보존할 초안'; entry.data.turns = [{ id: 'turn-1', status: 'completed' }];
+  entry.conversation = { identity: c.conversationIdentity(s), authEpoch: c.state.authEpoch,
+    messages: [{ role: 'assistant', text: '분기 지점 답변', turnId: 'turn-1' }] };
+  vm.runInContext('openConversationFork', c.context)(s, entry);
+  assert.equal(calls.length, 0);
+  const points = c.get('conversation-fork-point'); points.value = 'turn-1';
+  await c.get('conversation-fork-submit').events.click();
+  assert.equal(calls[0].url, '/api/chat/command'); assert.equal(calls[0].body.command, 'fork');
+  assert.equal(calls[0].body.value, 'turn-1'); assert.equal(entry.text, '보존할 초안');
+  assert.match(c.get('conversation-fork-note').textContent, new RegExp(childId));
+  assert.equal(calls.some((call) => call.url === '/api/chat/send'), false);
+});
+
+test('Claude 분기는 현재 대화로 새 터미널을 열고 초안을 보존한다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, body: options.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/chat/command'
+      ? { status: 'opened', id: 'fork-id', terminal: { id: 'terminal-id' }, reason: '첫 입력 뒤 새 대화가 저장됩니다.' }
+      : { route: c.sourceOf(s), phase: 'idle', capability: { supported: false }, messages: [] } };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: null });
+  entry.data.route = c.sourceOf(s); entry.data.messages = []; entry.text = '보존할 초안';
+  c.buildChatComposer(s);
+  vm.runInContext('openConversationFork', c.context)(s, entry);
+  assert.equal(c.get('conversation-fork-point').hidden, true);
+  await c.get('conversation-fork-submit').events.click();
+  assert.equal(calls[0].body.command, 'fork'); assert.equal(calls[0].body.value, null);
+  assert.match(c.get('conversation-fork-note').textContent, /첫 입력 뒤/);
+  assert.equal(entry.text, '보존할 초안');
+  assert.equal(calls.some((call) => call.url === '/api/chat/send'), false);
+});
+
+test('분기 결과가 불명이면 확인 시 같은 요청 번호를 사용한다', async () => {
+  const ids = [];
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/command') ids.push(JSON.parse(options.body).requestId);
+    return { ok: true, status: 200, json: async () => ({ status: 'unknown', reason: '분기 결과 미확인' }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c); c.buildChatComposer(s);
+  vm.runInContext('openConversationFork', c.context)(s, entry);
+  await c.get('conversation-fork-submit').events.click();
+  assert.match(c.get('conversation-fork-note').textContent, /미확인/);
+  assert.equal(c.get('conversation-fork-point').disabled, true);
+  await c.get('conversation-fork-submit').events.click();
+  assert.equal(ids.length, 2); assert.equal(ids[0], ids[1]);
+  assert.equal(c.get('conversation-fork-clear').hidden, false);
+  c.get('conversation-fork-clear').events.click();
+  assert.equal(entry.commandRequest, null); assert.equal(ids.length, 2);
+});
+
+test('입력 초안이 없어도 확인 중인 분기 요청 번호를 복원한다', () => {
+  const c = client(undefined, noChatTimers); c.context.localStorage = draftStorage();
+  const { entry } = selectChat(c);
+  entry.commandRequest = { requestId: 'fork-request-0001', command: 'fork', value: null, status: 'pending' };
+  const { persistChatDraft, restoreChatDraft } = vm.runInContext('({persistChatDraft,restoreChatDraft})', c.context);
+  assert.equal(persistChatDraft(entry), true);
+  entry.commandRequest = null; restoreChatDraft(entry);
+  assert.equal(entry.commandRequest.requestId, 'fork-request-0001'); assert.equal(entry.commandRequest.status, 'unknown');
+});
+
+test('잠금 시 여러 대화 실행 기록도 기기 초안과 함께 지운다', () => {
+  const c = client(undefined, noChatTimers); c.context.localStorage = draftStorage();
+  c.context.localStorage.setItem('sessionholic:batch:v1:fixture', 'private');
+  vm.runInContext('clearSavedDrafts()', c.context);
+  assert.equal(c.context.localStorage.getItem('sessionholic:batch:v1:fixture'), null);
+});
+
+test('서버 실행은 검토 후 시작하고 창을 닫아도 저장된 상태를 다시 읽는다', async () => {
+  const calls = []; let saved = null;
+  const c = client(async (url, options) => {
+    const body = options.body && JSON.parse(options.body); calls.push({ url, body });
+    if (url === '/api/batch/start') saved = { ...body.record, running: true };
+    return { ok: true, status: 200, json: async () => ({ record: saved }) };
+  }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one'; entry.text = '기존 초안';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  const open = vm.runInContext('openBatchWork', c.context); open(s, entry); await settle();
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click();
+  assert.match(c.get('batch-work-note').textContent, /대상과 내용을 확인/);
+  assert.deepEqual(calls.map((call) => call.url), ['/api/batch/get']);
+  await c.get('batch-work-start').events.click();
+  assert.deepEqual(calls.map((call) => call.url), ['/api/batch/get', '/api/batch/start'], c.get('batch-work-note').textContent);
+  assert.equal(calls[1].body.record.tasks.length, 2);
+  assert.equal(entry.text, '기존 초안');
+  c.get('batch-work-dialog').close(); open(s, entry); await settle();
+  assert.match(c.get('batch-work-note').textContent, /브라우저를 닫아도 계속/);
+  assert.match(textOf(c.get('batch-work-preview')), /첫 작업.*둘째 작업/);
+  assert.equal(calls.some((call) => call.url === '/api/chat/send'), false);
+});
+
+test('여러 대화 작업은 검토 후 보내고 불명 전송은 확인할 때까지 나머지를 멈춘다', async () => {
+  const calls = [], store = draftStorage();
+  const c = client(async (url, options) => {
+    const body = options.body && JSON.parse(options.body); calls.push({ url, body });
+    if (url === '/api/chat/send') {
+      return { ok: true, status: 200, json: async () => ({ status: 'unknown', receipt: { requestId: body.requestId, confirmed: false } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ receipts: [{ requestId: body.requestId, status: 'accepted', confirmed: true }] }) };
+  }, noChatTimers);
+  c.context.localStorage = store;
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback({}) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one'; entry.text = '기존 초안';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other'), title: '두 번째' };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click(); assert.equal(calls.length, 0);
+  assert.match(textOf(c.get('batch-work-preview')), /첫 작업.*둘째 작업/);
+  await c.get('batch-work-start').events.click();
+  assert.equal(calls.filter((call) => call.url === '/api/chat/send').length, 1);
+  assert.equal(calls[0].body.requireIdle, true);
+  assert.match(c.get('batch-work-note').textContent, /확인되지 않은 전송/);
+  assert.equal(entry.text, '기존 초안');
+  const request = calls[0].body.requestId;
+  c.get('batch-work-dialog').close(); vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  await c.get('batch-work-check').events.click();
+  assert.equal(calls[1].url, '/api/chat/state'); assert.equal(calls[1].body.requestId, request);
+  await c.get('batch-work-resume').events.click();
+  const sends = calls.filter((call) => call.url === '/api/chat/send');
+  assert.equal(sends.length, 2); assert.equal(sends[1].body.text, '둘째 작업');
+  assert.notEqual(sends[1].body.requestId, request);
+});
+
+test('여러 대화 작업은 검토 후 대상 폴더가 바뀌면 보내지 않는다', async () => {
+  const calls = [], c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback({}) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(other); fields[0].children[1].value = '다른 일';
+  fields[1].children[0].value = c.conversationIdentity(s); fields[1].children[1].value = '현재 일';
+  c.get('batch-work-review').events.click(); other.cwd = '/changed';
+  await c.get('batch-work-start').events.click();
+  assert.deepEqual(calls, []); assert.match(textOf(c.get('batch-work-preview')), /작업 폴더가 바뀌었습니다/);
+});
+
+test('여러 대화 작업은 창 간 잠금을 확보하지 못하면 시작하지 않는다', async () => {
+  const calls = [], c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback(null) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click(); await c.get('batch-work-start').events.click();
+  assert.deepEqual(calls, []); assert.match(c.get('batch-work-note').textContent, /다른 창/);
+});
+
+test('여러 대화 작업은 대상에 다른 전송이 진행 중이면 보내지 않는다', async () => {
+  const calls = [], c = client(async (url) => { calls.push(url); return { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback({}) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click(); entry.sending = true;
+  await c.get('batch-work-start').events.click();
+  assert.deepEqual(calls, []); assert.match(textOf(c.get('batch-work-preview')), /다른 입력이 진행 중/);
+});
+
+test('여러 대화 전송 중 인증 상태가 바뀌면 다음 작업을 보내지 않는다', async () => {
+  let finish;
+  const calls = [], c = client((url) => { calls.push(url); return new Promise((resolve) => { finish = resolve; }); }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback({}) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click(); const pending = c.get('batch-work-start').events.click();
+  assert.deepEqual(calls, ['/api/chat/send']);
+  c.state.authenticated = false;
+  finish({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { confirmed: true } }) });
+  await pending; assert.deepEqual(calls, ['/api/chat/send']);
+  c.state.authenticated = true; c.get('batch-work-dialog').close();
+  vm.runInContext('openLegacyBatchWork', c.context)(s, entry);
+  assert.match(c.get('batch-work-note').textContent, /확인되지 않은 전송/);
+  assert.equal(c.get('batch-work-resume').hidden, true);
+});
+
+test('여러 대화 전송 중 창을 다시 열어도 이전 전송기가 다음 작업을 보내지 않는다', async () => {
+  let finish;
+  const calls = [], c = client((url) => { calls.push(url); return new Promise((resolve) => { finish = resolve; }); }, noChatTimers);
+  c.context.localStorage = draftStorage();
+  c.context.navigator = { locks: { request: async (_name, _options, callback) => callback({}) } };
+  const { s, entry } = selectChat(c); s.cwd = '/fixture/one';
+  const other = { ...s, id: 'other', cwd: '/fixture/two', key: s.key.replace(s.id, 'other') };
+  c.state.snapshot.hosts[0].data.codex.push(other); c.buildChatComposer(s);
+  const open = vm.runInContext('openLegacyBatchWork', c.context); open(s, entry);
+  const fields = byClass(c.get('batch-work-editor'), 'batch-task');
+  fields[0].children[0].value = c.conversationIdentity(s); fields[0].children[1].value = '첫 작업';
+  fields[1].children[0].value = c.conversationIdentity(other); fields[1].children[1].value = '둘째 작업';
+  c.get('batch-work-review').events.click(); const pending = c.get('batch-work-start').events.click();
+  c.get('batch-work-dialog').close(); open(s, entry);
+  finish({ ok: true, status: 200, json: async () => ({ status: 'accepted', receipt: { confirmed: true } }) });
+  await pending;
+  assert.deepEqual(calls, ['/api/chat/send']); assert.match(c.get('batch-work-note').textContent, /확인되지 않은 전송/);
+});
+
+test('부모 카드의 하위 작업 답변 표시는 정확히 연결된 최신 상태만 사용한다', () => {
+  const c = client(undefined, noChatTimers), { s } = selectChat(c); loadContextModules(c);
+  const child = { ...s, id: 'child', key: 'child', parentSessionId: s.id, phase: 'needs_input', runtimeKnown: true };
+  const api = c.context.window.SessionholicRelations, attention = vm.runInContext('cardAttention', c.context);
+  const index = (rows) => api.buildRelationIndex(rows);
+  assert.equal(attention(s, index([s, child])), '하위 작업 답변 필요');
+  assert.equal(attention(s, index([s, { ...child, stale: true }])), '');
+  assert.equal(attention(s, index([s, { ...child, host: 'other' }])), '');
+  assert.equal(attention(s, index([s, s, child])), '');
+});
+
+test('세션 묶기는 선택한 정확한 세션만 기존 작업 저장소에 연결하며 실행하지 않는다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, method: options.method, body: options.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => url === '/api/goals' && options.method === 'GET'
+      ? { goals: [] } : { goal: { id: 'a'.repeat(32) } } };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  const other = { ...s, id: 'source-two', key: s.key.replace(s.id, 'source-two'), title: '두 번째 대화' };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  const { openWorkGroup } = vm.runInContext('({openWorkGroup})', c.context);
+  openWorkGroup(s); await settle();
+  assert.equal(calls.length, 1); assert.equal(calls[0].method, 'GET');
+  c.get('work-group-name').value = '하나의 일';
+  const rows = byClass(c.get('work-group-sessions'), 'work-group-option');
+  const check = rows[1].children[0]; check.checked = true; check.events.change();
+  await c.get('work-group-save').events.click();
+  assert.equal(calls.length, 2); assert.equal(calls[1].url, '/api/goals');
+  assert.deepEqual(calls[1].body.sessions.map((item) => item.id), [s.id, other.id]);
+  assert.equal(calls[1].body.title, '하나의 일');
+  assert.equal(calls.some((call) => /send|launch|terminal/.test(call.url)), false);
+});
+
+test('묶음 결과는 사용자가 읽기를 눌렀을 때 정확히 연결된 대화만 모은다', async () => {
+  const calls = [], goalId = 'a'.repeat(32);
+  let goal;
+  const c = client(async (url, options) => {
+    calls.push({ url, method: options.method });
+    return { ok: true, status: 200, json: async () => url === '/api/goals' ? { goals: [goal] } :
+      { messages: [{ role: 'assistant', text: `결과: \`docs/${url.includes('other') ? 'other' : 'first'}.md\`\n\n검증: 보고된 검증` }] } };
+  }, noChatTimers);
+  const { s } = selectChat(c); loadContextModules(c);
+  const other = { ...s, id: 'other', key: s.key.replace(s.id, 'other'), title: '다른 대화' };
+  c.state.snapshot.hosts[0].data.codex.push(other);
+  goal = { id: goalId, title: '하나의 일', sessions: [
+    { host: s.host, agent: s.agent, home: s.home, id: s.id },
+    { host: other.host, agent: other.agent, home: other.home, id: other.id },
+    { host: other.host, agent: other.agent, home: '.codex-other', id: other.id },
+  ] };
+  vm.runInContext('openWorkGroup', c.context)(s); await settle();
+  const picker = c.get('work-group-picker'); picker.value = goalId; picker.events.change();
+  assert.equal(calls.length, 1, '목표 선택만으로 대화를 읽지 않는다');
+  await c.get('group-results-load').events.click();
+  assert.equal(calls.length, 3); assert.ok(calls.slice(1).every((call) => call.method === 'GET' && call.url.startsWith('/api/read?')));
+  const text = textOf(c.get('group-results-list'));
+  assert.match(text, /docs\/first.md/); assert.match(text, /docs\/other.md/);
+  assert.match(text, /식별을 확인하지 못해/); assert.match(text, /파일 존재와 검증 성공은 별도 확인/);
+});
+
+test('묶음 결과 조회 중 다른 작업으로 바꾸면 늦은 결과를 표시하지 않는다', async () => {
+  let finish;
+  const c = client(async (url) => url === '/api/goals'
+    ? { ok: true, status: 200, json: async () => ({ goals }) }
+    : new Promise((resolve) => { finish = resolve; }), noChatTimers);
+  const { s } = selectChat(c); loadContextModules(c);
+  const ref = { host: s.host, agent: s.agent, home: s.home, id: s.id };
+  const goals = [{ id: 'a'.repeat(32), title: '첫 작업', sessions: [ref] },
+    { id: 'b'.repeat(32), title: '둘째 작업', sessions: [ref] }];
+  vm.runInContext('openWorkGroup', c.context)(s); await settle();
+  const picker = c.get('work-group-picker'); picker.value = goals[0].id; picker.events.change();
+  const pending = c.get('group-results-load').events.click();
+  picker.value = goals[1].id; picker.events.change();
+  finish({ ok: true, status: 200, json: async () => ({ messages: [{ role: 'assistant', text: '`docs/private.md`' }] }) });
+  await pending; assert.doesNotMatch(textOf(c.get('group-results-list')), /private/);
+});
+
+test('작업 완료는 사용자가 조건과 근거를 입력하기 전에는 저장하지 않는다', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    calls.push({ url, method: options.method, body: options.body && JSON.parse(options.body) });
+    return { ok: true, status: 200, json: async () => options.method === 'GET' ? { goals: [] } : { goal: { id: 'a'.repeat(32) } } };
+  }, noChatTimers);
+  const { s } = selectChat(c);
+  c.state.snapshot.hosts[0].data.codex.push({ ...s, id: 'other', key: s.key.replace(s.id, 'other') });
+  vm.runInContext('openWorkGroup', c.context)(s); await settle();
+  c.get('work-group-name').value = '검토';
+  const check = byClass(c.get('work-group-sessions'), 'work-group-option')[1].children[0]; check.checked = true; check.events.change();
+  c.get('work-group-status').value = 'done';
+  await c.get('work-group-save').events.click(); assert.equal(calls.length, 1);
+  c.get('work-group-completionCriteria').value = '기준'; c.get('work-group-evidence').value = '확인한 내용';
+  await c.get('work-group-save').events.click();
+  assert.equal(calls[1].body.status, 'done'); assert.equal(calls[1].body.evidence, '확인한 내용');
+});
+
 test('위임 요청은 내용 확인 후 정확한 부모로 한 번 보내고 기존 초안·첨부는 보존한다', async () => {
   const calls = [];
   const c = client(async (url, options) => {
@@ -15179,43 +15740,6 @@ test('관측 응답의 명시적인 이유 삭제는 구 snapshot 문구를 복�
   note({ phase: 'working', runtimeKnown: true, runtimeReason: '새로 확인한 이유', runtimeObservation: observation(4) });
   note({ phase: 'working', runtimeKnown: true, runtimeObservation: observation(5) });
   assert.equal(listed().runtimeReason, '새로 확인한 이유');
-});
-
-test('에이전트에 전달된 긴 요청은 접고 일반 세션의 내 메시지는 그대로 보인다', () => {
-  const c = client(undefined, noChatTimers);
-  const { s } = selectChat(c, { initiator: 'agent' });
-  c.drawDetail(s); wireTree(c, c.get('detail'));
-  const text = '지침 '.repeat(300) + '실제 작업';
-  c.renderMessages(s, [{ role: 'user', text }], '', true);
-  let row = c.get('messages').conversationRows[0];
-  assert.match(textOf(row.row), /전달된 요청/);
-  assert.equal(row.bubble.children[0].tagName, 'DETAILS');
-  assert.match(row.bubble.children[1].textContent, /실제 작업/);
-  assert.equal(row.bubble.children[0].children[1].textContent, text);
-  const direct = { ...s, initiator: 'human', id: 'direct', key: s.key + '-direct' };
-  c.drawDetail(direct); wireTree(c, c.get('detail'));
-  c.renderMessages(direct, [{ role: 'user', text }], '', true);
-  row = c.get('messages').conversationRows[0];
-  assert.equal(row.bubble.textContent, text);
-});
-
-test('봇 세션은 긴 최초 요청만 기본으로 접고 앞부분이 잘린 기록은 최초라고 추정하지 않는다', () => {
-  const c = client(undefined, noChatTimers), helpers = loadContextModules(c);
-  const { s } = selectChat(c);
-  Object.assign(s, { botOrigin: 'slack', source: 'exec' });
-  c.drawDetail(s); wireTree(c, c.get('detail'));
-  const text = '지침 '.repeat(300) + '요청';
-  const messages = [{ role: 'user', text }, { role: 'assistant', text: '응답' }, { role: 'user', text }];
-  helpers.rememberConversation(s, messages);
-  c.renderMessages(s, messages, '', true);
-  let rows = c.get('messages').conversationRows;
-  assert.match(rows[0].bubble.children[0].className, /delivered-prompt-first/);
-  assert.equal(rows[0].bubble.children[0].children[1].textContent, text);
-  assert.equal(rows[2].bubble.children[1].className, 'delivered-prompt-preview');
-  helpers.rememberConversation(s, messages, { olderOmitted: true });
-  c.renderMessages(s, messages);
-  rows = c.get('messages').conversationRows;
-  assert.equal(rows[0].bubble.children[1].className, 'delivered-prompt-preview');
 });
 
 test('복귀한 Claude 기본 계정 별칭은 목록·다른 대화를 거쳐 재선택해도 같은 entry·초안·스크롤로 돌아온다', () => {

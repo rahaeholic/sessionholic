@@ -8,6 +8,32 @@ const context = require('../web/session_context.js');
 const user = (text, extra = {}) => ({ role: 'user', text, ...extra });
 const answer = (text, extra = {}) => ({ role: 'assistant', text, ...extra });
 
+test('reference choices preserve excerpt scope and quote only the selected text', () => {
+  const choices = context.referenceChoices([user('첫 질문'), answer('첫 답'), user('새 질문')], { olderOmitted: true });
+  assert.equal(choices[0].label, '최근 요청');
+  assert.equal(choices[0].text, '새 질문');
+  assert.equal(choices.some((item) => item.label === '최근 답변'), false);
+  const selected = choices.find((item) => item.text === '첫 답');
+  const result = context.referenceText({ title: '원본', host: 'Mini', agent: 'Codex', account: '개인' }, selected,
+    { olderOmitted: true, stale: true });
+  assert.match(result, /원본 · Mini · Codex · 개인/);
+  assert.match(result, /이전 대화 일부 제외 · 최신 내용 미확인/);
+  assert.match(result, /> 첫 답/);
+  assert.doesNotMatch(result, /첫 질문|새 질문/);
+  assert.equal(context.referenceText({}, { text: '' }), '');
+});
+
+test('evidence aggregates only explicit assistant results and keeps their source message', () => {
+  const rows = [user('`private.txt`'), answer('기록: `docs/first.md`'), user('다음'),
+    answer('[보고서](https://example.com/report)\n검증: 확인함', { ts: 42 }), answer('내용 없음')];
+  const result = context.collectEvidence(rows);
+  assert.deepEqual(result.map((item) => item.index), [3, 1]);
+  assert.deepEqual(result[0].artifacts.map((item) => item.target), ['https://example.com/report']);
+  assert.equal(result[0].verification, '확인함');
+  assert.equal(result[0].excerpt.ts, 42);
+  assert.doesNotMatch(JSON.stringify(result), /private\.txt/);
+});
+
 test('final answer remains the selected result after a later commentary message', () => {
   const result = context.project([user('작업 요청'), answer('최종 결과', { phase: 'final_answer' }),
     answer('후속 상태 안내', { phase: 'commentary' })]);
