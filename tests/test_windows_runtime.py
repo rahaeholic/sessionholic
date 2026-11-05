@@ -111,6 +111,10 @@ class FakeReader:
                     if getattr(owner, 'compact_timeout', False):
                         raise TimeoutError('synthetic lost compact reply')
                     return {}
+                if method == 'thread/fork':
+                    if getattr(owner, 'fork_timeout', False):
+                        raise TimeoutError('synthetic lost fork reply')
+                    return {'thread': {'id': owner.fork_id, 'forkedFromId': owner.sid, 'cwd': str(owner.cwd)}}
                 if method == 'thread/resume':
                     owner.loaded.append(params['threadId'])
                     modes = {'danger-full-access': 'dangerFullAccess', 'workspace-write': 'workspaceWrite',
@@ -169,6 +173,58 @@ class WindowsRuntimeTest(unittest.TestCase):
     def send(self, request='request-1234', text='합성 입력'):
         return self.runtime.chat({'action': 'send', 'source': self.source, 'requestId': request,
                                   'input': [{'type': 'text', 'text': text}]})
+
+    def test_claude_fork_checks_exact_transcript_and_project(self):
+        sid, fork = str(uuid.uuid4()), str(uuid.uuid4())
+        folder = self.reader.claude_home / 'projects/fixture'; folder.mkdir(parents=True)
+        (folder / (sid + '.jsonl')).write_text(json.dumps({'sessionId': sid, 'cwd': str(self.reader.cwd)}) + '\n')
+        binary = self.home / '.local/bin/claude.exe'; binary.parent.mkdir(parents=True); binary.touch()
+        source = {'host': 'fixture-pc', 'agent': 'claude', 'id': sid, 'sessionId': sid, 'cwd': str(self.reader.cwd)}
+        result = self.runtime.claude_fork_plan(source, fork)
+        self.assertEqual(result['argv'], [str(binary), '--resume', sid, '--fork-session', '--session-id', fork])
+        self.assertEqual(result['cwd'], str(self.reader.cwd))
+        with self.assertRaises(ValueError):
+            self.runtime.claude_fork_plan({**source, 'cwd': str(self.home)}, fork)
+
+    def test_profile_starts_one_new_codex_turn_with_chosen_model(self):
+        self.assertIn('thread/start', wr.NativeProxy.ALLOWED)
+        self.models()
+        new_id = str(uuid.uuid4())
+        proxy = self.reader.proxy
+        class Client:
+            def __init__(inner, *args): inner.client = proxy(*args)
+            def __enter__(inner): inner.client.__enter__(); return inner
+            def __exit__(inner, *args): return inner.client.__exit__(*args)
+            def call(inner, method, params):
+                if method == 'thread/start':
+                    self.reader.calls.append((method, copy.deepcopy(params)))
+                    return {'thread': {'id': new_id, 'cwd': str(self.reader.cwd)}, 'model': 'example-one', 'reasoningEffort': 'high'}
+                return inner.client.call(method, params)
+        self.runtime.proxy_factory = Client
+        args = {'source': self.source, 'requestId': 'profile-request-1', 'model': 'example-one',
+                'effort': 'high', 'prompt': 'synthetic first task'}
+        with patch.object(self.runtime, 'recover_session'):
+            first = self.runtime.stage_profile(args)
+            again = self.runtime.stage_profile(args)
+        self.assertEqual(first, again)
+        self.assertEqual(first['nativeSource']['id'], new_id)
+        self.assertEqual(self.reader.send_calls, 1)
+        turn = next(params for method, params in self.reader.calls if method == 'turn/start')
+        self.assertEqual((turn['threadId'], turn['model'], turn['effort']), (new_id, 'example-one', 'high'))
+        self.assertEqual(turn['input'], [{'type': 'text', 'text': 'synthetic first task'}])
+
+    def test_profile_pc_claude_checks_transcript_and_argument_safety(self):
+        sid = str(uuid.uuid4())
+        folder = self.reader.claude_home / 'projects/fixture'; folder.mkdir(parents=True)
+        (folder / (sid + '.jsonl')).write_text(json.dumps({'sessionId': sid, 'cwd': str(self.reader.cwd)}) + '\n')
+        binary = self.home / '.local/bin/claude.exe'; binary.parent.mkdir(parents=True); binary.touch()
+        source = {'host': 'fixture-pc', 'agent': 'claude', 'id': sid, 'sessionId': sid, 'cwd': str(self.reader.cwd)}
+        args = {'source': source, 'model': 'sonnet', 'effort': 'high', 'prompt': 'synthetic task', 'requestId': 'profile-request-1'}
+        result = self.runtime.stage_profile(args)
+        self.assertEqual(result['status'], 'prepared')
+        self.assertEqual(result['argv'][-3:], ['high', '--', 'synthetic task'])
+        with self.assertRaisesRegex(ValueError, '한 줄'):
+            self.runtime.stage_profile({**args, 'prompt': 'line one\nline two'})
 
     def active(self):
         self.reader.thread['status']['type'] = 'active'
@@ -359,6 +415,41 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(self.model_command('compact'), first)
         self.assertEqual(sum(method == 'thread/compact/start' for method, _ in self.reader.calls), 1)
         self.assertEqual(self.reader.send_calls, 0)
+
+    def test_fork_uses_completed_turn_and_never_repeats_unknown(self):
+        self.reader.thread['turns'] = [{'id': 'turn-done', 'status': 'completed', 'items': []}]
+        self.reader.fork_id = str(uuid.uuid4())
+        result = self.model_command('fork', 'turn-done')
+        self.assertEqual((result['status'], result['id']), ('created', self.reader.fork_id))
+        self.assertEqual(self.model_command('fork', 'turn-done'), result)
+        forks = [params for method, params in self.reader.calls if method == 'thread/fork']
+        self.assertEqual(forks, [{'threadId': self.source['id'], 'lastTurnId': 'turn-done', 'deferGoalContinuation': True}])
+        self.reader.fork_timeout = True
+        result = self.model_command('fork', None, 'fork-request-5678')
+        self.assertEqual(result['status'], 'unknown')
+        self.assertEqual(self.model_command('fork', None, 'fork-request-5678'), result)
+        self.assertEqual(sum(method == 'thread/fork' for method, _ in self.reader.calls), 2)
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_batch_send_never_steers_an_active_pc_turn(self):
+        self.active()
+        result = self.runtime.chat({'action': 'send', 'source': self.source, 'requestId': 'batch-request-001',
+                                    'requireIdle': True, 'input': [{'type': 'text', 'text': 'fixture'}]})
+        self.assertEqual(result['delivery'], 'rejected')
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_send_receipt_replay_keeps_and_checks_the_original_folder_binding(self):
+        result = self.send()
+        self.assertEqual(self.send(), result)
+        self.assertEqual(self.reader.send_calls, 1)
+        identity = wr._identity(self.source)
+        name = 'chat-' + wr._digest([identity, 'request-1234']) + '.json'
+        saved = self.runtime.store.read(name)
+        self.assertEqual(saved['binding']['cwd'], wc._norm(str(self.reader.cwd)))
+        saved['binding']['cwd'] = '/different-folder'
+        self.runtime.store.save(name, saved)
+        with self.assertRaises(ValueError): self.send()
+        self.assertEqual(self.reader.send_calls, 1)
 
     def execute(self, preview, action='terminate', request='request-1234', source=None):
         return self.runtime.execute({'source': source or self.source, 'action': action,

@@ -89,6 +89,21 @@ class LaunchTest(unittest.TestCase):
         self.assertEqual(by_id["claude:default"]["label"], "기본 환경 · 기본 Claude")
         self.assertNotIn("fixture: do not read", json.dumps(profiles))
 
+    def test_claude_fork_uses_verified_transcript_and_does_not_send_input(self):
+        sid, fork = str(uuid.uuid4()), str(uuid.uuid4())
+        project = self.home / '.claude/projects/fixture'
+        project.mkdir(parents=True)
+        (project / (sid + '.jsonl')).write_text(json.dumps({'sessionId': sid, 'cwd': str(self.cwd)}) + '\n')
+        source = {'host': 'local', 'agent': 'claude', 'id': 'worker1234', 'sessionId': sid,
+                  'home': '.claude', 'cwd': str(self.cwd)}
+        result = launch.build_claude_fork(source, fork, self.home)
+        self.assertEqual(result['argv'], ['/native/claude', '--resume', sid, '--fork-session', '--session-id', fork])
+        self.assertEqual(result['cwd'], str(self.cwd))
+        with self.assertRaises(ValueError):
+            launch.build_claude_fork({**source, 'cwd': str(self.home)}, fork, self.home)
+        with self.assertRaises(ValueError):
+            launch.build_claude_fork(source, sid, self.home)
+
     def test_missing_saved_login_cannot_be_overridden_by_target_flag(self):
         target = self.profile("codex", ".codex-missing", auth=False)
         with self.assertRaisesRegex(ValueError, "로그인 파일"):

@@ -298,8 +298,8 @@ class Store:
 
 
 class NativeProxy(wc.Proxy):
-    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/archive', 'thread/resume',
-                                  'thread/settings/update', 'model/list', 'thread/compact/start'}
+    ALLOWED = wc.Proxy.ALLOWED | {'turn/start', 'turn/interrupt', 'thread/start', 'thread/archive', 'thread/resume',
+                                  'thread/settings/update', 'model/list', 'thread/compact/start', 'thread/fork'}
 
     def notification(self, until):
         """The next server notification before `until` (monotonic), else None. Waiting stops
@@ -807,6 +807,90 @@ class WindowsRuntime:
                 'cwd': cwd, 'env': {},
                 'nativeSource': {**identity, 'cwd': cwd, 'kind': 'interactive'}, 'connectionMode': 'resume', 'resumed': True}
 
+    def claude_fork_plan(self, source, fork_id):
+        identity = _identity(source)
+        if identity['agent'] != 'claude':
+            raise ValueError('PC Claude 대화를 확인해 주세요.')
+        try:
+            original = str(uuid.UUID(str(source.get('sessionId') or identity['id'])))
+            fork_id = str(uuid.UUID(str(fork_id)))
+        except (ValueError, AttributeError):
+            raise ValueError('PC Claude 대화 식별자를 확인해 주세요.') from None
+        if original == fork_id:
+            raise ValueError('원본과 다른 분기 식별자가 필요합니다.')
+        path = self.reader._transcripts().get(original)
+        if path is None:
+            raise ValueError('PC Claude 기록을 확인하지 못했습니다.')
+        entries = wc._head(path)
+        ids = {row['sessionId'] for row in entries if isinstance(row.get('sessionId'), str) and row['sessionId']}
+        cwds = {wc._norm(row['cwd']) for row in entries if isinstance(row.get('cwd'), str) and row['cwd']}
+        cwd = source.get('cwd')
+        binary = self.reader.home / '.local/bin/claude.exe'
+        if ids != {original} or not isinstance(cwd, str) or cwds != {wc._norm(cwd)} or not Path(wc._windows_path(cwd)).is_dir() or not binary.is_file():
+            raise ValueError('PC Claude 기록의 대화 또는 작업 폴더를 확인하지 못했습니다.')
+        return {'argv': [str(binary), '--resume', original, '--fork-session', '--session-id', fork_id], 'cwd': cwd, 'env': {}}
+
+    def stage_profile(self, args):
+        """Start a reviewed profile on the source's verified PC project server."""
+        if not isinstance(args, dict): raise ValueError('새 실행 정보를 확인해 주세요.')
+        source = args.get('source')
+        identity = _identity(source)
+        model, effort, prompt, request_id = (args.get(key) for key in ('model', 'effort', 'prompt', 'requestId'))
+        if (not isinstance(model, str) or not wc.MODEL_ID.fullmatch(model) or effort not in wc.EFFORTS
+                or not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode()) > 8000
+                or not isinstance(request_id, str) or not CONTROL_REQUEST.fullmatch(request_id)):
+            raise ValueError('새 실행의 모델과 첫 작업을 확인해 주세요.')
+        self.recover_session(source)
+        cwd = source['cwd']
+        if not Path(wc._windows_path(cwd)).is_dir(): raise ValueError('PC 작업 폴더를 확인해 주세요.')
+        if identity['agent'] == 'claude':
+            if model not in ('opus', 'sonnet', 'haiku') or effort not in ('low', 'medium', 'high', 'xhigh', 'max'):
+                raise ValueError('PC Claude의 모델과 에포트를 확인해 주세요.')
+            if len(prompt) > 4096 or any(ord(c) < 32 for c in prompt) or '"' in prompt or (any(c.isspace() for c in prompt) and prompt.endswith('\\')):
+                raise ValueError('PC Claude 첫 작업은 한 줄로 입력하고 큰따옴표를 제외해 주세요.')
+            binary = self.reader.home / '.local/bin/claude.exe'
+            if not binary.is_file(): raise ValueError('PC Claude 실행 파일을 확인해 주세요.')
+            sid = str(uuid.uuid4())
+            native = {'host': identity['host'], 'agent': 'claude', 'home': '.claude', 'id': sid,
+                      'sessionId': sid, 'kind': 'interactive', 'cwd': cwd}
+            return {'status': 'prepared', 'argv': [str(binary), '--session-id', sid, '--model', model,
+                    '--effort', effort, '--', prompt], 'cwd': cwd, 'env': {}, 'nativeSource': native}
+        observed = self._codex(source, time.monotonic() + 15)
+        name = 'profile-' + _digest([identity, request_id]) + '.json'
+        digest = _digest([identity, wc._norm(cwd), model, effort, prompt])
+        with self.store.lock():
+            prior = self.store.read(name)
+            if prior:
+                if prior.get('digest') != digest: raise ValueError('같은 실행 ID에 다른 내용을 사용할 수 없습니다.')
+                return prior['result']
+            with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 30) as client:
+                self._verify_endpoint(observed)
+                self._require_resume_verified(observed)
+                self._thread(client, identity, cwd)
+                chosen = next((row for row in _models(client) if row['model'] == model), None)
+                if not chosen or effort not in chosen['efforts']:
+                    raise ValueError('PC 계정에서 지원하는 모델과 에포트를 선택해 주세요.')
+                unknown = {'status': 'unknown'}
+                self.store.save(name, {'digest': digest, 'result': unknown})
+                try:
+                    started = client.call('thread/start', {'cwd': cwd, 'historyMode': 'legacy', 'model': model,
+                        'config': {'model_reasoning_effort': effort}})
+                    thread = started.get('thread') or {}
+                    sid = str(uuid.UUID(str(thread.get('id'))))
+                    if wc._norm(thread.get('cwd')) != wc._norm(cwd) or started.get('model') != model or started.get('reasoningEffort') != effort:
+                        return unknown
+                    result = client.call('turn/start', {'threadId': sid, 'clientUserMessageId': request_id,
+                        'input': [{'type': 'text', 'text': prompt}], 'model': model, 'effort': effort})
+                    if not (result.get('turn') or {}).get('id'): return unknown
+                    native = {'host': identity['host'], 'agent': 'codex', 'home': '.codex', 'id': sid, 'cwd': cwd}
+                    result = {'status': 'prepared', 'argv': [str(self.reader.binary), 'resume', sid, '--remote',
+                        'unix://' + Path(observed['path']).as_posix(), '--cd', cwd], 'cwd': cwd,
+                        'env': {'CODEX_HOME': str(self.reader.codex_home)}, 'nativeSource': native}
+                    self.store.save(name, {'digest': digest, 'result': result})
+                    return result
+                except (OSError, ValueError, TimeoutError):
+                    return unknown
+
     def _board_orphan(self, observed, source):
         """Whether an interactive Claude run is the board's own idle resume of this session:
         its parent is the PowerShell the board's SSH terminal starts for it (`_terminal_script`).
@@ -943,7 +1027,7 @@ class WindowsRuntime:
 
     def _command(self, args, observed):
         command, value, request_id = args.get('command'), args.get('value'), args.get('requestId')
-        if command not in ('models', 'model', 'effort', 'compact'):
+        if command not in ('models', 'model', 'effort', 'compact', 'fork'):
             raise ValueError('지원하는 PC 채팅 명령을 선택해 주세요.')
         if command in ('models', 'compact') and value is not None:
             raise ValueError('모델 조회와 요약 명령에는 인자를 넣지 않습니다.')
@@ -951,6 +1035,8 @@ class WindowsRuntime:
             raise ValueError('PC 명령 요청 식별자가 올바르지 않습니다.')
         if command in ('model', 'effort') and not isinstance(value, str):
             raise ValueError('모델 또는 에포트 목록에서 선택해 주세요.')
+        if command == 'fork' and value is not None and (not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', value)):
+            return {'status': 'rejected', 'reason': '분기할 대화 지점을 확인해 주세요.'}
         identity, binding = observed['source'], self._model_binding(observed)
         digest, name = _digest([command, value]), 'command-' + _digest([identity, request_id]) + '.json'
         # Catalog reads never mutate receipts or the runtime. Atomic preference
@@ -980,9 +1066,35 @@ class WindowsRuntime:
                 if command == 'models':
                     return {'models': _models(client), 'current': current, 'next': self._model_preferences(observed)}
                 if not _capabilities(thread)['canSend']:
+                    if command == 'fork':
+                        return {'status': 'rejected', 'reason': '현재 PC 원본 세션을 안전하게 확인하지 못했습니다.'}
                     raise ValueError('현재 PC 세션에서 이 명령을 사용할 수 없습니다.')
                 if command == 'compact' and _state(thread)['phase'] != 'idle':
                     raise ValueError('진행 중인 작업이 끝난 뒤 요약해 주세요.')
+                if command == 'fork':
+                    if _state(thread)['phase'] != 'idle':
+                        return {'status': 'rejected', 'reason': '원본 작업이 끝난 뒤 분기해 주세요.'}
+                    if value is not None and not any(t.get('id') == value and t.get('status') == 'completed' for t in thread['turns']):
+                        return {'status': 'rejected', 'reason': '완료된 원본 대화 지점을 확인하지 못했습니다.'}
+                    unknown = {'status': 'unknown', 'reason': '분기 생성 여부를 확인하지 못했습니다. 자동으로 다시 만들지 않습니다.'}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': unknown})
+                    try:
+                        params = {'threadId': identity['id'], 'deferGoalContinuation': True}
+                        if value is not None:
+                            params['lastTurnId'] = value
+                        answer = client.call('thread/fork', params)
+                        fork = answer.get('thread') if isinstance(answer, dict) else None
+                        if not isinstance(fork, dict):
+                            return unknown
+                        new_id = str(uuid.UUID(str(fork.get('id'))))
+                        if new_id == identity['id'] or fork.get('forkedFromId') not in (None, identity['id']) or wc._norm(fork.get('cwd')) != binding['cwd']:
+                            return unknown
+                        result = {'status': 'created', 'id': new_id, 'source': identity, 'cwd': observed['cwd'],
+                                  'reason': '원본 대화에서 새 세션을 만들었습니다.'}
+                    except (OSError, ValueError, TimeoutError):
+                        return unknown
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': result})
+                    return result
                 if command in ('model', 'effort'):
                     previous = self._model_preferences(observed) or current
                     model = value if command == 'model' else previous.get('model')
@@ -1048,6 +1160,9 @@ class WindowsRuntime:
 
     def _send(self, args, observed):
         identity, request_id = observed['source'], args['requestId']
+        binding = self._model_binding(observed)
+        if type(args.get('requireIdle', False)) is not bool:
+            raise ValueError('작업 상태 조건을 확인해 주세요.')
         inputs = args.get('input')
         # The 32 KiB is the user's text; the board's attachment lines come on top of it.
         if (not isinstance(inputs, list) or len(inputs) > 16
@@ -1075,13 +1190,15 @@ class WindowsRuntime:
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
                     return before
+                if args.get('requireIdle') is True and _state(thread)['phase'] != 'idle':
+                    return {**before, 'delivery': 'rejected', 'reason': '해당 대화가 작업 중이어서 보내지 않았습니다.'}
                 caps = _capabilities(thread)
                 if not caps['canSend']:
                     return {**before, 'delivery': 'rejected', 'reason': caps['reason']}
                 # A follow-up while a turn is running must not replace that turn's model.
                 preferences = self._model_preferences(observed) if _state(thread)['phase'] == 'idle' else {}
                 before = {**before, **named}
-                self.store.save(name, {'digest': digest, 'result': before, **named})
+                self.store.save(name, {'digest': digest, 'binding': binding, 'result': before, **named})
                 result = before
                 try:
                     response = client.call('turn/start', {'threadId': identity['id'], 'input': inputs,
@@ -1095,7 +1212,7 @@ class WindowsRuntime:
                         result = {**confirmed, **named}
                 except (OSError, ValueError, TimeoutError):
                     pass
-                self.store.save(name, {'digest': digest, 'result': result, **named})
+                self.store.save(name, {'digest': digest, 'binding': binding, 'result': result, **named})
                 return result
 
     def _verify_endpoint(self, observed):
@@ -1410,6 +1527,10 @@ def handle(request, data=None):
     if op == 'terminal_plan':
         return runtime.terminal_plan(args.get('source'), prepare=args.get('prepare') is True,
                                      takeover=args.get('takeover') is True)
+    if op == 'claude_fork_plan':
+        return runtime.claude_fork_plan(args.get('source'), args.get('forkId'))
+    if op == 'stage_profile':
+        return runtime.stage_profile(args)
     if op == 'terminal_settle':
         return runtime.terminal_settle(args.get('source'))
     if op == 'resume_preview':

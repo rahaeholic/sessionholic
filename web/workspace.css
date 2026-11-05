@@ -70,7 +70,7 @@ body.workspace-embedded .back { visibility: hidden; pointer-events: none; }
 body.workspace-embedded .detail-head { padding-top: 4px; }
 @media (max-width: 700px) {
   body.workspace-split .top { display: flex; min-height: 42px; }
-  body.workspace-split .top > :not(#home):not(#workspace-switcher):not(#workspace-split-open) { display: none; }
+  body.workspace-split .top > :not(#home):not(#board-status):not(#workspace-switcher):not(#workspace-split-open) { display: none; }
   body.workspace-split #task-list-pane { display: none; }
   body.workspace-split #session-layout { display: flex; flex-direction: column; }
   body.workspace-split #session-workspace { flex: 1; }

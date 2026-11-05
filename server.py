@@ -4158,6 +4158,18 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.chat.command(data)
                 self.follow_closely(data)
                 return self.send_json(200, result)
+            if path == "/api/chat/profile-session":
+                return self.send_json(200, self.server.chat.new_profile_session(data))
+            if path == "/api/chat/profile-clear":
+                return self.send_json(200, self.server.chat.clear_profile_unknown(data))
+            if path == "/api/batch/get":
+                return self.send_json(200, self.server.batch_jobs.get(data.get('source')))
+            if path == "/api/batch/start":
+                return self.send_json(200, self.server.batch_jobs.start(data.get('source'), data.get('record')))
+            if path == "/api/batch/control":
+                return self.send_json(200, self.server.batch_jobs.control(data.get('source'), data.get('action'), data.get('requestId')))
+            if path == "/api/batch/check":
+                return self.send_json(200, self.server.batch_jobs.check(data.get('source')))
             if path == "/api/plan":
                 return self.send_json(200, self.server.workflow.plan(data))
             if path == "/api/launch":
@@ -4223,7 +4235,7 @@ class Handler(BaseHTTPRequestHandler):
         except LaunchFailure as exc:
             return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:
-            safe = {"dispatchState": "not_started"} if path == "/api/session/action" and not getattr(self, "control_dispatched", False) else {}
+            safe = {"dispatchState": "not_started"} if (path == "/api/chat/profile-session" or path == "/api/session/action" and not getattr(self, "control_dispatched", False)) else {}
             return self.send_json(400, {"error": str(exc) if isinstance(exc, ValueError) else "터미널을 찾지 못했어요.", **safe})
         except RuntimeError as exc:
             safe = {"dispatchState": "not_started"} if path == "/api/session/action" and not getattr(self, "control_dispatched", False) else {}
@@ -4398,6 +4410,9 @@ class BoardHTTPServer(ThreadingHTTPServer):
     request_queue_size = 128
 
     def server_close(self):
+        batch_jobs = getattr(self, "batch_jobs", None)
+        if batch_jobs is not None:
+            batch_jobs.close()
         jobs = getattr(self, "termination_jobs", None)
         if jobs is not None:
             jobs.close()
@@ -4487,6 +4502,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.workflow.bot_requests = server.bot_requests
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
+    from batch_jobs import BatchJobs
+    server.batch_jobs = BatchJobs(state_dir, server.chat)
     server.termination_jobs = TerminationJobs(state_dir, lambda job, initial: run_termination_job(server, job, initial))
     from events import EventHub
     # Also announces the terminal list: what the board's terminals report, and while
@@ -4514,6 +4531,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
         server.work.start()
     if termination_worker:
         server.termination_jobs.start()
+    server.batch_jobs.start_worker()
     return server
 
 

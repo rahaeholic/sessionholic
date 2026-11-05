@@ -284,6 +284,21 @@ class PhaseTest(unittest.TestCase):
 
 
 class MessageTest(unittest.TestCase):
+    def test_response_model_metadata_is_attached_only_when_recorded(self):
+        claude = collector.claude_messages([
+            {"type": "assistant", "effort": "high", "message": {"model": "claude-opus-4-6", "content": "첫 답"}},
+            {"type": "assistant", "message": {"content": "다음 답"}},
+        ])
+        self.assertEqual((claude[0]["model"], claude[0]["effort"]), ("claude-opus-4-6", "high"))
+        self.assertNotIn("model", claude[1])
+        self.assertNotIn("effort", claude[1])
+        codex = collector.codex_messages([
+            {"model": "gpt-example", "reasoningEffort": "xhigh", "items": [{"type": "agentMessage", "text": "답"}]},
+            {"items": [{"type": "agentMessage", "text": "미확인"}]},
+        ])
+        self.assertEqual((codex[0]["model"], codex[0]["effort"]), ("gpt-example", "xhigh"))
+        self.assertNotIn("model", codex[1])
+
 
     def test_slack_request_preserves_quoted_trailer_indentation_and_body_length(self):
         header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 지침\n[요청]\n'

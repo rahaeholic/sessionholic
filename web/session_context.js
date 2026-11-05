@@ -119,5 +119,41 @@
     }
     return { artifacts, verification: verification.join('\n').slice(0, 1200) };
   }
-  return Object.freeze({ project, labeledNext, artifactEvidence, LIMITS });
+  // A reference is an explicit excerpt, never an instruction to read an unverified path.
+  function referenceChoices(messages, meta = {}) {
+    const rows = Array.isArray(messages) ? messages : [];
+    const projection = project(rows, meta);
+    const choices = [];
+    for (const [name, label] of [['lastRequest', '최근 요청'], ['lastResult', '최근 답변']]) {
+      const part = projection[name];
+      if (part?.text) choices.push({ label, ...part });
+    }
+    rows.forEach((message, index) => {
+      if (!message || !['user', 'assistant'].includes(message.role) || !clean(message.text)) return;
+      choices.push({ label: `${message.role === 'user' ? '요청' : '답변'} ${index + 1}`,
+        ...excerpt(message, index, LIMITS.result, 'selected_message') });
+    });
+    return choices;
+  }
+  function referenceText(source, choice, scope = {}) {
+    if (!source || !choice || !clean(choice.text)) return '';
+    const title = clean(source.title).slice(0, 160) || '제목 없는 대화';
+    const origin = [source.host, source.agent, source.account].map(clean).filter(Boolean).join(' · ');
+    const limits = [choice.truncated ? '발췌 일부' : '', scope.olderOmitted ? '이전 대화 일부 제외' : '',
+      scope.stale ? '최신 내용 미확인' : ''].filter(Boolean).join(' · ');
+    const quote = clean(choice.text).split('\n').map((line) => `> ${line}`).join('\n');
+    return `[참조: ${title}${origin ? ` · ${origin}` : ''} · ${clean(choice.label)}${limits ? ` · ${limits}` : ''}]\n${quote}\n[/참조]`;
+  }
+  function collectEvidence(messages) {
+    const rows = Array.isArray(messages) ? messages : [], results = [];
+    for (let index = rows.length - 1; index >= 0 && results.length < 80; index--) {
+      const message = rows[index];
+      if (!message || message.role !== 'assistant' || !clean(message.text)) continue;
+      const evidence = artifactEvidence(message.text);
+      if (!evidence.artifacts.length && !evidence.verification) continue;
+      results.push({ index, excerpt: excerpt(message, index, LIMITS.result, 'assistant_excerpt'), ...evidence });
+    }
+    return results;
+  }
+  return Object.freeze({ project, labeledNext, artifactEvidence, referenceChoices, referenceText, collectEvidence, LIMITS });
 });

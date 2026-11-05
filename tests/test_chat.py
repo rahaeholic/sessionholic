@@ -399,6 +399,11 @@ class ChatTest(unittest.TestCase):
         self.source['cwd']='/changed'
         self.board.poll(HOST)
         with self.assertRaises(ValueError): self.chat.upload(REF,'file',b'X')
+    def test_send_with_reviewed_folder_rejects_a_changed_folder_before_rpc(self):
+        with self.assertRaises(chat.SendRejected):
+            self.chat.send({'source': {**REF, 'cwd': '/wrong'}, 'requestId': 'request-0001', 'text': 'hello'})
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.chat.send({'source': {**REF, 'cwd': str(self.project)}, 'requestId': 'request-0002', 'text': 'hello'})['status'], 'accepted')
     def test_transport_failure_is_unknown_not_retry(self):
         self.flow.transfers.rpc=lambda *a,**k: (_ for _ in ()).throw(RuntimeError('timeout'))
         result=self.chat.send({'source':REF,'requestId':'request-0001','text':'hello'})
@@ -1008,6 +1013,21 @@ class StateShareTest(unittest.TestCase):
 
 
 class ChatHttpTest(ChatTest):
+    def test_batch_start_and_profile_start_require_auth_and_csrf(self):
+        for path, owner, method in [('/api/batch/start', self.httpd.batch_jobs, 'start'),
+                                    ('/api/chat/profile-session', self.chat, 'new_profile_session')]:
+            with self.subTest(path=path), patch.object(owner, method, return_value={'ok': True}) as called:
+                def request(headers):
+                    client = http.client.HTTPConnection('127.0.0.1', self.port, timeout=3)
+                    client.request('POST', path, json.dumps({'source': REF}), {'Content-Type': 'application/json', **headers})
+                    response = client.getresponse(); response.read(); client.close(); return response.status
+                self.assertEqual(request({}), 401)
+                self.assertEqual(request({'Authorization': 'Bearer synthetic'}), 403)
+                self.assertEqual(request({'Authorization': 'Bearer synthetic', 'X-CSRF-Token': self.httpd.csrf,
+                                          'Origin': 'https://evil.example'}), 403)
+                called.assert_not_called()
+                self.assertEqual(request({'Authorization': 'Bearer synthetic', 'X-CSRF-Token': self.httpd.csrf}), 200)
+                called.assert_called_once()
     def test_connect_route_requires_auth_csrf_origin_and_has_no_message_body(self):
         calls = []
         self.chat.connect = lambda data: calls.append(data) or {'connected': True}
@@ -1123,7 +1143,7 @@ class FakeTerminals:
         if self.paste_error:
             raise self.paste_error
         return {'ok': True}
-    def capture(self, terminal_id):
+    def capture(self, terminal_id, styled=False):
         self.log.append('capture')
         if self.capture_error:
             raise self.capture_error
@@ -1191,6 +1211,64 @@ class ChatClaudeTest(unittest.TestCase):
 
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
+
+    def test_fork_opens_one_terminal_and_replays_receipt_without_sending(self):
+        from contextlib import nullcontext
+        spec = {'argv': ['/native/claude'], 'cwd': str(self.project), 'env': {}}
+        with patch('launch.build_claude_fork', return_value=spec), \
+             patch.object(self.terms, 'reserve', return_value=nullcontext(), create=True), \
+             patch.object(self.terms, 'create', return_value={'id': TERMINAL_ID}, create=True) as create:
+            first = self.control('fork', request='fork-0001')
+            again = self.control('fork', request='fork-0001')
+        self.assertEqual(first, again)
+        self.assertEqual(first['status'], 'opened')
+        create.assert_called_once()
+        self.assertFalse(self.terms.pastes)
+
+    def test_fork_refuses_busy_and_does_not_repeat_unknown_dispatch(self):
+        from contextlib import nullcontext
+        self.phase = 'working'
+        with self.assertRaisesRegex(ValueError, '작업이 끝난'):
+            self.control('fork', request='fork-0002')
+        self.phase = 'idle'
+        spec = {'argv': ['/native/claude'], 'cwd': str(self.project), 'env': {}}
+        with patch('launch.build_claude_fork', return_value=spec), \
+             patch.object(self.terms, 'reserve', return_value=nullcontext(), create=True), \
+             patch.object(self.terms, 'create', side_effect=OSError('fixture'), create=True) as create:
+            self.assertEqual(self.control('fork', request='fork-0003')['status'], 'unknown')
+            self.assertEqual(self.control('fork', request='fork-0003')['status'], 'unknown')
+        create.assert_called_once()
+
+    def test_profile_session_is_idempotent_and_uses_explicit_prompt(self):
+        from contextlib import nullcontext
+        spec = {'argv': ['/native/claude', 'first task'], 'cwd': str(self.project), 'env': {}, 'mode': 'profile'}
+        data = {'source': CLAUDE_REF, 'model': 'sonnet', 'effort': 'high', 'prompt': 'first task', 'requestId': 'profile-0001'}
+        with patch.object(self.chat, 'command', return_value={'models': [{'model': 'sonnet', 'efforts': ['high']}]}), \
+             patch('launch.build_profile_launch', return_value=(spec, {'agent': 'claude', 'home': '.claude'})) as build, \
+             patch('managed_launch.bind', return_value=spec), \
+             patch.object(self.terms, 'reserve', return_value=nullcontext(), create=True), \
+             patch.object(self.terms, 'create', return_value={'id': TERMINAL_ID}, create=True) as create:
+            first = self.chat.new_profile_session(data)
+            again = self.chat.new_profile_session(data)
+        self.assertEqual(first, again)
+        self.assertEqual(first['status'], 'opened')
+        self.assertEqual(build.call_args.args[1:], ('sonnet', 'high', 'first task'))
+        create.assert_called_once()
+
+    def test_unknown_profile_requires_explicit_clear_before_a_new_request(self):
+        from contextlib import nullcontext
+        data = {'source': CLAUDE_REF, 'model': 'sonnet', 'effort': 'high', 'prompt': 'first task', 'requestId': 'profile-0002'}
+        with patch.object(self.chat, 'command', return_value={'models': [{'model': 'sonnet', 'efforts': ['high']}]}), \
+             patch('launch.build_profile_launch', side_effect=OSError('fixture')) as build, \
+             patch.object(self.terms, 'reserve', return_value=nullcontext(), create=True):
+            first = self.chat.new_profile_session(data)
+            blocked = self.chat.new_profile_session({**data, 'requestId': 'profile-0003'})
+            self.assertEqual(first['status'], 'unknown')
+            self.assertEqual(blocked['requestId'], 'profile-0002')
+            build.assert_called_once()
+            self.chat.clear_profile_unknown({'source': CLAUDE_REF, 'requestId': 'profile-0002'})
+            self.chat.new_profile_session({**data, 'requestId': 'profile-0003'})
+            self.assertEqual(build.call_count, 2)
 
     def test_moved_claude_keeps_live_terminal_and_previous_attachments(self):
         self.board.hosts = [{**HOST, 'platform': 'windows'}]
@@ -1262,6 +1340,20 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(len(self.terms.pastes), 1)
         with self.assertRaisesRegex(ValueError, '같은'): self.control('model', 'sonnet')
 
+    def test_compact_accepts_colored_placeholder_but_refuses_typed_draft(self):
+        self.terminal()
+        placeholder = ('──────────\n❯ \x1b[7mT\x1b[27m\x1b[38;2;153;153;153mry "fix lint errors"\x1b[39m\n──────────\n')
+        self.terms.screen = placeholder
+        with patch.object(chat, 'SUBMIT_CHECK_SECONDS', 0):
+            result = self.control('compact')
+        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '/compact', True)])
+        for draft in ['❯ user text', '❯ \x1b[7mx\x1b[27m', '❯ first\nsecond']:
+            self.terms.screen = '──────────\n' + draft + '\n──────────\n'
+            with self.assertRaises(ValueError):
+                self.control('compact', request='draft-' + str(len(draft)).zfill(8))
+        self.assertEqual(len(self.terms.pastes), 1)
+
     def test_commands_refuse_menus_existing_input_busy_and_invalid_values(self):
         self.terminal()
         for screen in [CLAUDE_PERMISSION, '──────────\n❯ already typed\n──────────\n', 'loading...']:
@@ -1318,6 +1410,11 @@ class ChatClaudeTest(unittest.TestCase):
 
     def send(self, rid='request-0001', text='안녕하세요', **extra):
         return self.chat.send({'source': CLAUDE_REF, 'requestId': rid, 'text': text, **extra})
+
+    def test_batch_send_does_not_paste_into_an_active_claude_session(self):
+        self.phase = 'working'
+        with self.assertRaises(chat.SendRejected): self.send(requireIdle=True)
+        self.assertEqual(self.terms.pastes, [])
 
     def state(self, **extra):
         self.chat.cache.clear()
@@ -2342,6 +2439,30 @@ class MenuDemoTmuxTest(unittest.TestCase):
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def test_profile_applies_model_and_effort_to_new_native_session_and_first_turn(self):
+        class Client:
+            def __init__(self): self.calls = []
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def call(self, method, args):
+                self.calls.append((method, args))
+                if method == 'model/list': return {'data': [{'model': 'fixture-model', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]}]}
+                if method == 'thread/start': return {'thread': {'id': SID, 'cwd': '/tmp/fixture'}, 'model': 'fixture-model', 'reasoningEffort': 'high'}
+                if method == 'thread/read': return {'thread': {'id': SID, 'turns': [{'id': 't1'}]}}
+                return {'turn': {'id': 't1'}}
+        client = Client()
+        spec = {'mode': 'profile', 'argv': ['codex', 'user first task'], 'cwd': '/tmp/fixture', 'env': {},
+                'model': 'fixture-model', 'effort': 'high'}
+        with tempfile.TemporaryDirectory() as folder, patch('transfer_native._socket_path', return_value=Path('/tmp/control.sock')), \
+             patch('native_chat._client', return_value=client), patch('managed_launch.ensure_app_server'):
+            out = managed_launch.bind(spec, {'agent': 'codex', 'home': '.codex'}, 'fixture', receipt_path=Path(folder) / 'receipt.json')
+        calls = dict(client.calls)
+        self.assertEqual(calls['thread/start']['config'], {'model_reasoning_effort': 'high'})
+        self.assertEqual((calls['thread/start']['model'], calls['turn/start']['model'], calls['turn/start']['effort']),
+                         ('fixture-model', 'fixture-model', 'high'))
+        self.assertEqual(calls['turn/start']['input'], [{'type': 'text', 'text': 'user first task'}])
+        self.assertEqual(out['nativeSource']['id'], SID)
+        self.assertNotIn('user first task', out['argv'])
     def test_new_codex_prompt_is_native_once_and_tui_only_attaches(self):
         class Client:
             def __init__(self): self.calls=[]

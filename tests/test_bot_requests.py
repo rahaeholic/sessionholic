@@ -451,6 +451,37 @@ class BotRequestsTest(unittest.TestCase):
     ENVELOPE = ('[슬랙 요청]\n- 요청자: 예시 요청자\n- 작업 번호: 7\n[처리 원칙]\n- 합성 원칙\n'
                 '[요청]\n재고 수량을 알려 주세요\n\n[마무리 규칙] 최종 답변만 Slack에 올라간다.')
 
+    def test_codex_harness_before_bot_envelope_is_removed_before_clipping(self):
+        agent = '# AGENTS.md instructions for /example\n<INSTRUCTIONS>' + '합성 지침' * 1000 + '</INSTRUCTIONS>'
+        env = '<environment_context>합성 환경</environment_context>'
+        wrapped = agent + '\n' + env + '\n' + self.ENVELOPE
+        row = bots._message('user', wrapped, 1, len(wrapped))
+        self.assertEqual(row['text'], '재고 수량을 알려 주세요')
+        self.assertNotIn('truncated', row)
+        self.assertIsNone(bots._message('user', agent + '\n' + env, 1, len(agent + '\n' + env)))
+        quoted = '이 문구 검토: # AGENTS.md instructions for /example\n<INSTRUCTIONS>합성 지침</INSTRUCTIONS>'
+        self.assertEqual(bots._message('user', quoted, 1, len(quoted))['text'], quoted)
+        incomplete = '# AGENTS.md instructions for /example\n<INSTRUCTIONS>끝나지 않은 지침'
+        row = bots._message('user', incomplete, 1, len(incomplete) + 100)
+        self.assertEqual(row['text'], incomplete)
+        self.assertTrue(row['truncated'])
+        assistant = bots._message('assistant', wrapped, 1, len(wrapped))
+        self.assertTrue(assistant['text'].startswith('# AGENTS.md instructions for /example'))
+        self.assertTrue(assistant['truncated'])
+
+    def test_bot_conversation_skips_harness_only_turn_and_shows_request(self):
+        session = '20990101_000000_abc123'
+        self.hermes_ledger(['hermes:' + session])
+        agent = '# AGENTS.md instructions for /example\n<INSTRUCTIONS>합성 지침</INSTRUCTIONS>'
+        self.hermes_store(self.home / 'bot/hermes/state.db', {session: [
+            ('user', agent, None, 1700000001),
+            ('user', agent + '\n' + self.ENVELOPE, None, 1700000002),
+            ('assistant', '확인했습니다.', None, 1700000003)]})
+        api = self.configure()
+        [segment] = api.conversation(self.source['id'], api.snapshot()['requests'][0]['id'])['segments']
+        self.assertEqual([(row['role'], row['text']) for row in segment['messages']],
+                         [('user', '재고 수량을 알려 주세요'), ('assistant', '확인했습니다.')])
+
     def hermes_store(self, path, sessions):
         """sessions: {session id: [(role, content, tool_calls, timestamp)]}."""
         path.parent.mkdir(parents=True, exist_ok=True)

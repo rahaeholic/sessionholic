@@ -1955,6 +1955,7 @@ button.host:focus-visible {
 .msg-label {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   margin: 0 8px 4px;
   color: var(--label-3);
@@ -1964,6 +1965,8 @@ button.host:focus-visible {
   color: var(--label-2);
   font-weight: 600;
 }
+.msg-model { min-width: 0; font-size: 0.9em; overflow-wrap: anywhere; }
+.msg-model:empty { display: none; }
 .bubble {
   max-width: 100%;
   padding: 9px 14px;
@@ -2120,6 +2123,11 @@ li[data-task] {
   background: var(--accent-fill);
   color: var(--on-accent);
 }
+.delivered-prompt-toggle { cursor: pointer; font-weight: 650; margin-bottom: 8px; }
+.delivered-prompt-preview, .delivered-prompt-full { white-space: pre-wrap; overflow-wrap: anywhere; }
+.delivered-prompt[open] + .delivered-prompt-preview { display: none; }
+.delivered-prompt-first-note { font-size: var(--fs-cap); }
+.delivered-prompt-first[open] + .delivered-prompt-first-note { display: none; }
 .msg.system {
   align-items: center;
   text-align: center;
@@ -3046,6 +3054,7 @@ li[data-task] {
 }
 .chat-composer .chat-main > #chat-attach-inline,
 .chat-composer .chat-main > #chat-quick-inline,
+.chat-composer .chat-main > #chat-reference-inline,
 .chat-composer .chat-main > #chat-mic {
   flex: none;
   display: inline-flex;
@@ -3264,9 +3273,6 @@ li[data-task] {
   }
   body.show-detail .detail-pane {
     display: flex;
-  }
-  body.show-detail .top {
-    display: none;
   }
   body.show-detail .app {
     background: var(--surface);
@@ -4013,6 +4019,10 @@ li[data-task] {
   padding-top: 10px;
   padding-bottom: 8px;
 }
+/* Keep the editor away from the iPad's bottom-edge home gesture. */
+:root[data-ipad] body:not(.keyboard-open) .chat-composer {
+  padding-bottom: max(48px, env(safe-area-inset-bottom));
+}
 
 /* Status: no space when empty (existing :empty rule); long errors stay
    readable by scrolling instead of stretching the compact bar. */
@@ -4176,7 +4186,9 @@ li[data-task] {
     0 0 0 1px var(--sep),
     var(--shadow-pop);
 }
-.chat-tools-actions > button {
+.chat-tools-actions > button,
+.chat-more-actions > button,
+.chat-more-actions > summary {
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -4194,13 +4206,21 @@ li[data-task] {
   text-align: left;
   white-space: normal;
 }
-.chat-tools-actions > button:active:not(:disabled) {
+.chat-more-actions > summary { cursor: pointer; color: var(--label-2); list-style: none; }
+.chat-more-actions > summary::-webkit-details-marker { display: none; }
+.chat-more-actions > summary::after { content: ""; margin-left: auto; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); }
+.chat-more-actions[open] > summary::after { transform: translateY(2px) rotate(225deg); }
+.chat-tools-actions > button:active:not(:disabled),
+.chat-more-actions > button:active:not(:disabled),
+.chat-more-actions > summary:active {
   background: var(--fill-press);
 }
-.chat-tools-actions > button:focus-visible {
+.chat-tools-actions > button:focus-visible,
+.chat-more-actions > button:focus-visible,
+.chat-more-actions > summary:focus-visible {
   outline-offset: -3px;
 }
-.chat-tools-actions > #chat-clipboard::before {
+.chat-more-actions > #chat-clipboard::before {
   color: var(--accent);
 }
 
@@ -4220,7 +4240,9 @@ li[data-task] {
 @media (hover: hover) and (pointer: fine) {
   .chat-toolbar > button:hover:not(:disabled),
   .chat-tools > summary:hover,
-  .chat-tools-actions > button:hover:not(:disabled) {
+  .chat-tools-actions > button:hover:not(:disabled),
+  .chat-more-actions > button:hover:not(:disabled),
+  .chat-more-actions > summary:hover {
     background-color: var(--fill-soft);
   }
 }
@@ -4286,7 +4308,7 @@ li[data-task] {
     border: 1px solid ButtonText;
   }
   .chat-toolbar > #chat-attach::before,
-  .chat-tools-actions > #chat-clipboard::before {
+  .chat-more-actions > #chat-clipboard::before {
     background: ButtonText;
   }
 }
@@ -7591,6 +7613,47 @@ input.switch:focus-visible {
 .delegation-field textarea { background: var(--surface); border: 1px solid var(--sep-strong); border-radius: 8px; }
 .delegation-field:has(input[type="checkbox"]) { display: flex; align-items: center; justify-content: space-between; }
 .delegation-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 26vh; overflow: auto; font: inherit; background: var(--fill); padding: 10px; border-radius: 8px; }
+.reference-dialog { width: 100%; max-width: 620px; }
+.reference-dialog [hidden] { display: none !important; }
+.reference-body { display: grid; gap: 10px; padding: 0 16px 16px; min-width: 0; }
+.reference-body input { width: 100%; min-height: 44px; font: inherit; padding: 8px 10px; border: 1px solid var(--sep-strong); border-radius: 8px; background: var(--surface); color: var(--label); }
+.reference-handoff summary { cursor: pointer; padding: 10px 0; }
+.reference-handoff .reference-body { padding: 0; }
+.reference-handoff textarea { width: 100%; min-height: 52px; font: inherit; padding: 8px 10px; border: 1px solid var(--sep-strong); border-radius: 8px; background: var(--surface); color: var(--label); resize: vertical; }
+#task-plan-goal { width: 100%; min-height: 88px; font: inherit; padding: 8px; border: 1px solid var(--sep-strong); border-radius: 8px; background: var(--surface); color: var(--label); resize: vertical; }
+.new-session-profiles { margin: 12px 0; }
+.new-session-profiles summary { cursor: pointer; padding: 8px 0; }
+#new-session-profiles { display: grid; gap: 8px; }
+#new-session-profiles input, #new-session-profiles select { width: 100%; min-height: 44px; font: inherit; padding: 8px 10px; border: 1px solid var(--sep-strong); border-radius: 8px; background: var(--surface); color: var(--label); }
+.launch-profile-list { display: grid; gap: 8px; }
+.launch-profile-row { display: flex; gap: 8px; min-width: 0; }
+.launch-profile-row .secondary { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.reference-list, .reference-choices { display: grid; gap: 4px; max-height: min(20vh, 180px); overflow-y: auto; }
+.reference-dialog .reference-list, .reference-dialog .reference-choices { max-height: min(48vh, 440px); }
+.reference-dialog .reference-preview { max-height: min(42vh, 400px); }
+.reference-session, .reference-choice { display: grid; gap: 2px; width: 100%; min-height: 44px; padding: 8px 10px; text-align: left; border: 1px solid var(--sep); border-radius: 8px; background: var(--surface); color: var(--label); overflow-wrap: anywhere; }
+.reference-session small, .reference-choice span { color: var(--label-2); font-size: var(--fs-cap); }
+.reference-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24vh; overflow: auto; margin: 0; font: inherit; }
+.reference-preview:empty { display: none; }
+.results-dialog { width: 100%; max-width: 620px; }
+.results-body { display: grid; gap: 12px; padding: 0 16px 16px; }
+.results-item { display: grid; gap: 4px; min-width: 0; padding-top: 8px; border-top: 1px solid var(--sep); }
+.results-file { overflow-wrap: anywhere; color: var(--label-2); }
+.card-attention { color: var(--label-2); }
+.work-group-dialog { width: 100%; max-width: 620px; }
+.work-group-dialog select { width: 100%; min-height: 44px; font: inherit; }
+.group-results { min-width: 0; }
+.group-results[hidden] { display: none; }
+.group-results summary { cursor: pointer; min-height: 44px; padding: 10px 0; }
+.group-results-list { display: grid; gap: 12px; margin-top: 12px; }
+.batch-editor, .batch-preview { display: grid; gap: 12px; }
+.batch-task { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid var(--sep); border-radius: var(--radius); }
+.batch-task textarea { width: 100%; min-height: 72px; font: inherit; padding: 8px; border: 1px solid var(--sep-strong); border-radius: 8px; background: var(--surface); color: var(--label); resize: vertical; }
+.batch-task-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.work-group-option { display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.work-group-option input { width: auto; min-height: auto; }
+.work-group-option span { display: grid; min-width: 0; overflow-wrap: anywhere; }
+.work-group-option small { color: var(--label-2); }
 .work-context-evidence > a, .work-context-evidence > button { display: block; }
 .session-child-result { flex-basis: 100%; min-width: 0; padding-left: 12px; border-left: 2px solid var(--sep); }
 .session-child-result-body p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
@@ -8047,8 +8110,8 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 
 /* 집중 모드 on every screen: the conversation takes what the bars leave. The header is one
    line holding the title, the 터미널/채팅 tabs (app.js placeModeTabs moves them in) and its
-   actions; the device and model lines, 작업 맥락 and, beside the list, the top bar wait for
-   전체 보기. A narrow conversation (a phone, an upright iPad) puts the title under the tabs
+   actions; the device and model lines and 작업 맥락 wait for 전체 보기. The global top bar
+   stays the same in both modes. A narrow conversation puts the title under the tabs
    and leaves the app reload to 전체 보기; a wide one puts the composer's buttons beside its
    input. A split workspace keeps its top bar (it switches the panes), and so do 목표. */
 #detail.is-reading .detail-head {
@@ -8108,10 +8171,5 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
   #detail.is-reading .chat-composer .chat-main > #chat-send {
     order: 2;
     margin-left: 0;
-  }
-}
-@media (min-width: 701px) {
-  body.show-detail:not(.workspace-split):not(.goals-active):has(#detail.is-reading) .top {
-    display: none;
   }
 }

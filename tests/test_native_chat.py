@@ -134,6 +134,40 @@ class NativeChatTests(unittest.TestCase):
         return self.handle(client, {'action': 'command', 'source': self.source, 'command': command,
                                     'value': value, 'requestId': request})
 
+    def test_fork_clones_exact_completed_turn_once_and_defers_goal(self):
+        thread = self.thread()
+        thread['turns'] = [{'id': 'turn-one', 'status': 'completed', 'items': []}]
+        child_id = str(uuid.uuid4())
+        client = FakeClient(thread, {'thread/fork': {'thread': {'id': child_id, 'forkedFromId': thread['id'], 'cwd': thread['cwd']}}})
+        result = self.command(client, 'fork', 'turn-one')
+        self.assertEqual((result['status'], result['id']), ('created', child_id))
+        self.assertEqual(self.command(client, 'fork', 'turn-one'), result)
+        forks = [params for method, params in client.calls if method == 'thread/fork']
+        self.assertEqual(forks, [{'threadId': thread['id'], 'lastTurnId': 'turn-one', 'deferGoalContinuation': True}])
+        with self.assertRaises(ValueError): self.command(client, 'fork', None)
+
+    def test_fork_never_repeats_uncertain_or_unverified_source(self):
+        thread = self.thread()
+        client = FakeClient(thread, {'thread/fork': TimeoutError('fixture')})
+        self.assertEqual(self.command(client, 'fork')['status'], 'unknown')
+        self.assertEqual(self.command(client, 'fork')['status'], 'unknown')
+        self.assertEqual(methods(client).count('thread/fork'), 1)
+        for change, value in [({'status': {'type': 'active', 'activeFlags': []}}, None),
+                              ({'cwd': '/wrong'}, None), ({}, 'missing-turn')]:
+            with self.subTest(change=change, value=value):
+                other = FakeClient({**self.thread(), **change})
+                self.assertEqual(self.command(other, 'fork', value, request='control-0002')['status'], 'rejected')
+                self.assertNotIn('thread/fork', methods(other))
+
+    def test_batch_send_rechecks_idle_before_native_input(self):
+        initial = self.thread()
+        active = self.running()
+        client = FakeClient(initial)
+        with patch.object(chat, '_thread', side_effect=[initial, active]):
+            result = self.handle(client, {**self.args, 'requireIdle': True})
+        self.assertEqual(result['delivery'], 'rejected')
+        self.assertNotIn('turn/start', methods(client))
+
     def test_model_choices_are_account_catalog_and_changes_only_apply_on_an_idle_send(self):
         thread = {**self.thread(), 'model': 'example-one', 'reasoningEffort': 'high'}
         client = FakeClient(thread, {'model/list': self.models()})

@@ -37,6 +37,7 @@ def _save(path, value):
 def _resume(spec, identity, socket, receipt_path):
     return {**spec, 'nativeSource': identity, 'connectionMode': 'attach',
             'nativeReceiptPath': str(receipt_path),
+            'initialDelivery': json.loads(Path(receipt_path).read_text()).get('delivery', 'unknown'),
             'argv': [spec['argv'][0], 'resume', identity['id'], '--remote',
                      'unix://' + str(socket), '--cd', spec['cwd']]}
 
@@ -100,7 +101,7 @@ def mark_attached(spec, terminal_id):
 
 
 def bind(spec, profile, host, *, home=None, receipt_path=None):
-    if spec.get('mode') not in ('handoff', 'transfer'):
+    if spec.get('mode') not in ('handoff', 'transfer', 'profile'):
         return spec
     spec = dict(spec)
     agent, key = profile['agent'], profile['home']
@@ -108,7 +109,9 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
     if agent != 'codex':
         identity.update(id=str(uuid.uuid4()), kind='interactive')
         identity['sessionId'] = identity['id']
-        spec.update(nativeSource=identity, argv=[spec['argv'][0], '--session-id', identity['id'], spec['argv'][-1]])
+        options = (['--model', spec['model'], '--effort', spec['effort']] if spec.get('mode') == 'profile' else [])
+        separator = ['--'] if spec.get('mode') == 'profile' else []
+        spec.update(nativeSource=identity, argv=[spec['argv'][0], '--session-id', identity['id'], *options, *separator, spec['argv'][-1]])
         return spec
     from transfer_native import _socket_path
     from native_chat import _client, NativeRejected
@@ -132,7 +135,17 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
     request_id = 'handoff-' + uuid.uuid4().hex
     with _client(selector, home, time.monotonic() + 15) as client:
         # legacy is supported by both installed versions and the existing reader.
-        thread = client.call('thread/start', {'cwd': spec['cwd'], 'historyMode': 'legacy'}).get('thread', {})
+        params = {'cwd': spec['cwd'], 'historyMode': 'legacy'}
+        if spec.get('mode') == 'profile':
+            from native_chat import _models
+            model = next((row for row in _models(client) if row['model'] == spec['model']), None)
+            if not model or spec['effort'] not in model['efforts']:
+                raise ValueError('이 계정에서 사용할 수 있는 모델과 에포트를 선택해 주세요.')
+            params.update(model=spec['model'], config={'model_reasoning_effort': spec['effort']})
+        started_thread = client.call('thread/start', params)
+        if spec.get('mode') == 'profile' and (started_thread.get('model') != spec['model'] or started_thread.get('reasoningEffort') != spec['effort']):
+            raise ValueError('새 세션의 모델과 에포트를 확인하지 못했습니다.')
+        thread = started_thread.get('thread', {})
         identity['id'] = str(uuid.UUID(thread.get('id', '')))
         if thread.get('cwd') != spec['cwd']:
             raise ValueError('새 세션의 작업 경로가 일치하지 않아 실행을 중단했습니다.')
@@ -143,8 +156,10 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
         # the already-authorized handoff prompt natively before attaching the TUI.
         try:
             # turn/start submits the prompt directly; there is no board-side queue.
-            started = client.call('turn/start', {'threadId': identity['id'],
-                'clientUserMessageId': request_id, 'input': [{'type': 'text', 'text': prompt}]}).get('turn', {})
+            turn = {'threadId': identity['id'], 'clientUserMessageId': request_id,
+                    'input': [{'type': 'text', 'text': prompt}]}
+            if spec.get('mode') == 'profile': turn.update(model=spec['model'], effort=spec['effort'])
+            started = client.call('turn/start', turn).get('turn', {})
             if not started.get('id'):
                 raise ValueError('첫 메시지 접수 결과를 확인하지 못했습니다.')
             record.update(delivery='accepted', turnId=started['id']); _save(receipt_path, record)

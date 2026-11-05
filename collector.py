@@ -527,6 +527,13 @@ def claude_rows(entries):
                 out.append(attachment_row)
             attachment_row["attachments"] = attached
         for row in out[start:]:
+            if row["role"] == "assistant":
+                model = message.get("model") if isinstance(message, dict) else None
+                effort = entry.get("effort") or entry.get("perTurnEffort")
+                if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}", model):
+                    row["model"] = model
+                if effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+                    row["effort"] = effort
             if evidence_id(entry.get("uuid")):
                 row["messageId"] = entry["uuid"]
             if evidence_id(entry.get("parentUuid")):
@@ -1363,7 +1370,14 @@ def codex_turn_rows(turn):
                 rows.append(row)
                 stamped = True
         elif kind == "agentMessage" and str(item.get("text") or "").strip():
-            rows.append(text_row("assistant", item["text"], completed if index in final else None))
+            row = text_row("assistant", item["text"], completed if index in final else None)
+            model = item.get("model") or turn.get("model")
+            effort = item.get("reasoningEffort") or turn.get("reasoningEffort")
+            if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}", model):
+                row["model"] = model
+            if effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+                row["effort"] = effort
+            rows.append(row)
         elif kind in CODEX_TOOL_KINDS:
             if kind == "commandExecution":
                 text = "$ " + one_line(item.get("command"), 160)

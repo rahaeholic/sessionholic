@@ -312,6 +312,24 @@ def stage_handoff(args):
             'connectionMode': spec.get('connectionMode'), 'warnings': spec.get('warnings', [])}
 
 
+def stage_profile(args):
+    """Prepare one exact new session on this host and retain its private launch."""
+    from launch import build_profile_launch
+    from managed_launch import bind, ensure_app_server
+    if not isinstance(args, dict):
+        raise ValueError('실행 요청 형식이 올바르지 않습니다.')
+    token = handoff_token(args.get('requestId'))
+    with handoff_operation(token) as folder:
+        if (folder / 'launch.json').exists() or (folder / 'started.json').exists():
+            raise ValueError('이미 처리한 실행입니다. 작업 목록을 확인해 주세요.')
+        spec, profile = build_profile_launch(args.get('source'), args.get('model'), args.get('effort'), args.get('prompt'))
+        ensure_app_server(spec, profile)
+        spec = bind(spec, profile, args['source']['host'], receipt_path=folder / 'native.json')
+        save(folder / 'launch.json', spec)
+    return {'token': token, 'cwd': spec['cwd'], 'nativeSource': spec.get('nativeSource'),
+            'connectionMode': spec.get('connectionMode'), 'initialDelivery': spec.get('initialDelivery')}
+
+
 def check_handoff(args):
     """`handoff --check -`: validate and build like `stage_handoff`, but bind nothing, start
     nothing and keep no file. Prints what a prepared launch would run."""
@@ -429,6 +447,12 @@ def _rpc(request):
     if op == 'recover_session':
         from launch import recover_saved_session
         return recover_saved_session(args.get('source'))
+    if op == 'claude_fork_plan':
+        from launch import build_claude_fork
+        spec = build_claude_fork(args.get('source'), args.get('forkId'))
+        return {'cwd': spec['cwd']}
+    if op == 'stage_profile':
+        return stage_profile(args)
     if op == 'launcher_programs':
         from launcher_programs import launcher_programs
         return launcher_programs(args)
@@ -742,6 +766,15 @@ def _main():
             raise SystemExit(1)
     if len(sys.argv) == 3 and sys.argv[1] == 'reattach':
         return hold_attach(sys.argv[2])
+    if len(sys.argv) == 4 and sys.argv[1] == 'claude-fork':
+        try:
+            from launch import build_claude_fork
+            spec = build_claude_fork(json.loads(sys.argv[2]), sys.argv[3])
+            os.chdir(spec['cwd'])
+            _execve(spec['argv'], spec['env'])
+        except (ValueError, OSError, KeyError):
+            print('Claude 분기를 열지 못했습니다. 원본 대화와 작업 폴더를 다시 확인해 주세요.', file=sys.stderr)
+            raise SystemExit(1)
     if len(sys.argv) >= 3 and sys.argv[1] == 'handoff':
         return handoff_main(sys.argv[2:])
     if len(sys.argv) >= 2 and sys.argv[1] == 'new-session':
