@@ -320,6 +320,17 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(collector.text_row('user', '프롬프트 인용:\n' + header + request, None)['text'], '프롬프트 인용:\n' + header + request)
 
 
+    def test_slack_request_drops_the_bots_closing_blocks_by_name_whatever_their_wording(self):
+        # The bot's blocks after a request as of 2026-11-03 (a [중간 보고] block right before
+        # [마무리 규칙], whose wording changed): synthetic contents in the bot's structure.
+        header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 지침\n[요청]\n'
+        request = '최적화 규칙이 뭔데 블로커가 됐지?\n\n[중간 보고] 요청에 인용한 문구\n\n이 줄도 요청이다.'
+        for trailer in ('\n\n[중간 보고] 합성 진행 보고 규칙.\n[마무리 규칙] 최종 답변은 Slack에 올라간다. 합성 규칙.',
+                        '\n\n[마무리 규칙] 바뀐 문구의 합성 규칙.'):
+            for newline in ('\n', '\r\n'):
+                wrapped = (header + request + trailer).replace('\n', newline)
+                self.assertEqual(collector.text_row('user', wrapped, None)['text'], request.replace('\n', newline))
+
     def test_slack_envelope_is_removed_before_clipping_without_changing_real_text(self):
         header = '[슬랙 요청]\n- 요청자: 테스트\n- 작업 번호: 1\n[처리 원칙] 내부 처리 지침\n'
         request = '계획을 수정해 주세요.\n\n[요청]이라는 제목도 본문에 남겨 주세요.'

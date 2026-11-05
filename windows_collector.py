@@ -1380,8 +1380,12 @@ def _bot_request_text(text):
                             (r"^- 요청자:", r"^- 작업 번호:", r"^\[처리 원칙\]")):
         return text
     rest = match[2]
-    trailers = list(re.finditer(r"^\[마무리 규칙\][ \t]*(?:\r?\n[ \t]*)?최종 답변만 Slack에 올라간다\.", rest, re.M))
+    # As collector.bot_request_text: the bot's [중간 보고] and [마무리 규칙] blocks, by their names.
+    trailers = list(re.finditer(r"^\[마무리 규칙\]", rest, re.M))
     body = rest[:trailers[-1].start()] if trailers else rest
+    progress = list(re.finditer(r"^\[중간 보고\]", body, re.M))
+    if progress and not re.search(r"\n[ \t]*\r?\n", body[progress[-1].start():]):
+        body = body[:progress[-1].start()]
     body = re.sub(r"\A(?:[ \t]*\r?\n)+", "", body)
     body = re.sub(r"(?:\r?\n[ \t]*)+\Z", "", body)
     return body if body.strip() else text
