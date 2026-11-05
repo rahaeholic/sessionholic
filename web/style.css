@@ -171,6 +171,21 @@
   color-scheme: light dark;
   font-synthesis: none;
 }
+
+.woni-dialog { width: min(620px, calc(100% - 24px)); height: min(720px, calc(100dvh - 32px)); max-width: none; max-height: none; padding: 16px; border: 0; border-radius: 18px; background: var(--surface); color: var(--label); box-shadow: var(--shadow-dialog); }
+.woni-dialog[open] { display: flex; flex-direction: column; gap: 10px; }
+.woni-dialog::backdrop { background: var(--backdrop); }
+.woni-head { display: flex; align-items: center; justify-content: space-between; }
+.woni-head h2 { margin: 0; font-size: 1.1rem; }
+.woni-status { margin: 0; color: var(--label-2); font-size: .85rem; }
+.woni-messages { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.woni-message { margin: 12px 0; padding: 12px; border-radius: 14px; background: var(--bubble); overflow-wrap: anywhere; }
+.woni-message.user { margin-left: 12%; background: var(--accent-tint); }
+.woni-message strong { display: block; margin-bottom: 6px; font-size: .8rem; }
+.woni-message div { white-space: pre-wrap; }
+.woni-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.woni-form label { width: 100%; font-size: .85rem; }
+.woni-form textarea { flex: 1; min-width: 0; resize: vertical; }
 @supports (transition-timing-function: linear(0, 1)) {
   :root {
     --ease-spring: linear(0, 0.035, 0.119, 0.23, 0.351, 0.471, 0.582, 0.68, 0.764, 0.833, 0.888, 0.931, 0.963, 0.986, 1.001, 1.011, 1.017, 1.019, 1.02, 1.019, 1.017, 1.015, 1.012, 1.01, 1.008, 1.006, 1.004, 1.003, 1);

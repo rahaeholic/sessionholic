@@ -14961,6 +14961,7 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
+    if (firstAuthentication) window.SessionholicWoni?.check?.(api);
     savedPromptsAnnounced(snapshot.savedPrompts);
     // Keep the visible bot list current, even when it has reached the bounded
     // source window. This read is independent of chat input and never navigates.
@@ -15251,6 +15252,7 @@ function showLogin() {
   state.accountFilterRoutes = null;
   state.inputEpoch++;
   state.authenticated = false;
+  window.SessionholicWoni?.lock?.();
   state.csrf = "";
   state.capabilities = null;
   state.capabilitiesRevision = null;

@@ -13,6 +13,7 @@
 const CACHE = "sessionholic-shell-v15";
 const ASSETS = new Set([
   "/app.js",
+  "/woni.js",
   "/workspace.js",
   "/terminal-ime.js",
   "/workspace.css",

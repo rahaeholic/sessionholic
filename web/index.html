@@ -35,6 +35,7 @@
     <script src="/workspace.js" defer></script>
     <script src="/terminal-ime.js" defer></script>
     <script src="/app.js" defer></script>
+    <script src="/woni.js" defer></script>
   </head>
   <body>
     <div id="login" class="login" hidden>
@@ -147,11 +148,18 @@
             <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
           </svg>
         </button>
+        <button id="woni-open" class="quiet" type="button" aria-haspopup="dialog" hidden>원이</button>
         <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
         <button id="workspace-arrange" class="quiet workspace-split-open" type="button" title="창을 좌우에 같은 너비로 나란히 배치" hidden>세로 정렬</button>
         <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>＋ 분할 추가</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
+      <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title">
+        <div class="woni-head"><h2 id="woni-title">원이</h2><button id="woni-close" type="button" class="quiet" aria-label="원이 닫기">닫기</button></div>
+        <p id="woni-status" class="woni-status" role="status"></p>
+        <div id="woni-messages" class="woni-messages" aria-label="원이 대화"></div>
+        <form id="woni-form" class="woni-form"><label for="woni-input">원이에게 메시지</label><textarea id="woni-input" rows="2" maxlength="12000" required></textarea><button type="submit" class="primary">보내기</button></form>
+      </dialog>
       <div
         id="connection-notice"
         class="connection-notice"

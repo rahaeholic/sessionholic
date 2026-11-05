@@ -3598,6 +3598,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.work.snapshot())
                 if url.path == "/api/bot-requests":
                     return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
+                if url.path == "/api/woni":
+                    if query.get("availability") == "1":
+                        return self.send_json(200, {"enabled": self.server.woni.host() is not None})
+                    return self.send_json(200, scrub_payload(self.server.woni.call()))
                 if url.path == "/api/bot-requests/conversation":
                     # A listed request's conversation, watch-only: a bounded read-only read,
                     # at most two at once. Nothing is sent to, or resumed in, the bot.
@@ -4073,6 +4077,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.session_history.preserve(data['key'], data['preserved']))
             if path == "/api/bot-requests/refresh":
                 return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
+            if path == "/api/woni":
+                return self.send_json(200, scrub_payload(self.server.woni.call(data)))
             if path == "/api/push/subscribe":
                 return self.send_json(200, self.server.push.subscribe(data))
             if path == "/api/push/unsubscribe":
@@ -4500,6 +4506,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     from bot_requests import BotRequests
     server.bot_requests = BotRequests(board.hosts, CONFIG_DIR / "bot-sources.json", state_dir)
     server.workflow.bot_requests = server.bot_requests
+    from woni_bridge import WoniBridge
+    server.woni = WoniBridge(board.hosts, CONFIG_DIR / "woni.json", state_dir)
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from batch_jobs import BatchJobs
