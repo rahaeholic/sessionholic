@@ -201,5 +201,6 @@
   "web/woni.js",
   "woni_bridge.py",
   "tests/test_woni_frontend.cjs",
-  "tests/test_woni_http.py"
+  "tests/test_woni_http.py",
+  "docs/plan/2026-11-06-woni-composer.md"
 ]

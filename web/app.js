@@ -5423,7 +5423,7 @@ function dictationListening(field) {
 // A pending restart is distinct from listening; another press cancels it.
 function renderDictation() {
   const supported = !!speechRecognitionClass();
-  for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"]]) {
+  for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"], ["woni-mic", "woni-input"]]) {
     const node = $(id);
     if (!node) continue;
     const listening = !!state.dictation && state.dictation.field === $(fieldId);
@@ -5448,6 +5448,8 @@ function renderDictationOverlay() {
   overlay.hidden = !session;
   if (!session) return;
   // In a split board the first pane's mic screen covers that pane, as the other panes' do.
+  const parent = session.field === $("woni-input") ? $("woni-dialog") : $("app");
+  if (parent && overlay.parentElement !== parent) parent.append(overlay);
   placeInPane(overlay, firstPaneArea(session.field));
   const stop = $("dictation-overlay-stop");
   if (stop && !stop.dataset.bound) {
@@ -5652,7 +5654,7 @@ function dictationSkipped(results, count) {
 // line's 보내기): pressed as the user would, so every rule of that send (nothing to send, a
 // send under way, a locked field, a word still composing committed first) still holds.
 function dictationSendButton(field) {
-  return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : null;
+  return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : field === $("woni-input") ? $("woni-send") : null;
 }
 // A listening that failed, left the screen or lost its words to other text sends nothing (an
 // end with nothing heard still sends what the field holds). Our stop answered with "aborted"
@@ -7375,7 +7377,7 @@ function renderAttachmentTiles(entry, box = $("chat-attachments")) {
 // available until it settles. Retry only an explicit pre-write CSRF refusal.
 const UPLOAD_TIMEOUT_MS = 120000;
 const UPLOAD_TIMEOUT_MESSAGE = "첨부 응답이 늦어 기다리기를 멈췄습니다. 다시 올리거나 취소해 주세요.";
-async function sendUpload(file, headers, onProgress, { signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
+async function sendUpload(file, headers, onProgress, { signal, authEpoch = state.authEpoch, csrfRetry = true, path = "/api/chat/upload", timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
   const response = await new Promise((resolve, reject) => {
     let request = null, timer = null, finished = false;
     const controller = new AbortController();
@@ -7391,9 +7393,9 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     const timeout = () => finish(new Error(UPLOAD_TIMEOUT_MESSAGE));
     if (signal?.aborted) { cancel(); return; }
     signal?.addEventListener?.("abort", cancel, { once: true });
-    timer = setTimeout(timeout, UPLOAD_TIMEOUT_MS);
+    timer = setTimeout(timeout, timeoutMs);
     if (typeof XMLHttpRequest !== "function") {
-      fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store",
+      fetch(path, { method: "POST", credentials: "same-origin", cache: "no-store",
         body: file, headers, signal: controller.signal })
         .then(async (r) => ({ status: r.status, ok: r.ok, data: await r.json().catch(() => ({})) }))
         .then((result) => finish(null, result), () => finish(new Error("첨부파일을 올리지 못했습니다. 연결 후 다시 올려 주세요.")));
@@ -7401,8 +7403,8 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     }
     try {
       request = new XMLHttpRequest();
-      request.open("POST", "/api/chat/upload");
-      request.timeout = UPLOAD_TIMEOUT_MS;
+      request.open("POST", path);
+      request.timeout = timeoutMs;
       for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
       request.upload?.addEventListener?.("progress", (event) => {
         if (!finished && event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
@@ -7423,7 +7425,7 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     await loadCapabilities(authEpoch, { refreshView: false });
     assertAuthEpoch(authEpoch);
     return sendUpload(file, { ...headers, "X-CSRF-Token": state.csrf }, onProgress,
-      { signal, authEpoch, csrfRetry: false });
+      { signal, authEpoch, csrfRetry: false, path, timeoutMs });
   }
   return response;
 }
@@ -14961,7 +14963,24 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
-    if (firstAuthentication) window.SessionholicWoni?.check?.(api);
+    if (firstAuthentication) window.SessionholicWoni?.check?.(api, {
+      upload: async (file, progress, signal) => {
+        const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+          "X-File-Name": encodeURIComponent(file.name || "첨부파일"), "X-File-Mime": file.type || "application/octet-stream" },
+          progress, { signal, path: "/api/woni/attachment", timeoutMs: 300000 });
+        if (response.status === 401) showLogin();
+        if (!response.ok || !response.data?.attachment?.id) throw new Error(response.data?.error || "파일을 올리지 못했어요.");
+        return response.data.attachment;
+      },
+      voice: {
+        supported: () => !!speechRecognitionClass(),
+        toggle: (field, report) => dictationListening(field) ? stopDictation({ field }) : startDictation(field, {
+          report, releaseKeyboard: true, active: () => state.authenticated && !!$("woni-dialog")?.open && !document.hidden,
+        }),
+        stop: (field) => stopDictation({ field, abort: true }),
+        typed: dictationTyped,
+      },
+    });
     savedPromptsAnnounced(snapshot.savedPrompts);
     // Keep the visible bot list current, even when it has reached the bounded
     // source window. This read is independent of chat input and never navigates.

@@ -155,10 +155,24 @@
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
       <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title">
-        <div class="woni-head"><h2 id="woni-title">원이</h2><button id="woni-close" type="button" class="quiet" aria-label="원이 닫기">닫기</button></div>
-        <p id="woni-status" class="woni-status" role="status"></p>
+        <header class="woni-head"><div><h2 id="woni-title">원이</h2><p id="woni-status" class="woni-status" role="status"></p></div><button id="woni-close" type="button" class="icon-button" aria-label="원이 닫기">×</button></header>
         <div id="woni-messages" class="woni-messages" aria-label="원이 대화"></div>
-        <form id="woni-form" class="woni-form"><label for="woni-input">원이에게 메시지</label><textarea id="woni-input" rows="2" maxlength="12000" required></textarea><button type="submit" class="primary">보내기</button></form>
+        <form id="woni-form" class="woni-form">
+          <div id="woni-attachments" class="woni-attachments" aria-label="첨부 파일" hidden></div>
+          <label class="sr-only" for="woni-input">원이에게 메시지</label>
+          <textarea id="woni-input" rows="2" maxlength="12000" placeholder="원이에게 물어보세요" aria-describedby="woni-hint"></textarea>
+          <div class="woni-actions">
+            <input id="woni-files" type="file" multiple hidden />
+            <button id="woni-attach" type="button" class="woni-tool" aria-label="파일 첨부" title="파일 첨부">
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 4v12M4 10h12"/></svg>
+            </button>
+            <button id="woni-mic" type="button" class="woni-tool" aria-label="음성 입력" aria-pressed="false" title="음성 입력" hidden>
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
+            </button>
+            <span id="woni-hint" class="woni-hint">⌘ Enter로 보내기</span>
+            <button id="woni-send" type="submit" class="primary" aria-keyshortcuts="Meta+Enter Control+Enter">보내기</button>
+          </div>
+        </form>
       </dialog>
       <div
         id="connection-notice"
