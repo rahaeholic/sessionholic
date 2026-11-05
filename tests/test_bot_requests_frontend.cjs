@@ -161,6 +161,24 @@ test("봇 대화의 긴 첫 요청은 원문을 접고 다음 요청은 그대�
   assert.equal(byClass(box, "delivered-prompt-first").length, 0, "앞부분이 없는 대화의 첫 화면은 최초 메시지라고 추정하지 않는다");
 });
 
+test("보드가 사람 말로 읽은 요청은 길어도 그대로 보이고, 승인 실행은 한 줄 이벤트로 보인다", () => {
+  const c = client(), row = conversationRequest(), key = c.botRequestKey(row);
+  const box = c.get("bot-conversation"); box.dataset.conversationKey = key;
+  const typed = "광고 예산 전략을 검토해 주세요. ".repeat(60);
+  const segment = { more: false, messages: [
+    { role: "user", text: typed, words: true, ts: 2000000000 },
+    { role: "assistant", text: "검토했습니다." },
+    { role: "user", text: "승인 #16 실행 · SB 리뷰 영상 캠페인의 최적화 규칙 연결 해제", event: "approval", ts: 2000000100 }] };
+  c.state.botConversations.set(key, { data: { segments: [segment] } });
+  c.renderBotConversation({ key, latest: row });
+  const rows = byClass(box, "msg");
+  assert.deepEqual(rows.map((item) => item.className), ["msg user", "msg assistant", "msg system bot-event"]);
+  assert.equal(byClass(box, "delivered-prompt").length, 0, "사람 말은 길이와 상관없이 접지 않는다");
+  assert.equal(byClass(rows[0], "bubble")[0].textContent, typed);
+  assert.match(textOf(rows[2]), /승인 #16 실행 · SB 리뷰 영상 캠페인의 최적화 규칙 연결 해제/);
+  assert.equal(byClass(rows[2], "msg-label").length, 0, "승인 실행은 요청자의 말풍선이 아니다");
+});
+
 test("봇 대화 첫 읽기는 최신으로 이동하고 갱신할 때 읽던 위치를 지킨다", () => {
   const c = client(), row = conversationRequest(), key = c.botRequestKey(row);
   const box = c.get("bot-conversation"); box.dataset.conversationKey = key;

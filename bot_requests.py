@@ -263,7 +263,8 @@ def _ledger(connection, source):
              "LEFT JOIN channels c ON c.id=t.channel ORDER BY t.id DESC")
     result = []
     for row in connection.execute(query, (LIMIT,)):
-        result.append(_base(source, row["id"], title=_text(row["title"], "봇 요청", 120),
+        approval = _approval_line(row["title"]) if isinstance(row["title"], str) else None
+        result.append(_base(source, row["id"], title=_text(approval or row["title"], "봇 요청", 120),
                             status=_text(row["status"], "unknown", 40),
                             updated=row["finished_at"] or row["started_at"] or row["created_at"],
                             channel=_text(row["channel_name"], _alias("채널", source, row["channel"]), 60),
@@ -483,9 +484,103 @@ def _hermes_typed(head, tail=None):
     return typed, whole
 
 
+# A bot's envelope around one request (its first line) names the request's task in the "- " lines
+# under it, and the bot's ledger keeps that task's text as the person wrote it: the board shows
+# that text, whatever the bot wraps around it. A request longer than the read is unwrapped from
+# its header lines and its end, the bot's policy block on. The markers are the bot's own
+# (BEAULINK beaulink-agent-config, scripts/windows/beuring_slack_gateway.py prompt_for and crm_prompt).
+BOT_ENVELOPES = ("[슬랙 요청]", "[CRM 업데이트 스레드 댓글]")
+BOT_TASK = re.compile(r"- 작업 번호: ([0-9]{1,12})[ \t]*")
+BOT_POLICY = "\n[처리 원칙]"
+# A bot's own turns: a person's words added while it worked, after one line of the bot's
+# (beuring_hermes_worker.py STEER_HEADER), and an approval's run (start_approved), one line.
+BOT_STEER = "[작업 중 추가 지시]"
+BOT_APPROVED = re.compile(r"\[승인됨\][^\n]{0,200}?변경 승인 #([0-9]{1,12})을 승인했다\.")
+BOT_SUMMARY = re.compile(r"^- 요약:[ \t]*(\S[^\n]*)", re.M)
+
+
+def _task_number(text):
+    """The task an envelope's header lines name, or None (not an envelope, or none named)."""
+    lines = text.lstrip().split("\n", 40)
+    if lines[0].rstrip() not in BOT_ENVELOPES:
+        return None
+    for line in lines[1:40]:
+        if not line.startswith("- "):
+            return None
+        match = BOT_TASK.fullmatch(line.rstrip("\r"))
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _envelope_end(head, tail):
+    """A Slack request longer than the read as its header lines and the end the tail reaches from
+    the bot's policy block on (the request comes after it), or None."""
+    if not head.lstrip().startswith(BOT_ENVELOPES[0]) or _task_number(head) is None:
+        return None
+    start = tail.find(BOT_POLICY)
+    if start < 0:
+        return None
+    text = head.lstrip().split("\n\n", 1)[0] + tail[start:]
+    return text if len(text) <= BODY_LIMIT else None
+
+
+def _ledger_texts(source, home, numbers):
+    """{task: (its text as the person wrote it, its length)} from a request ledger, read-only and
+    bounded; empty when it cannot be read (those turns then show as the bot sent them)."""
+    numbers = sorted(set(numbers))
+    if source["kind"] != "slack_ledger" or not numbers:
+        return {}
+    deadline = time.monotonic() + 1
+    try:
+        connection = _connect(_safe_file(home / source["path"], home), home)
+    except (OSError, ValueError, sqlite3.Error):
+        return {}
+    connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+    found = {}
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        _columns(connection, "tasks", {"id", "text"})
+        for start in range(0, len(numbers), 400):
+            chunk = numbers[start:start + 400]
+            query = "SELECT id,substr(text,1,?),length(text) FROM tasks WHERE id IN (" + ",".join("?" * len(chunk)) + ")"
+            for number, text, size in connection.execute(query, [BODY_LIMIT] + chunk):
+                if isinstance(text, str) and text.strip() and isinstance(size, int):
+                    found[number] = (_body(text), size)
+    except (sqlite3.Error, ValueError):
+        return {}
+    finally:
+        connection.close()
+    return found
+
+
+def _approval_line(text):
+    """'승인 #N 실행 · <요약>' for a bot's approval run, or None."""
+    match = BOT_APPROVED.match(text.lstrip())
+    if not match:
+        return None
+    summary = BOT_SUMMARY.search(text)
+    return "승인 #" + match.group(1) + " 실행" + (" · " + summary.group(1).strip() if summary else "")
+
+
+def _bot_turn(text):
+    """(text, event, words) of a person's turn the bot wrote itself: an approval run as one line
+    (event "approval"), added words without the bot's line before them; else the text as it is."""
+    line = _approval_line(text)
+    if line:
+        return line, "approval", False
+    head = text.lstrip()
+    if head.startswith(BOT_STEER) and "\n" in head:
+        rest = head.split("\n", 1)[1].strip()
+        if rest:
+            return rest, None, True
+    return text, None, False
+
+
 def read_conversation(source, sessions, home=None):
     """The newest user and assistant text of these Hermes sessions (newest session first),
-    read-only and bounded. Tool calls, tool results and reasoning are never selected."""
+    read-only and bounded. Tool calls, tool results and reasoning are never selected. A turn
+    a bot's envelope wraps shows its task's text from the bot's ledger ("ledger": true)."""
     source = _validate_source(source)
     if (not isinstance(sessions, list) or not 0 < len(sessions) <= CONVERSATION_SESSIONS
             or len(set(sessions)) != len(sessions)
@@ -525,10 +620,14 @@ def read_conversation(source, sessions, home=None):
                 whole = size <= len(body)
                 if row["role"] == "user":
                     # Only what the person typed; a notice the gateway wrote itself is not shown.
-                    typed = _hermes_typed(body, row["tail"] if isinstance(row["tail"], str) else None)
+                    tail = row["tail"] if isinstance(row["tail"], str) else None
+                    typed = _hermes_typed(body, tail)
                     if typed is None:
                         continue
                     body, whole = typed
+                    end = _envelope_end(body, tail) if tail is not None and not whole else None
+                    if end is not None:
+                        body, whole = end, True
                 else:
                     # An answer a compaction merged its summary into keeps only the answer.
                     tail = row["tail"] if isinstance(row["tail"], str) else None
@@ -547,10 +646,20 @@ def read_conversation(source, sessions, home=None):
                 # Its length as shown when whole (masking changes it), else longer: the board says cut.
                 rows.append({"role": row["role"], "text": text, "ts": _seconds(row["timestamp"]),
                              "size": len(text) if whole else max(size, len(text) + 1)})
+                number = _task_number(body) if row["role"] == "user" else None
+                if number is not None:
+                    rows[-1]["_task"] = number
             rows.reverse()
             result.append({"id": session, "messages": rows, "more": more})
     finally:
         connection.close()
+    words = _ledger_texts(source, home, [row["_task"] for item in result for row in item["messages"] if "_task" in row])
+    for item in result:
+        for row in item["messages"]:
+            number = row.pop("_task", None)
+            if number in words:
+                text, size = words[number]
+                row.update(text=text, size=len(text) if size <= BODY_LIMIT else max(size, len(text) + 1), ledger=True)
     return {"conversations": result}
 
 
@@ -931,35 +1040,45 @@ class BotRequests:
                 if (not isinstance(text, str) or len(text) > BODY_LIMIT
                         or message.get("role") not in ("user", "assistant")):
                     raise SourceError("봇 대화 형식이 올바르지 않습니다.")
-                shown = _message(message["role"], text, message.get("ts"), message.get("size"))
+                shown = _message(message["role"], text, message.get("ts"), message.get("size"),
+                                 ledger=message.get("ledger") is True)
                 if shown is not None:
                     rows.append(shown)
             found[item["id"]] = {"messages": rows, "more": item.get("more") is True}
         return found
 
 
-def _message(role, text, ts, size):
-    """A conversation row as the board shows its other conversations (collector.text_row):
-    a Slack request's envelope unwrapped, then cut to the board's length. The board only."""
+def _message(role, text, ts, size, ledger=False):
+    """A conversation row as the board shows its other conversations (collector.text_row): a
+    person's words (a ledger's text, or a Slack request's envelope unwrapped, "words": true), a
+    bot's approval run as one line ("event"), then cut to the board's length. The board only."""
     import collector
     ts = ts if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0 else None
+    words = event = None
+    text_for_row = text
     if role == "user":
-        unwrapped = collector.codex_user_text(text)
-        if unwrapped is not None:
-            text_for_row = unwrapped
-        elif (not isinstance(size, int) or size <= len(text)) and collector.codex_user_text(
-                text + "\n__sessionholic_end_marker__") == "__sessionholic_end_marker__":
-            return None  # A complete turn made entirely of known harness blocks.
-        else:
-            text_for_row = text  # An incomplete or unrecognized record must remain visible.
-    else:
-        text_for_row = text
+        if not ledger:
+            unwrapped = collector.codex_user_text(text)
+            if unwrapped is not None:
+                text_for_row = unwrapped
+            elif (not isinstance(size, int) or size <= len(text)) and collector.codex_user_text(
+                    text + "\n__sessionholic_end_marker__") == "__sessionholic_end_marker__":
+                return None  # A complete turn made entirely of known harness blocks.
+            # An incomplete or unrecognized record must remain visible.
+        shown = collector.bot_request_text(text_for_row)
+        words = ledger or shown != text_for_row
+        text_for_row, event, steered = _bot_turn(shown)
+        words = words or steered
+    if event:
+        return {"role": role, "text": text_for_row, "ts": ts, "event": event}
     row = collector.text_row(role, text_for_row, ts)
     row.pop("bodyHash", None)
     if isinstance(size, int) and not isinstance(size, bool) and size > len(text):
         # The reader cut it before the envelope came off: its full length is not this text's.
         row["truncated"] = True
         row.pop("fullLength", None)
+    if words:
+        row["words"] = True
     return row
 
 

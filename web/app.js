@@ -2402,6 +2402,13 @@ function botConversationBreak(segment) {
 function botMessageRow(message, request, { first = false } = {}) {
   const role = message?.role === "user" ? "user" : "assistant";
   const text = typeof message?.text === "string" ? message.text : "";
+  // A bot's approval run is one line between the turns, not a person's message.
+  if (role === "user" && message.event === "approval") {
+    const row = el("article", "msg system bot-event");
+    const when = typeof message.ts === "number" && message.ts > 0 ? `${clock(message.ts)} · ` : "";
+    row.append(el("div", "bubble", when + text));
+    return row;
+  }
   const row = el("article", `msg ${role}`);
   const label = el("div", "msg-label");
   label.append(el("strong", null, role === "user" ? "요청자" : botLabel(request.botName)));
@@ -2409,6 +2416,9 @@ function botMessageRow(message, request, { first = false } = {}) {
   const bubble = el("div", "bubble");
   if (role === "assistant" && typeof MessageFormat !== "undefined")
     MessageFormat.render(bubble, text, { onCopy: (value) => copyText(value, "코드를 복사했습니다.") });
+  // The board read the person's words (the bot's ledger, an envelope it knows): shown as written,
+  // whatever their length. Only text it could not tell from the bot's instructions is folded.
+  else if (role === "user" && message.words === true) bubble.textContent = text;
   else if (role === "user") renderDeliveredText(bubble, text, message.truncated === true, { first });
   else bubble.textContent = text;
   row.append(label, bubble);
