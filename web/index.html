@@ -148,7 +148,10 @@
             <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
           </svg>
         </button>
-        <button id="woni-open" class="quiet" type="button" aria-haspopup="dialog" hidden>원이</button>
+        <button id="woni-open" class="woni-launch" type="button" aria-haspopup="dialog" aria-label="원이 열기" hidden>
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5a8 8 0 0 1-8 8 8.6 8.6 0 0 1-3.4-.7L4 20l1.2-3.9A8 8 0 1 1 20 11.5Z"/><path d="M8.5 11.5h7"/></svg>
+          <span>원이</span><span id="woni-unread" class="woni-unread" aria-hidden="true" hidden></span>
+        </button>
         <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
         <button id="workspace-arrange" class="quiet workspace-split-open" type="button" title="창을 좌우에 같은 너비로 나란히 배치" hidden>세로 정렬</button>
         <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>＋ 분할 추가</button>

@@ -4561,7 +4561,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # Board.snapshot() hands the push watcher a copy of its own: its titles are set in place.
     server.push = PushService(board, state_dir, classify=push_category,
                               labels=lambda snapshot: server.session_labels.decorate(snapshot, in_place=True),
-                              log_prefix=LOG_PREFIX, enabled=push)
+                              log_prefix=LOG_PREFIX, enabled=push, woni=server.woni.call)
     if push:
         server.push.start()
     if automatic_work:

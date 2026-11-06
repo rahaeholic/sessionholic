@@ -153,7 +153,7 @@ async function cacheFirst(event, request, url) {
 // Phone notifications. The board sends an empty push; what to show is read from the
 // board itself, so no conversation text passes through a push service. Delayed wake-ups
 // with no current notices must never repeat an old completion or invent a new one.
-const PUSH_URL = /^\/(?:\?session=[A-Za-z0-9%._~-]{1,600})?$/;
+const PUSH_URL = /^\/(?:\?(?:session=[A-Za-z0-9%._~-]{1,600}|woni=[A-Za-z0-9_-]{1,100}))?$/;
 function pushUrl(value) {
   return typeof value === "string" && PUSH_URL.test(value) ? value : "/";
 }

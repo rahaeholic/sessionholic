@@ -854,6 +854,13 @@ function requestSessionOpen(url) {
   openRequestedSession();
   return true;
 }
+function requestWoniOpen(url) {
+  try {
+    const parsed = new URL(url, globalThis.location?.origin || "http://board.invalid");
+    const id = parsed.pathname === "/" ? parsed.searchParams.get("woni") : null;
+    return !!id && !!window.SessionholicWoni?.openFromNotification?.(id);
+  } catch { return false; }
+}
 function openRequestedSession() {
   const request = state.openRequest;
   if (!request) return;
@@ -14964,6 +14971,7 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
     if (firstAuthentication) window.SessionholicWoni?.check?.(api, {
+      toast,
       upload: async (file, progress, signal) => {
         const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
           "X-File-Name": encodeURIComponent(file.name || "첨부파일"), "X-File-Mime": file.type || "application/octet-stream" },
@@ -16219,11 +16227,11 @@ window.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator && !window.SessionholicWorkspace?.embedded) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
     navigator.serviceWorker.addEventListener?.("message", (event) => {
-      if (event.data?.type === "open-session") requestSessionOpen(event.data.url);
+      if (event.data?.type === "open-session") requestWoniOpen(event.data.url) || requestSessionOpen(event.data.url);
     });
   }
   // Opened from a notification: remember the session, then drop it from the address.
-  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href) && !window.SessionholicWorkspace?.detached)
+  if (globalThis.location?.search && (requestWoniOpen(globalThis.location.href) || requestSessionOpen(globalThis.location.href)) && !window.SessionholicWorkspace?.detached)
     window.history.replaceState(window.history.state, "", "/");
   if (!window.SessionholicWorkspace?.embedded)
     window.launchQueue?.setConsumer((params) => handleAppLaunch(params).catch(() => {}));

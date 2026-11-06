@@ -10221,6 +10221,17 @@ test('the folded session connections row keeps the keyboard focus as it opens', 
   c.context.document.activeElement = null;
 });
 
+test('원이 알림 경로를 원이 화면으로 전달한다', () => {
+  const c = client();
+  const opened = [];
+  c.context.window.SessionholicWoni = { openFromNotification: id => { opened.push(id); return /^[A-Za-z0-9_-]{1,100}$/.test(id); } };
+  assert.equal(vm.runInContext("requestWoniOpen('/?woni=chat-42')", c.context), true);
+  assert.deepEqual(opened, ['chat-42']);
+  assert.equal(vm.runInContext("requestWoniOpen('/other?woni=chat-42')", c.context), false);
+  assert.equal(vm.runInContext("requestWoniOpen('/?session=chat-42')", c.context), false);
+  assert.equal(vm.runInContext("requestWoniOpen('/?woni=../unsafe')", c.context), false);
+});
+
 test('a notification link opens its session once it is listed, and an old request expires', async () => {
   const c = client(async () => ({ ok: true, status: 200, json: async () => ({ terminals: [] }) }), noChatTimers);
   assert.equal(c.requestedSessionFrom('/?session=workstation%7Ccodex%7C.codex-example%7Cnote'), 'workstation|codex|.codex-example|note');

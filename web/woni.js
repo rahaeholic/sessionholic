@@ -10,8 +10,50 @@
   let attachments = [], uploading = false, uploadAbort = null, composing = false, compositionEndedAt = 0, authEpoch = 0;
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
   let pendingState = "uncertain";
+  let enabled = false, focusId = null;
   const pendingKey = "sessionholic:woni:pending";
+  const seenKey = "sessionholic:woni:seen";
+  let seen = null, unread = new Set();
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
+
+  function loadSeen() {
+    try {
+      const value = JSON.parse(sessionStorage.getItem(seenKey) || "null");
+      seen = value && value.seen && typeof value.seen === "object" && !Array.isArray(value.seen) ? value.seen : null;
+      unread = new Set(Array.isArray(value?.unread) ? value.unread.filter((id) => typeof id === "string") : []);
+    } catch (_) { seen = null; unread = new Set(); }
+    badge();
+  }
+  function saveSeen() {
+    try { sessionStorage.setItem(seenKey, JSON.stringify({ seen, unread: [...unread] })); } catch (_) {}
+  }
+  function badge() {
+    const count = unread.size, node = $("woni-unread");
+    node.hidden = !count; node.textContent = count > 99 ? "99+" : String(count);
+    open.setAttribute("aria-label", count ? `원이 열기, 새 답변 ${count}개` : "원이 열기");
+  }
+  function observeReplies(data) {
+    const chats = Array.isArray(data.chats) ? data.chats : [];
+    const first = seen === null, next = Object.create(null), visible = dialog.open && view === "chat" && !document.hidden;
+    let arrived = false;
+    for (const chat of chats) {
+      if (typeof chat.id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(chat.id)) continue;
+      const complete = chat.status === "complete" && !!chat.answer && chat.kind !== "alert";
+      next[chat.id] = complete;
+      if (!first && complete && seen[chat.id] !== true) {
+        if (!visible || (filter && chat.stream !== filter.id)) { unread.add(chat.id); arrived = true; }
+      }
+      if (visible && (!filter || chat.stream === filter.id)) unread.delete(chat.id);
+    }
+    for (const id of unread) if (!Object.prototype.hasOwnProperty.call(next, id)) unread.delete(id);
+    seen = next; badge(); saveSeen();
+    if (arrived && !document.hidden) services.toast?.("원이의 새 답변이 도착했어요. 원이 버튼에서 확인해 주세요.");
+  }
+  function markVisibleRead() {
+    if (!latestData || document.hidden || view !== "chat") return;
+    for (const chat of latestData.chats || []) if (!filter || chat.stream === filter.id) unread.delete(chat.id);
+    badge(); saveSeen();
+  }
 
   function savedPending() {
     try { return JSON.parse(sessionStorage.getItem(pendingKey) || "null"); } catch (_) { return null; }
@@ -35,6 +77,7 @@
     filterBox.hidden = !isChat || !filter;
     chatTab.setAttribute("aria-pressed", String(isChat)); workTab.setAttribute("aria-pressed", String(!isChat));
     original.hidden = true;
+    if (isChat && dialog.open) markVisibleRead();
     if (!isChat) { renderWork(); clearTimeout(timer); refresh(); }
   }
   function setReply(chat, part) {
@@ -217,29 +260,39 @@
     status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.") : running ? `작업 중 ${running}건` : "나의 개인 비서";
   }
   async function refresh() {
-    if (!dialog.open || reading || !api) return;
-    reading = true; const current = epoch;
+    if (!enabled || reading || !api) return;
+    reading = true; const current = authEpoch;
     try {
       const data = await api("/api/woni");
-      if (current === epoch && dialog.open) show(data);
-      if (current === epoch && dialog.open && view === "work") {
+      if (current !== authEpoch || !enabled) return;
+      latestData = data; observeReplies(data);
+      if (dialog.open) {
+        show(data);
+        if (focusId) {
+          const id = focusId; focusId = null;
+          if (data.chats?.some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
+          else showOriginal(id);
+        }
+      }
+      if (current === authEpoch && dialog.open && view === "work") {
         try {
           const result = await api("/api/woni/activity");
-          if (current === epoch && dialog.open) { workData = result; workError = ""; }
-        } catch (_) { if (current === epoch && dialog.open) workError = "작업 현황을 확인하지 못했어요."; }
-        if (current === epoch && dialog.open && view === "work") renderWork();
+          if (current === authEpoch && dialog.open) { workData = result; workError = ""; }
+        } catch (_) { if (current === authEpoch && dialog.open) workError = "작업 현황을 확인하지 못했어요."; }
+        if (current === authEpoch && dialog.open && view === "work") renderWork();
       }
     } catch (_) {
-      if (current === epoch && dialog.open) {
+      if (current === authEpoch && dialog.open) {
         status.textContent = "원이에 연결하지 못했어요. 잠시 후 다시 확인해 주세요.";
         if (view === "work") { workError = "작업 현황을 확인하지 못했어요."; renderWork(); }
       }
     } finally {
       reading = false;
-      if (dialog.open) timer = setTimeout(refresh, current === epoch ? 4000 : 0);
+      if (enabled) timer = setTimeout(refresh, current === authEpoch ? (dialog.open ? 4000 : 6000) : 0);
     }
   }
   open.addEventListener("click", () => {
+    if (dialog.open) { setView("chat"); markVisibleRead(); return; }
     pending = savedPending();
     if (pending) {
       if (!attachments.length) attachments = (pending.attachments || []).map((id) => ({ id, name: "첨부 파일", state: "ready" }));
@@ -249,11 +302,12 @@
       replyBox.hidden = true;
     }
     renderAttachments(); dialog.showModal(); setView("chat");
-    if (pending) show(latestData || { chats: [], activity: {} });
+    if (latestData || pending) show(latestData || { chats: [], activity: {} });
+    markVisibleRead();
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { clearTimeout(timer); services.voice?.stop(input); epoch++; });
+  dialog.addEventListener("close", () => { clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
   $("woni-filter-clear").addEventListener("click", () => { filter = null; if (latestData) show(latestData); });
@@ -311,14 +365,26 @@
   });
   window.SessionholicWoni = {
     async check(call, helpers = {}) {
-      api = call; services = helpers; mic.hidden = !services.voice?.supported(); const current = epoch;
-      try { const data = await api("/api/woni?availability=1"); if (current === epoch) open.hidden = !data.enabled; } catch (_) { if (current === epoch) open.hidden = true; }
+      api = call; services = helpers; mic.hidden = !services.voice?.supported(); const current = authEpoch;
+      try {
+        const data = await api("/api/woni?availability=1");
+        if (current === authEpoch) {
+          enabled = !!data.enabled; open.hidden = !enabled;
+          if (enabled) { loadSeen(); if (focusId) open.click(); refresh(); }
+        }
+      } catch (_) { if (current === authEpoch) { enabled = false; open.hidden = true; } }
+    },
+    openFromNotification(id) {
+      if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) return false;
+      focusId = id; filter = null;
+      if (enabled) { open.click(); clearTimeout(timer); refresh(); }
+      return true;
     },
     lock() {
-      epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
+      enabled = false; epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; filter = null; latestData = null; workData = null;
-      pending = null; pendingState = "uncertain"; sending = false;
+      pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); renderAttachments();
     }
   };
