@@ -59,6 +59,27 @@ class WoniBridgeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             woni_bridge.validate({**data, 'attachments': ['../unsafe']})
 
+    def test_reply_and_read_operations_are_narrowly_validated(self):
+        data = {'text': '계속', 'requestId': 'request-123456', 'replyTo': {'id': 'chat-1', 'part': 'answer'}}
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'status': 'queued'})) as urlopen:
+            woni_bridge.local_call(data, self.home)
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data), data)
+        for invalid in ({'id': '../x', 'part': 'answer'}, {'id': 'chat-1', 'part': 'other'}, {'id': 'chat-1', 'part': 'answer', 'extra': True}):
+            with self.assertRaises(ValueError): woni_bridge.validate({**data, 'replyTo': invalid})
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'id': 'chat-1', 'text': '질문', 'private': 'x'})):
+            self.assertEqual(woni_bridge.local_call(home=self.home, operation='chat', query={'id': 'chat-1'}), {'id': 'chat-1', 'text': '질문', 'attachments': []})
+        with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='chat', query={'id': '../unsafe'})
+        with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='worker-result', query={'batch': 'bad', 'n': '1'})
+
+    def test_activity_removes_unneeded_worker_details(self):
+        value = {'running': [{'id': 'chat-1', 'text': '질문', 'steps': [{'tool': '읽기', 'private': 'x'}],
+                  'batches': [{'id': '20261106-010101-abcd', 'tasks': [{'n': 1, 'title': '작업', 'status': 'ok', 'pid': 123}]}], 'secret': 'x'}], 'recent': []}
+        with patch.object(woni_bridge, 'urlopen', return_value=Response(value)):
+            result = woni_bridge.local_call(home=self.home, operation='activity')
+        self.assertEqual(result['running'][0]['batches'][0]['tasks'], [{'n': 1, 'title': '작업', 'status': 'ok'}])
+        self.assertEqual(result['running'][0]['steps'], [{'tool': '읽기'}])
+        self.assertNotIn('secret', result['running'][0])
+
     def test_upload_streams_selected_bytes_with_metadata_and_checks_response(self):
         config = self.home / 'woni.json'
         config.write_text(json.dumps({'host': 'air'})); config.chmod(0o600)

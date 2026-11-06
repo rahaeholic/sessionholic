@@ -156,8 +156,16 @@
       </header>
       <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title">
         <header class="woni-head"><div><h2 id="woni-title">원이</h2><p id="woni-status" class="woni-status" role="status"></p></div><button id="woni-close" type="button" class="icon-button" aria-label="원이 닫기">×</button></header>
+        <nav class="woni-tabs" aria-label="원이 화면">
+          <button id="woni-chat-tab" type="button" aria-pressed="true">대화</button>
+          <button id="woni-work-tab" type="button" aria-pressed="false">작업 현황</button>
+        </nav>
+        <div id="woni-filter" class="woni-filter" hidden><span id="woni-filter-label"></span><button id="woni-filter-clear" type="button" class="quiet">전체 대화</button></div>
         <div id="woni-messages" class="woni-messages" aria-label="원이 대화"></div>
+        <div id="woni-work" class="woni-work" aria-label="원이 작업 현황" hidden></div>
+        <div id="woni-original" class="woni-original" hidden></div>
         <form id="woni-form" class="woni-form">
+          <div id="woni-reply" class="woni-reply" hidden><span id="woni-reply-label"></span><button id="woni-reply-clear" type="button" class="quiet" aria-label="답글 취소">×</button></div>
           <div id="woni-attachments" class="woni-attachments" aria-label="첨부 파일" hidden></div>
           <label class="sr-only" for="woni-input">원이에게 메시지</label>
           <textarea id="woni-input" rows="2" maxlength="12000" placeholder="원이에게 물어보세요" aria-describedby="woni-hint"></textarea>

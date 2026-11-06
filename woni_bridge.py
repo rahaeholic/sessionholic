@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -16,7 +17,7 @@ ATTACHMENT_ID = re.compile(r"\d{8}-[0-9a-f]{12}\Z")
 
 
 def validate(data):
-    if not isinstance(data, dict) or not {"text", "requestId"} <= set(data) or set(data) - {"text", "requestId", "attachments"}:
+    if not isinstance(data, dict) or not {"text", "requestId"} <= set(data) or set(data) - {"text", "requestId", "attachments", "replyTo"}:
         raise ValueError("메시지와 요청 ID를 확인해 주세요.")
     if not isinstance(data["text"], str) or not 1 <= len(data["text"].strip()) <= 12000:
         raise ValueError("메시지를 확인해 주세요.")
@@ -26,10 +27,26 @@ def validate(data):
     if (not isinstance(files, list) or len(files) > 10 or
             any(not isinstance(item, str) or not ATTACHMENT_ID.fullmatch(item) for item in files) or len(set(files)) != len(files)):
         raise ValueError("첨부 파일을 다시 확인해 주세요.")
+    reply = data.get("replyTo")
+    if reply is not None and (not isinstance(reply, dict) or set(reply) != {"id", "part"} or
+            not isinstance(reply["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", reply["id"]) or
+            reply["part"] not in ("question", "answer")):
+        raise ValueError("답글 대상을 다시 확인해 주세요.")
     return data
 
 
-def local_call(data=None, home=None):
+def local_call(data=None, home=None, operation="state", query=None):
+    if operation not in ("state", "activity", "chat", "worker-result") or data is not None and operation != "state":
+        raise ValueError("원이 요청을 다시 확인해 주세요.")
+    query = query or {}
+    if operation == "chat":
+        if set(query) != {"id"} or not isinstance(query["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", query["id"]):
+            raise ValueError("대화를 다시 선택해 주세요.")
+    elif operation == "worker-result":
+        if set(query) != {"batch", "n"} or not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", str(query["batch"])) or str(query["n"]) not in tuple("12345678"):
+            raise ValueError("작업 결과를 다시 선택해 주세요.")
+    elif query:
+        raise ValueError("원이 요청을 다시 확인해 주세요.")
     config = json.loads(((home or Path.home()) / ".local/share/ryan-one/config.json").read_text())
     token = config["token"] if data is not None else config.get("readToken") or config["token"]
     headers = {"Authorization": "Bearer " + token, "X-Woni-Task-Roles": "1"}
@@ -38,7 +55,8 @@ def local_call(data=None, home=None):
         headers.update({"Content-Type": "application/json", "X-Woni": "1"})
         request = Request("http://127.0.0.1:18772/v1/chat", data=body, headers=headers)
     else:
-        request = Request("http://127.0.0.1:18772/v1/state", headers=headers)
+        url = "http://127.0.0.1:18772/v1/" + operation
+        request = Request(url + ("?" + urlencode(query) if query else ""), headers=headers)
     try:
         with urlopen(request, timeout=15) as response:
             result = json.load(response)
@@ -50,17 +68,34 @@ def local_call(data=None, home=None):
         raise ValueError(message or "원이 요청을 처리하지 못했어요.") from None
     except (URLError, OSError, ValueError):
         raise RuntimeError("원이에 연결하지 못했어요. Air15 연결을 확인해 주세요.") from None
-    if data is None:
-        keys = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt")
+    if data is None and operation in ("state", "chat"):
+        keys = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo")
         chats = []
-        for chat in result.get("chats", []):
+        for chat in (result.get("chats", []) if operation == "state" else [result]):
             if not isinstance(chat, dict):
                 continue
             item = {key: chat[key] for key in keys if key in chat}
             item["attachments"] = [{key: file[key] for key in ("id", "name", "size", "mime") if key in file}
                                    for file in (chat.get("attachments") or []) if isinstance(file, dict)]
             chats.append(item)
+        if operation == "chat":
+            return chats[0] if chats else {}
         return {"enabled": True, "chats": chats, "activity": result.get("activity", {})}
+    if data is None and operation == "activity":
+        def clean_row(row):
+            keys = ("id", "text", "stream", "streamTitle", "status", "createdAt", "finishedAt", "progress", "tools", "workers", "workersFailed")
+            item = {key: row[key] for key in keys if key in row}
+            item["steps"] = [{"tool": step.get("tool", "")} for step in (row.get("steps") or []) if isinstance(step, dict)]
+            item["batches"] = [{"id": batch.get("id"), "tasks": [{key: task[key] for key in ("n", "title", "status", "seconds") if key in task}
+                                  for task in (batch.get("tasks") or []) if isinstance(task, dict)]}
+                               for batch in (row.get("batches") or []) if isinstance(batch, dict)]
+            return item
+        output = {key: [clean_row(row) for row in (result.get(key) or []) if isinstance(row, dict)] for key in ("running", "recent")}
+        output["loose"] = [clean_row({"text": "대화와 연결되지 않은 작업", "status": "running", "batches": [batch]})
+                           for batch in (result.get("loose") or []) if isinstance(batch, dict)]
+        return output
+    if data is None and operation == "worker-result":
+        return {key: result[key] for key in ("batch", "n", "text", "truncated") if key in result}
     return {key: result[key] for key in ("id", "status") if key in result}
 
 
@@ -110,18 +145,19 @@ class WoniBridge:
             raise ValueError("원이 연결 기기를 확인해 주세요.")
         return host
 
-    def call(self, data=None):
+    def call(self, data=None, operation="state", query=None):
         host = self.host()
         if host is None:
-            if data is not None:
+            if data is not None or operation != "state":
                 raise ValueError("원이가 연결되지 않았어요.")
             return {"enabled": False}
         if data is not None:
             validate(data)
         if host.get("local"):
-            return local_call(data)
+            return local_call(data, operation=operation, query=query)
         from server import collector_command
-        program = ("REMOTE_REQUEST = " + ascii(data) + "\n").encode() + Path(__file__).read_bytes()
+        program = ("REMOTE_REQUEST = " + ascii(data) + "\nREMOTE_OPERATION = " + ascii(operation) +
+                   "\nREMOTE_QUERY = " + ascii(query) + "\n").encode() + Path(__file__).read_bytes()
         try:
             result = subprocess.run(collector_command(host, [], self.state_dir), input=program,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=25, check=False)
@@ -177,7 +213,7 @@ class WoniBridge:
 
 if __name__ == "__main__" and "REMOTE_REQUEST" in globals():
     try:
-        print(json.dumps(local_call(REMOTE_REQUEST), ensure_ascii=True))
+        print(json.dumps(local_call(REMOTE_REQUEST, operation=REMOTE_OPERATION, query=REMOTE_QUERY), ensure_ascii=True))
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=True))
     except Exception:

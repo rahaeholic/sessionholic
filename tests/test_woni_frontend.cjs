@@ -17,13 +17,13 @@ function fixture(call) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-original']) nodes[id] = element();
   nodes['woni-form'].submit = element();
   const storage = new Map();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: {},
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
-    setTimeout: () => 1, clearTimeout: () => {}, AbortController };
+    setTimeout: () => 1, clearTimeout: () => {}, AbortController, URLSearchParams, CSS: { escape: value => value } };
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
   return { nodes, storage, app: context.window.SessionholicWoni, call };
 }
@@ -52,6 +52,43 @@ test('실패한 전송을 같은 요청 ID로 재시도하고 서버에서 확�
   await new Promise(setImmediate);
   assert.deepEqual(sent, [{ text: '안녕', requestId: 'request-123456' }, { text: '안녕', requestId: 'request-123456' }]);
   assert.equal(nodes['woni-input'].value, '');
+});
+
+test('답글은 원래 대화 ID를 유지하고 작업 화면에서 같은 대화를 연다', async () => {
+  const sent = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') { sent.push(options.body); return {}; }
+    if (url.includes('/activity')) return { running: [{ id: 'old-1', text: '작업', status: 'running' }], recent: [], loose: [] };
+    return { chats: [{ id: 'old-1', text: '원래 질문', answer: '원이 답변', stream: 's1', streamTitle: '작업 흐름' }], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const answer = nodes['woni-messages'].children[1];
+  answer.children.find(child => child.className === 'woni-message-actions').children[0].click();
+  assert.match(nodes['woni-reply-label'].textContent, /원이 답변/);
+  nodes['woni-input'].value = '이어서';
+  await nodes['woni-form'].listeners.submit({ preventDefault() {} });
+  assert.equal(sent[0].replyTo.id, 'old-1'); assert.equal(sent[0].replyTo.part, 'answer');
+  nodes['woni-work-tab'].click(); await new Promise(setImmediate);
+  assert.equal(nodes['woni-work'].hidden, false);
+  assert.ok(nodes['woni-work'].children.some(child => child.className === 'woni-work-card'));
+});
+
+test('잠금 뒤 늦게 도착한 작업 응답은 다시 열었을 때 남지 않는다', async () => {
+  let finishActivity;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url.includes('/activity')) return new Promise(resolve => { finishActivity = resolve; });
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-work-tab'].click(); await new Promise(setImmediate);
+  app.lock(); finishActivity({ running: [{ text: '이전 비밀', status: 'running' }] }); await new Promise(setImmediate);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-work-tab'].click();
+  assert.equal(JSON.stringify(nodes['woni-work'].children).includes('이전 비밀'), false);
 });
 
 test('잠금 후 늦게 온 연결 응답은 원이 버튼을 다시 표시하지 않는다', async () => {

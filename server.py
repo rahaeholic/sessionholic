@@ -3602,6 +3602,9 @@ class Handler(BaseHTTPRequestHandler):
                     if query.get("availability") == "1":
                         return self.send_json(200, {"enabled": self.server.woni.host() is not None})
                     return self.send_json(200, scrub_payload(self.server.woni.call()))
+                if url.path in ("/api/woni/activity", "/api/woni/chat", "/api/woni/worker-result"):
+                    operation = url.path.rsplit("/", 1)[-1]
+                    return self.send_json(200, scrub_payload(self.server.woni.call(operation=operation, query=query)))
                 if url.path == "/api/bot-requests/conversation":
                     # A listed request's conversation, watch-only: a bounded read-only read,
                     # at most two at once. Nothing is sent to, or resumed in, the bot.
