@@ -15,6 +15,7 @@ function fixture(call, storage = new Map()) {
       append(...items) { this.children.push(...items); },
       replaceChildren(...items) { this.children = items; },
       querySelector() { return this.submit; },
+      focus() { this.focused = true; },
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
@@ -27,6 +28,17 @@ function fixture(call, storage = new Map()) {
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
   return { nodes, storage, app: context.window.SessionholicWoni, call, tick: async () => { const fn = scheduled; scheduled = null; if (fn) await fn(); } };
 }
+
+test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포커스한다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call);
+  nodes['woni-input'].value = '작성 중인 초안';
+  nodes['woni-open'].click();
+  assert.equal(nodes['woni-dialog'].open, true);
+  assert.equal(nodes['woni-input'].focused, true);
+  assert.equal(nodes['woni-input'].value, '작성 중인 초안');
+});
 
 test('팝업을 닫아도 새 답변 배지를 표시하고 확인하면 지운다', async () => {
   let chats = [{ id: 'old', status: 'complete', answer: '기존 답변' }, { id: 'new', status: 'running' }];

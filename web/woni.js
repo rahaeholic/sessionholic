@@ -304,6 +304,7 @@
     renderAttachments(); dialog.showModal(); setView("chat");
     if (latestData || pending) show(latestData || { chats: [], activity: {} });
     markVisibleRead();
+    input.focus({ preventScroll: true });
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
