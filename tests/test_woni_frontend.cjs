@@ -40,6 +40,25 @@ test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포
   assert.equal(nodes['woni-input'].value, '작성 중인 초안');
 });
 
+test('완료된 답변에 기록된 날짜와 시간을 표시하며 누락된 시간은 추측하지 않는다', async () => {
+  const finishedAt = Date.UTC(2026, 10, 6, 4, 23) / 1000;
+  const chats = [
+    { id: 'known', text: '질문', answer: '기록된 답변', status: 'complete', createdAt: finishedAt - 600, finishedAt },
+    { id: 'missing', text: '다른 질문', answer: '시각 없는 답변', status: 'complete', createdAt: finishedAt - 30 },
+    { id: 'invalid', text: '질문', answer: '잘못된 시각', status: 'complete', finishedAt: 0 },
+  ];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const answers = nodes['woni-messages'].children.filter(item => item.className === 'woni-message assistant');
+  const time = answers[0].children.find(item => item.className === 'woni-message-time');
+  assert.equal(time.dateTime, '2026-11-06T04:23:00.000Z');
+  assert.match(time.textContent, /2026\.\s*11\.\s*06\..*13:23/);
+  assert.match(time['aria-label'], /답변 시각/);
+  assert.equal(answers[1].children.some(item => item.className === 'woni-message-time'), false);
+  assert.equal(answers[2].children.some(item => item.className === 'woni-message-time'), false);
+});
+
 test('팝업을 닫아도 새 답변 배지를 표시하고 확인하면 지운다', async () => {
   let chats = [{ id: 'old', status: 'complete', answer: '기존 답변' }, { id: 'new', status: 'running' }];
   const toasts = [];

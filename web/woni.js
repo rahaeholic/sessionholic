@@ -15,6 +15,7 @@
   const seenKey = "sessionholic:woni:seen";
   let seen = null, unread = new Set();
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
+  const answerTimeFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 
   function loadSeen() {
     try {
@@ -71,6 +72,15 @@
   function action(label, fn) {
     const button = el("button", "", label); button.type = "button"; button.addEventListener("click", fn); return button;
   }
+  function answerTime(seconds) {
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return null;
+    const date = new Date(seconds * 1000);
+    if (!Number.isFinite(date.getTime())) return null;
+    const text = answerTimeFormat.format(date);
+    const node = el("time", "woni-message-time", text);
+    node.dateTime = date.toISOString(); node.setAttribute("aria-label", `답변 시각 ${text}`);
+    return node;
+  }
   function setView(value) {
     view = value; const isChat = value === "chat";
     messages.hidden = !isChat; form.hidden = !isChat; work.hidden = isChat;
@@ -112,6 +122,10 @@
       const list = el("div", "woni-message-files");
       for (const file of files) list.append(el("span", "woni-message-file", file.name || "첨부 파일"));
       article.append(list);
+    }
+    if (role === "assistant" && chat?.answer) {
+      const time = answerTime(chat.finishedAt);
+      if (time) article.append(time);
     }
     if (chat?.id) {
       const actions = el("div", "woni-message-actions");

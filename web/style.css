@@ -204,6 +204,7 @@
 .woni-message-body { white-space: pre-wrap; }
 .woni-message.assistant .woni-message-body { white-space: normal; }
 .woni-message.user .woni-message-body { padding: 10px 14px; border-radius: 16px 16px 4px 16px; background: var(--bubble); }
+.woni-message-time { display: block; margin-top: 8px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
 .woni-send-status { margin: 4px 4px 0; color: var(--label-2); font-size: var(--fs-cap); text-align: right; }
 .woni-send-status button { margin-left: 8px; padding: 4px 8px; border: 0; border-radius: 8px; color: var(--accent); background: transparent; font: inherit; cursor: pointer; }
 .woni-send-status button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
