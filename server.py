@@ -4107,6 +4107,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
             if path == "/api/woni":
                 return self.send_json(200, scrub_payload(self.server.woni.call(data)))
+            if path == "/api/woni/read":
+                return self.send_json(200, scrub_payload(self.server.woni.call(data, operation="read")))
             if path == "/api/push/subscribe":
                 return self.send_json(200, self.server.push.subscribe(data))
             if path == "/api/push/unsubscribe":

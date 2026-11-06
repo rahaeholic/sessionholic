@@ -317,3 +317,57 @@ test('마이크는 기존 받아쓰기 기능에 연결하고 팝업을 닫으�
   nodes['woni-close'].listeners.click();
   assert.deepEqual(calls.map((item) => item[0]), ['toggle', 'stop']);
 });
+
+test('원이앱에서 읽은 답은 하던일 원이에서 새 답변으로 세지 않고, 여기서 읽으면 같은 기준에 남긴다', async () => {
+  let readThrough = 100;
+  let chats = [{ id: 'old', status: 'complete', answer: '읽은 답', finishedAt: 90 }, { id: 'unseen', status: 'complete', answer: '아직 안 읽은 답', finishedAt: 110 }];
+  const toasts = [], reads = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/read') { reads.push({ ...options.body }); readThrough = Math.max(readThrough, options.body.through); return { readThrough }; }
+    return { chats, activity: {}, readThrough };
+  };
+  const { nodes, app, tick } = fixture(call);
+  await app.check(call, { toast: text => toasts.push(text) }); await new Promise(setImmediate);
+  assert.equal(nodes['woni-unread'].textContent, '1');  // 공유 기준보다 늦게 끝난 답은 처음 확인에도 표시
+  assert.equal(toasts.length, 0);
+  readThrough = 115;  // 원이앱에서 읽음
+  await tick();
+  assert.equal(nodes['woni-unread'].hidden, true);
+  chats = [...chats, { id: 'next', status: 'complete', answer: '새 답', finishedAt: 130 }];
+  await tick();
+  assert.equal(nodes['woni-unread'].textContent, '1');
+  assert.equal(toasts.length, 1);
+  nodes['woni-open'].click(); await new Promise(setImmediate);
+  assert.equal(nodes['woni-unread'].hidden, true);
+  assert.deepEqual(reads, [{ through: 130 }]);
+  await tick(); await new Promise(setImmediate);
+  assert.equal(reads.length, 1);  // 이미 남긴 기준은 다시 보내지 않는다
+});
+
+test('원이 답의 추천 답장(👉)을 버튼으로 보여 주고 누르면 그 말을 바로 보낸다', async () => {
+  const sent = [];
+  const chats = [
+    { id: 'older', text: '앞 질문', status: 'complete', answer: '앞 답\n\n👉 예전 제안', finishedAt: 10 },
+    { id: 'latest', text: '질문', status: 'complete', answer: '정리했어요.\n\n👉 응, 정리해 줘 | 장소 후보부터 봐 줘\n🔊 정리했어요.', finishedAt: 20 },
+  ];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push({ ...options.body }); return { id: options.body.requestId, status: 'queued' }; }
+    if (options?.method === 'POST') return {};
+    return { chats, activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-input'].value = '쓰던 초안';
+  const answers = nodes['woni-messages'].children.filter(node => node.className === 'woni-message assistant');
+  assert.deepEqual(answers.map(node => node.children[1].textContent), ['앞 답', '정리했어요.']);
+  const boxes = nodes['woni-messages'].children.filter(node => node.className === 'woni-suggestions');
+  assert.equal(boxes.length, 1);  // 가장 최근 답에만
+  assert.deepEqual(boxes[0].children.map(button => button.textContent), ['응, 정리해 줘', '장소 후보부터 봐 줘']);
+  assert.equal(boxes[0].children[0].type, 'button');
+  await boxes[0].children[0].click();
+  assert.deepEqual(sent, [{ text: '응, 정리해 줘', requestId: 'request-123456' }]);
+  assert.equal(nodes['woni-input'].value, '쓰던 초안');
+  assert.equal(nodes['woni-messages'].children.some(node => node.className === 'woni-suggestions'), false);  // 확인 전 두 번 보내지 않게 숨긴다
+});

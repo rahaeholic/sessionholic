@@ -1,5 +1,6 @@
 """Opt-in bridge to the existing Woni API on a registered machine."""
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -35,8 +36,21 @@ def validate(data):
     return data
 
 
+def validate_read(data):
+    through = data.get("through") if isinstance(data, dict) and set(data) == {"through"} else None
+    if isinstance(through, bool) or not isinstance(through, (int, float)) or not math.isfinite(through) or through <= 0:
+        raise ValueError("읽은 시각을 확인해 주세요.")
+    return data
+
+
+def read_through(value):
+    return value if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else None
+
+
 def local_call(data=None, home=None, operation="state", query=None):
-    if operation not in ("state", "activity", "chat", "worker-result") or data is not None and operation != "state":
+    # A write is either a chat message (operation "state") or the shared read mark ("read").
+    if (operation not in ("state", "activity", "chat", "worker-result", "read") or
+            data is not None and operation not in ("state", "read") or data is None and operation == "read"):
         raise ValueError("원이 요청을 다시 확인해 주세요.")
     query = query or {}
     if operation == "chat":
@@ -51,9 +65,9 @@ def local_call(data=None, home=None, operation="state", query=None):
     token = config["token"] if data is not None else config.get("readToken") or config["token"]
     headers = {"Authorization": "Bearer " + token, "X-Woni-Task-Roles": "1"}
     if data is not None:
-        body = json.dumps(validate(data), ensure_ascii=False).encode()
+        body = json.dumps(validate_read(data) if operation == "read" else validate(data), ensure_ascii=False).encode()
         headers.update({"Content-Type": "application/json", "X-Woni": "1"})
-        request = Request("http://127.0.0.1:18772/v1/chat", data=body, headers=headers)
+        request = Request("http://127.0.0.1:18772/v1/" + ("read" if operation == "read" else "chat"), data=body, headers=headers)
     else:
         url = "http://127.0.0.1:18772/v1/" + operation
         request = Request(url + ("?" + urlencode(query) if query else ""), headers=headers)
@@ -80,7 +94,10 @@ def local_call(data=None, home=None, operation="state", query=None):
             chats.append(item)
         if operation == "chat":
             return chats[0] if chats else {}
-        return {"enabled": True, "chats": chats, "activity": result.get("activity", {})}
+        output = {"enabled": True, "chats": chats, "activity": result.get("activity", {})}
+        if read_through(result.get("readThrough")) is not None:
+            output["readThrough"] = result["readThrough"]  # 원이앱·하던일이 함께 쓰는 '이 시각까지 끝난 답은 읽음'
+        return output
     if data is None and operation == "activity":
         def clean_row(row):
             keys = ("id", "text", "stream", "streamTitle", "status", "createdAt", "finishedAt", "progress", "tools", "workers", "workersFailed")
@@ -96,6 +113,10 @@ def local_call(data=None, home=None, operation="state", query=None):
         return output
     if data is None and operation == "worker-result":
         return {key: result[key] for key in ("batch", "n", "text", "truncated") if key in result}
+    if operation == "read":
+        if read_through(result.get("readThrough")) is None:
+            raise ValueError("읽음 표시를 확인하지 못했어요.")
+        return {"readThrough": result["readThrough"]}
     return {key: result[key] for key in ("id", "status") if key in result}
 
 
@@ -152,7 +173,7 @@ class WoniBridge:
                 raise ValueError("원이가 연결되지 않았어요.")
             return {"enabled": False}
         if data is not None:
-            validate(data)
+            validate_read(data) if operation == "read" else validate(data)
         if host.get("local"):
             return local_call(data, operation=operation, query=query)
         from server import collector_command

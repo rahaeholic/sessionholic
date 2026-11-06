@@ -71,6 +71,22 @@ class WoniBridgeTest(unittest.TestCase):
         with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='chat', query={'id': '../unsafe'})
         with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='worker-result', query={'batch': 'bad', 'n': '1'})
 
+    def test_shared_read_mark_is_passed_through_and_written_narrowly(self):
+        # 원이앱에서 확인한 답이 하던일 원이에 새 답으로 계속 남지 않게, 원이 서버의 읽음 기준을 그대로 쓴다.
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'chats': [], 'activity': {}, 'readThrough': 1794000000.5})):
+            self.assertEqual(woni_bridge.local_call(home=self.home)['readThrough'], 1794000000.5)
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'chats': [], 'activity': {}, 'readThrough': 'bad'})):
+            self.assertNotIn('readThrough', woni_bridge.local_call(home=self.home))
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'readThrough': 1794000001.0, 'private': 'x'})) as urlopen:
+            self.assertEqual(woni_bridge.local_call({'through': 1794000001.0}, self.home, operation='read'), {'readThrough': 1794000001.0})
+        request = urlopen.call_args.args[0]
+        self.assertEqual((request.full_url, json.loads(request.data), request.get_header('X-woni')),
+                         ('http://127.0.0.1:18772/v1/read', {'through': 1794000001.0}, '1'))
+        for invalid in ({'through': True}, {'through': '1'}, {'through': -1}, {'through': 1, 'extra': 1}, {}):
+            with self.assertRaises(ValueError): woni_bridge.local_call(invalid, self.home, operation='read')
+        with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='read')
+        with self.assertRaises(ValueError): woni_bridge.local_call({'through': 1.0}, self.home, operation='activity')
+
     def test_activity_removes_unneeded_worker_details(self):
         value = {'running': [{'id': 'chat-1', 'text': '질문', 'steps': [{'tool': '읽기', 'private': 'x'}],
                   'batches': [{'id': '20261106-010101-abcd', 'tasks': [{'n': 1, 'title': '작업', 'status': 'ok', 'pid': 123}]}], 'secret': 'x'}], 'recent': []}

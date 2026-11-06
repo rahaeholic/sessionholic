@@ -14,6 +14,8 @@
   const pendingKey = "sessionholic:woni:pending";
   const seenKey = "sessionholic:woni:seen";
   let seen = null, unread = new Set();
+  // Woni's shared read mark: answers finished at or before it were seen in the Woni app or a board.
+  let readThrough = null, serverRead = 0, readPosting = 0;
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
   const answerTimeFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 
@@ -33,27 +35,76 @@
     node.hidden = !count; node.textContent = count > 99 ? "99+" : String(count);
     open.setAttribute("aria-label", count ? `원이 열기, 새 답변 ${count}개` : "원이 열기");
   }
+  function finishedAt(chat) {
+    const at = Number(chat.finishedAt) > 0 ? Number(chat.finishedAt) : Number(chat.createdAt);
+    return Number.isFinite(at) ? at : 0;
+  }
   function observeReplies(data) {
     const chats = Array.isArray(data.chats) ? data.chats : [];
     const first = seen === null, next = Object.create(null), visible = dialog.open && view === "chat" && !document.hidden;
+    // With Woni's shared mark an answer read in the Woni app is not new here; older Woni servers keep the per-tab baseline.
+    const shared = typeof data.readThrough === "number" && Number.isFinite(data.readThrough);
+    if (shared) { serverRead = Math.max(serverRead, data.readThrough); readThrough = Math.max(readThrough ?? 0, data.readThrough); }
+    if (shared) unread = new Set();
     let arrived = false;
     for (const chat of chats) {
       if (typeof chat.id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(chat.id)) continue;
       const complete = chat.status === "complete" && !!chat.answer && chat.kind !== "alert";
+      const shown = visible && (!filter || chat.stream === filter.id);
       next[chat.id] = complete;
-      if (!first && complete && seen[chat.id] !== true) {
-        if (!visible || (filter && chat.stream !== filter.id)) { unread.add(chat.id); arrived = true; }
+      if (shared) {
+        if (complete && !shown && finishedAt(chat) > readThrough) {
+          unread.add(chat.id);
+          if (!first && seen[chat.id] !== true) arrived = true;
+        }
+        continue;
       }
-      if (visible && (!filter || chat.stream === filter.id)) unread.delete(chat.id);
+      if (!first && complete && seen[chat.id] !== true) {
+        if (!shown) { unread.add(chat.id); arrived = true; }
+      }
+      if (shown) unread.delete(chat.id);
     }
     for (const id of unread) if (!Object.prototype.hasOwnProperty.call(next, id)) unread.delete(id);
     seen = next; badge(); saveSeen();
+    if (shared && visible) markVisibleRead();
     if (arrived && !document.hidden) services.toast?.("원이의 새 답변이 도착했어요. 원이 버튼에서 확인해 주세요.");
   }
   function markVisibleRead() {
     if (!latestData || document.hidden || view !== "chat") return;
     for (const chat of latestData.chats || []) if (!filter || chat.stream === filter.id) unread.delete(chat.id);
     badge(); saveSeen();
+    if (readThrough === null) return;
+    // Advance through answers in finish order; stop before an unread one hidden by a stream filter.
+    let through = readThrough;
+    const finished = (latestData.chats || []).filter((chat) => !["queued", "running"].includes(chat.status))
+      .map((chat) => [finishedAt(chat), !filter || chat.stream === filter.id]).sort((a, b) => a[0] - b[0]);
+    for (const [at, shown] of finished) { if (at <= through) continue; if (!shown) break; through = at; }
+    readThrough = through;
+    if (through > serverRead && through > readPosting) postRead(through);
+  }
+  async function postRead(through) {
+    if (!api) return;
+    const current = authEpoch; readPosting = through;
+    try {
+      const result = await api("/api/woni/read", { method: "POST", body: { through } });
+      if (current === authEpoch && typeof result?.readThrough === "number") serverRead = Math.max(serverRead, result.readThrough);
+    } catch (_) { /* the next check while the chat is open records it again */ }
+    finally { if (readPosting === through) readPosting = 0; }
+  }
+  // Woni's 👉 line holds tap-to-send replies; the 🔊 line is for listening only. Neither is shown as answer text.
+  function suggestedReplies(answer) {
+    const line = String(answer || "").split("\n").find((item) => /^\s*👉/u.test(item));
+    return line ? line.replace(/^\s*👉\uFE0F?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 2) : [];
+  }
+  function visibleAnswer(answer) {
+    return String(answer || "").replace(/^[ \t]*(?:👉|🔊).*$/gmu, "").replace(/\n{3,}/g, "\n\n").trim();
+  }
+  async function sendSuggestion(text) {
+    if (pending || sending || uploading) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
+    savePending({ text, requestId: crypto.randomUUID() });
+    filter = null;
+    const result = sendPending(); messages.scrollTop = messages.scrollHeight;
+    await result;
   }
 
   function savedPending() {
@@ -251,7 +302,13 @@
     const nodes = [];
     for (const chat of chats.filter((item) => !filter || item.stream === filter.id)) {
       if (chat.kind !== "alert" && (chat.text || chat.attachments?.length)) nodes.push(row("user", chat.text || "", chat.attachments || [], chat));
-      if (chat.answer) nodes.push(row("assistant", chat.answer, [], chat));
+      if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat));
+      const replies = chat.answer && chat === chats.at(-1) && !pending ? suggestedReplies(chat.answer) : [];
+      if (replies.length) {
+        const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
+        for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply)));
+        nodes.push(box);
+      }
       else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…"));
       else if (["failed", "interrupted"].includes(chat.status)) nodes.push(row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요."));
     }
@@ -401,6 +458,7 @@
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; filter = null; latestData = null; workData = null;
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
+      readThrough = null; serverRead = 0; readPosting = 0;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); renderAttachments();
     }
   };

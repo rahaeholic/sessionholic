@@ -211,6 +211,9 @@
 .woni-message-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .woni-message.user .woni-message-actions { justify-content: flex-end; }
 .woni-message-actions button, .woni-work button, .woni-original button { min-height: 36px; padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); cursor: pointer; }
+.woni-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin: -6px 0 18px; }
+.woni-suggestions button { min-height: 40px; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); text-align: left; cursor: pointer; touch-action: manipulation; }
+.woni-suggestions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .woni-message-quote { display: block; max-width: 100%; margin-bottom: 8px; padding: 8px 12px; border: 0; border-left: 2px solid var(--accent); background: var(--fill-soft); color: var(--label-2); text-align: left; font: inherit; font-size: var(--fs-sub); cursor: pointer; }
 .woni-work { flex: 1; min-height: 0; padding: 12px 20px; overflow-y: auto; overscroll-behavior: contain; }
 .woni-work h3 { margin: 12px 0; font-size: var(--fs-head); }
