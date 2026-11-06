@@ -181,8 +181,9 @@
 .woni-messages { flex: 1; min-height: 0; padding: 8px 20px 18px; overflow-y: auto; overscroll-behavior: contain; }
 .woni-message { max-width: 95%; margin: 18px 0; overflow-wrap: anywhere; line-height: 1.6; }
 .woni-message.user { max-width: 88%; margin-left: auto; }
-.woni-message strong { display: block; margin: 0 4px 5px; color: var(--label-2); font-size: var(--fs-cap); }
-.woni-message.user strong { text-align: right; }
+.woni-message.assistant { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--sep); }
+.woni-message > strong { display: block; margin: 0 4px 8px; color: var(--label); font-size: var(--fs-body); font-weight: 700; line-height: 1.35; }
+.woni-message.user > strong { color: var(--label-2); font-size: var(--fs-sub); text-align: right; }
 .woni-message-body { white-space: pre-wrap; }
 .woni-message.assistant .woni-message-body { white-space: normal; }
 .woni-message.user .woni-message-body { padding: 10px 14px; border-radius: 16px 16px 4px 16px; background: var(--bubble); }
