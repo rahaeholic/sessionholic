@@ -5554,6 +5554,51 @@ test('two turns that start with the same command keep their own tool groups when
   assert.deepEqual(second.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · 2.py']);
 });
 
+// Ryan 2026-11-06: a bot request's page scrolled only from a blank spot; a drag on its
+// messages became "당겨서 새로고침". Every scroller under the finger must be at its top.
+test('pull to refresh waits for every scroller under the finger, a bot request page and inner boxes included', () => {
+  const { c } = edgeClient();
+  const app = c.get('app');
+  const indicator = c.get('pull-refresh');
+  const pull = (target) => {
+    const at = (type, y) => {
+      const done = { prevented: 0 };
+      app.events[type]?.({ type, target, touches: type === 'touchend' ? [] : [{ clientX: 200, clientY: y }], cancelable: true,
+        preventDefault() { done.prevented++; } });
+      return done;
+    };
+    at('touchstart', 300);
+    let prevented = 0, shown = false;
+    for (let y = 320; y <= 500; y += 30) {
+      prevented += at('touchmove', y).prevented;
+      shown ||= indicator.style.opacity === '1';
+    }
+    at('touchend', 500);
+    return { prevented, shown };
+  };
+  // detail > head | page(.bot-request-detail) > conversation > row > bubble
+  const box = (parentElement, scrollTop = 0) => ({ parentElement, scrollTop, closest: (selector) => (selector.includes('#detail') ? detail : null) });
+  const detail = { parentElement: null, scrollTop: 0, closest: () => null, querySelectorAll: () => [page] };
+  const page = box(detail, 900), head = box(detail);
+  const conversation = box(page), row = box(conversation), bubble = box(row);
+  let result = pull(bubble);
+  assert.equal(result.prevented, 0, 'the page scrolls back up from its messages');
+  assert.equal(result.shown, false, 'and no pull shows');
+  assert.equal(pull(head).prevented, 0, 'the page read halfway also decides from its head');
+  // A tool output or a wide code block at its own top, inside a conversation read halfway.
+  const output = box(row, 0);
+  assert.equal(pull(output).prevented, 0, 'an inner box at its top does not make the drag a pull');
+  // At the very top everything pulls as before.
+  page.scrollTop = 0;
+  result = pull(bubble);
+  assert.ok(result.prevented > 0, 'from the top a downward drag pulls');
+  assert.equal(result.shown, true);
+  // The session list (outside a conversation): its own scroller decides too.
+  const list = { parentElement: null, scrollTop: 400, closest: () => null };
+  const chips = { parentElement: list, scrollTop: 0, closest: () => null };
+  assert.equal(pull(chips).prevented, 0, 'a sideways chip row at its top inside the read list is not a pull');
+});
+
 test('pull distance is elastic and the large title collapses into the bar on phones only', () => {
   const c = client(undefined, noChatTimers);
   assert.equal(c.pullDistance(0), 0);

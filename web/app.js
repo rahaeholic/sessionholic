@@ -15192,12 +15192,21 @@ function scrollListToTop() {
 }
 // Pull to refresh: the installed app has no browser gesture (overscroll is off),
 // so a downward pull from the top of the list or conversation reloads both.
-function scrollParent(node) {
-  for (let item = node; item && item !== document.body; item = item.parentElement) {
-    const overflow = window.getComputedStyle?.(item)?.overflowY || "";
-    if (/(auto|scroll)/.test(overflow) && item.scrollHeight > item.clientHeight) return item;
-  }
-  return null;
+// A conversation pane's own reading areas: a session's messages, a bot request's page.
+const PULL_READING_AREAS = "#messages, .bot-request-detail";
+// A pull starts only when everything that could scroll under the finger is at its top. Only
+// the nearest scroller was asked before: a bot request's page (no #messages in it) or an inner
+// box at its own top (a tool output, a wide code block) turned every downward drag on the
+// content into a pull, and the page scrolled back up only from a blank spot (Ryan 2026-11-06).
+function pullBlocked(target) {
+  for (let item = target; item && item !== document.body; item = item.parentElement)
+    if ((item.scrollTop || 0) > 0) return true;
+  if ((document.scrollingElement?.scrollTop || 0) > 0) return true;
+  // In a conversation its reading area decides wherever the finger starts (the head, the composer).
+  const detail = target?.closest?.("#detail");
+  for (const area of detail?.querySelectorAll?.(PULL_READING_AREAS) || [])
+    if ((area.scrollTop || 0) > 0) return true;
+  return false;
 }
 function pullDistance(pulled) {
   // Elastic: the indicator follows the finger less and less, like a rubber band.
@@ -15247,9 +15256,7 @@ function bindPullToRefresh(root) {
     distance = 0;
     if (event.touches.length !== 1 || boardCovered() || state.pullRefreshing) return;
     if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
-    // In a conversation the message list decides, wherever the finger starts.
-    const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
-    if (scroller && scroller.scrollTop > 0) return;
+    if (pullBlocked(event.target)) return;
     start = event.touches[0].clientY;
     startX = event.touches[0].clientX;
   }, { passive: true });
