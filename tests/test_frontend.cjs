@@ -216,7 +216,9 @@ test('분할창이 여러 개여도 원이 답변 감시는 메인 보드에서 
   const started = [];
   for (const embedded of [false, true, true]) {
     const c = client(async url => ({ ok: true, status: 200, json: async () =>
-      url.startsWith('/api/snapshot') ? { hosts: [] } : { hosts: [], terminals: [], csrfToken: 'test' } }), noChatTimers);
+      url.startsWith('/api/snapshot') ? { hosts: [] } : { hosts: [], terminals: [], csrfToken: 'test' } }),
+      // Inline: test_session_recoveries_frontend.cjs reruns this file only up to the routing test, before noChatTimers is defined.
+      { setTimeout: () => 1, clearTimeout() {} });
     c.context.window.SessionholicWorkspace = { embedded, visible: () => true, managed: () => false, sharedRead: () => null, readingActive: () => true, dataChanged() {}, changed() {} };
     c.context.window.SessionholicWoni = { check: () => started.push(embedded ? 'pane' : 'board') };
     await c.poll(false);
