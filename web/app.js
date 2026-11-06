@@ -854,6 +854,13 @@ function requestSessionOpen(url) {
   openRequestedSession();
   return true;
 }
+function requestWoniOpen(url) {
+  try {
+    const parsed = new URL(url, globalThis.location?.origin || "http://board.invalid");
+    const id = parsed.pathname === "/" ? parsed.searchParams.get("woni") : null;
+    return !!id && !!window.SessionholicWoni?.openFromNotification?.(id);
+  } catch { return false; }
+}
 function openRequestedSession() {
   const request = state.openRequest;
   if (!request) return;
@@ -5423,7 +5430,7 @@ function dictationListening(field) {
 // A pending restart is distinct from listening; another press cancels it.
 function renderDictation() {
   const supported = !!speechRecognitionClass();
-  for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"]]) {
+  for (const [id, fieldId] of [["chat-mic", "chat-input"], ["draft-mic", "terminal-draft"], ["woni-mic", "woni-input"]]) {
     const node = $(id);
     if (!node) continue;
     const listening = !!state.dictation && state.dictation.field === $(fieldId);
@@ -5448,6 +5455,8 @@ function renderDictationOverlay() {
   overlay.hidden = !session;
   if (!session) return;
   // In a split board the first pane's mic screen covers that pane, as the other panes' do.
+  const parent = session.field === $("woni-input") ? $("woni-dialog") : $("app");
+  if (parent && overlay.parentElement !== parent) parent.append(overlay);
   placeInPane(overlay, firstPaneArea(session.field));
   const stop = $("dictation-overlay-stop");
   if (stop && !stop.dataset.bound) {
@@ -5652,7 +5661,7 @@ function dictationSkipped(results, count) {
 // line's 보내기): pressed as the user would, so every rule of that send (nothing to send, a
 // send under way, a locked field, a word still composing committed first) still holds.
 function dictationSendButton(field) {
-  return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : null;
+  return field === $("chat-input") ? $("chat-send") : field === $("terminal-draft") ? $("draft-paste") : field === $("woni-input") ? $("woni-send") : null;
 }
 // A listening that failed, left the screen or lost its words to other text sends nothing (an
 // end with nothing heard still sends what the field holds). Our stop answered with "aborted"
@@ -7375,7 +7384,7 @@ function renderAttachmentTiles(entry, box = $("chat-attachments")) {
 // available until it settles. Retry only an explicit pre-write CSRF refusal.
 const UPLOAD_TIMEOUT_MS = 120000;
 const UPLOAD_TIMEOUT_MESSAGE = "첨부 응답이 늦어 기다리기를 멈췄습니다. 다시 올리거나 취소해 주세요.";
-async function sendUpload(file, headers, onProgress, { signal, authEpoch = state.authEpoch, csrfRetry = true } = {}) {
+async function sendUpload(file, headers, onProgress, { signal, authEpoch = state.authEpoch, csrfRetry = true, path = "/api/chat/upload", timeoutMs = UPLOAD_TIMEOUT_MS } = {}) {
   const response = await new Promise((resolve, reject) => {
     let request = null, timer = null, finished = false;
     const controller = new AbortController();
@@ -7391,9 +7400,9 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     const timeout = () => finish(new Error(UPLOAD_TIMEOUT_MESSAGE));
     if (signal?.aborted) { cancel(); return; }
     signal?.addEventListener?.("abort", cancel, { once: true });
-    timer = setTimeout(timeout, UPLOAD_TIMEOUT_MS);
+    timer = setTimeout(timeout, timeoutMs);
     if (typeof XMLHttpRequest !== "function") {
-      fetch("/api/chat/upload", { method: "POST", credentials: "same-origin", cache: "no-store",
+      fetch(path, { method: "POST", credentials: "same-origin", cache: "no-store",
         body: file, headers, signal: controller.signal })
         .then(async (r) => ({ status: r.status, ok: r.ok, data: await r.json().catch(() => ({})) }))
         .then((result) => finish(null, result), () => finish(new Error("첨부파일을 올리지 못했습니다. 연결 후 다시 올려 주세요.")));
@@ -7401,8 +7410,8 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     }
     try {
       request = new XMLHttpRequest();
-      request.open("POST", "/api/chat/upload");
-      request.timeout = UPLOAD_TIMEOUT_MS;
+      request.open("POST", path);
+      request.timeout = timeoutMs;
       for (const [name, value] of Object.entries(headers)) request.setRequestHeader(name, value);
       request.upload?.addEventListener?.("progress", (event) => {
         if (!finished && event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
@@ -7423,7 +7432,7 @@ async function sendUpload(file, headers, onProgress, { signal, authEpoch = state
     await loadCapabilities(authEpoch, { refreshView: false });
     assertAuthEpoch(authEpoch);
     return sendUpload(file, { ...headers, "X-CSRF-Token": state.csrf }, onProgress,
-      { signal, authEpoch, csrfRetry: false });
+      { signal, authEpoch, csrfRetry: false, path, timeoutMs });
   }
   return response;
 }
@@ -10847,7 +10856,83 @@ function updateReadNotice(data) {
   note.textContent = `기기에 연결되지 않아 ${data.fetchedAt ? `${ago(data.fetchedAt)} 저장한` : "저장된"} 대화를 표시합니다. 실행 상태는 연결 후 확인해 주세요.`;
 }
 
+// Mobile browser Back moves history before notifying the page. Keep one root entry
+// available so an open dialog can consume Back and the first root Back can warn.
+const MOBILE_BACK_EXIT_MS = 2200;
+let mobileExitTimer = null, mobileDialogOrder = [];
+function mobileBackEnabled() {
+  const nav = globalThis.navigator;
+  return !window.SessionholicWorkspace?.embedded &&
+    (/Android/i.test(String(nav?.userAgent || "")) || (phoneLayout() && (nav?.standalone === true || window.matchMedia?.("(display-mode: standalone)")?.matches)));
+}
+function armMobileRootBack() {
+  if (!mobileBackEnabled()) return;
+  const entry = window.history.state;
+  if (!entry?.[INSTANCE.historyKey] || entry.view !== "list" || entry.mobileRootGuard || state.detailShown || state.terminalVisible) return;
+  window.history.pushState({ ...entry, mobileRootGuard: true }, "");
+  state.historyCursor = window.history.state;
+}
+function cancelMobileExit() {
+  if (mobileExitTimer === null) return;
+  clearTimeout(mobileExitTimer); mobileExitTimer = null;
+  armMobileRootBack();
+}
+function dismissLocalMobileOverlay() {
+  if (state.dictation && !$('dictation-overlay')?.hidden) {
+    state.dictation.sendWhenDone = null;
+    stopDictation({ field: state.dictation.field });
+    return true;
+  }
+  const open = [...(document.querySelectorAll?.("dialog[open]") || [])].filter((dialog) => dialog.open);
+  if (!open.length) return false;
+  const focused = document.activeElement?.closest?.("dialog[open]");
+  const dialog = [...mobileDialogOrder].reverse().find((item) => open.includes(item)) || (open.includes(focused) ? focused : open[open.length - 1]);
+  const event = new Event("cancel", { cancelable: true });
+  if (dialog.dispatchEvent(event) && dialog.open) dialog.close();
+  return true;
+}
+function handleMobileHistoryBack(event) {
+  if (!mobileBackEnabled()) return false;
+  const previous = state.historyCursor;
+  if (!previous?.[INSTANCE.historyKey]) return false;
+  if (dismissLocalMobileOverlay() || window.SessionholicWorkspace?.dismissActiveDialog?.()) {
+    window.history.pushState(previous, "");
+    state.historyCursor = window.history.state;
+    return true;
+  }
+  if (previous.mobileRootGuard && !event.state?.mobileRootGuard && previous.view === "list") {
+    state.historyCursor = event.state;
+    if (previous.sessionholicGoals?.tab === "goals") {
+      window.SessionholicGoals?.openTab?.("sessions", { history: false, clearSelection: true });
+      armMobileRootBack();
+    } else {
+      toast("한 번 더 뒤로 가면 나갑니다.");
+      clearTimeout(mobileExitTimer);
+      mobileExitTimer = setTimeout(() => { mobileExitTimer = null; armMobileRootBack(); }, MOBILE_BACK_EXIT_MS);
+    }
+    return true;
+  }
+  return false;
+}
+function initMobileBack() {
+  if (!mobileBackEnabled()) return;
+  armMobileRootBack();
+  document.addEventListener("pointerdown", cancelMobileExit, true);
+  document.addEventListener("keydown", (event) => { if (event.key !== "Escape") cancelMobileExit(); }, true);
+  if (typeof MutationObserver === "function") {
+    new MutationObserver((changes) => {
+      for (const { target } of changes) {
+        if (target.tagName !== "DIALOG") continue;
+        mobileDialogOrder = mobileDialogOrder.filter((dialog) => dialog !== target);
+        if (target.open) { mobileDialogOrder.push(target); cancelMobileExit(); }
+      }
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ["open"], subtree: true });
+  }
+}
+window.SessionholicMobileBack = { record: () => { if (mobileBackEnabled()) state.historyCursor = window.history.state; }, prepare: cancelMobileExit };
+
 function navigateView(view, replace = false, extra = {}) {
+  if (!replace && view !== "list") cancelMobileExit();
   let current = window.history.state;
   if (mobileStartOnList() && !replace && view !== "list" &&
       (!current?.[INSTANCE.historyKey] || !Number.isInteger(current.listDepth) ||
@@ -10857,13 +10942,13 @@ function navigateView(view, replace = false, extra = {}) {
   }
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   // `notice` belongs to the one entry a notification opened.
-  const { notice, ...kept } = current || {};
+  const { notice, mobileRootGuard, ...kept } = current || {};
   const depth = view === "list" ? 0 : replace ? (current?.listDepth || 0)
     : current?.[INSTANCE.historyKey] && Number.isInteger(current.listDepth) ? current.listDepth + 1 : 0;
   const navigationId = replace && current?.[INSTANCE.historyKey] && current.navigationId ? current.navigationId : requestId();
   const parentDetailId = view === "terminal" && current?.[INSTANCE.historyKey] && current.view === "detail" ? current.navigationId : null;
   window.history[replace ? "replaceState" : "pushState"](
-    { ...kept, ...extra, [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
+    { ...kept, ...extra, ...(replace && view === "list" && mobileRootGuard ? { mobileRootGuard: true } : {}), [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
     "",
   );
   // A new entry drops the entries ahead of it, in the browser and for forward swipes.
@@ -14961,6 +15046,25 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
+    if (firstAuthentication && !window.SessionholicWorkspace?.embedded) window.SessionholicWoni?.check?.(api, {
+      toast,
+      upload: async (file, progress, signal) => {
+        const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,
+          "X-File-Name": encodeURIComponent(file.name || "첨부파일"), "X-File-Mime": file.type || "application/octet-stream" },
+          progress, { signal, path: "/api/woni/attachment", timeoutMs: 300000 });
+        if (response.status === 401) showLogin();
+        if (!response.ok || !response.data?.attachment?.id) throw new Error(response.data?.error || "파일을 올리지 못했어요.");
+        return response.data.attachment;
+      },
+      voice: {
+        supported: () => !!speechRecognitionClass(),
+        toggle: (field, report) => dictationListening(field) ? stopDictation({ field }) : startDictation(field, {
+          report, releaseKeyboard: true, active: () => state.authenticated && !!$("woni-dialog")?.open && !document.hidden,
+        }),
+        stop: (field) => stopDictation({ field, abort: true }),
+        typed: dictationTyped,
+      },
+    });
     savedPromptsAnnounced(snapshot.savedPrompts);
     // Keep the visible bot list current, even when it has reached the bounded
     // source window. This read is independent of chat input and never navigates.
@@ -15088,12 +15192,21 @@ function scrollListToTop() {
 }
 // Pull to refresh: the installed app has no browser gesture (overscroll is off),
 // so a downward pull from the top of the list or conversation reloads both.
-function scrollParent(node) {
-  for (let item = node; item && item !== document.body; item = item.parentElement) {
-    const overflow = window.getComputedStyle?.(item)?.overflowY || "";
-    if (/(auto|scroll)/.test(overflow) && item.scrollHeight > item.clientHeight) return item;
-  }
-  return null;
+// A conversation pane's own reading areas: a session's messages, a bot request's page.
+const PULL_READING_AREAS = "#messages, .bot-request-detail";
+// A pull starts only when everything that could scroll under the finger is at its top. Only
+// the nearest scroller was asked before: a bot request's page (no #messages in it) or an inner
+// box at its own top (a tool output, a wide code block) turned every downward drag on the
+// content into a pull, and the page scrolled back up only from a blank spot (Ryan 2026-11-06).
+function pullBlocked(target) {
+  for (let item = target; item && item !== document.body; item = item.parentElement)
+    if ((item.scrollTop || 0) > 0) return true;
+  if ((document.scrollingElement?.scrollTop || 0) > 0) return true;
+  // In a conversation its reading area decides wherever the finger starts (the head, the composer).
+  const detail = target?.closest?.("#detail");
+  for (const area of detail?.querySelectorAll?.(PULL_READING_AREAS) || [])
+    if ((area.scrollTop || 0) > 0) return true;
+  return false;
 }
 function pullDistance(pulled) {
   // Elastic: the indicator follows the finger less and less, like a rubber band.
@@ -15143,9 +15256,7 @@ function bindPullToRefresh(root) {
     distance = 0;
     if (event.touches.length !== 1 || boardCovered() || state.pullRefreshing) return;
     if (event.target?.closest?.("textarea, input, select, dialog[open]")) return;
-    // In a conversation the message list decides, wherever the finger starts.
-    const scroller = event.target?.closest?.("#detail") ? $("messages") : scrollParent(event.target);
-    if (scroller && scroller.scrollTop > 0) return;
+    if (pullBlocked(event.target)) return;
     start = event.touches[0].clientY;
     startX = event.touches[0].clientX;
   }, { passive: true });
@@ -15251,6 +15362,7 @@ function showLogin() {
   state.accountFilterRoutes = null;
   state.inputEpoch++;
   state.authenticated = false;
+  window.SessionholicWoni?.lock?.();
   state.csrf = "";
   state.capabilities = null;
   state.capabilitiesRevision = null;
@@ -15551,7 +15663,8 @@ function pageShown() {
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
     [...terminalAttachmentDrafts.values()].some((entry) => entry.attachments.length || entry.uploadQueue.length || entry.uploads) ||
-    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads || entry.uploadQueue?.length);
+    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads || entry.uploadQueue?.length) ||
+    !!window.SessionholicWoni?.hasDraft?.();
 }
 function warnDraftUnload(event) {
   if (state.discardOnReload) return;
@@ -15583,8 +15696,13 @@ async function openLaunchList() {
   state.forwardEntries.length = 0;
   state.launchNavigationEntries = new Set();
   // Replace, rather than push, so relaunching does not build a stack of homes.
+  const rootGuard = window.history.state?.mobileRootGuard;
   window.history.replaceState(null, "", "/");
   navigateView("list", true);
+  if (rootGuard && mobileBackEnabled()) {
+    window.history.replaceState({ ...window.history.state, mobileRootGuard: true }, "");
+    state.historyCursor = window.history.state;
+  } else armMobileRootBack();
   window.SessionholicWorkspace?.showList?.();
   render();
 }
@@ -15797,6 +15915,8 @@ function workspaceHooks() {
       else poll(false);
     },
     locked: () => showLogin(),
+    dismissDialog: dismissLocalMobileOverlay,
+    prepareMobileBack: cancelMobileExit,
     unsaved: () => { persistAllDrafts(); return !state.discardOnReload && unsavedWork(); },
   };
 }
@@ -15823,11 +15943,13 @@ window.addEventListener("DOMContentLoaded", () => {
     hideSession: () => setDetailShown(false), getSheet: sheet,
     onChanged: render,
     onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
+  initMobileBack();
   document.addEventListener("pointerdown", closeChatToolsOutside);
   // Where a sheet a press opens belongs (paneSheet); buttons a mouse clicks take no focus in Safari.
   document.addEventListener("pointerdown", (event) => { state.pressOrigin = { target: event.target, at: Date.now() }; }, true);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
+    if (handleMobileHistoryBack(event)) return;
     // A committed edge swipe already slid the screens: the change shows at once and ends it.
     // Any other swipe on screen gives way to the history change.
     const swipe = state.edge;
@@ -16198,11 +16320,11 @@ window.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator && !window.SessionholicWorkspace?.embedded) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
     navigator.serviceWorker.addEventListener?.("message", (event) => {
-      if (event.data?.type === "open-session") requestSessionOpen(event.data.url);
+      if (event.data?.type === "open-session") requestWoniOpen(event.data.url) || requestSessionOpen(event.data.url);
     });
   }
   // Opened from a notification: remember the session, then drop it from the address.
-  if (globalThis.location?.search && requestSessionOpen(globalThis.location.href) && !window.SessionholicWorkspace?.detached)
+  if (globalThis.location?.search && (requestWoniOpen(globalThis.location.href) || requestSessionOpen(globalThis.location.href)) && !window.SessionholicWorkspace?.detached)
     window.history.replaceState(window.history.state, "", "/");
   if (!window.SessionholicWorkspace?.embedded)
     window.launchQueue?.setConsumer((params) => handleAppLaunch(params).catch(() => {}));

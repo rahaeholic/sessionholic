@@ -35,6 +35,7 @@
     <script src="/workspace.js" defer></script>
     <script src="/terminal-ime.js" defer></script>
     <script src="/app.js" defer></script>
+    <script src="/woni.js" defer></script>
   </head>
   <body>
     <div id="login" class="login" hidden>
@@ -147,11 +148,43 @@
             <circle cx="7.5" cy="15.5" r="2.2" fill="none" stroke="currentColor" stroke-width="1.8" />
           </svg>
         </button>
+        <button id="woni-open" class="woni-launch" type="button" aria-haspopup="dialog" aria-label="원이 열기" hidden>
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5a8 8 0 0 1-8 8 8.6 8.6 0 0 1-3.4-.7L4 20l1.2-3.9A8 8 0 1 1 20 11.5Z"/><path d="M8.5 11.5h7"/></svg>
+          <span>원이</span><span id="woni-unread" class="woni-unread" aria-hidden="true" hidden></span>
+        </button>
         <nav id="workspace-switcher" aria-label="열린 세션 창" hidden></nav>
         <button id="workspace-arrange" class="quiet workspace-split-open" type="button" title="창을 좌우에 같은 너비로 나란히 배치" hidden>세로 정렬</button>
         <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>＋ 분할 추가</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
+      <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title">
+        <header class="woni-head"><div><h2 id="woni-title">원이</h2><p id="woni-status" class="woni-status" role="status"></p></div><button id="woni-close" type="button" class="icon-button" aria-label="원이 닫기">×</button></header>
+        <nav class="woni-tabs" aria-label="원이 화면">
+          <button id="woni-chat-tab" type="button" aria-pressed="true">대화</button>
+          <button id="woni-work-tab" type="button" aria-pressed="false">작업 현황</button>
+        </nav>
+        <div id="woni-filter" class="woni-filter" hidden><span id="woni-filter-label"></span><button id="woni-filter-clear" type="button" class="quiet">전체 대화</button></div>
+        <div id="woni-messages" class="woni-messages" aria-label="원이 대화"></div>
+        <div id="woni-work" class="woni-work" aria-label="원이 작업 현황" hidden></div>
+        <div id="woni-original" class="woni-original" hidden></div>
+        <form id="woni-form" class="woni-form">
+          <div id="woni-reply" class="woni-reply" hidden><span id="woni-reply-label"></span><button id="woni-reply-clear" type="button" class="quiet" aria-label="답글 취소">×</button></div>
+          <div id="woni-attachments" class="woni-attachments" aria-label="첨부 파일" hidden></div>
+          <label class="sr-only" for="woni-input">원이에게 메시지</label>
+          <textarea id="woni-input" rows="2" maxlength="12000" placeholder="원이에게 물어보세요" aria-describedby="woni-hint"></textarea>
+          <div class="woni-actions">
+            <input id="woni-files" type="file" multiple hidden />
+            <button id="woni-attach" type="button" class="woni-tool" aria-label="파일 첨부" title="파일 첨부">
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M10 4v12M4 10h12"/></svg>
+            </button>
+            <button id="woni-mic" type="button" class="woni-tool" aria-label="음성 입력" aria-pressed="false" title="음성 입력" hidden>
+              <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
+            </button>
+            <span id="woni-hint" class="woni-hint">⌘ Enter로 보내기</span>
+            <button id="woni-send" type="submit" class="primary" aria-keyshortcuts="Meta+Enter Control+Enter">보내기</button>
+          </div>
+        </form>
+      </dialog>
       <div
         id="connection-notice"
         class="connection-notice"

@@ -222,7 +222,7 @@ def http_post(url, headers, timeout=SEND_TIMEOUT):
 
 class PushService:
     def __init__(self, board, state_dir, classify=None, labels=None, sender=None, vapid=None,
-                 clock=time.time, monotonic=time.monotonic, log_prefix="세션 알림", enabled=True):
+                 clock=time.time, monotonic=time.monotonic, log_prefix="세션 알림", enabled=True, woni=None):
         self.board, self.log_prefix, self.enabled = board, log_prefix, enabled
         self.directory = Path(state_dir) / "push"
         self.classify = classify or (lambda host, row: "general")
@@ -230,6 +230,7 @@ class PushService:
         self.sender = sender or http_post
         self.vapid = vapid or Vapid(self.directory, openssl=shutil.which("openssl", path="/usr/bin:/opt/homebrew/bin") or OPENSSL)
         self.clock, self.monotonic = clock, monotonic
+        self.woni = woni
         self.lock = threading.RLock()
         self.wake, self.closed, self.thread = threading.Event(), False, None
         self.subscriptions = [row for row in read_private(self.directory / "subscriptions.json", [])
@@ -240,6 +241,7 @@ class PushService:
         self.seen = saved.get("seen", {}) if saved else seen if isinstance(seen, dict) else {}
         if not isinstance(self.seen, dict):
             self.seen = {}
+        self.woni_seen = saved.get("woni", {}) if isinstance(saved.get("woni", {}), dict) else {}
         registered = {row["id"] for row in self.subscriptions}
         pending = saved.get("pending", {})
         self.pending = {key: self._fresh(value) for key, value in pending.items()
@@ -250,6 +252,7 @@ class PushService:
         # Hosts looked at by this process: a session first seen on one of them is new.
         self.observed_hosts = set()
         self.last_poll = -1e9
+        self.woni_wake, self.woni_thread = threading.Event(), None
 
     # ---------- subscriptions ----------
     def status(self, identifier=None):
@@ -286,6 +289,7 @@ class PushService:
             self._save_subscriptions(rows)
             self.retry_after.pop(identifier, None)
         self.wake.set()
+        self.woni_wake.set()
         return {"ok": True, "id": identifier, "subscriptions": len(rows)}
 
     def unsubscribe(self, data):
@@ -420,6 +424,10 @@ class PushService:
         self.board.add_listener(self.changed)
         self.thread = threading.Thread(target=self.run, daemon=True, name="board-push")
         self.thread.start()
+        if self.woni:
+            self.woni_thread = threading.Thread(target=self.run_woni, daemon=True, name="woni-push")
+            self.woni_thread.start()
+            self.woni_wake.set()
 
     def changed(self, *_):
         self.wake.set()
@@ -427,6 +435,7 @@ class PushService:
     def close(self):
         self.closed = True
         self.wake.set()
+        self.woni_wake.set()
         try:
             self.board.remove_listener(self.changed)
         except ValueError:
@@ -442,6 +451,73 @@ class PushService:
                 self.step()
             except Exception as exc:  # noqa: BLE001 - the watcher must survive one bad round
                 sys.stderr.write("%s: 알림 상태 확인 실패 (%s)\n" % (self.log_prefix, type(exc).__name__))
+
+    def run_woni(self):
+        while not self.closed:
+            self.woni_wake.wait(TICK)
+            self.woni_wake.clear()
+            if self.closed:
+                return
+            try:
+                self.woni_step()
+            except Exception as exc:  # 원이 연결 실패가 세션 알림 처리를 막지 않는다.
+                sys.stderr.write("%s: 원이 알림 확인 실패 (%s)\n" % (self.log_prefix, type(exc).__name__))
+
+    def woni_step(self):
+        with self.lock:
+            if not self.enabled or not self.woni or not self.subscriptions:
+                return 0
+        data = self.woni()
+        if self.closed:
+            return 0
+        if not isinstance(data, dict) or not data.get("enabled") or not isinstance(data.get("chats"), list):
+            return 0
+        now = int(self.clock())
+        with self.lock:
+            targets = list(self.subscriptions)
+            if not targets:
+                return 0
+            baseline = self.woni_seen.get("baselineAt")
+            if not isinstance(baseline, (int, float)):
+                baseline = None
+            known = self.woni_seen.get("chats", {})
+            if not isinstance(known, dict):
+                known = {}
+            events, changed = [], baseline is None
+            for chat in data["chats"]:
+                if not isinstance(chat, dict):
+                    continue
+                identifier = chat.get("id")
+                if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", identifier):
+                    continue
+                previous = known.get(identifier, {})
+                if not isinstance(previous, dict):
+                    previous = {}
+                finished = chat.get("finishedAt")
+                complete = (chat.get("status") == "complete" and bool(chat.get("answer")) and chat.get("kind") != "alert"
+                            and isinstance(finished, (int, float)))
+                recent = isinstance(finished, (int, float)) and now - PENDING_TTL <= finished <= now + 60
+                if baseline is not None and complete and not previous.get("complete") and recent and (previous or finished >= baseline):
+                    notice = {"title": "원이 답변 도착", "body": "답변이 도착했어요. 눌러서 확인해 주세요.",
+                              "tag": "woni:" + identifier, "url": "/?woni=" + identifier,
+                              "kind": "woni_reply", "createdAt": now}
+                    self._queue(targets, notice, persist=False)
+                    events.append(identifier)
+                seen_at = previous.get("seenAt")
+                if previous.get("complete") != complete or not isinstance(seen_at, (int, float)) or now - seen_at >= 3600:
+                    known[identifier] = {"complete": complete, "seenAt": now}
+                    changed = True
+            before_prune = len(known)
+            known = {key: value for key, value in known.items() if isinstance(value, dict) and isinstance(value.get("seenAt"), (int, float)) and now - value["seenAt"] <= SEEN_TTL}
+            changed = changed or len(known) != before_prune
+            self.woni_seen = {"baselineAt": baseline if isinstance(baseline, (int, float)) else now, "chats": known}
+            if changed or events:
+                self._save_seen(now)
+        if events:
+            statuses = [self._send(target, ttl=3600, urgency="normal") for target in targets]
+            sys.stderr.write("%s: 원이 답변 알림 %d건 · 기기 %d대 중 %d대 전달\n" %
+                             (self.log_prefix, len(events), len(targets), sum(status in (200, 201, 202) for status in statuses)))
+        return len(events)
 
     def step(self):
         with self.lock:
@@ -570,10 +646,13 @@ class PushService:
             rows = dict(sorted(rows.items(), key=lambda item: item[1].get("seenAt") or 0)[-SEEN_LIMIT:])
         self.seen = rows
         registered = {item["id"] for item in self.subscriptions}
+        if not registered:
+            self.woni_seen = {}
         self.pending = {key: self._fresh(value) for key, value in self.pending.items() if key in registered and self._fresh(value)}
         self.last_wake = {key: value for key, value in self.last_wake.items() if key in self.pending}
         try:
-            write_private(self.directory / "seen.json", {"version": 2, "seen": rows, "pending": self.pending, "wake": self.last_wake})
+            write_private(self.directory / "seen.json", {"version": 2, "seen": rows, "pending": self.pending, "wake": self.last_wake,
+                                                         "woni": self.woni_seen})
         except OSError:
             sys.stderr.write("%s: 알림 상태 기록 저장 실패\n" % self.log_prefix)
             if required:

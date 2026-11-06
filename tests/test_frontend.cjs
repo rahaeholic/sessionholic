@@ -212,6 +212,21 @@ test("embedded panes never create global EventSources and layout restore never s
   assert.equal(hooks.canClose(), false, "a delayed composition commit still owns the original editor after blur");
 });
 
+test('분할창이 여러 개여도 원이 답변 감시는 메인 보드에서 한 번만 시작한다', async () => {
+  const started = [];
+  for (const embedded of [false, true, true]) {
+    const c = client(async url => ({ ok: true, status: 200, json: async () =>
+      url.startsWith('/api/snapshot') ? { hosts: [] } : { hosts: [], terminals: [], csrfToken: 'test' } }),
+      // Inline: test_session_recoveries_frontend.cjs reruns this file only up to the routing test, before noChatTimers is defined.
+      { setTimeout: () => 1, clearTimeout() {} });
+    c.context.window.SessionholicWorkspace = { embedded, visible: () => true, managed: () => false, sharedRead: () => null, readingActive: () => true, dataChanged() {}, changed() {} };
+    c.context.window.SessionholicWoni = { check: () => started.push(embedded ? 'pane' : 'board') };
+    await c.poll(false);
+    assert.equal(c.state.authenticated, true);
+  }
+  assert.deepEqual(started, ['board']);
+});
+
 test("routing uses runtime identity; Codex accounts preserve home isolation", () => {
   const c = client();
   assert.equal(
@@ -1336,6 +1351,84 @@ test("browser history keeps only navigation metadata, and Android back returns o
   c.navigateView("terminal");
   c.backFromTerminal();
   assert.equal(c.context.window.history.backCount, 2);
+});
+
+function mobileBackClient() {
+  const callbacks = new Map(); let timerId = 0;
+  const timers = { setTimeout: (fn, ms) => { const id = ++timerId; callbacks.set(id, { fn, ms }); return id; }, clearTimeout: id => callbacks.delete(id) };
+  const c = client(undefined, timers), history = c.context.window.history;
+  const entries = [null]; let index = 0, exits = 0;
+  Object.defineProperty(history, 'state', { configurable: true, get: () => entries[index], set: value => { entries[index] = value; } });
+  history.pushState = value => { entries.splice(index + 1); entries.push(value); index++; };
+  history.replaceState = value => { entries[index] = value; };
+  history.back = () => { if (!index) { exits++; return; } index--; c.windowEvents.popstate({ state: entries[index] }); };
+  c.context.navigator = { onLine: false, userAgent: 'Mozilla/5.0 (Linux; Android 14)' };
+  c.context.window.matchMedia = query => ({ matches: query === '(max-width: 700px)' });
+  c.context.Event = class { constructor(type, options) { this.type = type; this.cancelable = options?.cancelable; this.defaultPrevented = false; } preventDefault() { if (this.cancelable) this.defaultPrevented = true; } };
+  c.context.document.querySelectorAll = selector => selector === 'dialog[open]' ? [...c.nodes.values()].filter(item => item.isDialog && item.open) : [];
+  c.windowEvents.DOMContentLoaded();
+  c.state.authenticated = true;
+  return { ...c, history, exits: () => exits, expireExit: () => { for (const [id, t] of callbacks) if (t.ms === 2200) { callbacks.delete(id); t.fn(); } } };
+}
+
+test('모바일 뒤로 가기는 원이 창을 먼저 닫고 최상위에서는 두 번 눌러야 나간다', () => {
+  const c = mobileBackClient(), dialog = c.get('woni-dialog');
+  dialog.isDialog = true; dialog.open = true;
+  dialog.dispatchEvent = event => !event.defaultPrevented;
+  c.get('woni-input').value = '보존할 초안';
+  c.history.back();
+  assert.equal(dialog.open, false);
+  assert.equal(c.get('woni-input').value, '보존할 초안');
+  assert.equal(c.exits(), 0);
+  c.history.back();
+  assert.match(c.get('toast').textContent, /한 번 더 뒤로/);
+  assert.equal(c.exits(), 0);
+  c.history.back();
+  assert.equal(c.exits(), 1);
+});
+
+test('모바일 뒤로 가기는 중첩 시트의 최상단부터 닫고 취소 거절을 존중한다', () => {
+  const c = mobileBackClient(), first = c.get('settings-dialog'), top = c.get('action-sheet');
+  first.isDialog = top.isDialog = true; first.open = top.open = true;
+  let refusing = true;
+  top.dispatchEvent = event => { if (refusing) event.preventDefault(); return !event.defaultPrevented; };
+  first.dispatchEvent = event => !event.defaultPrevented;
+  c.context.document.activeElement = { closest: () => top };
+  c.history.back(); assert.equal(top.open, true); assert.equal(first.open, true); assert.equal(c.exits(), 0);
+  refusing = false;
+  c.history.back(); assert.equal(top.open, false); assert.equal(first.open, true);
+  c.context.document.activeElement = { closest: () => first };
+  c.history.back(); assert.equal(first.open, false); assert.equal(c.exits(), 0);
+});
+
+test('모바일 상세 화면의 시트를 닫은 다음에야 목록으로 돌아가고 종료 대기는 시간 후 초기화된다', () => {
+  const c = mobileBackClient(), sheet = c.get('filter-dialog');
+  c.navigateView('detail'); c.state.detailShown = true;
+  sheet.isDialog = true; sheet.open = true; sheet.dispatchEvent = event => !event.defaultPrevented;
+  c.history.back(); assert.equal(sheet.open, false); assert.equal(c.history.state.view, 'detail');
+  c.history.back(); assert.equal(c.history.state.view, 'list'); assert.equal(c.state.detailShown, false);
+  c.history.back(); assert.equal(c.exits(), 0);
+  c.expireExit();
+  c.history.back(); assert.equal(c.exits(), 0);
+  c.history.back(); assert.equal(c.exits(), 1);
+});
+
+test('모바일 뒤로 가기는 활성 분할창의 시트도 화면 이동보다 먼저 닫는다', () => {
+  const c = mobileBackClient();
+  let childOpen = true;
+  c.context.window.SessionholicWorkspace = { embedded: false, dismissActiveDialog: () => { if (!childOpen) return false; childOpen = false; return true; } };
+  c.history.back();
+  assert.equal(childOpen, false); assert.equal(c.exits(), 0);
+  assert.equal(c.history.state.mobileRootGuard, true);
+});
+
+test('원이 초안이 있으면 브라우저 종료 전에 기존 초안 보호를 적용한다', () => {
+  const c = client();
+  c.context.window.SessionholicWoni = { hasDraft: () => true };
+  assert.equal(c.unsavedWork(), true);
+  let prevented = false;
+  c.warnDraftUnload({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
 });
 
 test("oversized Korean draft is retained and not sent over the input limit", async () => {
@@ -5461,6 +5554,51 @@ test('two turns that start with the same command keep their own tool groups when
   assert.deepEqual(groups(), [second, third], 'each turn keeps its own group');
   assert.deepEqual(groups().map((group) => group.open), [false, true]);
   assert.deepEqual(second.toolList.children.map((item) => textOf(item).trim()), ['$ npm test', '파일 수정 · 2.py']);
+});
+
+// Ryan 2026-11-06: a bot request's page scrolled only from a blank spot; a drag on its
+// messages became "당겨서 새로고침". Every scroller under the finger must be at its top.
+test('pull to refresh waits for every scroller under the finger, a bot request page and inner boxes included', () => {
+  const { c } = edgeClient();
+  const app = c.get('app');
+  const indicator = c.get('pull-refresh');
+  const pull = (target) => {
+    const at = (type, y) => {
+      const done = { prevented: 0 };
+      app.events[type]?.({ type, target, touches: type === 'touchend' ? [] : [{ clientX: 200, clientY: y }], cancelable: true,
+        preventDefault() { done.prevented++; } });
+      return done;
+    };
+    at('touchstart', 300);
+    let prevented = 0, shown = false;
+    for (let y = 320; y <= 500; y += 30) {
+      prevented += at('touchmove', y).prevented;
+      shown ||= indicator.style.opacity === '1';
+    }
+    at('touchend', 500);
+    return { prevented, shown };
+  };
+  // detail > head | page(.bot-request-detail) > conversation > row > bubble
+  const box = (parentElement, scrollTop = 0) => ({ parentElement, scrollTop, closest: (selector) => (selector.includes('#detail') ? detail : null) });
+  const detail = { parentElement: null, scrollTop: 0, closest: () => null, querySelectorAll: () => [page] };
+  const page = box(detail, 900), head = box(detail);
+  const conversation = box(page), row = box(conversation), bubble = box(row);
+  let result = pull(bubble);
+  assert.equal(result.prevented, 0, 'the page scrolls back up from its messages');
+  assert.equal(result.shown, false, 'and no pull shows');
+  assert.equal(pull(head).prevented, 0, 'the page read halfway also decides from its head');
+  // A tool output or a wide code block at its own top, inside a conversation read halfway.
+  const output = box(row, 0);
+  assert.equal(pull(output).prevented, 0, 'an inner box at its top does not make the drag a pull');
+  // At the very top everything pulls as before.
+  page.scrollTop = 0;
+  result = pull(bubble);
+  assert.ok(result.prevented > 0, 'from the top a downward drag pulls');
+  assert.equal(result.shown, true);
+  // The session list (outside a conversation): its own scroller decides too.
+  const list = { parentElement: null, scrollTop: 400, closest: () => null };
+  const chips = { parentElement: list, scrollTop: 0, closest: () => null };
+  assert.equal(pull(chips).prevented, 0, 'a sideways chip row at its top inside the read list is not a pull');
 });
 
 test('pull distance is elastic and the large title collapses into the bar on phones only', () => {
@@ -10219,6 +10357,17 @@ test('the folded session connections row keeps the keyboard focus as it opens', 
   assert.equal(reopened.focusCount, 1, 'the redrawn row takes the focus back');
   assert.equal(byClass(c.get('running-list'), 'running-terminal-row').length, 1, 'opening it shows the connection');
   c.context.document.activeElement = null;
+});
+
+test('원이 알림 경로를 원이 화면으로 전달한다', () => {
+  const c = client();
+  const opened = [];
+  c.context.window.SessionholicWoni = { openFromNotification: id => { opened.push(id); return /^[A-Za-z0-9_-]{1,100}$/.test(id); } };
+  assert.equal(vm.runInContext("requestWoniOpen('/?woni=chat-42')", c.context), true);
+  assert.deepEqual(opened, ['chat-42']);
+  assert.equal(vm.runInContext("requestWoniOpen('/other?woni=chat-42')", c.context), false);
+  assert.equal(vm.runInContext("requestWoniOpen('/?session=chat-42')", c.context), false);
+  assert.equal(vm.runInContext("requestWoniOpen('/?woni=../unsafe')", c.context), false);
 });
 
 test('a notification link opens its session once it is listed, and an old request expires', async () => {

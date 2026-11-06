@@ -171,6 +171,78 @@
   color-scheme: light dark;
   font-synthesis: none;
 }
+
+.woni-launch { position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 12px; border: 1px solid var(--accent); border-radius: 12px; color: var(--accent); background: var(--accent-tint); font: inherit; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.woni-launch[hidden], .woni-unread[hidden] { display: none; }
+.woni-launch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.woni-unread { position: absolute; top: -4px; right: -4px; display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 4px; border-radius: 10px; background: var(--accent-fill); color: var(--on-accent); font-size: 12px; line-height: 1; }
+@media (max-width: 380px) {
+  .woni-launch { gap: 4px; padding: 0 8px; }
+  .top .quick-reload { width: 44px; padding: 0; }
+  .top .quick-reload span { display: none; }
+  .top .quick-reload svg { display: block; }
+}
+.woni-dialog { width: min(680px, calc(100% - 32px)); height: min(760px, calc(var(--app-height, 100dvh) - 32px)); max-width: none; max-height: none; padding: 0; border: 0; border-radius: 18px; background: var(--surface); color: var(--label); box-shadow: var(--shadow-dialog); overflow: hidden; }
+.woni-dialog[open] { display: flex; flex-direction: column; }
+.woni-dialog::backdrop { background: var(--backdrop); }
+.woni-head { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px 12px 20px; border-bottom: 1px solid var(--sep); }
+.woni-head h2 { margin: 0; font-size: var(--fs-head); }
+.woni-status { margin: 2px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
+.woni-tabs { display: flex; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--sep); }
+.woni-tabs button { min-height: 40px; padding: 0 16px; border: 0; border-radius: 10px; color: var(--label-2); background: transparent; font: inherit; cursor: pointer; }
+.woni-tabs button[aria-pressed="true"] { color: var(--accent); background: var(--accent-tint); font-weight: 700; }
+.woni-filter, .woni-reply { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--fill-soft); border-radius: 10px; font-size: var(--fs-sub); }
+.woni-filter { margin: 8px 16px 0; }
+.woni-filter span, .woni-reply span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.woni-filter[hidden], .woni-reply[hidden], .woni-work[hidden], .woni-messages[hidden], .woni-form[hidden], .woni-original[hidden] { display: none; }
+.woni-messages { flex: 1; min-height: 0; padding: 8px 20px 18px; overflow-y: auto; overscroll-behavior: contain; }
+.woni-message { max-width: 95%; margin: 18px 0; overflow-wrap: anywhere; line-height: 1.6; }
+.woni-message.user { max-width: 88%; margin-left: auto; }
+.woni-message.assistant { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--sep); }
+.woni-message > strong { display: block; margin: 0 4px 8px; color: var(--label); font-size: var(--fs-body); font-weight: 700; line-height: 1.35; }
+.woni-message.user > strong { color: var(--label-2); font-size: var(--fs-sub); text-align: right; }
+.woni-message-body { white-space: pre-wrap; }
+.woni-message.assistant .woni-message-body { white-space: normal; }
+.woni-message.user .woni-message-body { padding: 10px 14px; border-radius: 16px 16px 4px 16px; background: var(--bubble); }
+.woni-message-time { display: block; margin-top: 8px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
+.woni-send-status { margin: 4px 4px 0; color: var(--label-2); font-size: var(--fs-cap); text-align: right; }
+.woni-send-status button { margin-left: 8px; padding: 4px 8px; border: 0; border-radius: 8px; color: var(--accent); background: transparent; font: inherit; cursor: pointer; }
+.woni-send-status button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.woni-message-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.woni-message.user .woni-message-actions { justify-content: flex-end; }
+.woni-message-actions button, .woni-work button, .woni-original button { min-height: 36px; padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); cursor: pointer; }
+.woni-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin: -6px 0 18px; }
+.woni-suggestions button { min-height: 40px; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); text-align: left; cursor: pointer; touch-action: manipulation; }
+.woni-suggestions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.woni-message-quote { display: block; max-width: 100%; margin-bottom: 8px; padding: 8px 12px; border: 0; border-left: 2px solid var(--accent); background: var(--fill-soft); color: var(--label-2); text-align: left; font: inherit; font-size: var(--fs-sub); cursor: pointer; }
+.woni-work { flex: 1; min-height: 0; padding: 12px 20px; overflow-y: auto; overscroll-behavior: contain; }
+.woni-work h3 { margin: 12px 0; font-size: var(--fs-head); }
+.woni-work-card { margin-bottom: 12px; padding: 16px; border: 1px solid var(--sep); border-radius: 12px; overflow-wrap: anywhere; }
+.woni-work-card h4 { margin: 0 0 8px; font-size: var(--fs-body); }
+.woni-work-card p { margin: 4px 0; color: var(--label-2); font-size: var(--fs-sub); }
+.woni-original { max-height: 35%; overflow: auto; margin: 8px 16px; padding: 12px; border: 1px solid var(--sep); border-radius: 12px; white-space: pre-wrap; }
+.woni-reply { margin-bottom: 8px; }
+.woni-message-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.woni-message-file { padding: 5px 9px; border-radius: 8px; background: var(--fill); font-size: var(--fs-cap); }
+.woni-form { flex: none; padding: 12px 16px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--sep); }
+.woni-form textarea { display: block; width: 100%; min-height: 56px; max-height: 180px; padding: 10px 12px; resize: vertical; font: inherit; font-size: max(16px, var(--fs-body)); color: var(--label); background: var(--fill-soft); border: 1px solid var(--sep); border-radius: 12px; }
+.woni-form textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.woni-actions { display: flex; align-items: center; gap: 4px; margin-top: 8px; }
+.woni-tool { display: grid; place-items: center; width: 40px; height: 40px; border: 0; border-radius: 10px; background: transparent; color: var(--label-2); cursor: pointer; }
+.woni-tool:hover { background: var(--fill); }
+.woni-tool:focus-visible, .woni-file-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.woni-hint { flex: 1; padding-left: 4px; color: var(--label-3); font-size: var(--fs-cap); }
+.woni-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.woni-attachments[hidden], .woni-tool[hidden] { display: none; }
+.woni-file { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 8px; border-radius: 8px; background: var(--fill); font-size: var(--fs-cap); }
+.woni-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.woni-file-remove { flex: none; border: 0; background: none; color: var(--label-2); font: inherit; cursor: pointer; }
+@media (max-width: 600px) {
+  .woni-dialog { width: calc(100% - 16px); height: calc(var(--app-height, 100dvh) - 16px); border-radius: 16px; }
+  .woni-head { padding-left: 16px; }
+  .woni-messages { padding-inline: 16px; }
+  .woni-hint { font-size: 0; }
+}
 @supports (transition-timing-function: linear(0, 1)) {
   :root {
     --ease-spring: linear(0, 0.035, 0.119, 0.23, 0.351, 0.471, 0.582, 0.68, 0.764, 0.833, 0.888, 0.931, 0.963, 0.986, 1.001, 1.011, 1.017, 1.019, 1.02, 1.019, 1.017, 1.015, 1.012, 1.01, 1.008, 1.006, 1.004, 1.003, 1);

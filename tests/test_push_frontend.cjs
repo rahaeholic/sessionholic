@@ -118,6 +118,20 @@ test("tapping a notice focuses an open board and asks it to open the session, or
   assert.deepEqual(cold.opened, ["/"]);
 });
 
+test('원이 답변 알림은 기존 보드 또는 새 보드에서 해당 대화로 이동하고 다른 주소는 막는다', async () => {
+  const messages = [];
+  const board = { url: 'https://board.example/', focus: async () => {}, postMessage: value => messages.push(value) };
+  const open = worker({ windows: [board], pending: [{ title: '원이 답변 도착', tag: 'woni:chat-42', url: '/?woni=chat-42' }] });
+  await open.fire('push');
+  assert.equal(open.notifications[0].data.url, '/?woni=chat-42');
+  await open.fire('notificationclick', { notification: { data: open.notifications[0].data, close() {} } });
+  assert.deepEqual(plain(messages), [{ type: 'open-session', url: '/?woni=chat-42' }]);
+  const cold = worker();
+  await cold.fire('notificationclick', { notification: { data: { url: '/?woni=chat-42' }, close() {} } });
+  await cold.fire('notificationclick', { notification: { data: { url: '/?woni=chat-42&redirect=evil' }, close() {} } });
+  assert.deepEqual(cold.opened, ['/?woni=chat-42', '/']);
+});
+
 function settings({ supported = true, agent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2)", standalone = true,
   permission = "default", grant = "granted", existing = null, registered = false,
   status = { available: true, publicKey: "BAEC" } } = {}) {

@@ -172,6 +172,46 @@ class ServiceTest(unittest.TestCase):
         return (service or self.service).subscribe({"subscription": {"endpoint": endpoint, "keys": {"p256dh": "x", "auth": "y"}},
                                                     "label": "  iPhone \n 홈 화면  "})
 
+    def test_woni_reply_push_baseline_completion_restart_and_no_content_in_push(self):
+        data = {'enabled': True, 'chats': [
+            {'id': 'old-1', 'status': 'complete', 'answer': '옛 답변', 'finishedAt': self.clock.now - 5},
+            {'id': 'active-1', 'status': 'running'}]}
+        calls = []
+        self.service.woni = lambda: calls.append(True) or data
+        self.assertEqual(self.service.woni_step(), 0)
+        self.assertEqual(calls, [])  # 기기 구독이 없으면 원이를 조회하지 않는다.
+        self.subscribe()
+        self.assertEqual(self.service.woni_step(), 0)  # 과거 답변은 기준선일 뿐이다.
+        data['chats'][1].update(status='complete', answer='비공개 답변')
+        self.assertEqual(self.service.woni_step(), 0)  # 완료 시각이 저장되기 전이다.
+        self.clock.now += 1
+        data['chats'][1]['finishedAt'] = self.clock.now
+        data['chats'].append({'id': 'quick-1', 'status': 'complete', 'answer': '빠른 답변', 'finishedAt': self.clock.now})
+        self.assertEqual(self.service.woni_step(), 2)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][1]['Content-Length'], '0')
+        notices = self.service.pending_for(self.service.subscriptions[0]['id'], retain=True)['notifications']
+        self.assertEqual({n['url'] for n in notices}, {'/?woni=active-1', '/?woni=quick-1'})
+        self.assertTrue(all(n['title'] == '원이 답변 도착' and '비공개' not in n['body'] for n in notices))
+        self.assertEqual(self.service.woni_step(), 0)
+        restarted = self.make(); restarted.woni = lambda: data
+        self.assertEqual(restarted.woni_step(), 0)
+        self.assertEqual(len(self.sent), 1)
+        restarted.unsubscribe({'endpoint': APPLE})
+        self.assertEqual(restarted.woni_seen, {})
+
+    def test_woni_disconnection_does_not_reset_baseline(self):
+        self.subscribe()
+        self.service.woni = lambda: {'enabled': True, 'chats': [{'id': 'active', 'status': 'running'}]}
+        self.service.woni_step()
+        before = dict(self.service.woni_seen)
+        self.service.woni = lambda: {'enabled': False}
+        self.assertEqual(self.service.woni_step(), 0)
+        self.assertEqual(self.service.woni_seen, before)
+        self.clock.now += 1
+        self.service.woni = lambda: {'enabled': True, 'chats': [{'id': 'active', 'status': 'complete', 'answer': '완료', 'finishedAt': self.clock.now}]}
+        self.assertEqual(self.service.woni_step(), 1)
+
     def test_subscriptions_are_private_validated_and_deduplicated(self):
         with self.assertRaisesRegex(ValueError, "알림 주소"):
             self.service.subscribe({"subscription": {"endpoint": "https://evil.test/x"}})

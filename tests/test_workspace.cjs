@@ -146,6 +146,20 @@ function fixture(saved = null, { mobile = false, search = "" } = {}) {
   return { workspace, nodes, calls, preferences, frames, document, window, app, primary, infos, attach };
 }
 
+test('시스템 뒤로 가기는 활성 분할창의 열린 시트에만 전달한다', () => {
+  const f = fixture();
+  f.workspace.add({ key: 'session-b' });
+  const second = f.attach('p2');
+  let closed = 0;
+  second.child.dismissDialog = () => { closed++; return true; };
+  f.workspace.focus('p2', false);
+  assert.equal(f.workspace.dismissActiveDialog(), true);
+  assert.equal(closed, 1);
+  f.workspace.focus('p1', false);
+  assert.equal(f.workspace.dismissActiveDialog(), false);
+  assert.equal(closed, 1);
+});
+
 test('mobile cold starts ignore saved conversation and terminal panes while desktop restoration stays available', () => {
   for (const saved of [
     { version: 1, tree: W.leaf('p1'), active: 'p1', panes: { p1: { key: 'session-b', mode: 'chat' } } },

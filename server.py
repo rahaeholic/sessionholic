@@ -3598,6 +3598,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.work.snapshot())
                 if url.path == "/api/bot-requests":
                     return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot()))
+                if url.path == "/api/woni":
+                    if query.get("availability") == "1":
+                        return self.send_json(200, {"enabled": self.server.woni.host() is not None})
+                    return self.send_json(200, scrub_payload(self.server.woni.call()))
+                if url.path in ("/api/woni/activity", "/api/woni/chat", "/api/woni/worker-result"):
+                    operation = url.path.rsplit("/", 1)[-1]
+                    return self.send_json(200, scrub_payload(self.server.woni.call(operation=operation, query=query)))
                 if url.path == "/api/bot-requests/conversation":
                     # A listed request's conversation, watch-only: a bounded read-only read,
                     # at most two at once. Nothing is sent to, or resumed in, the bot.
@@ -3996,6 +4003,31 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_body(421, b"misdirected", "text/plain; charset=utf-8")
         if not self.origin_allowed():
             return self.send_json(403, {"error": "이 보드에서 요청해 주세요.", **not_started})
+        if path == "/api/woni/attachment":
+            if not self.authorized():
+                return self.send_json(401, {"error": "로그인이 필요합니다."})
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", "").encode(), self.server.csrf.encode()):
+                return self.send_json(403, {"error": "보안 연결을 갱신한 뒤 다시 시도해 주세요.", "code": "csrf_expired"})
+            try:
+                from woni_bridge import MAX_FILE
+                length = int(self.headers.get("Content-Length") or 0)
+                if self.headers.get("Transfer-Encoding") or not 0 < length <= MAX_FILE:
+                    raise ValueError("파일은 100MB 이하로 첨부해 주세요.")
+                if self.headers.get_content_type() != "application/octet-stream":
+                    raise ValueError("파일 전송 형식을 확인해 주세요.")
+                name = unquote(self.headers.get("X-File-Name", ""), errors="strict")
+                mime = self.headers.get("X-File-Mime", "application/octet-stream")
+                self.connection.settimeout(120)
+                if not self.server.woni_upload_gate.acquire(blocking=False):
+                    raise RuntimeError("다른 파일을 올리고 있어요. 잠시 뒤 다시 시도해 주세요.")
+                try:
+                    return self.send_json(200, self.server.woni.upload(self.rfile, length, name, mime))
+                finally:
+                    self.server.woni_upload_gate.release()
+            except (ValueError, UnicodeError) as exc:
+                return self.send_json(400, {"error": str(exc)[:300]})
+            except (RuntimeError, OSError):
+                return self.send_json(503, {"error": "파일을 원이에 올리지 못했어요. 다시 첨부해 주세요."})
         if path == "/api/chat/upload":
             if not self.authorized():
                 return self.send_json(401, {"error": "로그인이 필요합니다."})
@@ -4073,6 +4105,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, self.server.session_history.preserve(data['key'], data['preserved']))
             if path == "/api/bot-requests/refresh":
                 return self.send_json(200, scrub_payload(self.server.bot_requests.snapshot(force=True)))
+            if path == "/api/woni":
+                return self.send_json(200, scrub_payload(self.server.woni.call(data)))
+            if path == "/api/woni/read":
+                return self.send_json(200, scrub_payload(self.server.woni.call(data, operation="read")))
             if path == "/api/push/subscribe":
                 return self.send_json(200, self.server.push.subscribe(data))
             if path == "/api/push/unsubscribe":
@@ -4500,6 +4536,9 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     from bot_requests import BotRequests
     server.bot_requests = BotRequests(board.hosts, CONFIG_DIR / "bot-sources.json", state_dir)
     server.workflow.bot_requests = server.bot_requests
+    from woni_bridge import WoniBridge
+    server.woni = WoniBridge(board.hosts, CONFIG_DIR / "woni.json", state_dir)
+    server.woni_upload_gate = threading.BoundedSemaphore(2)
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
     from batch_jobs import BatchJobs
@@ -4524,7 +4563,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # Board.snapshot() hands the push watcher a copy of its own: its titles are set in place.
     server.push = PushService(board, state_dir, classify=push_category,
                               labels=lambda snapshot: server.session_labels.decorate(snapshot, in_place=True),
-                              log_prefix=LOG_PREFIX, enabled=push)
+                              log_prefix=LOG_PREFIX, enabled=push, woni=server.woni.call)
     if push:
         server.push.start()
     if automatic_work:
