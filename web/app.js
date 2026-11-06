@@ -14970,7 +14970,7 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
     const firstAuthentication = !state.authenticated;
     state.authenticated = true;
-    if (firstAuthentication) window.SessionholicWoni?.check?.(api, {
+    if (firstAuthentication && !window.SessionholicWorkspace?.embedded) window.SessionholicWoni?.check?.(api, {
       toast,
       upload: async (file, progress, signal) => {
         const response = await sendUpload(file, { "Content-Type": "application/octet-stream", "X-CSRF-Token": state.csrf,

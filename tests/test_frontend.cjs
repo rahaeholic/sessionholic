@@ -212,6 +212,19 @@ test("embedded panes never create global EventSources and layout restore never s
   assert.equal(hooks.canClose(), false, "a delayed composition commit still owns the original editor after blur");
 });
 
+test('분할창이 여러 개여도 원이 답변 감시는 메인 보드에서 한 번만 시작한다', async () => {
+  const started = [];
+  for (const embedded of [false, true, true]) {
+    const c = client(async url => ({ ok: true, status: 200, json: async () =>
+      url.startsWith('/api/snapshot') ? { hosts: [] } : { hosts: [], terminals: [], csrfToken: 'test' } }), noChatTimers);
+    c.context.window.SessionholicWorkspace = { embedded, visible: () => true, managed: () => false, sharedRead: () => null, readingActive: () => true, dataChanged() {}, changed() {} };
+    c.context.window.SessionholicWoni = { check: () => started.push(embedded ? 'pane' : 'board') };
+    await c.poll(false);
+    assert.equal(c.state.authenticated, true);
+  }
+  assert.deepEqual(started, ['board']);
+});
+
 test("routing uses runtime identity; Codex accounts preserve home isolation", () => {
   const c = client();
   assert.equal(
