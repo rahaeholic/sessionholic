@@ -9,6 +9,7 @@
   let api, services = {}, timer, reading = false, sending = false, pending = null, epoch = 0;
   let attachments = [], uploading = false, uploadAbort = null, composing = false, compositionEndedAt = 0, authEpoch = 0;
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
+  let pendingState = "uncertain";
   const pendingKey = "sessionholic:woni:pending";
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
 
@@ -98,9 +99,10 @@
       chip.append(remove); return chip;
     });
     filesBox.replaceChildren(...nodes);
-    filesBox.hidden = !nodes.length;
+    filesBox.hidden = !!pending || !nodes.length;
     attach.disabled = !!pending || attachments.length >= maxFiles;
-    send.disabled = sending || uploading;
+    send.disabled = sending || uploading || !!pending;
+    send.textContent = sending ? "전송 중…" : pending ? (pendingState === "uncertain" ? "전송 확인 필요" : "확인 중…") : "보내기";
   }
   async function uploadFiles() {
     if (uploading || !services.upload) return;
@@ -181,7 +183,6 @@
     latestData = data;
     const chats = Array.isArray(data.chats) ? data.chats : [];
     if (pending && chats.some((chat) => chat.id === pending.requestId)) {
-      if (input.value === pending.text || (!input.value.trim() && pending.text === "첨부한 파일을 확인해 줘")) input.value = "";
       const ids = new Set(pending.attachments || []);
       attachments = attachments.filter((item) => !ids.has(item.id));
       if (JSON.stringify(pending.replyTo || null) === JSON.stringify(replyTarget && { id: replyTarget.id, part: replyTarget.part })) {
@@ -197,13 +198,23 @@
       else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…"));
       else if (["failed", "interrupted"].includes(chat.status)) nodes.push(row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요."));
     }
+    if (pending) {
+      const sentFiles = (pending.attachments || []).map((id) => attachments.find((item) => item.id === id) || { name: "첨부 파일" });
+      const outgoing = row("user", pending.text, sentFiles);
+      if (pending.replyTo) outgoing.append(el("div", "woni-send-status", `↩ 답글 · ${replyTarget?.excerpt || "이전 메시지"}`));
+      const message = pendingState === "sending" ? "전송 중…" : pendingState === "checking" ? "전달됨 · 대화 확인 중…" : "전송 여부를 확인하지 못했어요.";
+      const indicator = el("div", "woni-send-status", message);
+      indicator.setAttribute("role", "status");
+      if (pendingState === "uncertain" && !sending) indicator.append(action("다시 보내기", sendPending));
+      outgoing.append(indicator); nodes.push(outgoing);
+    }
     messages.replaceChildren(...nodes);
     if (atEnd || !messages.dataset.loaded) messages.scrollTop = messages.scrollHeight;
     messages.dataset.loaded = "1";
     filterBox.hidden = view !== "chat" || !filter;
     $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
     const running = data.activity?.running || 0;
-    status.textContent = pending ? "전송 여부를 확인하고 있어요." : running ? `작업 중 ${running}건` : "나의 개인 비서";
+    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.") : running ? `작업 중 ${running}건` : "나의 개인 비서";
   }
   async function refresh() {
     if (!dialog.open || reading || !api) return;
@@ -231,14 +242,15 @@
   open.addEventListener("click", () => {
     pending = savedPending();
     if (pending) {
-      if (!input.value) input.value = pending.text;
       if (!attachments.length) attachments = (pending.attachments || []).map((id) => ({ id, name: "첨부 파일", state: "ready" }));
       if (pending.replyTo && !replyTarget) {
-        replyTarget = { ...pending.replyTo, excerpt: "대상 메시지" }; replyBox.hidden = false;
-        $("woni-reply-label").textContent = "이전 메시지에 답글";
+        replyTarget = { ...pending.replyTo, excerpt: "대상 메시지" };
       }
+      replyBox.hidden = true;
     }
-    renderAttachments(); dialog.showModal(); setView("chat"); refresh();
+    renderAttachments(); dialog.showModal(); setView("chat");
+    if (pending) show(latestData || { chats: [], activity: {} });
+    refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
   dialog.addEventListener("close", () => { clearTimeout(timer); services.voice?.stop(input); epoch++; });
@@ -265,30 +277,37 @@
     form.requestSubmit();
   });
   mic.addEventListener("click", () => services.voice?.toggle(input, (text) => { if (text) status.textContent = text; }));
+  async function sendPending() {
+    if (!pending || sending) return;
+    const request = pending, current = authEpoch;
+    sending = true; pendingState = "sending"; renderAttachments();
+    show(latestData || { chats: [], activity: {} });
+    try {
+      await api("/api/woni", { method: "POST", body: request, csrfRetry: false });
+      if (current === authEpoch && pending?.requestId === request.requestId) pendingState = "checking";
+    } catch (_) {
+      if (current === authEpoch && pending?.requestId === request.requestId) pendingState = "uncertain";
+    } finally {
+      if (current === authEpoch) {
+        sending = false; renderAttachments();
+        if (dialog.open) show(latestData || { chats: [], activity: {} });
+        clearTimeout(timer); refresh();
+      }
+    }
+  }
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (sending || uploading || composing) return;
+    if (pending || sending || uploading || composing) return;
     if (attachments.some((item) => item.state !== "ready")) { status.textContent = "첨부를 다시 올리거나 제거해 주세요."; return; }
     const text = input.value.trim() ? input.value : attachments.length ? "첨부한 파일을 확인해 줘" : "";
     if (!text) return;
     const ids = attachments.map((item) => item.id);
     const reply = replyTarget ? { id: replyTarget.id, part: replyTarget.part } : null;
-    if (pending && (pending.text !== text || JSON.stringify(pending.attachments || []) !== JSON.stringify(ids) ||
-        JSON.stringify(pending.replyTo || null) !== JSON.stringify(reply))) {
-      status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return;
-    }
-    if (!pending) savePending({ text, requestId: crypto.randomUUID(), ...(ids.length ? { attachments: ids } : {}), ...(reply ? { replyTo: reply } : {}) });
+    savePending({ text, requestId: crypto.randomUUID(), ...(ids.length ? { attachments: ids } : {}), ...(reply ? { replyTo: reply } : {}) });
+    input.value = ""; replyBox.hidden = true; filter = null;
     services.voice?.stop(input);
-    sending = true; renderAttachments();
-    try {
-      await api("/api/woni", { method: "POST", body: pending, csrfRetry: false });
-      status.textContent = "메시지를 보냈어요. 대화를 확인하고 있어요.";
-    } catch (_) {
-      status.textContent = "전송 여부를 확인하지 못했어요. 같은 메시지로 다시 보낼 수 있어요.";
-    } finally {
-      sending = false; renderAttachments();
-      clearTimeout(timer); refresh();
-    }
+    const result = sendPending(); messages.scrollTop = messages.scrollHeight;
+    await result;
   });
   window.SessionholicWoni = {
     async check(call, helpers = {}) {
@@ -299,6 +318,7 @@
       epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; filter = null; latestData = null; workData = null;
+      pending = null; pendingState = "uncertain"; sending = false;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); renderAttachments();
     }
   };

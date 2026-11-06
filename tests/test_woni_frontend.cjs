@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function fixture(call) {
+function fixture(call, storage = new Map()) {
   const nodes = {};
   function element() {
     return { hidden: false, value: '', textContent: '', dataset: {}, children: [], listeners: {},
@@ -19,7 +19,6 @@ function fixture(call) {
   }
   for (const id of ['woni-dialog', 'woni-open', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-original']) nodes[id] = element();
   nodes['woni-form'].submit = element();
-  const storage = new Map();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: {},
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
@@ -28,7 +27,70 @@ function fixture(call) {
   return { nodes, storage, app: context.window.SessionholicWoni, call };
 }
 
-test('실패한 전송을 같은 요청 ID로 재시도하고 서버에서 확인되면 입력을 지운다', async () => {
+test('전송을 누르면 응답 전에도 말풍선과 전송 중 상태가 보이고 확인 전 중복 전송되지 않는다', async () => {
+  let finishPost, finishRead, count = 0;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') { count++; return new Promise(resolve => { finishPost = resolve; }); }
+    if (count) return new Promise(resolve => { finishRead = resolve; });
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-input'].value = '한 번만 보낼 메시지';
+  const submit = () => nodes['woni-form'].listeners.submit({ preventDefault() {} });
+  const sending = submit();
+  assert.equal(nodes['woni-input'].value, '');
+  assert.ok(JSON.stringify(nodes['woni-messages'].children).includes('한 번만 보낼 메시지'));
+  assert.ok(JSON.stringify(nodes['woni-messages'].children).includes('전송 중'));
+  assert.equal(nodes['woni-send'].disabled, true);
+  nodes['woni-input'].value = '다음 초안'; await submit();
+  assert.equal(count, 1);
+  finishPost({ id: 'request-123456', status: 'queued' }); await sending;
+  assert.equal(nodes['woni-send'].disabled, true);
+  finishRead({ chats: [{ id: 'request-123456', text: '한 번만 보낼 메시지', status: 'queued' }], activity: {} });
+  await new Promise(setImmediate);
+  assert.equal(nodes['woni-input'].value, '다음 초안');
+  assert.equal(nodes['woni-send'].disabled, false);
+  assert.equal(nodes['woni-messages'].children.filter(node => node.className === 'woni-message user').length, 1);
+});
+
+test('전송 중 닫았다가 다시 열어도 보낸 내용과 전송 상태가 남는다', async () => {
+  let finishPost;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') return new Promise(resolve => { finishPost = resolve; });
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-input'].value = '닫아도 남는 메시지';
+  const sending = nodes['woni-form'].listeners.submit({ preventDefault() {} });
+  nodes['woni-close'].click(); nodes['woni-open'].click();
+  assert.equal(nodes['woni-input'].value, '');
+  assert.ok(JSON.stringify(nodes['woni-messages'].children).includes('닫아도 남는 메시지'));
+  assert.equal(nodes['woni-send'].disabled, true);
+  finishPost({ id: 'request-123456', status: 'queued' }); await sending;
+});
+
+test('전송 중 잠근 뒤 이전 응답은 다시 열린 화면을 바꾸지 않는다', async () => {
+  let finishPost;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') return new Promise(resolve => { finishPost = resolve; });
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-input'].value = '이전 메시지';
+  const sending = nodes['woni-form'].listeners.submit({ preventDefault() {} });
+  app.lock();
+  finishPost({ id: 'request-123456', status: 'queued' }); await sending;
+  assert.equal(nodes['woni-open'].hidden, true);
+  assert.equal(nodes['woni-messages'].children.length, 0);
+});
+
+test('전송이 불확실하면 말풍선에서 같은 요청 ID로 재시도하고 새 초안을 보존한다', async () => {
   let stored = false;
   const sent = [];
   const call = async (url, options) => {
@@ -47,11 +109,37 @@ test('실패한 전송을 같은 요청 ID로 재시도하고 서버에서 확�
   nodes['woni-input'].value = '다른 메시지';
   await submit();
   assert.equal(sent.length, 1);
-  nodes['woni-input'].value = '안녕';
-  await submit();
+  const outgoing = nodes['woni-messages'].children.find(node => node.className === 'woni-message user');
+  const indicator = outgoing.children.find(node => node.className === 'woni-send-status');
+  assert.match(indicator.textContent, /전송 여부를 확인하지 못했어요/);
+  assert.equal(nodes['woni-send'].disabled, true);
+  await indicator.children[0].click();
   await new Promise(setImmediate);
   assert.deepEqual(sent, [{ text: '안녕', requestId: 'request-123456' }, { text: '안녕', requestId: 'request-123456' }]);
-  assert.equal(nodes['woni-input'].value, '');
+  assert.equal(nodes['woni-input'].value, '다른 메시지');
+});
+
+test('화면을 새로 열어도 확인되지 않은 메시지를 같은 요청 ID로 복구한다', async () => {
+  let stored = false;
+  const sent = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') { sent.push({ ...options.body }); if (sent.length === 1) throw Error('timeout'); stored = true; return {}; }
+    return { chats: stored ? [{ id: 'request-123456', text: '복구할 메시지', status: 'queued' }] : [], activity: {} };
+  };
+  const first = fixture(call);
+  await first.app.check(call); first.nodes['woni-open'].click(); await new Promise(setImmediate);
+  first.nodes['woni-input'].value = '복구할 메시지';
+  await first.nodes['woni-form'].listeners.submit({ preventDefault() {} });
+  const reopened = fixture(call, first.storage);
+  await reopened.app.check(call); reopened.nodes['woni-open'].click(); await new Promise(setImmediate);
+  assert.equal(reopened.nodes['woni-input'].value, '');
+  const outgoing = reopened.nodes['woni-messages'].children.find(node => node.className === 'woni-message user');
+  assert.ok(JSON.stringify(outgoing.children).includes('복구할 메시지'));
+  await outgoing.children.find(node => node.className === 'woni-send-status').children[0].click();
+  await new Promise(setImmediate);
+  assert.equal(sent[0].requestId, sent[1].requestId);
+  assert.equal(reopened.storage.has('sessionholic:woni:pending'), false);
 });
 
 test('답글은 원래 대화 ID를 유지하고 작업 화면에서 같은 대화를 연다', async () => {
@@ -145,7 +233,11 @@ test('붙여 넣은 첨부를 올리고 전송 실패 후 같은 파일과 요�
   assert.equal(nodes['woni-attachments'].hidden, false);
   nodes['woni-input'].value = '파일 설명';
   const submit = () => nodes['woni-form'].listeners.submit({ preventDefault() {} });
-  await submit(); await submit(); await new Promise(setImmediate);
+  await submit();
+  const outgoing = nodes['woni-messages'].children.find(node => node.className === 'woni-message user');
+  assert.ok(JSON.stringify(outgoing.children).includes('사진.png'));
+  await outgoing.children.find(node => node.className === 'woni-send-status').children[0].click();
+  await new Promise(setImmediate);
   assert.equal(sent.length, 2);
   assert.equal(sent[0].requestId, sent[1].requestId);
   assert.deepEqual(Array.from(sent[0].attachments), ['20261106-012345abcdef']);
