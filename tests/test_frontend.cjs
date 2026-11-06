@@ -1351,6 +1351,84 @@ test("browser history keeps only navigation metadata, and Android back returns o
   assert.equal(c.context.window.history.backCount, 2);
 });
 
+function mobileBackClient() {
+  const callbacks = new Map(); let timerId = 0;
+  const timers = { setTimeout: (fn, ms) => { const id = ++timerId; callbacks.set(id, { fn, ms }); return id; }, clearTimeout: id => callbacks.delete(id) };
+  const c = client(undefined, timers), history = c.context.window.history;
+  const entries = [null]; let index = 0, exits = 0;
+  Object.defineProperty(history, 'state', { configurable: true, get: () => entries[index], set: value => { entries[index] = value; } });
+  history.pushState = value => { entries.splice(index + 1); entries.push(value); index++; };
+  history.replaceState = value => { entries[index] = value; };
+  history.back = () => { if (!index) { exits++; return; } index--; c.windowEvents.popstate({ state: entries[index] }); };
+  c.context.navigator = { onLine: false, userAgent: 'Mozilla/5.0 (Linux; Android 14)' };
+  c.context.window.matchMedia = query => ({ matches: query === '(max-width: 700px)' });
+  c.context.Event = class { constructor(type, options) { this.type = type; this.cancelable = options?.cancelable; this.defaultPrevented = false; } preventDefault() { if (this.cancelable) this.defaultPrevented = true; } };
+  c.context.document.querySelectorAll = selector => selector === 'dialog[open]' ? [...c.nodes.values()].filter(item => item.isDialog && item.open) : [];
+  c.windowEvents.DOMContentLoaded();
+  c.state.authenticated = true;
+  return { ...c, history, exits: () => exits, expireExit: () => { for (const [id, t] of callbacks) if (t.ms === 2200) { callbacks.delete(id); t.fn(); } } };
+}
+
+test('모바일 뒤로 가기는 원이 창을 먼저 닫고 최상위에서는 두 번 눌러야 나간다', () => {
+  const c = mobileBackClient(), dialog = c.get('woni-dialog');
+  dialog.isDialog = true; dialog.open = true;
+  dialog.dispatchEvent = event => !event.defaultPrevented;
+  c.get('woni-input').value = '보존할 초안';
+  c.history.back();
+  assert.equal(dialog.open, false);
+  assert.equal(c.get('woni-input').value, '보존할 초안');
+  assert.equal(c.exits(), 0);
+  c.history.back();
+  assert.match(c.get('toast').textContent, /한 번 더 뒤로/);
+  assert.equal(c.exits(), 0);
+  c.history.back();
+  assert.equal(c.exits(), 1);
+});
+
+test('모바일 뒤로 가기는 중첩 시트의 최상단부터 닫고 취소 거절을 존중한다', () => {
+  const c = mobileBackClient(), first = c.get('settings-dialog'), top = c.get('action-sheet');
+  first.isDialog = top.isDialog = true; first.open = top.open = true;
+  let refusing = true;
+  top.dispatchEvent = event => { if (refusing) event.preventDefault(); return !event.defaultPrevented; };
+  first.dispatchEvent = event => !event.defaultPrevented;
+  c.context.document.activeElement = { closest: () => top };
+  c.history.back(); assert.equal(top.open, true); assert.equal(first.open, true); assert.equal(c.exits(), 0);
+  refusing = false;
+  c.history.back(); assert.equal(top.open, false); assert.equal(first.open, true);
+  c.context.document.activeElement = { closest: () => first };
+  c.history.back(); assert.equal(first.open, false); assert.equal(c.exits(), 0);
+});
+
+test('모바일 상세 화면의 시트를 닫은 다음에야 목록으로 돌아가고 종료 대기는 시간 후 초기화된다', () => {
+  const c = mobileBackClient(), sheet = c.get('filter-dialog');
+  c.navigateView('detail'); c.state.detailShown = true;
+  sheet.isDialog = true; sheet.open = true; sheet.dispatchEvent = event => !event.defaultPrevented;
+  c.history.back(); assert.equal(sheet.open, false); assert.equal(c.history.state.view, 'detail');
+  c.history.back(); assert.equal(c.history.state.view, 'list'); assert.equal(c.state.detailShown, false);
+  c.history.back(); assert.equal(c.exits(), 0);
+  c.expireExit();
+  c.history.back(); assert.equal(c.exits(), 0);
+  c.history.back(); assert.equal(c.exits(), 1);
+});
+
+test('모바일 뒤로 가기는 활성 분할창의 시트도 화면 이동보다 먼저 닫는다', () => {
+  const c = mobileBackClient();
+  let childOpen = true;
+  c.context.window.SessionholicWorkspace = { embedded: false, dismissActiveDialog: () => { if (!childOpen) return false; childOpen = false; return true; } };
+  c.history.back();
+  assert.equal(childOpen, false); assert.equal(c.exits(), 0);
+  assert.equal(c.history.state.mobileRootGuard, true);
+});
+
+test('원이 초안이 있으면 브라우저 종료 전에 기존 초안 보호를 적용한다', () => {
+  const c = client();
+  c.context.window.SessionholicWoni = { hasDraft: () => true };
+  assert.equal(c.unsavedWork(), true);
+  let prevented = false;
+  c.warnDraftUnload({ preventDefault() { prevented = true; } });
+  assert.equal(prevented, true);
+});
+
 test("oversized Korean draft is retained and not sent over the input limit", async () => {
   let calls = 0;
   const c = client(async () => {

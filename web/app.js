@@ -10856,7 +10856,83 @@ function updateReadNotice(data) {
   note.textContent = `기기에 연결되지 않아 ${data.fetchedAt ? `${ago(data.fetchedAt)} 저장한` : "저장된"} 대화를 표시합니다. 실행 상태는 연결 후 확인해 주세요.`;
 }
 
+// Mobile browser Back moves history before notifying the page. Keep one root entry
+// available so an open dialog can consume Back and the first root Back can warn.
+const MOBILE_BACK_EXIT_MS = 2200;
+let mobileExitTimer = null, mobileDialogOrder = [];
+function mobileBackEnabled() {
+  const nav = globalThis.navigator;
+  return !window.SessionholicWorkspace?.embedded &&
+    (/Android/i.test(String(nav?.userAgent || "")) || (phoneLayout() && (nav?.standalone === true || window.matchMedia?.("(display-mode: standalone)")?.matches)));
+}
+function armMobileRootBack() {
+  if (!mobileBackEnabled()) return;
+  const entry = window.history.state;
+  if (!entry?.[INSTANCE.historyKey] || entry.view !== "list" || entry.mobileRootGuard || state.detailShown || state.terminalVisible) return;
+  window.history.pushState({ ...entry, mobileRootGuard: true }, "");
+  state.historyCursor = window.history.state;
+}
+function cancelMobileExit() {
+  if (mobileExitTimer === null) return;
+  clearTimeout(mobileExitTimer); mobileExitTimer = null;
+  armMobileRootBack();
+}
+function dismissLocalMobileOverlay() {
+  if (state.dictation && !$('dictation-overlay')?.hidden) {
+    state.dictation.sendWhenDone = null;
+    stopDictation({ field: state.dictation.field });
+    return true;
+  }
+  const open = [...(document.querySelectorAll?.("dialog[open]") || [])].filter((dialog) => dialog.open);
+  if (!open.length) return false;
+  const focused = document.activeElement?.closest?.("dialog[open]");
+  const dialog = [...mobileDialogOrder].reverse().find((item) => open.includes(item)) || (open.includes(focused) ? focused : open[open.length - 1]);
+  const event = new Event("cancel", { cancelable: true });
+  if (dialog.dispatchEvent(event) && dialog.open) dialog.close();
+  return true;
+}
+function handleMobileHistoryBack(event) {
+  if (!mobileBackEnabled()) return false;
+  const previous = state.historyCursor;
+  if (!previous?.[INSTANCE.historyKey]) return false;
+  if (dismissLocalMobileOverlay() || window.SessionholicWorkspace?.dismissActiveDialog?.()) {
+    window.history.pushState(previous, "");
+    state.historyCursor = window.history.state;
+    return true;
+  }
+  if (previous.mobileRootGuard && !event.state?.mobileRootGuard && previous.view === "list") {
+    state.historyCursor = event.state;
+    if (previous.sessionholicGoals?.tab === "goals") {
+      window.SessionholicGoals?.openTab?.("sessions", { history: false, clearSelection: true });
+      armMobileRootBack();
+    } else {
+      toast("한 번 더 뒤로 가면 나갑니다.");
+      clearTimeout(mobileExitTimer);
+      mobileExitTimer = setTimeout(() => { mobileExitTimer = null; armMobileRootBack(); }, MOBILE_BACK_EXIT_MS);
+    }
+    return true;
+  }
+  return false;
+}
+function initMobileBack() {
+  if (!mobileBackEnabled()) return;
+  armMobileRootBack();
+  document.addEventListener("pointerdown", cancelMobileExit, true);
+  document.addEventListener("keydown", (event) => { if (event.key !== "Escape") cancelMobileExit(); }, true);
+  if (typeof MutationObserver === "function") {
+    new MutationObserver((changes) => {
+      for (const { target } of changes) {
+        if (target.tagName !== "DIALOG") continue;
+        mobileDialogOrder = mobileDialogOrder.filter((dialog) => dialog !== target);
+        if (target.open) { mobileDialogOrder.push(target); cancelMobileExit(); }
+      }
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ["open"], subtree: true });
+  }
+}
+window.SessionholicMobileBack = { record: () => { if (mobileBackEnabled()) state.historyCursor = window.history.state; }, prepare: cancelMobileExit };
+
 function navigateView(view, replace = false, extra = {}) {
+  if (!replace && view !== "list") cancelMobileExit();
   let current = window.history.state;
   if (mobileStartOnList() && !replace && view !== "list" &&
       (!current?.[INSTANCE.historyKey] || !Number.isInteger(current.listDepth) ||
@@ -10866,13 +10942,13 @@ function navigateView(view, replace = false, extra = {}) {
   }
   if (!replace && current?.[INSTANCE.historyKey] && current.view === view) return;
   // `notice` belongs to the one entry a notification opened.
-  const { notice, ...kept } = current || {};
+  const { notice, mobileRootGuard, ...kept } = current || {};
   const depth = view === "list" ? 0 : replace ? (current?.listDepth || 0)
     : current?.[INSTANCE.historyKey] && Number.isInteger(current.listDepth) ? current.listDepth + 1 : 0;
   const navigationId = replace && current?.[INSTANCE.historyKey] && current.navigationId ? current.navigationId : requestId();
   const parentDetailId = view === "terminal" && current?.[INSTANCE.historyKey] && current.view === "detail" ? current.navigationId : null;
   window.history[replace ? "replaceState" : "pushState"](
-    { ...kept, ...extra, [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
+    { ...kept, ...extra, ...(replace && view === "list" && mobileRootGuard ? { mobileRootGuard: true } : {}), [INSTANCE.historyKey]: true, view, listDepth: depth, navigationId, parentDetailId },
     "",
   );
   // A new entry drops the entries ahead of it, in the browser and for forward swipes.
@@ -15580,7 +15656,8 @@ function pageShown() {
 function unsavedWork() {
   return [...state.drafts.values(), state.terminal ? $("terminal-draft").value : ""].some(Boolean) ||
     [...terminalAttachmentDrafts.values()].some((entry) => entry.attachments.length || entry.uploadQueue.length || entry.uploads) ||
-    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads || entry.uploadQueue?.length);
+    [...state.chats.values()].some((entry) => entry.text || entry.attachments.length || entry.pending || entry.uploads || entry.uploadQueue?.length) ||
+    !!window.SessionholicWoni?.hasDraft?.();
 }
 function warnDraftUnload(event) {
   if (state.discardOnReload) return;
@@ -15612,8 +15689,13 @@ async function openLaunchList() {
   state.forwardEntries.length = 0;
   state.launchNavigationEntries = new Set();
   // Replace, rather than push, so relaunching does not build a stack of homes.
+  const rootGuard = window.history.state?.mobileRootGuard;
   window.history.replaceState(null, "", "/");
   navigateView("list", true);
+  if (rootGuard && mobileBackEnabled()) {
+    window.history.replaceState({ ...window.history.state, mobileRootGuard: true }, "");
+    state.historyCursor = window.history.state;
+  } else armMobileRootBack();
   window.SessionholicWorkspace?.showList?.();
   render();
 }
@@ -15826,6 +15908,8 @@ function workspaceHooks() {
       else poll(false);
     },
     locked: () => showLogin(),
+    dismissDialog: dismissLocalMobileOverlay,
+    prepareMobileBack: cancelMobileExit,
     unsaved: () => { persistAllDrafts(); return !state.discardOnReload && unsavedWork(); },
   };
 }
@@ -15852,11 +15936,13 @@ window.addEventListener("DOMContentLoaded", () => {
     hideSession: () => setDetailShown(false), getSheet: sheet,
     onChanged: render,
     onSearch: (query) => { state.search = query.trim(); $("search").value = query; render(); } });
+  initMobileBack();
   document.addEventListener("pointerdown", closeChatToolsOutside);
   // Where a sheet a press opens belongs (paneSheet); buttons a mouse clicks take no focus in Safari.
   document.addEventListener("pointerdown", (event) => { state.pressOrigin = { target: event.target, at: Date.now() }; }, true);
   document.addEventListener("keydown", documentKeydown);
   window.addEventListener("popstate", (event) => {
+    if (handleMobileHistoryBack(event)) return;
     // A committed edge swipe already slid the screens: the change shows at once and ends it.
     // Any other swipe on screen gives way to the history change.
     const swipe = state.edge;

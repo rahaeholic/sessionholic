@@ -164,9 +164,11 @@
     if (history) recordHistory(true);
   }
   function recordHistory(replace = false) {
-    const next = { ...(root.history.state || {}), view: state.conversation ? 'detail' : 'list',
+    const { mobileRootGuard, ...kept } = root.history.state || {};
+    const next = { ...kept, ...(replace && mobileRootGuard ? { mobileRootGuard: true } : {}), view: state.conversation ? 'detail' : 'list',
       sessionholicGoals: { tab: state.tab, id: state.selected, conversation: state.conversation, sessionKey: state.sessionKey } };
     root.history[replace ? 'replaceState' : 'pushState'](next, '');
+    root.SessionholicMobileBack?.record?.();
   }
   function openGoal(id, { history = true, focus = true } = {}) {
     if (!state.goals.some((goal) => goal.id === id)) return;

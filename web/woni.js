@@ -379,6 +379,7 @@
     await result;
   });
   window.SessionholicWoni = {
+    hasDraft() { return !!input.value || !!attachments.length || uploading || !!pending; },
     async check(call, helpers = {}) {
       api = call; services = helpers; mic.hidden = !services.voice?.supported(); const current = authEpoch;
       try {

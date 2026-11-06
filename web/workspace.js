@@ -307,6 +307,7 @@
   // keyboard: moved from a hardware keyboard, whose editor focus a phone or an iPad keeps too.
   function focus(id, editor = true, keyboard = false) {
     if (!ids(tree).includes(id)) return false;
+    hooks?.prepareMobileBack?.();
     if (active !== id && panes.get(active)?.hooks?.describe().composing) {
       const from = active, owner = panes.get(from)?.hooks;
       if (owner?.commitComposition) {
@@ -539,6 +540,10 @@
     return (row?.ref || row?.hooks?.describe().ref)?.key || null;
   }
   function readingActive() { return embedded ? frameReady && parent.isActive(ownId, root) : !enabled || active === "p1"; }
+  function dismissActiveDialog() {
+    if (embedded || active === "p1") return false;
+    return !!panes.get(active)?.hooks?.dismissDialog?.();
+  }
   function isActive(id, win) { return active === id && panes.get(id)?.frame?.contentWindow === win; }
   function claimTerminal(terminal, { passive = false } = {}) {
     if (embedded) return frameReady && parent.claim(ownId, root, terminal.id, { passive });
@@ -730,5 +735,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList };
+    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
 })(typeof window !== "undefined" ? window : null);
