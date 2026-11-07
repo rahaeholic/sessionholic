@@ -365,6 +365,14 @@
   open.addEventListener("click", () => {
     if (dialog.open) { setView("chat"); markVisibleRead(); return; }
     pending = savedPending();
+    if (!input.value && !attachments.length && !uploading && !pending && !replyTarget && !sending) {
+      try {
+        if (window.RyanOneHost?.version === 1 && window.RyanOneHost.openWoni(focusId || "") === true) {
+          focusId = null;
+          return;
+        }
+      } catch (_) { /* The normal web composer remains available if the host cannot navigate. */ }
+    }
     if (pending) {
       if (!attachments.length) attachments = (pending.attachments || []).map((id) => ({ id, name: "첨부 파일", state: "ready" }));
       if (pending.replyTo && !replyTarget) {
@@ -436,7 +444,7 @@
     await result;
   });
   window.SessionholicWoni = {
-    hasDraft() { return !!input.value || !!attachments.length || uploading || !!pending; },
+    hasDraft() { return !!input.value || !!attachments.length || uploading || !!pending || !!replyTarget; },
     async check(call, helpers = {}) {
       api = call; services = helpers; mic.hidden = !services.voice?.supported(); const current = authEpoch;
       try {
