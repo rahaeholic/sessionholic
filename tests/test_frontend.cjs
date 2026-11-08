@@ -1431,6 +1431,19 @@ test('원이 초안이 있으면 브라우저 종료 전에 기존 초안 보호
   assert.equal(prevented, true);
 });
 
+test('앱 내부 제어 이동은 초안을 보존하고 실제 페이지 종료 경고는 유지한다', () => {
+  const c = client();
+  c.context.window.SessionholicWoni = { hasDraft: () => true };
+  c.context.window.RyanOneHost = { compact: true, navigating: true };
+  let warnings = 0;
+  c.warnDraftUnload({ preventDefault() { warnings++; } });
+  assert.equal(warnings, 0);
+  c.context.window.RyanOneHost.navigating = false;
+  c.warnDraftUnload({ preventDefault() { warnings++; } });
+  assert.equal(warnings, 1);
+  assert.equal(c.unsavedWork(), true);
+});
+
 test("oversized Korean draft is retained and not sent over the input limit", async () => {
   let calls = 0;
   const c = client(async () => {
@@ -5389,7 +5402,7 @@ test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, �
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-terminal-keys', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -6592,7 +6605,7 @@ test('beside the list a conversation shows no back chevron; where the list stepp
   const block = /@media \(min-width: 701px\) \{\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.back \{\s*display: none;\s*\}\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.detail-titles \{\s*grid-column: 1 \/ 3;\s*\}\s*\}/;
   assert.match(css, block);
   // Later rules must not show it again on wide screens.
-  const after = css.slice(css.search(block));
+  const after = css.slice(css.search(block), css.indexOf('/* Mobile sessions share'));
   assert.doesNotMatch(after.replace(block, ''), /\.detail-head > \.back \{[^}]*display: (?:inline-)?flex/);
 });
 
@@ -8485,8 +8498,8 @@ test('gesture thresholds live in one frozen object with the values the board use
   assert.doesNotMatch(source, /\b(LONG_PRESS_MS|PRESS_SLOP|SWIPE_RATIO|SWIPE_REVEAL|PULL_TRIGGER|FONT_MIN|FONT_MAX|LARGE_TITLE_COLLAPSE)\b/);
 });
 
-test('on a phone a tap on the conversation shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
-  const { c, pane, list, tap, scrollTo, reading } = phoneConversation();
+test('on a wide touch screen a tap shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
+  const { c, pane, list, tap, scrollTo, reading } = phoneConversation({ wide: true });
   assert.equal(c.state.chromeVisible, true, 'a conversation opens with its bars');
   scrollTo(2390);
   assert.equal(reading(), false, 'a 10px wobble keeps them');
@@ -8511,7 +8524,7 @@ test('a drag, a slow press, a long press, a control, a selection or a touch that
   const callbacks = [];
   const timers = { setTimeout: (callback, ms) => { callbacks.push({ callback, ms }); return callbacks.length; },
     clearTimeout(id) { if (callbacks[id - 1]) callbacks[id - 1].cleared = true; } };
-  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers });
+  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers, wide: true });
   tap({}, { dx: 11 });
   assert.equal(reading(), false, 'moving past tapSlopPx is a drag');
   tap({}, { dx: 9 });
@@ -8552,8 +8565,8 @@ test('a drag, a slow press, a long press, a control, a selection or a touch that
   assert.equal(c.isChromeTap(null, {}), false);
 });
 
-test('the board\'s own scrolling, layout changes and typing never hide the bars on a phone', () => {
-  const { c, s, list, clock, scrollTo, reading } = phoneConversation();
+test('the board\'s own scrolling, layout changes and typing preserve the wide touch screen bars', () => {
+  const { c, s, list, clock, scrollTo, reading } = phoneConversation({ wide: true });
   // New messages at the end keep the reader at the end without hiding anything.
   c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
   list.scrollHeight = 3400;
@@ -8579,7 +8592,7 @@ test('the board\'s own scrolling, layout changes and typing never hide the bars 
   const pane = c.get('detail');
   c.context.document.activeElement = input;
   input.events.focus();
-  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(pane.classList.contains('is-typing'), false, 'wide layouts retain their own typing rules');
   assert.equal(reading(), true, 'typing preserves the focus choice');
   assert.equal(c.state.chromeVisible, false, 'the reader\'s choice is kept for later');
   scrollTo(1500);
@@ -8671,7 +8684,7 @@ test('a conversation opens in focus mode; on a touch screen it says once how to 
 
 test('bars brought back fold on a deliberate scroll, and revisiting preserves focus mode and the one-time hint', () => {
   const writes = [];
-  const { c, list, scrollTo, reading } = phoneConversation();
+  const { c, list, scrollTo, reading } = phoneConversation({ wide: true });
   c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
   const hint = c.get('tap-hint');
   assert.equal(hint.hidden, true);
@@ -8688,7 +8701,7 @@ test('bars brought back fold on a deliberate scroll, and revisiting preserves fo
   assert.equal(hint.hidden, true, 'shown once');
   assert.equal(writes.length, 1);
   // A board that saw it before (another page load) never shows it.
-  const other = phoneConversation();
+  const other = phoneConversation({ wide: true });
   other.c.context.localStorage = { getItem: (key) => (key === 'sessionholic:ui:tapHint' ? 'true' : null), setItem() { throw new Error('no write'); } };
   other.scrollTo(2350);
   assert.equal(other.reading(), true);
@@ -9916,7 +9929,7 @@ test('집중 모드는 대화에 공간을 주면서 기기·사용량을 열 �
   const css = styleSheet();
   const start = css.indexOf('/* 집중 모드 on every screen');
   assert.ok(start > 0);
-  const rules = css.slice(start);
+  const rules = css.slice(start, css.indexOf('/* Mobile sessions share'));
   assert.match(rules, /#detail\.is-reading \.detail-head \{\s*grid-template-columns: 44px minmax\(0, 1fr\) auto auto;/);
   assert.match(rules, /#detail\.is-reading \.detail-titles > \.detail-device,\s*#detail\.is-reading \.detail-titles > \.chat-model-summary \{\s*display: none;/);
   assert.match(rules, /#detail\.is-reading \.detail-head > \.detail-mode-tabs \{\s*grid-column: 3;\s*grid-row: 1;/);
@@ -17334,4 +17347,55 @@ test('a proven Claude conversation keeps its terminal, draft and view when it mo
   assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
   c.context.fixtureTerminal.linkConfidence = 'exact'; c.context.fixtureTerminal.nativeSource.home = '.claude-other';
   assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
+});
+
+
+test('mobile web and Android use the same compact session without tap-to-expand chrome', () => {
+  const { c, pane, tap, reading } = phoneConversation();
+  c.setChromeVisible(true);
+  assert.equal(reading(), true);
+  tap();
+  assert.equal(reading(), true);
+  assert.equal(c.state.chromeVisible, false);
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  c.setChromeVisible(true);
+  assert.equal(reading(), true, 'landscape Android uses the same mobile layout');
+  c.context.navigator.userAgent = 'Mozilla/5.0 Macintosh';
+  c.setChromeVisible(true);
+  assert.equal(reading(), false, 'PC still supports its full view');
+});
+
+test('mobile text input begins on one line, caps at three, and keeps draft and composition', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  c.context.window.innerHeight = 800;
+  c.context.window.getComputedStyle = () => ({ lineHeight: '22px', paddingTop: '10px', paddingBottom: '10px', borderTopWidth: '1px', borderBottomWidth: '1px' });
+  input.scrollHeight = 500; input.value = entry.text = '보존할 긴 초안'; entry.expanded = false;
+  c.resizeChatInput(entry, s);
+  assert.equal(input.style.minHeight, '44px');
+  assert.equal(input.style.maxHeight, '88px');
+  assert.equal(input.value, '보존할 긴 초안');
+  entry.composing = true; input.style.height = '77px'; c.resizeChatInput(entry, s);
+  assert.equal(input.style.height, '77px', 'do not move the IME candidate region');
+});
+
+test('mobile session menu keeps model controls and native settings reachable with a draft', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  let settings = 0;
+  c.context.window.RyanOneHost = { compact: true, openSettings() { settings++; } };
+  c.drawDetail(s); entry.text = '보존할 초안';
+  entry.data.capability.attachments = false;
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-attach').disabled, true);
+  assert.equal(c.get('chat-attach-inline').disabled, false, 'mobile tools remain available without file upload');
+  c.get('detail-session-menu').events.click();
+  const actions = c.get('action-list').children;
+  assert.ok(actions.some(item => item.textContent === '모델 선택'));
+  assert.ok(actions.some(item => item.textContent === '에포트 선택'));
+  actions.find(item => item.textContent === '라이언원 설정').events.click({ detail: 0 });
+  assert.equal(settings, 1); assert.equal(entry.text, '보존할 초안');
 });
