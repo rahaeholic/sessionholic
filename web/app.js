@@ -162,7 +162,7 @@ const prefs = {
   },
 };
 const THEMES = ["auto", "light", "dark"];
-const TEXT_SIZES = ["xsmall", "small", "default", "large", "xlarge"];
+const TEXT_SIZES = ["xsmall", "small", "default", "large", "xlarge", "xxlarge", "xxxlarge"];
 const state = {
   snapshot: null,
   capabilities: null,
@@ -534,6 +534,112 @@ function navTransition(direction, update) {
 }
 // Phone screens: the list or one conversation. State changes at once (chat
 // reads depend on it); only the visible switch may wait for the transition.
+function compactSessionLayout() { return phoneLayout() || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || ""); }
+function ryanOneCompact() { return window.RyanOneHost?.compact === true; }
+function compactSessionActions() {
+  const actions = [];
+  if (state.terminalVisible) {
+    for (const [id, label] of [["terminal-copy", "선택한 터미널 내용 복사"], ["terminal-bottom", "터미널 맨 아래"],
+      ["terminal-compose", "통합 입력 사용"], ["terminal-reopen", "이 세션 다시 열기"], ["terminal-close", "터미널 닫기"]]) {
+      const control = $(id);
+      if (control && !control.hidden) actions.push({ label, disabled: control.disabled, run: () => control.click() });
+    }
+    actions.push({ label: "터미널 글자 크게", run: () => setTerminalFontSize(state.fontSize + 1) },
+      { label: "터미널 글자 작게", run: () => setTerminalFontSize(state.fontSize - 1) });
+    for (const [id, label] of [["terminal-direct-input", "터미널 직접 입력"], ["terminal-accessibility", "스크린리더 지원"]]) {
+      const control = $(id);
+      if (control) actions.push({ label: `${label} ${control.checked ? "끄기" : "켜기"}`, run: () => control.click() });
+    }
+  }
+  actions.push({ label: "하던일 설정", run: openSettings });
+  return actions;
+}
+function openCompactSessionMenu(trigger) {
+  openActionSheet({ title: state.terminalVisible ? "터미널 메뉴" : "하던일 메뉴", preview: state.terminalVisible ? $("terminal-context").textContent : "", actions: compactSessionActions(), trigger });
+}
+function ryanOneRecordingButton() {
+  const control = button("", "ryan-recording icon-button", () => window.RyanOneHost.openRecording());
+  control.hidden = true;
+  return control;
+}
+function syncRyanOneRecording() {
+  if (!ryanOneCompact()) return;
+  const status = window.ryanOneRecording;
+  for (const control of document.querySelectorAll?.(".ryan-recording") || []) {
+    control.hidden = !["recording", "paused"].includes(status);
+    control.dataset.paused = String(status === "paused");
+    control.setAttribute("aria-label", status === "paused" ? "녹음 일시정지 · 제어 열기" : "녹음 중 · 제어 열기");
+    control.title = control.getAttribute("aria-label");
+  }
+}
+function syncCompactSessionLayout() {
+  const compact = compactSessionLayout();
+  document.documentElement.setAttribute?.("data-compact-mobile", String(compact));
+  setClass(document.body, "compact-session", compact && !!(state.detailShown || state.terminalVisible));
+  window.RyanOneHost?.setSessionFocused?.(!!(state.detailShown || state.terminalVisible));
+  const draft = $("terminal-draft");
+  if (draft) {
+    draft.originalPlaceholder ??= draft.placeholder;
+    draft.placeholder = compact ? "터미널 입력…" : draft.originalPlaceholder;
+  }
+  if (!compact) {
+    placeModeTabs($("detail"), !state.chromeVisible);
+    return;
+  }
+  const head = $("detail")?.querySelector?.(".detail-head");
+  if (head) {
+    head.id ||= "detail-head";
+    placeModeTabs($("detail"), true);
+    let actions = head.querySelector(".detail-head-actions");
+    if (!actions) {
+      actions = el("div", "detail-head-actions compact-launcher-actions");
+      const menu = button("⋯", "detail-session-menu icon-button", () => openCompactSessionMenu(menu));
+      menu.setAttribute("aria-label", "세션 메뉴"); menu.setAttribute("aria-haspopup", "dialog");
+      actions.append(menu); head.append(actions);
+    }
+    if (ryanOneCompact() && !actions.querySelector(".ryan-recording")) actions.prepend(ryanOneRecordingButton());
+    if (!head.querySelector(".compact-connection")) {
+      const dot = el("span", "compact-connection"); dot.setAttribute("role", "status");
+      head.querySelector(".detail-titles")?.prepend?.(dot);
+    }
+  }
+  const top = document.querySelector?.(".terminal-header");
+  if (top && !top.querySelector(".compact-terminal-menu")) {
+    const menu = button("⋯", "compact-terminal-menu terminal-button", () => openCompactSessionMenu(menu));
+    menu.setAttribute("aria-label", "터미널 메뉴");
+    menu.setAttribute("aria-haspopup", "dialog");
+    if (ryanOneCompact()) top.append(ryanOneRecordingButton());
+    top.append(menu);
+    const dot = el("span", "compact-connection"); dot.setAttribute("role", "status");
+    top.querySelector(".terminal-title-group")?.prepend(dot);
+  }
+  if (top && ryanOneCompact() && !top.querySelector(".ryan-recording")) top.append(ryanOneRecordingButton());
+  syncRyanOneRecording();
+  syncCompactConnection();
+}
+function syncCompactConnection() {
+  if (!compactSessionLayout()) return;
+  const connected = state.terminalVisible ? state.connected : !selectedSession()?.stale;
+  const status = state.terminalVisible ? $("terminal-status")?.textContent || "연결 확인 중" : connected ? "대화 보기" : "저장된 대화 · 기기 연결 안 됨";
+  for (const dot of document.querySelectorAll?.(".compact-connection") || []) {
+    dot.dataset.connected = String(!!connected); dot.setAttribute("aria-label", status); dot.title = status;
+  }
+  setClass($("terminal-screen"), "compact-connected", !!state.connected);
+}
+function toggleTerminalKeys() {
+  const open = !$("terminal-screen").classList.contains("compact-keys-open");
+  $("terminal-screen").classList.toggle("compact-keys-open", open);
+  for (const control of document.querySelectorAll(".terminal-keys-toggle")) control.setAttribute("aria-expanded", String(open));
+  if (!open) clearTerminalMods();
+  requestAnimationFrame(fitTerminal);
+}
+window.addEventListener("ryanone-ready", () => {
+  if (!ryanOneCompact()) return;
+  syncCompactSessionLayout();
+  setReading(true);
+});
+window.addEventListener("ryanone-recording", syncRyanOneRecording);
+
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
   if (!shown && state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (!shown) state.launcherWorkspace = null;
@@ -544,6 +650,7 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
   const apply = () => {
     if (shown) document.body.classList.add("show-detail");
     else document.body.classList.remove("show-detail");
+    syncCompactSessionLayout();
     // A phone lays the conversation out only now: a scroll set while it was
     // hidden did nothing, so a pinned one is put at its end once it has a size.
     if (shown) {
@@ -3309,7 +3416,14 @@ function openCardMenu(row, at = null) {
 function openSessionMenu(s, { at = null, trigger = null } = {}) {
   if (!s || !state.authenticated) return;
   closeSwipe();
-  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), actions: cardActions(s), at, trigger });
+  const actions = cardActions(s);
+  if (compactSessionLayout()) {
+    if (state.selected === s.key && chatSupported(chatEntry(s), s)) actions.push(
+      { label: "모델 선택", run: () => openChatSettings(chatEntry(s), "model") },
+      { label: "에포트 선택", run: () => openChatSettings(chatEntry(s), "effort") });
+    actions.push(...compactSessionActions());
+  }
+  openActionSheet({ eyebrow: cardProject(s), title: cardTitle(s), preview: compactSessionLayout() ? [s.hostLabel || s.host, s.cwd, $("chat-model-summary")?.textContent].filter(Boolean).join(" · ") : "", actions, at, trigger });
 }
 function bindCardGestures(root) {
   let drag = null;
@@ -4184,6 +4298,7 @@ function drawDetail(s) {
   setChromeVisible(state.chromeVisible);
   renderSessionRelations(s);
   renderDetailMode();
+  syncCompactSessionLayout();
   // Reuse an already running, proven connection only. Selecting or reading a
   // conversation must never create/resume a native CLI as a side effect.
   queueMicrotask(() => syncSessionTerminal(s));
@@ -4617,6 +4732,7 @@ function observeMessages(list) {
 }
 // The explicit choice survives keyboard, network, receipt and viewport changes.
 function setChromeVisible(visible, { stickBottom = false } = {}) {
+  if (compactSessionLayout()) visible = false;
   state.chromeVisible = !!visible;
   setReading(!visible, { stickBottom });
   const toggle = $("focus-toggle");
@@ -4629,6 +4745,7 @@ function setChromeVisible(visible, { stickBottom = false } = {}) {
   rememberConversationView();
 }
 function toggleChrome() {
+  if (compactSessionLayout()) return;
   const hint = $("tap-hint");
   if (hint && !hint.hidden) hint.hidden = true;
   setChromeVisible(!state.chromeVisible, { stickBottom: messagesAtEnd($("messages")) });
@@ -4692,6 +4809,7 @@ function chatPlaceholder(oneShot) {
   return $("detail")?.classList?.contains?.("is-reading") ? "메시지…" : "이 세션에 보낼 메시지…";
 }
 function setReading(reading, { stickBottom = false } = {}) {
+  if (compactSessionLayout()) reading = true;
   const pane = $("detail");
   if (!pane?.classList || pane.classList.contains?.("is-reading") === reading) return;
   const list = $("messages");
@@ -4715,6 +4833,7 @@ function setReading(reading, { stickBottom = false } = {}) {
 // 집중 모드: the 터미널/채팅 tabs join the folded header's line (style.css places them),
 // and shown bars give them back their own row under the header. A tab keeps its focus.
 function placeModeTabs(pane, reading) {
+  if (compactSessionLayout()) reading = true;
   const head = $("detail-head"), tabs = $("detail-mode-tabs");
   if (!head || !tabs || head.parentElement !== pane) return;
   const inHead = tabs.parentElement === head;
@@ -5376,6 +5495,8 @@ function speechRecognitionClass() {
 }
 // The error code is kept in the message: it is what tells one platform's refusal from another's.
 function dictationErrorText(code, message = "") {
+  if (ryanOneCompact() && ["not-allowed", "service-not-allowed"].includes(code))
+    return `마이크 사용이 허용되지 않았습니다. 휴대폰 설정 > 앱 > Ryan One > 권한에서 마이크를 허용해 주세요. 음성 인식 서비스의 마이크 권한도 확인해 주세요. (${code})`;
   const words = (Object.hasOwn(DICTATION_REFUSALS, message) && DICTATION_REFUSALS[message]) || DICTATION_ERRORS[code];
   return `${words || "음성 입력을 마치지 못했습니다. 다시 눌러 주세요."} (${code})`;
 }
@@ -6619,9 +6740,17 @@ function buildChatComposer(s) {
   quickInline.title = "빠른 답장";
   quickInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const main = el("div", "chat-main");
-  const attachInline = button("＋", "chat-attach-inline", () => { if (editorCurrent() && !attach.disabled) { beginNextDraft(); files.click(); } });
+  const attachInline = button("＋", "chat-attach-inline", () => {
+    if (!editorCurrent()) return;
+    if (compactSessionLayout()) {
+      const choices = [attach, reference, results, expand, clipboard, check, native, closeTerm, manage, capabilities, taskPlan, batch, fork, profile, delegate];
+      openActionSheet({ title: "입력 도구", trigger: attachInline, actions: choices.filter(control => !control.hidden).map(control => ({
+        label: control.textContent, disabled: control.disabled, run: () => control.click(),
+      })) });
+    } else if (!attach.disabled) { beginNextDraft(); files.click(); }
+  });
   attachInline.id = "chat-attach-inline";
-  attachInline.setAttribute("aria-label", "사진 또는 파일 첨부");
+  attachInline.setAttribute("aria-label", compactSessionLayout() ? "입력 도구와 첨부" : "사진 또는 파일 첨부");
   attachInline.title = "사진 또는 파일 첨부";
   attachInline.addEventListener("pointerdown", (event) => event.preventDefault());
   const referenceInline = button("@", "chat-reference-inline", () => {
@@ -6632,7 +6761,11 @@ function buildChatComposer(s) {
   referenceInline.setAttribute("aria-haspopup", "dialog");
   referenceInline.title = "다른 대화 참조";
   referenceInline.addEventListener("pointerdown", (event) => event.preventDefault());
-  main.append(input, attachInline, mic, quickInline, referenceInline, send);
+  const keys = button("⌨", "terminal-keys-toggle chat-terminal-keys", toggleTerminalKeys);
+  keys.id = "chat-terminal-keys";
+  keys.setAttribute("aria-label", "터미널 특수키"); keys.setAttribute("aria-expanded", "false"); keys.setAttribute("aria-controls", "terminal-keys");
+  keys.addEventListener("pointerdown", event => event.preventDefault());
+  main.append(input, attachInline, mic, quickInline, referenceInline, keys, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -6652,8 +6785,8 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const base = Math.max(44, line + padding + border);
   const viewport = viewportHeight();
   const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
-    Math.min(line * (entry.expanded ? 11 : 6) + padding + border, viewport * 0.34, viewport - 200));
-  const minimum = Math.min(cap, entry.expanded ? 3 * line + padding + border : base);
+    Math.min(line * (entry.expanded ? 11 : compactSessionLayout() ? 3 : 6) + padding + border, viewport * 0.34, viewport - 200));
+  const minimum = Math.min(cap, entry.expanded && !compactSessionLayout() ? 3 * line + padding + border : base);
   const list = $("messages");
   const atBottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
   const inputScroll = input.scrollTop || 0;
@@ -6691,7 +6824,7 @@ function closeChatToolsOutside(event) {
   const settings = $("chat-settings-panel");
   if (settings?.isConnected && !settings.contains?.(event.target) && !event.target?.closest?.(".chat-model-controls")) closeChatSettings();
   const quick = state.quickRepliesOpen;
-  if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
+  if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger && !quick.trigger?.contains?.(event.target)) closeQuickReplies();
   for (const id of ["chat-tools", "terminal-settings", "board-status"]) {
     const tools = $(id);
     if (tools?.open && !tools.contains?.(event.target)) tools.open = false;
@@ -7207,7 +7340,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   input.setAttribute("aria-disabled", String(input.disabled || input.readOnly));
   $("chat-attach").disabled = offline || !chatAttachmentsSupported(entry, selected) || entry.sending || !!entry.uploads;
   $("chat-clipboard").disabled = $("chat-attach").disabled;
-  $("chat-attach-inline").disabled = $("chat-attach").disabled;
+  $("chat-attach-inline").disabled = compactSessionLayout() ? !state.authenticated : $("chat-attach").disabled;
   // A word still composing does not lock it: the send commits it first (buildChatComposer).
   $("chat-send").disabled = blocked || (!entry.text.trim() && !entry.attachments.length);
   // A listening mic always stays pressable, so a locked input can still end it.
@@ -9321,7 +9454,10 @@ function openQuickReplies(entry, input, trigger) {
     return prompt.mode === "insert" ? undefined : sendChat(entry);
   };
   const replies = quickReplies(), prompts = savedPrompts();
-  const composer = touchDevice() && document.activeElement === input ? input.closest?.(".chat-composer") : null;
+  // Compact sessions expose a direct button; keep its choices above the editor even
+  // before typing, instead of opening a bottom sheet over the small viewport.
+  const composer = compactSessionLayout() || touchDevice() && document.activeElement === input
+    ? input.closest?.(".chat-composer") : null;
   if (composer) {
     const same = state.quickRepliesOpen?.input === input;
     closeQuickReplies();
@@ -10884,7 +11020,10 @@ function dismissLocalMobileOverlay() {
     return true;
   }
   const open = [...(document.querySelectorAll?.("dialog[open]") || [])].filter((dialog) => dialog.open);
-  if (!open.length) return false;
+  if (!open.length) {
+    if (state.quickRepliesOpen) { closeQuickReplies(); return true; }
+    return false;
+  }
   const focused = document.activeElement?.closest?.("dialog[open]");
   const dialog = [...mobileDialogOrder].reverse().find((item) => open.includes(item)) || (open.includes(focused) ? focused : open[open.length - 1]);
   const event = new Event("cancel", { cancelable: true });
@@ -11803,6 +11942,7 @@ function terminalStatus(text, connected = false, { manualReconnect } = {}) {
   $("draft-type").disabled = !connected || !!state.draftPaste;
   $("terminal-reconnect").hidden = connected || !state.terminalAlive || !state.terminalManualReconnect;
   renderTerminalAttachments();
+  syncCompactConnection();
 }
 function terminalInfo(terminal) {
   return { ...terminal?.metadata, ...terminal };
@@ -12367,6 +12507,7 @@ function showTerminalScreen(visible) {
   if ($("board-status")) $("board-status").open = false;
   $("terminal-screen").hidden = !visible;
   applyDock();
+  syncCompactSessionLayout();
 }
 function inlineTerminalRef(s) {
   return s ? { key: s.key, identity: conversationIdentity(s) } : null;
@@ -13667,7 +13808,7 @@ function resizeDraft() {
   const before = input.style.height;
   input.style.height = "auto";
   const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
-  input.style.height = `${Math.min(input.scrollHeight, line * 4 + 20)}px`;
+  input.style.height = `${Math.min(input.scrollHeight, line * (compactSessionLayout() ? 3 : 4) + 20)}px`;
   // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
   if (input.style.height !== before) requestAnimationFrame(fitTerminal);
 }
@@ -15431,6 +15572,9 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
+// Keep room for iPad's hardware-keyboard accessory bar even before an editor takes focus.
+// A larger measured accessory bar is remembered for this page, never a software keyboard.
+const IPAD_INPUT_ROOM = 55;
 // The height the app has: the visual viewport (an on-screen keyboard takes its space), except
 // that without a focused text field no keyboard takes space, so a visual viewport shorter than
 // the window is stale: iPadOS reports one for a moment when the app comes back from the
@@ -15438,8 +15582,16 @@ async function lock() {
 // visual viewport is then meant to be smaller).
 function viewportHeight() {
   const viewport = window.visualViewport;
-  const height = viewport?.height || window.innerHeight || 800;
-  if (!editingText() && (viewport?.scale || 1) <= 1.01 && window.innerHeight > height) return window.innerHeight;
+  let height = viewport?.height || window.innerHeight || 800;
+  const unzoomed = (viewport?.scale || 1) <= 1.01;
+  if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
+  // The parent already reserved room before sizing its split-pane iframes.
+  if (unzoomed && document.documentElement.hasAttribute?.("data-ipad") && !window.SessionholicWorkspace?.embedded) {
+    const inset = keyboardInset();
+    if (editingText() && inset > 0 && inset <= KEYBOARD_MIN_PX)
+      state.ipadInputRoom = Math.max(state.ipadInputRoom || IPAD_INPUT_ROOM, Math.round(inset));
+    height = Math.min(height, Math.max(0, (state.viewportTall || window.innerHeight || height) - (state.ipadInputRoom || IPAD_INPUT_ROOM)));
+  }
   return height;
 }
 function updateViewport() {
@@ -15450,6 +15602,7 @@ function updateViewport() {
   renderAppShift();
   traceKeyboardRoom();
   syncChromeMode();
+  syncCompactSessionLayout();
   const selected = selectedSession();
   if (selected) resizeChatInput(chatEntry(selected));
   fitTerminal();
@@ -15669,6 +15822,8 @@ function unsavedWork() {
 function warnDraftUnload(event) {
   if (state.discardOnReload) return;
   persistAllDrafts();
+  // The Android host intercepts this navigation and keeps this exact WebView alive.
+  if (ryanOneCompact() && window.RyanOneHost.navigating) return;
   if (!unsavedWork() || state.discardOnReload) return;
   event.preventDefault();
   event.returnValue = "";
@@ -16223,6 +16378,8 @@ window.addEventListener("DOMContentLoaded", () => {
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
   bindDraftInput($("terminal-draft"));
+  $("terminal-keys-toggle").addEventListener("pointerdown", event => event.preventDefault());
+  $("terminal-keys-toggle").addEventListener("click", toggleTerminalKeys);
   // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
   $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
   $("draft-attach").addEventListener("click", () => $("terminal-files").click());

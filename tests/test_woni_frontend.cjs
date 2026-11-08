@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function fixture(call, storage = new Map()) {
+function fixture(call, storage = new Map(), host = undefined) {
   const nodes = {};
   let scheduled;
   function element() {
@@ -21,7 +21,7 @@ function fixture(call, storage = new Map()) {
   }
   for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-original']) nodes[id] = element();
   nodes['woni-form'].submit = element();
-  const context = { document: { getElementById: id => nodes[id], createElement: element }, window: {},
+  const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     setTimeout: fn => { scheduled = fn; return 1; }, clearTimeout: () => { scheduled = null; }, AbortController, URLSearchParams, CSS: { escape: value => value } };
@@ -370,4 +370,62 @@ test('원이 답의 추천 답장(👉)을 버튼으로 보여 주고 누르면 
   assert.deepEqual(sent, [{ text: '응, 정리해 줘', requestId: 'request-123456' }]);
   assert.equal(nodes['woni-input'].value, '쓰던 초안');
   assert.equal(nodes['woni-messages'].children.some(node => node.className === 'woni-suggestions'), false);  // 확인 전 두 번 보내지 않게 숨긴다
+});
+
+
+test('Android 호스트가 있을 때만 정확한 대화로 이동하고 기존 웹은 유지한다', async () => {
+  const calls = [];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  const host = { version: 1, openWoni(id) { calls.push(id); return true; } };
+  const { nodes, app } = fixture(call, new Map(), host);
+  await app.check(call);
+  nodes['woni-open'].click();
+  assert.deepEqual(calls, ['']);
+  assert.notEqual(nodes['woni-dialog'].open, true);
+  app.openFromNotification('chat-42');
+  assert.deepEqual(calls, ['', 'chat-42']);
+  assert.notEqual(nodes['woni-dialog'].open, true);
+});
+
+test('작성 중인 웹 초안이나 미확인 전송은 네이티브 이동 대신 웹에서 이어 간다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  for (const pending of [false, true]) {
+    const storage = new Map();
+    const calls = [];
+    const { nodes, app } = fixture(call, storage, { version: 1, openWoni(id) { calls.push(id); return true; } });
+    await app.check(call);
+    if (pending) storage.set('sessionholic:woni:pending', JSON.stringify({ text: '미확인 요청', requestId: 'pending-001', attachments: ['file-1'], replyTo: { id: 'chat-1', part: 'answer' } }));
+    else nodes['woni-input'].value = '기존 초안';
+    nodes['woni-open'].click();
+    assert.equal(nodes['woni-dialog'].open, true);
+    assert.equal(nodes['woni-input'].value, pending ? '' : '기존 초안');
+    assert.equal(app.hasDraft(), true);
+    assert.deepEqual(calls, []);
+  }
+});
+
+test('Android 호스트 거절과 예외는 일반 웹 대화로 돌아간다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  for (const host of [undefined, { version: 2, openWoni() { throw Error(); } },
+    { version: 1, openWoni() { return false; } }, { version: 1, openWoni() { throw Error(); } }]) {
+    const { nodes, app } = fixture(call, new Map(), host);
+    await app.check(call); nodes['woni-open'].click();
+    assert.equal(nodes['woni-dialog'].open, true);
+  }
+});
+
+
+test('답글 대상만 남은 웹 입력도 호스트로 이동시키지 않는다', async () => {
+  const calls = [];
+  const host = { version: 0, openWoni(id) { calls.push(id); return true; } };
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [{ id: 'chat-one', text: '질문', answer: '답변' }], activity: {} };
+  const { nodes, app } = fixture(call, new Map(), host);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-messages'].children[1].children.find(child => child.className === 'woni-message-actions').children[0].click();
+  nodes['woni-close'].click(); host.version = 1;
+  assert.equal(nodes['woni-input'].value, '');
+  assert.equal(app.hasDraft(), true);
+  nodes['woni-open'].click();
+  assert.equal(nodes['woni-dialog'].open, true);
+  assert.deepEqual(calls, []);
 });

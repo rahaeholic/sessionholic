@@ -1431,6 +1431,19 @@ test('원이 초안이 있으면 브라우저 종료 전에 기존 초안 보호
   assert.equal(prevented, true);
 });
 
+test('앱 내부 제어 이동은 초안을 보존하고 실제 페이지 종료 경고는 유지한다', () => {
+  const c = client();
+  c.context.window.SessionholicWoni = { hasDraft: () => true };
+  c.context.window.RyanOneHost = { compact: true, navigating: true };
+  let warnings = 0;
+  c.warnDraftUnload({ preventDefault() { warnings++; } });
+  assert.equal(warnings, 0);
+  c.context.window.RyanOneHost.navigating = false;
+  c.warnDraftUnload({ preventDefault() { warnings++; } });
+  assert.equal(warnings, 1);
+  assert.equal(c.unsavedWork(), true);
+});
+
 test("oversized Korean draft is retained and not sent over the input limit", async () => {
   let calls = 0;
   const c = client(async () => {
@@ -5389,7 +5402,7 @@ test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, �
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-terminal-keys', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -6592,7 +6605,7 @@ test('beside the list a conversation shows no back chevron; where the list stepp
   const block = /@media \(min-width: 701px\) \{\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.back \{\s*display: none;\s*\}\s*body:not\(\.dock-solo\):not\(\.goal-has-conversation\) \.detail-head > \.detail-titles \{\s*grid-column: 1 \/ 3;\s*\}\s*\}/;
   assert.match(css, block);
   // Later rules must not show it again on wide screens.
-  const after = css.slice(css.search(block));
+  const after = css.slice(css.search(block), css.indexOf('/* Mobile sessions share'));
   assert.doesNotMatch(after.replace(block, ''), /\.detail-head > \.back \{[^}]*display: (?:inline-)?flex/);
 });
 
@@ -8229,7 +8242,7 @@ test('the board text size is its own stored choice scaling the rem type scale, a
   c.windowEvents.DOMContentLoaded();
   c.get('text-size-small').events.change({ target: { checked: true } });
   assert.equal(root.attributes['data-text-size'], 'small');
-  for (const size of ['xsmall', 'xlarge']) {
+  for (const size of ['xsmall', 'xlarge', 'xxlarge', 'xxxlarge']) {
     c.get('text-size-' + size).events.change({ target: { checked: true } });
     assert.equal(root.attributes['data-text-size'], size);
     assert.equal(c.get('text-size-' + size).checked, true);
@@ -8307,7 +8320,7 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.deepEqual(run({ 'sessionholic:ui:theme': '"light"' }).metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
   const auto = run({ 'sessionholic:ui:theme': '"auto"', 'sessionholic:ui:textSize': '"default"' });
   assert.deepEqual(auto.attributes, {});
-  for (const size of ['xsmall', 'xlarge'])
+  for (const size of ['xsmall', 'xlarge', 'xxlarge', 'xxxlarge'])
     assert.equal(run({ 'sessionholic:ui:textSize': JSON.stringify(size) }).attributes['data-text-size'], size);
   assert.equal(auto.metas[0].attributes['data-original'], undefined);
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
@@ -8485,8 +8498,8 @@ test('gesture thresholds live in one frozen object with the values the board use
   assert.doesNotMatch(source, /\b(LONG_PRESS_MS|PRESS_SLOP|SWIPE_RATIO|SWIPE_REVEAL|PULL_TRIGGER|FONT_MIN|FONT_MAX|LARGE_TITLE_COLLAPSE)\b/);
 });
 
-test('on a phone a tap on the conversation shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
-  const { c, pane, list, tap, scrollTo, reading } = phoneConversation();
+test('on a wide touch screen a tap shows or hides its bars; scrolling hides them and the end does not bring them back', () => {
+  const { c, pane, list, tap, scrollTo, reading } = phoneConversation({ wide: true });
   assert.equal(c.state.chromeVisible, true, 'a conversation opens with its bars');
   scrollTo(2390);
   assert.equal(reading(), false, 'a 10px wobble keeps them');
@@ -8511,7 +8524,7 @@ test('a drag, a slow press, a long press, a control, a selection or a touch that
   const callbacks = [];
   const timers = { setTimeout: (callback, ms) => { callbacks.push({ callback, ms }); return callbacks.length; },
     clearTimeout(id) { if (callbacks[id - 1]) callbacks[id - 1].cleared = true; } };
-  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers });
+  const { c, list, clock, pointer, tap, reading } = phoneConversation({ timers, wide: true });
   tap({}, { dx: 11 });
   assert.equal(reading(), false, 'moving past tapSlopPx is a drag');
   tap({}, { dx: 9 });
@@ -8552,8 +8565,8 @@ test('a drag, a slow press, a long press, a control, a selection or a touch that
   assert.equal(c.isChromeTap(null, {}), false);
 });
 
-test('the board\'s own scrolling, layout changes and typing never hide the bars on a phone', () => {
-  const { c, s, list, clock, scrollTo, reading } = phoneConversation();
+test('the board\'s own scrolling, layout changes and typing preserve the wide touch screen bars', () => {
+  const { c, s, list, clock, scrollTo, reading } = phoneConversation({ wide: true });
   // New messages at the end keep the reader at the end without hiding anything.
   c.renderMessages(s, [{ role: 'assistant', text: '첫 답', ts: 1 }], '', true);
   list.scrollHeight = 3400;
@@ -8579,7 +8592,7 @@ test('the board\'s own scrolling, layout changes and typing never hide the bars 
   const pane = c.get('detail');
   c.context.document.activeElement = input;
   input.events.focus();
-  assert.equal(pane.classList.contains('is-typing'), true);
+  assert.equal(pane.classList.contains('is-typing'), false, 'wide layouts retain their own typing rules');
   assert.equal(reading(), true, 'typing preserves the focus choice');
   assert.equal(c.state.chromeVisible, false, 'the reader\'s choice is kept for later');
   scrollTo(1500);
@@ -8671,7 +8684,7 @@ test('a conversation opens in focus mode; on a touch screen it says once how to 
 
 test('bars brought back fold on a deliberate scroll, and revisiting preserves focus mode and the one-time hint', () => {
   const writes = [];
-  const { c, list, scrollTo, reading } = phoneConversation();
+  const { c, list, scrollTo, reading } = phoneConversation({ wide: true });
   c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
   const hint = c.get('tap-hint');
   assert.equal(hint.hidden, true);
@@ -8688,7 +8701,7 @@ test('bars brought back fold on a deliberate scroll, and revisiting preserves fo
   assert.equal(hint.hidden, true, 'shown once');
   assert.equal(writes.length, 1);
   // A board that saw it before (another page load) never shows it.
-  const other = phoneConversation();
+  const other = phoneConversation({ wide: true });
   other.c.context.localStorage = { getItem: (key) => (key === 'sessionholic:ui:tapHint' ? 'true' : null), setItem() { throw new Error('no write'); } };
   other.scrollTo(2350);
   assert.equal(other.reading(), true);
@@ -9916,7 +9929,7 @@ test('집중 모드는 대화에 공간을 주면서 기기·사용량을 열 �
   const css = styleSheet();
   const start = css.indexOf('/* 집중 모드 on every screen');
   assert.ok(start > 0);
-  const rules = css.slice(start);
+  const rules = css.slice(start, css.indexOf('/* Mobile sessions share'));
   assert.match(rules, /#detail\.is-reading \.detail-head \{\s*grid-template-columns: 44px minmax\(0, 1fr\) auto auto;/);
   assert.match(rules, /#detail\.is-reading \.detail-titles > \.detail-device,\s*#detail\.is-reading \.detail-titles > \.chat-model-summary \{\s*display: none;/);
   assert.match(rules, /#detail\.is-reading \.detail-head > \.detail-mode-tabs \{\s*grid-column: 3;\s*grid-row: 1;/);
@@ -13546,7 +13559,7 @@ test('both iPad panes follow a scrolled keyboard viewport through blur until the
   assert.equal(vars['--app-shift'], '422px');
   c.updateViewport(); assert.equal(vars['--app-shift'], '422px');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  assert.match(css, /body\.app-shifted \.app,\s*body\.app-shifted \.terminal-screen\s*\{\s*transform: translateY\(var\(--app-shift/);
+  assert.match(css, /body\.app-shifted \.app,\s*body\.app-shifted:not\(\.terminal-inline\) \.terminal-screen\s*\{\s*transform: translateY\(var\(--app-shift/);
   c.context.window.innerHeight = 788;
   c.context.window.visualViewport = { height: 788, pageTop: 0, offsetTop: 0, scale: 1 };
   c.updateViewport(); assert.equal(vars['--app-shift'], '0px');
@@ -13655,6 +13668,31 @@ test('touch quick replies keep the input focus, send once on selection, and neve
   c.closeChatToolsEscape({ key: 'Escape', preventDefault() {} });
   assert.equal(c.state.quickRepliesOpen, null); assert.equal(focused, 0); assert.equal(trigger.attributes['aria-expanded'], 'false');
   assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
+});
+
+test('compact quick replies open above the editor without focusing it or opening a sheet', () => {
+  for (const focused of [false, true]) {
+    const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+    c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+    const composer = c.buildChatComposer(s), input = c.get('chat-input'), trigger = c.get('chat-quick-inline');
+    input.closest = () => composer;
+    c.context.document.activeElement = focused ? input : null;
+    entry.text = input.value = '보존할 초안';
+    trigger.events.click({ currentTarget: trigger });
+    const panel = c.state.quickRepliesOpen.panel;
+    assert.ok(composer.children.includes(panel));
+    assert.notEqual(c.get('action-sheet').open, true);
+    assert.equal(c.context.document.activeElement, focused ? input : null);
+    assert.equal(trigger.attributes['aria-expanded'], 'true');
+    const iconPath = node(); trigger.contains = target => target === iconPath;
+    c.closeChatToolsOutside({ target: iconPath });
+    assert.equal(c.state.quickRepliesOpen.panel, panel, 'touching the SVG must not close and reopen the list');
+    trigger.events.click({ currentTarget: trigger });
+    assert.equal(c.state.quickRepliesOpen, null);
+    assert.equal(entry.text, '보존할 초안');
+    c.get('chat-attach-inline').events.click();
+    assert.ok(!c.get('action-list').children.some(item => item.textContent === '빠른 답장'));
+  }
 });
 
 test('quick reply sheet sends the selected phrase with the existing draft, selection and attachments', async () => {
@@ -17334,4 +17372,101 @@ test('a proven Claude conversation keeps its terminal, draft and view when it mo
   assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
   c.context.fixtureTerminal.linkConfidence = 'exact'; c.context.fixtureTerminal.nativeSource.home = '.claude-other';
   assert.equal(vm.runInContext('terminalMatchesDetail(fixtureTerminal, fixtureSession)', c.context), false);
+});
+
+
+test('mobile web and Android use the same compact session without tap-to-expand chrome', () => {
+  const { c, pane, tap, reading } = phoneConversation();
+  c.setChromeVisible(true);
+  assert.equal(reading(), true);
+  tap();
+  assert.equal(reading(), true);
+  assert.equal(c.state.chromeVisible, false);
+  c.context.window.matchMedia = () => ({ matches: false });
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  c.setChromeVisible(true);
+  assert.equal(reading(), true, 'landscape Android uses the same mobile layout');
+  c.context.navigator.userAgent = 'Mozilla/5.0 Macintosh';
+  c.setChromeVisible(true);
+  assert.equal(reading(), false, 'PC still supports its full view');
+});
+
+test('mobile text input begins on one line, caps at three, and keeps draft and composition', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  c.context.window.innerHeight = 800;
+  c.context.window.getComputedStyle = () => ({ lineHeight: '22px', paddingTop: '10px', paddingBottom: '10px', borderTopWidth: '1px', borderBottomWidth: '1px' });
+  input.scrollHeight = 500; input.value = entry.text = '보존할 긴 초안'; entry.expanded = false;
+  c.resizeChatInput(entry, s);
+  assert.equal(input.style.minHeight, '44px');
+  assert.equal(input.style.maxHeight, '88px');
+  assert.equal(input.value, '보존할 긴 초안');
+  entry.composing = true; input.style.height = '77px'; c.resizeChatInput(entry, s);
+  assert.equal(input.style.height, '77px', 'do not move the IME candidate region');
+});
+
+test('mobile session menu keeps model controls and opens only board settings with a draft', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  let settings = 0;
+  c.context.window.RyanOneHost = { compact: true, openSettings() { settings++; } };
+  c.drawDetail(s); entry.text = '보존할 초안';
+  entry.data.capability.attachments = false;
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-attach').disabled, true);
+  assert.equal(c.get('chat-attach-inline').disabled, false, 'mobile tools remain available without file upload');
+  c.get('detail-session-menu').events.click();
+  const actions = c.get('action-list').children;
+  assert.ok(actions.some(item => item.textContent === '모델 선택'));
+  assert.ok(actions.some(item => item.textContent === '에포트 선택'));
+  assert.ok(!actions.some(item => item.textContent === '라이언원 설정'));
+  actions.find(item => item.textContent === '하던일 설정').events.click({ detail: 0 });
+  assert.equal(c.get('settings-dialog').open, true);
+  assert.equal(settings, 0); assert.equal(entry.text, '보존할 초안');
+});
+
+test('iPad reserves its input accessory room before focus and keeps the same height through blur', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
+  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
+  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '779px');
+  for (const id of ['chat-input','terminal-draft']) {
+    c.context.document.activeElement = { tagName: 'TEXTAREA', id };
+    c.context.window.visualViewport.height = 779;
+    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+    c.context.document.activeElement = null;
+    c.context.window.visualViewport.height = 834;
+    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+  }
+  c.context.document.activeElement = { tagName: 'TEXTAREA' };
+  c.context.window.visualViewport.height = 764;
+  c.updateViewport(); assert.equal(vars['--app-height'], '764px');
+  c.context.document.activeElement = null; c.context.window.visualViewport.height = 834;
+  c.updateViewport(); assert.equal(vars['--app-height'], '764px', 'keep the larger measured bar after blur');
+  c.context.document.activeElement = { tagName: 'TEXTAREA' }; c.context.window.visualViewport.height = 434;
+  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'software keyboard is not charged twice');
+  c.context.window.innerHeight = 434;
+  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'resizes-content keyboard is not charged twice');
+  c.context.document.activeElement = null;
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.updateViewport(); assert.equal(vars['--app-height'], '1124px', 'rotation recomputes full height');
+  c.context.window.visualViewport = { height: 597, scale: 2 };
+  c.updateViewport(); assert.equal(vars['--app-height'], '597px', 'pinch zoom keeps the actual visual viewport');
+});
+
+test('iPad room belongs to the top-level screen; desktop, Android and child panes keep their own height', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
+  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  for (const userAgent of ['Mozilla/5.0 Macintosh','Mozilla/5.0 Android 15']) {
+    c.context.navigator = { userAgent }; c.updateViewport(); assert.equal(vars['--app-height'], '834px');
+  }
+  c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
+  c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true };
+  c.context.window.innerHeight = 779; c.context.window.visualViewport.height = 779;
+  c.updateViewport(); assert.equal(vars['--app-height'], '779px', 'parent already reserved the room');
 });

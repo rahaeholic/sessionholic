@@ -450,6 +450,7 @@
           <p class="draft-mode-note">터미널에 보낼 내용 · 보내기 버튼으로 실행</p>
           <p id="terminal-draft-keys" class="sr-only">비어 있을 때 방향키·Tab·Esc는 터미널로 갑니다. 입력줄을 벗어나려면 글자를 입력한 뒤 Tab을 누르세요.</p>
           <div class="draft-row">
+            <button id="terminal-keys-toggle" class="terminal-keys-toggle" type="button" aria-label="터미널 특수키" aria-expanded="false" aria-controls="terminal-keys">⌨</button>
             <textarea
               id="terminal-draft"
               enterkeyhint="enter"
@@ -571,6 +572,10 @@
             ><input id="text-size-large" type="radio" name="text-size" value="large" /><span class="text-size-sample large" aria-hidden="true">가</span>크게</label
           ><label class="theme-option text-size-option"
             ><input id="text-size-xlarge" type="radio" name="text-size" value="xlarge" /><span class="text-size-sample xlarge" aria-hidden="true">가</span>더 크게</label
+          ><label class="theme-option text-size-option"
+            ><input id="text-size-xxlarge" type="radio" name="text-size" value="xxlarge" /><span class="text-size-sample xxlarge" aria-hidden="true">가</span>아주 크게</label
+          ><label class="theme-option text-size-option"
+            ><input id="text-size-xxxlarge" type="radio" name="text-size" value="xxxlarge" /><span class="text-size-sample xxxlarge" aria-hidden="true">가</span>최대</label
           >
         </div>
         <p class="plan-preserve">
