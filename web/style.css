@@ -2354,7 +2354,8 @@ li[data-task] {
   bottom: calc(100% + 8px);
   left: 0;
   right: 0;
-  max-height: min(240px, 35vh);
+  /* The retained Android WebView can cache vh as zero after a hidden tab. */
+  max-height: min(240px, calc(var(--app-height, 100dvh) * .35));
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 8px;
@@ -8319,7 +8320,6 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] #detail .chat-main > #chat-attach-inline { order: 0; }
 :root[data-compact-mobile="true"] #detail .chat-main > :not(.chat-input):not(#chat-attach-inline) { order: 2; }
 :root[data-compact-mobile="true"] #detail .chat-toolbar,
-:root[data-compact-mobile="true"] #detail #chat-quick-inline,
 :root[data-compact-mobile="true"] #detail #chat-reference-inline { display: none; }
 :root[data-compact-mobile="true"] #detail #chat-send,
 :root[data-compact-mobile="true"] #draft-paste { min-width: 44px; width: 44px; min-height: 44px; padding: 0; font-size: 0; }

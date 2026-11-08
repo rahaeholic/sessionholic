@@ -13670,6 +13670,31 @@ test('touch quick replies keep the input focus, send once on selection, and neve
   assert.equal(requests.filter((r) => r.url === '/api/chat/send').length, 1);
 });
 
+test('compact quick replies open above the editor without focusing it or opening a sheet', () => {
+  for (const focused of [false, true]) {
+    const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+    c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+    const composer = c.buildChatComposer(s), input = c.get('chat-input'), trigger = c.get('chat-quick-inline');
+    input.closest = () => composer;
+    c.context.document.activeElement = focused ? input : null;
+    entry.text = input.value = '보존할 초안';
+    trigger.events.click({ currentTarget: trigger });
+    const panel = c.state.quickRepliesOpen.panel;
+    assert.ok(composer.children.includes(panel));
+    assert.notEqual(c.get('action-sheet').open, true);
+    assert.equal(c.context.document.activeElement, focused ? input : null);
+    assert.equal(trigger.attributes['aria-expanded'], 'true');
+    const iconPath = node(); trigger.contains = target => target === iconPath;
+    c.closeChatToolsOutside({ target: iconPath });
+    assert.equal(c.state.quickRepliesOpen.panel, panel, 'touching the SVG must not close and reopen the list');
+    trigger.events.click({ currentTarget: trigger });
+    assert.equal(c.state.quickRepliesOpen, null);
+    assert.equal(entry.text, '보존할 초안');
+    c.get('chat-attach-inline').events.click();
+    assert.ok(!c.get('action-list').children.some(item => item.textContent === '빠른 답장'));
+  }
+});
+
 test('quick reply sheet sends the selected phrase with the existing draft, selection and attachments', async () => {
   const requests = [];
   const c = client(async (url, options) => {

@@ -6752,7 +6752,7 @@ function buildChatComposer(s) {
   const attachInline = button("＋", "chat-attach-inline", () => {
     if (!editorCurrent()) return;
     if (compactSessionLayout()) {
-      const choices = [attach, quick, reference, results, expand, clipboard, check, native, closeTerm, manage, capabilities, taskPlan, batch, fork, profile, delegate];
+      const choices = [attach, reference, results, expand, clipboard, check, native, closeTerm, manage, capabilities, taskPlan, batch, fork, profile, delegate];
       openActionSheet({ title: "입력 도구", trigger: attachInline, actions: choices.filter(control => !control.hidden).map(control => ({
         label: control.textContent, disabled: control.disabled, run: () => control.click(),
       })) });
@@ -6833,7 +6833,7 @@ function closeChatToolsOutside(event) {
   const settings = $("chat-settings-panel");
   if (settings?.isConnected && !settings.contains?.(event.target) && !event.target?.closest?.(".chat-model-controls")) closeChatSettings();
   const quick = state.quickRepliesOpen;
-  if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger) closeQuickReplies();
+  if (quick && !quick.panel.contains?.(event.target) && event.target !== quick.trigger && !quick.trigger?.contains?.(event.target)) closeQuickReplies();
   for (const id of ["chat-tools", "terminal-settings", "board-status"]) {
     const tools = $(id);
     if (tools?.open && !tools.contains?.(event.target)) tools.open = false;
@@ -9463,7 +9463,10 @@ function openQuickReplies(entry, input, trigger) {
     return prompt.mode === "insert" ? undefined : sendChat(entry);
   };
   const replies = quickReplies(), prompts = savedPrompts();
-  const composer = touchDevice() && document.activeElement === input ? input.closest?.(".chat-composer") : null;
+  // Compact sessions expose a direct button; keep its choices above the editor even
+  // before typing, instead of opening a bottom sheet over the small viewport.
+  const composer = compactSessionLayout() || touchDevice() && document.activeElement === input
+    ? input.closest?.(".chat-composer") : null;
   if (composer) {
     const same = state.quickRepliesOpen?.input === input;
     closeQuickReplies();
@@ -11026,7 +11029,10 @@ function dismissLocalMobileOverlay() {
     return true;
   }
   const open = [...(document.querySelectorAll?.("dialog[open]") || [])].filter((dialog) => dialog.open);
-  if (!open.length) return false;
+  if (!open.length) {
+    if (state.quickRepliesOpen) { closeQuickReplies(); return true; }
+    return false;
+  }
   const focused = document.activeElement?.closest?.("dialog[open]");
   const dialog = [...mobileDialogOrder].reverse().find((item) => open.includes(item)) || (open.includes(focused) ? focused : open[open.length - 1]);
   const event = new Event("cancel", { cancelable: true });
