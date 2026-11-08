@@ -8242,7 +8242,7 @@ test('the board text size is its own stored choice scaling the rem type scale, a
   c.windowEvents.DOMContentLoaded();
   c.get('text-size-small').events.change({ target: { checked: true } });
   assert.equal(root.attributes['data-text-size'], 'small');
-  for (const size of ['xsmall', 'xlarge']) {
+  for (const size of ['xsmall', 'xlarge', 'xxlarge', 'xxxlarge']) {
     c.get('text-size-' + size).events.change({ target: { checked: true } });
     assert.equal(root.attributes['data-text-size'], size);
     assert.equal(c.get('text-size-' + size).checked, true);
@@ -8320,7 +8320,7 @@ test('theme-init applies a forced theme and text size before paint, keeps meta o
   assert.deepEqual(run({ 'sessionholic:ui:theme': '"light"' }).metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
   const auto = run({ 'sessionholic:ui:theme': '"auto"', 'sessionholic:ui:textSize': '"default"' });
   assert.deepEqual(auto.attributes, {});
-  for (const size of ['xsmall', 'xlarge'])
+  for (const size of ['xsmall', 'xlarge', 'xxlarge', 'xxxlarge'])
     assert.equal(run({ 'sessionholic:ui:textSize': JSON.stringify(size) }).attributes['data-text-size'], size);
   assert.equal(auto.metas[0].attributes['data-original'], undefined);
   assert.deepEqual(run({ 'sessionholic:ui:theme': '{not json' }).attributes, {});
@@ -17407,7 +17407,7 @@ test('mobile text input begins on one line, caps at three, and keeps draft and c
   assert.equal(input.style.height, '77px', 'do not move the IME candidate region');
 });
 
-test('mobile session menu keeps model controls and native settings reachable with a draft', () => {
+test('mobile session menu keeps model controls and opens only board settings with a draft', () => {
   const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
   c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
   let settings = 0;
@@ -17421,8 +17421,10 @@ test('mobile session menu keeps model controls and native settings reachable wit
   const actions = c.get('action-list').children;
   assert.ok(actions.some(item => item.textContent === '모델 선택'));
   assert.ok(actions.some(item => item.textContent === '에포트 선택'));
-  actions.find(item => item.textContent === '라이언원 설정').events.click({ detail: 0 });
-  assert.equal(settings, 1); assert.equal(entry.text, '보존할 초안');
+  assert.ok(!actions.some(item => item.textContent === '라이언원 설정'));
+  actions.find(item => item.textContent === '하던일 설정').events.click({ detail: 0 });
+  assert.equal(c.get('settings-dialog').open, true);
+  assert.equal(settings, 0); assert.equal(entry.text, '보존할 초안');
 });
 
 test('iPad reserves its input accessory room before focus and keeps the same height through blur', () => {

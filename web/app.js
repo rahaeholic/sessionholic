@@ -162,7 +162,7 @@ const prefs = {
   },
 };
 const THEMES = ["auto", "light", "dark"];
-const TEXT_SIZES = ["xsmall", "small", "default", "large", "xlarge"];
+const TEXT_SIZES = ["xsmall", "small", "default", "large", "xlarge", "xxlarge", "xxxlarge"];
 const state = {
   snapshot: null,
   capabilities: null,
@@ -551,8 +551,7 @@ function compactSessionActions() {
       if (control) actions.push({ label: `${label} ${control.checked ? "끄기" : "켜기"}`, run: () => control.click() });
     }
   }
-  actions.push({ label: "화면 설정", run: openSettings });
-  if (ryanOneCompact()) actions.push({ label: "라이언원 설정", run: () => window.RyanOneHost.openSettings() });
+  actions.push({ label: "하던일 설정", run: openSettings });
   return actions;
 }
 function openCompactSessionMenu(trigger) {
@@ -578,20 +577,14 @@ function syncCompactSessionLayout() {
   document.documentElement.setAttribute?.("data-compact-mobile", String(compact));
   setClass(document.body, "compact-session", compact && !!(state.detailShown || state.terminalVisible));
   window.RyanOneHost?.setSessionFocused?.(!!(state.detailShown || state.terminalVisible));
-  const settings = $("settings");
   const draft = $("terminal-draft");
   if (draft) {
     draft.originalPlaceholder ??= draft.placeholder;
     draft.placeholder = compact ? "터미널 입력…" : draft.originalPlaceholder;
   }
   if (!compact) {
-    if (settings?.compactOriginal) { settings.innerHTML = settings.compactOriginal; settings.setAttribute("aria-label", "화면 설정"); }
     placeModeTabs($("detail"), !state.chromeVisible);
     return;
-  }
-  if (settings) {
-    settings.compactOriginal ||= settings.innerHTML;
-    settings.textContent = "⋯"; settings.setAttribute("aria-label", "하던일 메뉴");
   }
   const head = $("detail")?.querySelector?.(".detail-head");
   if (head) {
@@ -642,8 +635,6 @@ function toggleTerminalKeys() {
 }
 window.addEventListener("ryanone-ready", () => {
   if (!ryanOneCompact()) return;
-  $("settings").textContent = "⋯";
-  $("settings").setAttribute("aria-label", "하던일 메뉴");
   syncCompactSessionLayout();
   setReading(true);
 });
@@ -16127,7 +16118,7 @@ window.addEventListener("DOMContentLoaded", () => {
       state.historyCursor = window.history.state;
     }
   });
-  $("settings").addEventListener("click", event => compactSessionLayout() ? openCompactSessionMenu(event.currentTarget) : openSettings());
+  $("settings").addEventListener("click", openSettings);
   $("terminal-compose")?.addEventListener("click", useSessionComposer);
   document.addEventListener("focusin", (event) => {
     if (state.terminalVisible && (event.target?.closest?.("#terminal-screen") || event.target?.id === "chat-input" && sessionComposerTerminal()))

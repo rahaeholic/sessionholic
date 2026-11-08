@@ -5796,6 +5796,12 @@ body.edge-settling :is(.app, .app > *, .list-pane, .detail-pane, .terminal-scree
 :root[data-text-size="xlarge"] {
   font-size: 125%;
 }
+:root[data-text-size="xxlarge"] {
+  font-size: 137.5%;
+}
+:root[data-text-size="xxxlarge"] {
+  font-size: 150%;
+}
 
 /* --- Top bar and the large title ------------------------------------------ */
 .home-label {
@@ -6519,7 +6525,7 @@ dialog.action-sheet.is-popover {
   margin-top: 18px;
 }
 .text-size-picker {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(4rem, 1fr));
 }
 .text-size-option {
   gap: 0;
@@ -6542,6 +6548,12 @@ dialog.action-sheet.is-popover {
 }
 .text-size-sample.xlarge {
   font-size: 1.5625rem;
+}
+.text-size-sample.xxlarge {
+  font-size: 1.75rem;
+}
+.text-size-sample.xxxlarge {
+  font-size: 1.9375rem;
 }
 .push-actions {
   display: flex;
@@ -8248,8 +8260,14 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 }
 
 /* Mobile sessions share one compact layout in browsers and the Android host. */
+:root[data-compact-mobile="true"] .top { flex-wrap: wrap; }
+:root[data-compact-mobile="true"] .top .home-label,
+:root[data-compact-mobile="true"] .top .quick-reload span { display: none; }
+:root[data-compact-mobile="true"] .top .quick-reload { width: 44px; padding: 0; }
+:root[data-compact-mobile="true"] .top .quick-reload svg { display: block; }
+:root[data-compact-mobile="true"] .top .workspace-split-open { min-height: 44px; }
 .terminal-keys-toggle, .compact-terminal-menu, .compact-connection, .ryan-recording, .compact-launcher-actions { display: none; }
-:root[data-compact-mobile="true"] .compact-session #app > .top { display: none; }
+:root[data-compact-mobile="true"] .compact-session:not(.workspace-split) #app > .top { display: none; }
 :root[data-compact-mobile="true"] .compact-session #session-layout { display: flex; flex-direction: column; min-height: 0; }
 :root[data-compact-mobile="true"] .compact-session #task-list-pane { display: none; }
 :root[data-compact-mobile="true"] .compact-session #detail { display: flex; flex: 1; width: 100%; min-height: 0; }
