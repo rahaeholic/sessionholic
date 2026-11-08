@@ -13559,7 +13559,7 @@ test('both iPad panes follow a scrolled keyboard viewport through blur until the
   assert.equal(vars['--app-shift'], '422px');
   c.updateViewport(); assert.equal(vars['--app-shift'], '422px');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  assert.match(css, /body\.app-shifted \.app,\s*body\.app-shifted \.terminal-screen\s*\{\s*transform: translateY\(var\(--app-shift/);
+  assert.match(css, /body\.app-shifted \.app,\s*body\.app-shifted:not\(\.terminal-inline\) \.terminal-screen\s*\{\s*transform: translateY\(var\(--app-shift/);
   c.context.window.innerHeight = 788;
   c.context.window.visualViewport = { height: 788, pageTop: 0, offsetTop: 0, scale: 1 };
   c.updateViewport(); assert.equal(vars['--app-shift'], '0px');
@@ -17398,4 +17398,48 @@ test('mobile session menu keeps model controls and native settings reachable wit
   assert.ok(actions.some(item => item.textContent === '에포트 선택'));
   actions.find(item => item.textContent === '라이언원 설정').events.click({ detail: 0 });
   assert.equal(settings, 1); assert.equal(entry.text, '보존할 초안');
+});
+
+test('iPad reserves its input accessory room before focus and keeps the same height through blur', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
+  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
+  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '779px');
+  for (const id of ['chat-input','terminal-draft']) {
+    c.context.document.activeElement = { tagName: 'TEXTAREA', id };
+    c.context.window.visualViewport.height = 779;
+    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+    c.context.document.activeElement = null;
+    c.context.window.visualViewport.height = 834;
+    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+  }
+  c.context.document.activeElement = { tagName: 'TEXTAREA' };
+  c.context.window.visualViewport.height = 764;
+  c.updateViewport(); assert.equal(vars['--app-height'], '764px');
+  c.context.document.activeElement = null; c.context.window.visualViewport.height = 834;
+  c.updateViewport(); assert.equal(vars['--app-height'], '764px', 'keep the larger measured bar after blur');
+  c.context.document.activeElement = { tagName: 'TEXTAREA' }; c.context.window.visualViewport.height = 434;
+  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'software keyboard is not charged twice');
+  c.context.window.innerHeight = 434;
+  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'resizes-content keyboard is not charged twice');
+  c.context.document.activeElement = null;
+  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
+  c.updateViewport(); assert.equal(vars['--app-height'], '1124px', 'rotation recomputes full height');
+  c.context.window.visualViewport = { height: 597, scale: 2 };
+  c.updateViewport(); assert.equal(vars['--app-height'], '597px', 'pinch zoom keeps the actual visual viewport');
+});
+
+test('iPad room belongs to the top-level screen; desktop, Android and child panes keep their own height', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
+  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  for (const userAgent of ['Mozilla/5.0 Macintosh','Mozilla/5.0 Android 15']) {
+    c.context.navigator = { userAgent }; c.updateViewport(); assert.equal(vars['--app-height'], '834px');
+  }
+  c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
+  c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true };
+  c.context.window.innerHeight = 779; c.context.window.visualViewport.height = 779;
+  c.updateViewport(); assert.equal(vars['--app-height'], '779px', 'parent already reserved the room');
 });

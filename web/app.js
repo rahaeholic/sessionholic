@@ -15575,6 +15575,9 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
+// Keep room for iPad's hardware-keyboard accessory bar even before an editor takes focus.
+// A larger measured accessory bar is remembered for this page, never a software keyboard.
+const IPAD_INPUT_ROOM = 55;
 // The height the app has: the visual viewport (an on-screen keyboard takes its space), except
 // that without a focused text field no keyboard takes space, so a visual viewport shorter than
 // the window is stale: iPadOS reports one for a moment when the app comes back from the
@@ -15582,8 +15585,16 @@ async function lock() {
 // visual viewport is then meant to be smaller).
 function viewportHeight() {
   const viewport = window.visualViewport;
-  const height = viewport?.height || window.innerHeight || 800;
-  if (!editingText() && (viewport?.scale || 1) <= 1.01 && window.innerHeight > height) return window.innerHeight;
+  let height = viewport?.height || window.innerHeight || 800;
+  const unzoomed = (viewport?.scale || 1) <= 1.01;
+  if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
+  // The parent already reserved room before sizing its split-pane iframes.
+  if (unzoomed && document.documentElement.hasAttribute?.("data-ipad") && !window.SessionholicWorkspace?.embedded) {
+    const inset = keyboardInset();
+    if (editingText() && inset > 0 && inset <= KEYBOARD_MIN_PX)
+      state.ipadInputRoom = Math.max(state.ipadInputRoom || IPAD_INPUT_ROOM, Math.round(inset));
+    height = Math.min(height, Math.max(0, (state.viewportTall || window.innerHeight || height) - (state.ipadInputRoom || IPAD_INPUT_ROOM)));
+  }
   return height;
 }
 function updateViewport() {
