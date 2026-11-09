@@ -5397,6 +5397,26 @@ test('분할 창(휴대폰 폭의 데스크톱 창)에서 우클릭 메뉴는 1�
   }
 });
 
+test('데스크톱 보드의 분할 창은 칸 폭이 좁아도 휴대폰 압축 화면이 아니고, 빠른 답장도 1번 창처럼 시트로 연다', () => {
+  for (const desktopPane of [true, false]) {
+    const c = client(undefined, noChatTimers);
+    c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+    c.context.window.innerWidth = 450; c.context.window.innerHeight = 900;
+    c.context.document.documentElement.hasAttribute = (name) => desktopPane && name === 'data-desktop-pane';
+    assert.equal(vm.runInContext('compactSessionLayout()', c.context), !desktopPane);
+    const { entry } = selectChat(c); const input = c.get('chat-input');
+    const composer = node(); composer.append = function (panel) { this.children.push(panel); };
+    input.closest = () => composer;
+    c.openQuickReplies(entry, input, null);
+    assert.equal(c.get('action-sheet').open === true, desktopPane, desktopPane ? 'a desktop pane opens the sheet' : 'a phone keeps the inline list');
+    assert.equal(composer.children.length, desktopPane ? 0 : 1);
+  }
+  const android = client(undefined, noChatTimers);
+  android.context.window.matchMedia = () => ({ matches: false });
+  android.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  assert.equal(vm.runInContext('compactSessionLayout()', android.context), true, 'Android stays compact at any width');
+});
+
 test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, 입력이 막히면 비활성이다', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);

@@ -534,7 +534,12 @@ function navTransition(direction, update) {
 }
 // Phone screens: the list or one conversation. State changes at once (chat
 // reads depend on it); only the visible switch may wait for the transition.
-function compactSessionLayout() { return phoneLayout() || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || ""); }
+// A split pane of a board wider than a phone ([data-desktop-pane], theme-init.js and workspace.js)
+// lays out like the board's first pane, not like a phone, whatever its own width.
+function compactSessionLayout() {
+  const desktopPane = !!document.documentElement?.hasAttribute?.("data-desktop-pane");
+  return (phoneLayout() && !desktopPane) || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || "");
+}
 function ryanOneCompact() { return window.RyanOneHost?.compact === true; }
 function compactSessionActions() {
   const actions = [];
