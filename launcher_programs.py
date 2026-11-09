@@ -27,6 +27,8 @@ INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
 # ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
+# A host name or alias, never an option (`ssh -G` is asked about it).
+SSH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
 
 def table(runner=None, uid=None):
@@ -89,11 +91,40 @@ def program_of(command):
                     next(words, None)
                 continue
             host = word.rsplit("@", 1)[-1]
-            if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", host):
+            if SSH_NAME.fullmatch(host):
                 found["sshHost"] = host
             break
         return found
     return None
+
+
+def ssh_hostname(alias):
+    """The machine this host's SSH settings reach for `alias` (`ssh -G`), or None."""
+    if not isinstance(alias, str) or not SSH_NAME.fullmatch(alias):
+        return None
+    try:
+        out = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "hostname":
+            return value.strip().lower() or None
+    return None
+
+
+def ssh_board_host(destination, ssh_hosts, resolve=ssh_hostname):
+    """The board host ({name: its SSH alias}) whose alias reaches the same machine as an SSH
+    run's destination here: `bk` and `beaulink` differ only in name. None when none does."""
+    if not isinstance(destination, str) or not isinstance(ssh_hosts, dict):
+        return None
+    pairs = sorted((name, alias) for name, alias in ssh_hosts.items()
+                   if isinstance(name, str) and isinstance(alias, str))
+    for name, alias in pairs:
+        if destination in (name, alias):
+            return name
+    target = resolve(destination)
+    return next((name for name, alias in pairs if target and resolve(alias) == target), None)
 
 
 def describe(terminals, launcher, rows):
@@ -185,6 +216,11 @@ def launcher_programs(args):
         exact = held_codex(terminal.get("holdName"), rows)
         if exact:
             result[identifier] = exact
+        elif result[identifier].get("sshHost"):
+            # Named by the board host it reaches, so the board looks for its session there.
+            board = ssh_board_host(result[identifier]["sshHost"], args.get("sshHosts"))
+            result[identifier] = {**result[identifier], "sshHost": board} if board else \
+                {key: value for key, value in result[identifier].items() if key != "sshHost"}
     return {"terminals": result}
 
 

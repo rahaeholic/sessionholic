@@ -109,6 +109,32 @@ class ExactCodexTest(unittest.TestCase):
             self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
             self.assertIsNone(lp.held_codex("../other", rows))
 
+    def test_an_ssh_destination_is_named_by_the_board_host_its_alias_reaches_here(self):
+        machines = {"bk": "pc.tail.ts.net", "beaulink": "pc.tail.ts.net", "air15": "air15", "elsewhere": "elsewhere"}
+        hosts = {"beaulink": "beaulink", "air15": "air15", "local": None}
+        self.assertEqual(lp.ssh_board_host("bk", hosts, machines.get), "beaulink")
+        self.assertEqual(lp.ssh_board_host("beaulink", hosts, lambda alias: self.fail("asked")), "beaulink")
+        self.assertIsNone(lp.ssh_board_host("elsewhere", hosts, machines.get))
+        self.assertIsNone(lp.ssh_board_host("bk", None, machines.get))
+        # Never handed to ssh as an option.
+        with patch("subprocess.run") as run:
+            self.assertIsNone(lp.ssh_hostname("-oProxyCommand=x"))
+            self.assertIsNone(lp.ssh_hostname("-v"))
+            run.assert_not_called()
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "user r\nhostname PC.Tail.ts.net\n", "")) as run:
+            self.assertEqual(lp.ssh_hostname("bk"), "pc.tail.ts.net")
+            self.assertEqual(run.call_args[0][0], ["ssh", "-G", "bk"])
+        # The reply names the board host, or nothing when no board host is that machine.
+        terminal = {"id": FIRST, "createdAt": 1}
+        seen = {FIRST: {"program": "ssh", "cwd": None, "sshHost": "bk", "pid": 12}}
+        with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
+                patch.object(lp, "describe", side_effect=lambda *a: {k: dict(v) for k, v in seen.items()}), \
+                patch.object(lp, "held_codex", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get):
+            reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"beaulink": "beaulink"}})
+            self.assertEqual(reply["terminals"][FIRST]["sshHost"], "beaulink")
+            reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"air15": "air15"}})
+            self.assertNotIn("sshHost", reply["terminals"][FIRST])
+
     def test_exact_hold_evidence_overrides_only_the_program_time_description(self):
         terminal = {"id": FIRST, "createdAt": 1, "holdName": "sh-0123456789abcdef"}
         evidence = {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native}
@@ -279,7 +305,7 @@ class WorkflowTest(unittest.TestCase):
                         break
                     time.sleep(0.02)
                 flow.describe_launchers()
-        self.assertEqual(calls, [("laptop", "launcher_programs", {"terminals": [{"id": FIRST, "createdAt": 100}]})])
+        self.assertEqual(calls, [("laptop", "launcher_programs", {"terminals": [{"id": FIRST, "createdAt": 100}], "sshHosts": {}})])
         self.assertEqual(terminals.saved, [(FIRST, {"program": "claude-agents", "cwd": "/p"})])
 
 
