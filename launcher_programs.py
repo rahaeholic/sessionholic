@@ -113,11 +113,12 @@ def ssh_hostname(alias):
     return None
 
 
-def ssh_board_host(destination, ssh_hosts, resolve=ssh_hostname):
+def ssh_board_host(destination, ssh_hosts, resolve=None):
     """The board host ({name: its SSH alias}) whose alias reaches the same machine as an SSH
     run's destination here: `bk` and `beaulink` differ only in name. None when none does."""
     if not isinstance(destination, str) or not isinstance(ssh_hosts, dict):
         return None
+    resolve = resolve or ssh_hostname
     pairs = sorted((name, alias) for name, alias in ssh_hosts.items()
                    if isinstance(name, str) and isinstance(alias, str))
     for name, alias in pairs:

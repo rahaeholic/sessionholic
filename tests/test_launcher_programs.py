@@ -129,7 +129,8 @@ class ExactCodexTest(unittest.TestCase):
         seen = {FIRST: {"program": "ssh", "cwd": None, "sshHost": "bk", "pid": 12}}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
                 patch.object(lp, "describe", side_effect=lambda *a: {k: dict(v) for k, v in seen.items()}), \
-                patch.object(lp, "held_codex", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get):
+                patch.object(lp, "held_codex", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get), \
+                patch("subprocess.run", side_effect=AssertionError("this host's real ssh settings were read")):
             reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"beaulink": "beaulink"}})
             self.assertEqual(reply["terminals"][FIRST]["sshHost"], "beaulink")
             reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"air15": "air15"}})
