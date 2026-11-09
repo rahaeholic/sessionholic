@@ -16140,6 +16140,8 @@ test('미확인 터미널은 자동 추정을 열지 않고 선택한 채팅을 
   c.get('detail-mode-chat').events.click(); await settle();
   view = c.state.launcherChatView;
   assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  view.candidates = null; c.renderLauncherChat();
+  assert.equal(view.select.value, s.key, 'a redrawn picker keeps the conversation chosen for this terminal');
   c.stopChatPolling();
 });
 
@@ -16204,6 +16206,8 @@ test('Claude 에이전트 뷰 터미널의 채팅 탭은 그 뒤 같은 폴더(�
     assert.equal(c.launcherChatCandidates({ ...terminal, program: 'claude' }).some((item) => item.id === 'own'), false);
     await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
     assert.equal(c.state.launcherWorkspace.terminalId, terminal.id, 'the terminal tab is never left by itself');
+    assert.equal(vm.runInContext('estimatedConversation(state.terminals[0])', c.context)?.id, 'own',
+      'terminal attachments point to the chat of the conversation it started');
     c.get('detail-mode-chat').events.click(); await settle();
     assert.equal(c.state.selected, keyOf(c, 'own'), 'opened as a list choice would');
     assert.equal(c.state.launcherWorkspace, null);

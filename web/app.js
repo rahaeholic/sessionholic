@@ -12686,6 +12686,7 @@ function agentViewConversation(terminal) {
 // terminal's input or attachment route.
 function estimatedConversation(terminal) {
   const info = terminalInfo(terminal);
+  if (info.program === "claude-agents") return agentViewConversation(terminal);
   if (!terminalEstimated(terminal) || !info.nativeSource || info.chatSource) return null;
   return allSessions().find((s) => sameRecoverySource(sourceOf(s), info.nativeSource)) || null;
 }
@@ -12736,7 +12737,8 @@ function renderLauncherChat() {
     view.select.replaceChildren(placeholder, ...options);
     // The one conversation an agent view started is offered ready to connect (still a press).
     const own = candidates.filter((s) => agentViewSession(terminalInfo(terminal), s));
-    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : source && candidates.some((s) => s.key === chatKey(source)) ? chatKey(source)
+    const linked = source && candidates.find((s) => sameRecoverySource(sourceOf(s), source));
+    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : linked ? linked.key
       : own.length === 1 ? own[0].key : "";
     view.candidates = signature;
   }
