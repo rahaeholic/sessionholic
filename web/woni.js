@@ -6,6 +6,7 @@
   const send = $("woni-send"), mic = $("woni-mic");
   const chatTab = $("woni-chat-tab"), workTab = $("woni-work-tab"), work = $("woni-work");
   const filterBox = $("woni-filter"), replyBox = $("woni-reply"), original = $("woni-original");
+  const replyPicks = $("woni-reply-suggestions");
   let api, services = {}, timer, reading = false, sending = false, pending = null, epoch = 0;
   let attachments = [], uploading = false, uploadAbort = null, composing = false, compositionEndedAt = 0, authEpoch = 0;
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
@@ -107,9 +108,12 @@
   function visibleAnswer(answer) {
     return String(answer || "").replace(/^[ \t]*(?:👉|🔊).*$/gmu, "").replace(/\n{3,}/g, "\n\n").trim();
   }
-  async function sendSuggestion(text) {
+  // target: the Woni answer being replied to. A suggestion tapped while replying to that answer goes as a reply to it.
+  async function sendSuggestion(text, target = null) {
     if (pending || sending || uploading) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
-    savePending({ text, requestId: crypto.randomUUID() });
+    const reply = target?.part === "answer" ? { id: target.id, part: "answer" } : null;
+    savePending({ text, requestId: crypto.randomUUID(), ...(reply ? { replyTo: reply } : {}) });
+    if (reply) replyBox.hidden = true;
     filter = null;
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -183,10 +187,24 @@
   }
   function setReply(chat, part) {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
-    replyTarget = { id: chat.id, part, excerpt: (part === "question" ? chat.text : chat.answer) || "" };
+    // The reply bar quotes the answer as shown: the 👉 and 🔊 lines are left out (the 👉 ones come back as buttons below it).
+    const answer = part === "answer";
+    replyTarget = { id: chat.id, part, excerpt: (answer ? visibleAnswer(chat.answer) || chat.answer : chat.text) || "",
+      suggestions: answer ? suggestedReplies(chat.answer) : [] };
     replyBox.hidden = false;
-    $("woni-reply-label").textContent = `${part === "question" ? "라이언 메시지" : "원이 답변"}에 답글 · ${replyTarget.excerpt}`;
+    $("woni-reply-label").textContent = `${answer ? "원이 답변" : "라이언 메시지"}에 답글 · ${replyTarget.excerpt}`;
+    renderReplyPicks();
     setView("chat"); input.focus?.();
+  }
+  // Ryan 2026-11-10: "이전 답변에 답글 남길 때도 추천답변 뜨게 해줘" (same as Ryan One app 1.38.1).
+  // Replying to an earlier Woni answer shows its 👉 suggestions under the reply bar; a tap sends one as a reply to it.
+  // The latest answer already has them under its bubble, so they are not repeated here.
+  function renderReplyPicks() {
+    const chats = Array.isArray(latestData?.chats) ? latestData.chats : [];
+    const target = replyTarget, latest = chats.at(-1)?.id;
+    const picks = target?.part === "answer" && !pending && !replyBox.hidden && target.id !== latest ? target.suggestions || [] : [];
+    replyPicks.replaceChildren(...picks.map((text) => action(text, () => sendSuggestion(text, target))));
+    replyPicks.hidden = !picks.length;
   }
   async function showOriginal(id) {
     const current = epoch;
@@ -366,7 +384,9 @@
       const replies = chat.answer && chat === chats.at(-1) && !pending ? suggestedReplies(chat.answer) : [];
       if (replies.length) {
         const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
-        for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply)));
+        // While Ryan is replying to this answer (checked at tap time), a suggestion goes as a reply to it as well.
+        const target = () => replyTarget?.id === chat.id && replyTarget.part === "answer" ? replyTarget : null;
+        for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply, target())));
         nodes.push(box);
       }
       else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…"));
@@ -387,6 +407,7 @@
     messages.dataset.loaded = "1";
     filterBox.hidden = view !== "chat" || !filter;
     $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
+    renderReplyPicks();
     const running = data.activity?.running || 0;
     status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.") : running ? `작업 중 ${running}건` : "나의 개인 비서";
   }
@@ -453,7 +474,7 @@
   $("woni-filter-clear").addEventListener("click", () => { filter = null; if (latestData) show(latestData); });
   $("woni-reply-clear").addEventListener("click", () => {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
-    replyTarget = null; replyBox.hidden = true;
+    replyTarget = null; replyBox.hidden = true; renderReplyPicks();
   });
   attach.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
@@ -498,7 +519,7 @@
     const ids = attachments.map((item) => item.id);
     const reply = replyTarget ? { id: replyTarget.id, part: replyTarget.part } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(ids.length ? { attachments: ids } : {}), ...(reply ? { replyTo: reply } : {}) });
-    input.value = ""; replyBox.hidden = true; filter = null;
+    input.value = ""; replyBox.hidden = true; filter = null; renderReplyPicks();
     services.voice?.stop(input);
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -524,7 +545,8 @@
     lock() {
       enabled = false; epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
-      input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; filter = null; latestData = null; workData = null;
+      input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; replyPicks.replaceChildren(); replyPicks.hidden = true;
+      filter = null; latestData = null; workData = null;
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       readThrough = null; serverRead = 0; readPosting = 0;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); renderAttachments();

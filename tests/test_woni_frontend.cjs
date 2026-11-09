@@ -19,7 +19,7 @@ function fixture(call, storage = new Map(), host = undefined) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-original']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original']) nodes[id] = element();
   nodes['woni-form'].submit = element();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
@@ -411,6 +411,81 @@ test('원이 답의 추천 답장(👉)을 버튼으로 보여 주고 누르면 
   assert.equal(nodes['woni-messages'].children.some(node => node.className === 'woni-suggestions'), false);  // 확인 전 두 번 보내지 않게 숨긴다
 });
 
+
+test('이전 원이 답에 답글을 고르면 답글 띠 아래에 그 답의 추천이 뜨고 누르면 그 답에 단 답글로 보낸다', async () => {
+  // 라이언 2026-11-10: "이전 답변에 답글 남길 때도 추천답변 뜨게 해줘" (Ryan One 앱 1.38.1과 같게)
+  const sent = [];
+  const chats = [
+    { id: 'older', text: '앞 질문', status: 'complete', answer: '앞 답이에요.\n\n👉 일정 잡아 줘 | 기한 알림 고쳐 줘\n🔊 앞 답 요약', finishedAt: 10 },
+    { id: 'alert-1', kind: 'alert', text: '원이가 먼저 알림', status: 'complete', answer: '발주 마감이 오늘이에요.\n\n👉 발주서 열어 줘', finishedAt: 15 },
+    { id: 'latest', text: '질문', status: 'complete', answer: '정리했어요.\n\n👉 응, 정리해 줘 | 장소 후보부터 봐 줘', finishedAt: 20 },
+  ];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push(JSON.parse(JSON.stringify(options.body))); return { id: options.body.requestId, status: 'queued' }; }
+    if (options?.method === 'POST') return {};
+    return { chats, activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const picks = nodes['woni-reply-suggestions'];
+  const menu = id => nodes['woni-messages'].children.find(node => node.dataset.chatId === id && node.className.includes('assistant'))
+    .children.find(node => node.className === 'woni-message-actions').children;
+  assert.equal(picks.hidden, true);
+  // 말풍선 아래 추천은 지금처럼 가장 최근 답에만
+  assert.equal(nodes['woni-messages'].children.filter(node => node.className === 'woni-suggestions').length, 1);
+  menu('older')[0].click();
+  assert.equal(nodes['woni-reply'].hidden, false);
+  assert.equal(nodes['woni-reply-label'].textContent, '원이 답변에 답글 · 앞 답이에요.');  // 👉·🔊 줄은 띠에서 뺀다
+  assert.equal(picks.hidden, false);
+  assert.deepEqual(picks.children.map(button => button.textContent), ['일정 잡아 줘', '기한 알림 고쳐 줘']);
+  assert.equal(picks.children[0].type, 'button');
+  nodes['woni-input'].value = '쓰던 초안';
+  await picks.children[0].click();
+  assert.deepEqual(sent, [{ text: '일정 잡아 줘', requestId: 'request-123456', replyTo: { id: 'older', part: 'answer' } }]);
+  assert.equal(nodes['woni-input'].value, '쓰던 초안');
+  assert.equal(nodes['woni-reply'].hidden, true);
+  assert.equal(picks.hidden, true);  // 확인 전 두 번 보내지 않게 숨긴다
+  const outgoing = nodes['woni-messages'].children.find(node => node.className === 'woni-message user' && !node.dataset.chatId);
+  assert.ok(JSON.stringify(outgoing.children).includes('↩ 답글 · 앞 답이에요.'));
+});
+
+test('먼저 알림에도 답글 추천이 뜨고, 최근 답·라이언 메시지·취소한 답글에는 띠 아래 추천을 두지 않는다', async () => {
+  const sent = [];
+  const chats = [
+    { id: 'alert-1', kind: 'alert', text: '원이가 먼저 알림', status: 'complete', answer: '발주 마감이 오늘이에요.\n\n👉 발주서 열어 줘', finishedAt: 15 },
+    { id: 'plain', text: '그냥 질문', status: 'complete', answer: '추천 없는 답', finishedAt: 18 },
+    { id: 'latest', text: '질문', status: 'complete', answer: '정리했어요.\n\n👉 응, 정리해 줘 | 장소 후보부터 봐 줘', finishedAt: 20 },
+  ];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push(JSON.parse(JSON.stringify(options.body))); return { id: options.body.requestId, status: 'queued' }; }
+    if (options?.method === 'POST') return {};
+    return { chats, activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const picks = nodes['woni-reply-suggestions'];
+  const message = (id, role) => nodes['woni-messages'].children.find(node => node.dataset.chatId === id && node.className.includes(role));
+  const reply = (id, role) => message(id, role).children.find(node => node.className === 'woni-message-actions').children[0].click();
+  reply('alert-1', 'assistant');
+  assert.deepEqual(picks.children.map(button => button.textContent), ['발주서 열어 줘']);
+  assert.equal(picks.hidden, false);
+  nodes['woni-reply-clear'].click();
+  assert.equal(picks.hidden, true);
+  reply('plain', 'assistant');
+  assert.equal(picks.hidden, true);
+  reply('latest', 'user');
+  assert.equal(nodes['woni-reply-label'].textContent, '라이언 메시지에 답글 · 질문');
+  assert.equal(picks.hidden, true);
+  // 최근 답은 말풍선 아래에 이미 있으니 띠 아래에 또 두지 않고, 그 칩을 누르면 그 답에 단 답글로 간다.
+  reply('latest', 'assistant');
+  assert.equal(picks.hidden, true);
+  const box = nodes['woni-messages'].children.find(node => node.className === 'woni-suggestions');
+  await box.children[1].click();
+  assert.deepEqual(sent, [{ text: '장소 후보부터 봐 줘', requestId: 'request-123456', replyTo: { id: 'latest', part: 'answer' } }]);
+  assert.equal(nodes['woni-reply'].hidden, true);
+});
 
 test('Android 호스트가 있을 때만 정확한 대화로 이동하고 기존 웹은 유지한다', async () => {
   const calls = [];
