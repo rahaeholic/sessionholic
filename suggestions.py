@@ -18,11 +18,15 @@ import threading
 import time
 
 COUNT = 3
-MAX_REPLY = 40
+# A reply is sent exactly as shown: one too long to be a reply is left out, never cut short.
+MAX_REPLY = 120
+# Part of every kept reply's key: replies kept by an earlier version (cut at 40 characters) are asked again.
+FORMAT = 2
 MAX_QUESTION = 2000
 MAX_ANSWER = 6000
 CACHE_LIMIT = 400
 TIMEOUT = 45
+AT_ONCE = 2  # model runs at the same time; more answers wait their turn (each run may take TIMEOUT)
 AGENTS = ("codex", "claude")
 PROMPT = """아래는 사용자와 AI 코딩 에이전트의 대화 마지막 부분입니다.
 사용자가 이 답변에 이어서 보낼 법한 짧은 답장 {count}개를 제안하세요.
@@ -81,8 +85,8 @@ def parse(text):
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, str):
             continue
-        reply = " ".join(item.split())[:MAX_REPLY].strip()
-        if reply and reply not in replies:
+        reply = " ".join(item.split())
+        if reply and len(reply) <= MAX_REPLY and reply not in replies:
             replies.append(reply)
     return replies[:COUNT]
 
@@ -104,6 +108,7 @@ class Suggestions:
         self.enabled = enabled
         self.runner = runner
         self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(AT_ONCE)
         self.pending = set()
         self.cache = self._load()
 
@@ -136,8 +141,10 @@ class Suggestions:
         question, answer = data.get("question") or "", data.get("answer")
         if not isinstance(question, str) or not isinstance(answer, str) or not answer.strip():
             raise ValueError("추천 답변에 쓸 답변이 없습니다.")
-        question, answer = question[-MAX_QUESTION:], answer[-MAX_ANSWER:]
-        digest = hashlib.sha256(json.dumps([identity, question, answer], ensure_ascii=False).encode()).hexdigest()
+        # Half an emoji (a lone surrogate) from a text cut by the page would fail every later encode.
+        question, answer = (text[-limit:].encode("utf-8", "replace").decode("utf-8")
+                            for text, limit in ((question, MAX_QUESTION), (answer, MAX_ANSWER)))
+        digest = hashlib.sha256(json.dumps([FORMAT, identity, question, answer], ensure_ascii=False).encode()).hexdigest()
         with self.lock:
             kept = self.cache.get(digest)
             if kept is not None:
@@ -156,7 +163,8 @@ class Suggestions:
 
     def _fill(self, digest, question, answer):
         try:
-            replies = parse(self.runner(PROMPT.format(count=COUNT, question=question or "(없음)", answer=answer)))
+            with self.slots:
+                replies = parse(self.runner(PROMPT.format(count=COUNT, question=question or "(없음)", answer=answer)))
         except Exception:
             replies = []
         with self.lock:

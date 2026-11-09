@@ -17530,17 +17530,19 @@ function suggestionClient(reply) {
   const timers = { setTimeout: (callback, ms) => { if (ms === 2500) waits.push(callback); return 1; }, clearTimeout() {} };
   const c = client(async (url, options) => {
     requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    if (reply.fail?.(url)) throw new Error('network');
     const json = url === '/api/chat/suggestions' ? reply.current
+      : url.startsWith('/api/history/message') ? reply.history
       : url === '/api/chat/state' ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' };
     return { ok: true, status: 200, json: async () => json };
   }, timers);
   const { s, entry } = selectChat(c);
   c.state.capabilities = { ...(c.state.capabilities || {}), suggestedReplies: true };
-  const show = (answer, question = '테스트 고쳐 줘') => {
+  const show = (answer, question = '테스트 고쳐 줘', extra = {}) => {
     const list = c.get('messages');
     list.conversationSource = c.chatKey(entry.source);
     list.conversationRows = [{ message: { role: 'user', text: question } }, { message: { role: 'tool', text: 'ls' } },
-      { message: { role: 'assistant', text: answer } }];
+      { message: { role: 'assistant', text: answer, ...extra } }];
     c.updateChatComposer(entry);
   };
   const chips = () => Array.from(c.get('chat-suggestions').children, (chip) => chip.textContent);
@@ -17573,6 +17575,50 @@ test('추천 답변은 답변당 한 번 받아 입력칸 위에 띄우고, 누�
   c.stopChatPolling();
 });
 
+test('추천 답변: 보낸 뒤 이전 칩을 숨기고, 긴 답변은 끝부분으로, 실패는 1분 뒤 다시, 공백 초안은 지운다', async () => {
+  const reply = { current: { status: 'ready', replies: ['네, 진행해 주세요.'] } };
+  const { c, s, entry, requests, waits, show, chips } = suggestionClient(reply);
+  show('고쳤습니다. 진행할까요?'); await settle();
+  assert.deepEqual(chips(), ['네, 진행해 주세요.']);
+  // A message just sent waits for the agent: the previous answer's chips are gone (no second send).
+  entry.outbox = [{ text: '네, 진행해 주세요.', state: 'sent' }];
+  c.updateChatComposer(entry);
+  assert.equal(c.get('chat-suggestions').hidden, true);
+  entry.outbox = [];
+  // A 👉 used inside an answer is no reply; only a closing `👉 a | b` line is.
+  show('👉 RustDesk의 Air15 창을 여세요\n그다음 알려 주세요.'); await settle();
+  assert.equal(requests.at(-1).url, '/api/chat/suggestions', 'the board is asked instead');
+  // A long answer cut at 4000 characters: its end is read from the record, and its 👉 line used.
+  const hash = 'a'.repeat(64);
+  reply.history = { readOnly: true, text: '…끝부분입니다. 어떻게 할까요?\n👉 배포해 | 보류해', bodyHash: hash };
+  const before = requests.filter((r) => r.url === '/api/chat/suggestions').length;
+  show('가'.repeat(4000), '긴 보고 해 줘', { truncated: true, fullLength: 9000, bodyHash: hash, recordOffset: 12 }); await settle();
+  const read = requests.find((r) => r.url.startsWith('/api/history/message'));
+  assert.match(read.url, /textOffset=3000/);
+  assert.deepEqual(chips(), ['배포해', '보류해']);
+  assert.equal(requests.filter((r) => r.url === '/api/chat/suggestions').length, before, 'no model run for its own 👉 line');
+  // Half an emoji at the cut is dropped before sending.
+  assert.equal(vm.runInContext('textTail', c.context)('😀abc', 4), 'abc');
+  // A request that never settles is asked again after a minute (not before), at most three times.
+  reply.current = { status: 'pending', replies: [] };
+  show('다른 답변입니다.'); await settle();
+  for (let i = 0; i < 24; i++) { waits.shift()?.(); await settle(); }
+  const asked = requests.filter((r) => r.url === '/api/chat/suggestions').length;
+  c.updateChatComposer(entry); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/suggestions').length, asked, 'not again at once');
+  entry.suggestions.againAt = 1;
+  c.updateChatComposer(entry); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/suggestions').length, asked + 1, 'again after the wait');
+  assert.equal(entry.suggestions.attempts, 2);
+  // Stray spaces or line breaks in the draft are not sent with the reply.
+  reply.current = { status: 'ready', replies: ['좋아요'] };
+  show('마지막 답변'); await settle();
+  entry.text = '  \n'; c.get('chat-input').value = '  \n';
+  await vm.runInContext('sendSuggestedReply', c.context)(entry, '좋아요'); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/send').at(-1).body.text, '좋아요');
+  c.stopChatPolling();
+});
+
 test('답변 끝의 👉 줄이 있으면 그 답장을 쓰고, 보드 기능이 꺼져 있으면 다시 묻지 않는다', async () => {
   const reply = { current: { status: 'off', replies: [] } };
   const { c, requests, show, chips } = suggestionClient(reply);
@@ -17593,4 +17639,6 @@ test('답변 끝의 👉 줄이 있으면 그 답장을 쓰고, 보드 기능이
   other.c.stopChatPolling();
   // On a phone they stay one sideways-scrolling row above the editor.
   assert.match(styleSheet(), /:root\[data-compact-mobile="true"\] \.chat-suggestions \{[^}]*flex-wrap: nowrap;[^}]*overflow-x: auto/);
+  // Each chip shows its whole reply (what a tap sends): it wraps inside the row instead of spilling onto the next chip.
+  assert.match(styleSheet(), /:root\[data-compact-mobile="true"\] \.chat-suggestion \{[^}]*max-width: 85%;[^}]*white-space: normal/);
 });

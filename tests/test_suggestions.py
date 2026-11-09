@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -63,6 +64,28 @@ class SuggestionsTest(unittest.TestCase):
         self.assertEqual(self.ask(board), {"status": "failed", "replies": []})
         self.assertEqual(len(self.prompts), 1)
 
+    def test_at_most_two_model_runs_at_once_and_half_an_emoji_does_not_break_a_request(self):
+        release, running, peak, lock = threading.Event(), [0], [0], threading.Lock()
+
+        def runner(prompt):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            release.wait(5)
+            with lock:
+                running[0] -= 1
+            return '["네"]'
+        board = suggestions.Suggestions(self.path, enabled=True, runner=runner)
+        for index in range(4):
+            board.request({"source": SOURCE, "question": "\ud83d질문", "answer": "답변 %d" % index})
+        time.sleep(0.3)
+        self.assertEqual(peak[0], suggestions.AT_ONCE)
+        release.set()
+        for thread in threading.enumerate():
+            if thread.name == "suggested-replies":
+                thread.join(5)
+        self.assertEqual(board.request({"source": SOURCE, "question": "\ud83d질문", "answer": "답변 0"})["status"], "ready")
+
     def test_bad_requests_are_refused(self):
         board = self.make()
         for data in (None, {"source": {**SOURCE, "agent": "bash"}, "answer": "a"},
@@ -82,7 +105,10 @@ class SuggestionsTest(unittest.TestCase):
         self.assertEqual(suggestions.parse('네\n["  하나 ", "둘", "둘", 3, "", "셋", "넷"] 끝'), ["하나", "둘", "셋"])
         self.assertEqual(suggestions.parse("배열이 없음"), [])
         self.assertEqual(suggestions.parse('[깨진 json'), [])
-        self.assertEqual(len(suggestions.parse(json.dumps(["가" * 100]))[0]), suggestions.MAX_REPLY)
+        # Sent exactly as shown: a long reply stays whole, one too long to be a reply is left out (never cut).
+        long_reply = "배포 전에 변경 파일 목록과 테스트 결과, 그리고 운영 영향 범위를 먼저 정리해서 보여 줘"
+        self.assertEqual(suggestions.parse(json.dumps([long_reply, "짧게"])), [long_reply, "짧게"])
+        self.assertEqual(suggestions.parse(json.dumps(["가" * 100, "나" * (suggestions.MAX_REPLY + 1)])), ["가" * 100])
 
     def test_the_cli_runs_without_settings_hooks_tools_or_a_saved_session(self):
         home = Path(self.temp.name) / "home"

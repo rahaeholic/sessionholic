@@ -9433,10 +9433,19 @@ function saveSharedQuickReplies() {
 // The answer's own `👉 a | b | c` line (as 원이 writes it) wins; otherwise the board is asked once
 // per answer (suggestions.py, off unless the host turns it on). A tap sends like a quick reply.
 const SUGGESTION_RETRY_MS = 2500;
-const SUGGESTION_TRIES = 12;
+const SUGGESTION_TRIES = 24;  // 60 seconds: longer than the board's 45 second model limit
+const SUGGESTION_AGAIN_MS = 60000;  // an answer whose request failed or timed out is asked again after this
+const SUGGESTION_ATTEMPTS = 3;
+const SUGGESTION_TAIL = 6000;
+// Only a closing `👉 a | b | c` line offers replies: a 👉 used inside the answer is not one.
 function answerSuggestedReplies(text) {
-  const line = String(text || "").split("\n").find((item) => /^\s*👉/u.test(item));
-  return line ? line.replace(/^\s*👉️?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 3) : [];
+  const line = String(text || "").split("\n").map((item) => item.trim()).filter(Boolean).at(-1) || "";
+  return /^👉/u.test(line) && line.includes("|")
+    ? line.replace(/^👉️?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 3) : [];
+}
+// The end of a text cut by code unit, without a lone surrogate (half an emoji) at its start.
+function textTail(text, size) {
+  return String(text || "").slice(-size).replace(/^[\uDC00-\uDFFF]/, "");
 }
 function lastExchange(entry) {
   const list = $("messages");
@@ -9445,21 +9454,47 @@ function lastExchange(entry) {
   const answer = rows.at(-1);
   if (answer?.role !== "assistant" || !String(answer.text || "").trim()) return null;
   const question = rows.slice(0, -1).reverse().find((m) => m.role === "user");
-  return { question: String(question?.text || ""), answer: String(answer.text) };
+  return { question: String(question?.text || ""), answer: String(answer.text), message: answer };
+}
+// A long answer reaches the page cut to its start; its end (where a question or a 👉 line is)
+// is read from the saved record as 전체 보기 does. On any failure the start stands in.
+async function suggestionAnswer(s, message, authEpoch) {
+  const text = String(message.text || "");
+  if (!message.truncated || !/^[a-f0-9]{64}$/.test(message.bodyHash || "") || !Number.isInteger(message.fullLength)) return text;
+  let scan = Number.isInteger(message.recordOffset) ? message.recordOffset : 0, recent = !Number.isInteger(message.recordOffset);
+  try {
+    for (let page = 0; page < 8; page++) {
+      const params = new URLSearchParams({ ...sourceOf(s), bodyHash: message.bodyHash, offset: String(scan),
+        textOffset: String(Math.max(0, message.fullLength - SUGGESTION_TAIL)), recent: recent ? "1" : "0" });
+      const data = await api(`/api/history/message?${params}`, { authEpoch });
+      if (data?.readOnly !== true || data.error) break;
+      if (data.forwardFallback === true && recent) { recent = false; scan = 0; continue; }
+      if (typeof data.text === "string" && data.bodyHash === message.bodyHash) return data.text;
+      if (!Number.isInteger(data.nextOffset) || data.nextOffset <= scan) break;
+      scan = data.nextOffset;
+    }
+  } catch {
+    /* the start of the answer stands in */
+  }
+  return text;
 }
 function renderChatSuggestions(entry, selected, ready) {
   const box = $("chat-suggestions");
   if (!box) return;
-  const exchange = ready && !entry.text.trim() && !entry.attachments.length &&
+  // Nothing while a message just sent still waits for the agent: the previous answer's replies are stale.
+  const exchange = ready && !entry.text.trim() && !entry.attachments.length && !entry.sending && !entry.pending &&
+    !(entry.outbox || []).some(outboxAwaitsAgent) &&
     !["working", "needs_input"].includes(entry.data?.phase) && !!selected && sessionCategoryOf(selected) !== "bot" &&
     !chatOneShot(entry, selected) ? lastExchange(entry) : null;
   let replies = [];
   if (exchange) {
-    replies = answerSuggestedReplies(exchange.answer);
+    replies = exchange.message.truncated ? [] : answerSuggestedReplies(exchange.answer);
     const key = JSON.stringify([chatKey(entry.source), exchange.question, exchange.answer]);
-    if (!replies.length && entry.suggestions?.key === key) replies = entry.suggestions.replies;
-    else if (!replies.length && state.capabilities?.suggestedReplies === true && !state.suggestionsOff)
-      requestChatSuggestions(entry, key, exchange);
+    const job = entry.suggestions?.key === key ? entry.suggestions : null;
+    if (!replies.length && job) replies = job.replies;
+    if (!replies.length && (exchange.message.truncated || state.capabilities?.suggestedReplies === true) && !state.suggestionsOff &&
+        (!job || (job.againAt && Date.now() >= job.againAt && job.attempts < SUGGESTION_ATTEMPTS)))
+      requestChatSuggestions(entry, key, exchange, selected, (job?.attempts || 0) + 1);
   }
   const signature = JSON.stringify(replies);
   box.hidden = !replies.length;
@@ -9471,11 +9506,15 @@ function renderChatSuggestions(entry, selected, ready) {
     return chip;
   }));
 }
-async function requestChatSuggestions(entry, key, exchange) {
-  const job = entry.suggestions = { key, replies: [] };
+async function requestChatSuggestions(entry, key, exchange, selected, attempts = 1) {
+  const job = entry.suggestions = { key, replies: [], attempts, againAt: 0 };
   const authEpoch = state.authEpoch;
-  const body = { source: entry.source, question: exchange.question.slice(-2000), answer: exchange.answer.slice(-6000) };
-  for (let tries = 0; tries < SUGGESTION_TRIES; tries++) {
+  const answer = await suggestionAnswer(selected, exchange.message, authEpoch);
+  if (entry.suggestions !== job || authEpoch !== state.authEpoch) return;
+  job.replies = answerSuggestedReplies(answer);
+  const body = { source: entry.source, question: textTail(exchange.question, 2000), answer: textTail(answer, SUGGESTION_TAIL) };
+  let settled = !!job.replies.length || state.capabilities?.suggestedReplies !== true;
+  for (let tries = 0; !settled && tries < SUGGESTION_TRIES; tries++) {
     let data;
     try {
       data = await api("/api/chat/suggestions", { method: "POST", body, authEpoch });
@@ -9483,21 +9522,23 @@ async function requestChatSuggestions(entry, key, exchange) {
       break;
     }
     if (entry.suggestions !== job || authEpoch !== state.authEpoch) return;
-    if (data?.status === "off") { state.suggestionsOff = true; break; }
-    if (data?.status === "ready") {
+    if (data?.status === "off") state.suggestionsOff = true;
+    if (data?.status === "ready")
       job.replies = (Array.isArray(data.replies) ? data.replies : []).filter((item) => typeof item === "string" && item).slice(0, 3);
-      break;
-    }
-    if (data?.status !== "pending") break;
-    await new Promise((resolve) => setTimeout(resolve, SUGGESTION_RETRY_MS));
+    // "failed" is final on the board too; only no reply (an error or a timeout) is asked again later.
+    settled = data?.status !== "pending";
+    if (!settled) await new Promise((resolve) => setTimeout(resolve, SUGGESTION_RETRY_MS));
     if (entry.suggestions !== job) return;
   }
+  if (!settled) job.againAt = Date.now() + SUGGESTION_AGAIN_MS;
   if (entry.suggestions === job && currentChat(entry)) updateChatComposer(entry);
 }
 function sendSuggestedReply(entry, reply) {
   const input = $("chat-input");
   if (!currentChat(entry) || !input || input.disabled || input.readOnly || networkOffline() || !chatCanSend(entry) ||
       entry.composing || entry.sending || entry.pending || entry.uploads || entry.commandBusy) return;
+  // The chips show only over an empty draft: stray spaces or line breaks are not sent with the reply.
+  if (!entry.text.trim()) { input.value = ""; entry.text = ""; }
   insertChatText(entry, input, reply);
   return sendChat(entry);
 }
