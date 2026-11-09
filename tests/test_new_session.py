@@ -504,6 +504,21 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual([native['id'] for native in self.link()], [codex_row('1', 0)['id']])
         self.assertEqual([terminal_id for terminal_id, _ in self.terms.linked], [self.terminal['id']])
 
+    def test_a_launcher_that_went_over_ssh_takes_its_session_from_the_host_it_named(self):
+        # Opened on the local host, its launcher went to `remote` over SSH (a PC's 새 세션).
+        self.terminal.update(host='local', program='ssh', programHost='remote')
+        self.rows['local']['codex'] = [codex_row('5', 1001)]
+        self.rows['remote']['codex'] = [codex_row('1', 1003)]
+        self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'codex', 'id': codex_row('1', 0)['id'],
+                                        'home': '.codex', 'cwd': '/work/project'}])
+        self.assertEqual(self.terminal['linkConfidence'], 'estimated')
+
+    def test_ssh_to_an_unknown_or_its_own_host_takes_nothing(self):
+        for target in ('elsewhere', 'remote', None):
+            self.terminal.update(program='ssh', programHost=target)
+            self.rows['remote']['codex'] = [codex_row('1', 1003)]
+            self.assertEqual(self.link(), [], target)
+
     def test_a_claude_session_counts_with_its_session_id(self):
         self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
                                           'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'startedAt': 1020}]

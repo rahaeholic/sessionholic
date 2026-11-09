@@ -195,8 +195,13 @@ class ProgramTest(unittest.TestCase):
         self.assertEqual(lp.describe([terminal], LAUNCHER, menu), {FIRST: {"program": None, "launcher": True}})
         # A PC session the launcher opened: SSH is work of its own, never a menu.
         remote = menu + [(12, 11, opened + 9, "ssh -t -o BatchMode=yes beaulink powershell")]
-        self.assertEqual(lp.describe([terminal], LAUNCHER, remote), {FIRST: {"program": "ssh", "cwd": None, "pid": 12}})
-        self.assertEqual(lp.program_of("/usr/bin/ssh -t host"), {"program": "ssh", "cwd": None})
+        self.assertEqual(lp.describe([terminal], LAUNCHER, remote),
+                         {FIRST: {"program": "ssh", "cwd": None, "sshHost": "beaulink", "pid": 12}})
+        self.assertEqual(lp.program_of("/usr/bin/ssh -t host"), {"program": "ssh", "cwd": None, "sshHost": "host"})
+        # Option values are no destination; a login is not part of the host; nothing named, nothing claimed.
+        self.assertEqual(lp.program_of("ssh -tt -o ConnectTimeout=10 -p 22 -i /k/id me@pc.local cmd --payload x")["sshHost"], "pc.local")
+        self.assertNotIn("sshHost", lp.program_of("ssh -o BatchMode=yes"))
+        self.assertNotIn("sshHost", lp.program_of("ssh 'bad;host' cmd"))
         # No launcher named: no claim either way.
         self.assertEqual(lp.describe([terminal], LAUNCHER, []), {FIRST: {"program": None}})
 

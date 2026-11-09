@@ -25,6 +25,8 @@ LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
 INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
+# ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
+SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
 
 
 def table(runner=None, uid=None):
@@ -78,8 +80,19 @@ def program_of(command):
             return None
         return {"program": "codex", "cwd": None}
     # A session the launcher opened on another host (a PC's): work of its own, never a menu.
+    # Its destination (the first word that is no option or option value) names that host.
     if name == "ssh":
-        return {"program": "ssh", "cwd": None}
+        found, words = {"program": "ssh", "cwd": None}, iter(rest)
+        for word in words:
+            if word.startswith("-") and len(word) > 1:
+                if word[-1] in SSH_VALUE_OPTIONS:
+                    next(words, None)
+                continue
+            host = word.rsplit("@", 1)[-1]
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", host):
+                found["sshHost"] = host
+            break
+        return found
     return None
 
 

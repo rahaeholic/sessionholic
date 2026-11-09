@@ -2347,9 +2347,10 @@ class Workflow:
         difference allowed), and no other terminal names, is recorded as its own, once: its
         card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
         (Codex `exec`, Claude background agents) are never taken. A launcher seen running an
-        agent takes only that agent's sessions; one seen running SSH (its session is another
-        host's) or Claude's agent view (background sessions only) takes none here and so never
-        makes another launcher's session ambiguous."""
+        agent takes only that agent's sessions; one seen running SSH takes its session from the
+        board host its destination names (a PC's), never its own host's; one running Claude's agent
+        view (background sessions only) or SSH to an unknown host takes none and so never makes
+        another launcher's session ambiguous."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2357,9 +2358,16 @@ class Workflow:
             terminals = self.terminals.list()
         except (RuntimeError, OSError, ValueError):
             return
+        def session_host(terminal):
+            if terminal.get("program") == "claude-agents":
+                return None
+            if terminal.get("program") != "ssh":
+                return terminal.get("host")
+            target = terminal.get("programHost")
+            return next((h["name"] for h in self.board.hosts if target and h["name"] != terminal.get("host")
+                         and target in (h["name"], h.get("ssh"))), None)
         pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
-                          and not t.get("closed") and not t.get("nativeSource")
-                          and t.get("program") not in ("ssh", "claude-agents")
+                          and not t.get("closed") and not t.get("nativeSource") and session_host(t)
                           and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
         if not pending:
             return
@@ -2367,7 +2375,7 @@ class Workflow:
                  if isinstance(t.get("nativeSource"), dict)}
         found = []
         for terminal in pending:
-            host = terminal.get("host")
+            host = session_host(terminal)
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
             candidates = []

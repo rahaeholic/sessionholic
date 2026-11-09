@@ -1032,7 +1032,16 @@ class TmuxFixtureTest(unittest.TestCase):
         self.assertEqual((row["program"], row["programMenu"]), (None, True))
         self.manager.set_program(launched["id"], {"program": "ssh", "cwd": None})
         row = next(item for item in self.manager.list() if item["key"] == "launched")
-        self.assertEqual((row["program"], row["programMenu"]), ("ssh", False))
+        self.assertEqual((row["program"], row["programMenu"], row["programHost"]), ("ssh", False, None))
+        # Its destination is kept (and announced) only for SSH, and only as a host name.
+        before = len(changes)
+        self.manager.set_program(launched["id"], {"program": "ssh", "cwd": None, "sshHost": "beaulink"})
+        self.assertEqual(next(item for item in self.manager.list() if item["key"] == "launched")["programHost"], "beaulink")
+        self.assertEqual(len(changes), before + 1)
+        self.manager.set_program(launched["id"], {"program": "ssh", "sshHost": "a;b"})
+        self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "launched")["programHost"])
+        self.manager.set_program(launched["id"], {"program": "codex", "sshHost": "beaulink"})
+        self.assertIsNone(next(item for item in self.manager.list() if item["key"] == "launched")["programHost"])
         self.manager.set_program(launched["id"], {"program": None})
         self.assertFalse(next(item for item in self.manager.list() if item["key"] == "launched")["programMenu"])
 
