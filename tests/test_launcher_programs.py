@@ -1,4 +1,5 @@
 from pathlib import Path
+import datetime
 import json
 import subprocess
 import sys
@@ -67,6 +68,30 @@ class ExactCodexTest(unittest.TestCase):
                                      for i, (access, path) in enumerate(files))
         with patch.object(lp.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)):
             return lp.writable_codex_source({20}, home=self.home)
+
+    def test_a_tui_opened_with_resume_names_its_thread_and_its_saved_rollout_is_exact_evidence(self):
+        identifier = self.native["id"]
+        self.assertEqual(lp.program_of("/opt/homebrew/bin/codex resume %s --sandbox x --cd /w" % identifier)["sessionId"], identifier)
+        self.assertEqual(lp.program_of("codex -m gpt-x resume %s" % identifier)["sessionId"], identifier)
+        for command in ("codex resume --last", "codex resume not-a-uuid", "codex --cd /w", "codex exec resume %s" % identifier.upper()):
+            self.assertNotIn("sessionId", lp.program_of(command), command)
+        opened = int(datetime.datetime(2026, 10, 21, 12, 0).timestamp())
+        self.rollout()
+        self.assertEqual(lp.resumed_codex_source(identifier, opened, home=self.home), self.native)
+        self.assertIsNone(lp.resumed_codex_source(identifier, opened + 5 * 86400, home=self.home), "only around the day it opened")
+        self.assertIsNone(lp.resumed_codex_source("bad", opened, home=self.home))
+        # The board's describe turns it into exact evidence for the terminal.
+        terminal = {"id": FIRST, "createdAt": opened}
+        seen = {FIRST: {"program": "codex", "cwd": None, "sessionId": identifier, "pid": 31}}
+        with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
+                patch.object(lp, "describe", return_value=seen), patch.object(lp, "held_codex", return_value=None), \
+                patch.object(lp, "resumed_codex_source", wraps=lambda sid, at: lp.rollout_source(
+                    self.home / ".codex-work/sessions/2026/10/21" / ("rollout-now-" + sid + ".jsonl"), self.home)):
+            reply = lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST]
+        self.assertEqual(reply, {"program": "codex", "pid": 31, "cwd": "/work/project", "nativeSource": self.native})
+        # The same id saved in two homes is no evidence.
+        self.rollout(key=".codex-other")
+        self.assertIsNone(lp.resumed_codex_source(identifier, opened, home=self.home))
 
     def test_writable_original_is_unique_even_when_subagent_and_read_only_records_are_open(self):
         root = self.rollout()

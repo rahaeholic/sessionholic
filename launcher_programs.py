@@ -80,7 +80,16 @@ def program_of(command):
     if name == "codex":
         if rest[:2] == ["app-server", "daemon"] or rest[:1] == ["app-server"]:
             return None
-        return {"program": "codex", "cwd": None}
+        found = {"program": "codex", "cwd": None}
+        # `codex [-m M] resume <id>`: the launcher opened a thread it made on the shared daemon.
+        if "resume" in rest[:4] and rest.index("resume") + 1 < len(rest):
+            try:
+                identifier = str(uuid.UUID(rest[rest.index("resume") + 1]))
+            except ValueError:
+                identifier = None
+            if identifier == rest[rest.index("resume") + 1]:
+                found["sessionId"] = identifier
+        return found
     # A session the launcher opened on another host (a PC's): work of its own, never a menu.
     # Its destination (the first word that is no option or option value) names that host.
     if name == "ssh":
@@ -215,8 +224,13 @@ def launcher_programs(args):
         if identifier not in result:
             continue
         exact = held_codex(terminal.get("holdName"), rows)
+        resumed = result[identifier].get("sessionId") if result[identifier].get("program") == "codex" else None
+        source = None if exact or not resumed else resumed_codex_source(resumed, terminal.get("createdAt"))
         if exact:
             result[identifier] = exact
+        elif source:
+            result[identifier] = {"program": "codex", "pid": result[identifier].get("pid"), "cwd": source["cwd"],
+                                  "nativeSource": source}
         elif result[identifier].get("sshHost"):
             # Named by the board host it reaches, so the board looks for its session there.
             board = ssh_board_host(result[identifier]["sshHost"], args.get("sshHosts"))
@@ -285,7 +299,6 @@ def held_codex(hold, rows):
 
 def writable_codex_source(pids, home=None):
     """Only metadata from one writable, user-owned interactive rollout is evidence."""
-    from launch import HOME_KEY
     home = Path.home() if home is None else Path(home)
     done = subprocess.run(["/usr/sbin/lsof", "-a", "-p", ",".join(str(pid) for pid in sorted(pids)), "-Ffan"],
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, text=True)
@@ -303,33 +316,61 @@ def writable_codex_source(pids, home=None):
         return None
     sources = {}
     for name in paths:
-        path = Path(name)
-        try:
-            parts = path.relative_to(home).parts
-            position = parts.index("sessions")
-            key = "/".join(parts[:position])
-            if not HOME_KEY.fullmatch(key) or not path.name.startswith("rollout-"):
-                continue
-            if any(p.is_symlink() for p in (path, *path.parents) if p != home and home in p.parents):
-                continue
-            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as stream:
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                    continue
-                line = stream.readline(65537)
-            if len(line) > 65536:
-                continue
-            record = json.loads(line)
-            meta = record.get("payload") if record.get("type") == "session_meta" else None
-            if not isinstance(meta, dict) or meta.get("source") not in ("cli", "vscode"):
-                continue
-            identifier = str(uuid.UUID(meta.get("id")))
-            cwd = meta.get("cwd")
-            if (identifier != meta.get("id") or not path.name.endswith("-" + identifier + ".jsonl")
-                    or not isinstance(cwd, str) or not cwd.startswith("/") or "\0" in cwd):
-                continue
-            source = {"agent": "codex", "id": identifier, "home": key, "cwd": cwd}
+        source = rollout_source(Path(name), home)
+        if source:
             sources[json.dumps(source, sort_keys=True)] = source
-        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
-            continue
     return next(iter(sources.values())) if len(sources) == 1 else None
+
+
+def rollout_source(path, home):
+    """{"agent", "id", "home", "cwd"} from one user-owned interactive rollout's session_meta, or None."""
+    from launch import HOME_KEY
+    try:
+        parts = path.relative_to(home).parts
+        position = parts.index("sessions")
+        key = "/".join(parts[:position])
+        if not HOME_KEY.fullmatch(key) or not path.name.startswith("rollout-"):
+            return None
+        if any(p.is_symlink() for p in (path, *path.parents) if p != home and home in p.parents):
+            return None
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW)) as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return None
+            line = stream.readline(65537)
+        if len(line) > 65536:
+            return None
+        record = json.loads(line)
+        meta = record.get("payload") if record.get("type") == "session_meta" else None
+        if not isinstance(meta, dict) or meta.get("source") not in ("cli", "vscode"):
+            return None
+        identifier = str(uuid.UUID(meta.get("id")))
+        cwd = meta.get("cwd")
+        if (identifier != meta.get("id") or not path.name.endswith("-" + identifier + ".jsonl")
+                or not isinstance(cwd, str) or not cwd.startswith("/") or "\0" in cwd):
+            return None
+        return {"agent": "codex", "id": identifier, "home": key, "cwd": cwd}
+    except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+        return None
+
+
+def resumed_codex_source(session_id, opened, home=None):
+    """The thread a launcher made on the shared daemon and opened with `codex resume <id>` (zz):
+    its rollout, saved before the TUI started, in one Codex home's sessions folder of the day the
+    terminal opened (or the day before or after). Exactly one match, else None."""
+    from datetime import datetime, timedelta
+    home = Path.home() if home is None else Path(home)
+    try:
+        identifier = str(uuid.UUID(session_id))
+        day = datetime.fromtimestamp(int(opened))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    found = {}
+    for folder in sorted(home.glob(".codex*")):
+        for offset in (-1, 0, 1):
+            date = day + timedelta(days=offset)
+            for path in (folder / "sessions" / date.strftime("%Y/%m/%d")).glob("rollout-*-" + identifier + ".jsonl"):
+                source = rollout_source(path, home)
+                if source and source["id"] == identifier:
+                    found[json.dumps(source, sort_keys=True)] = source
+    return next(iter(found.values())) if len(found) == 1 else None
