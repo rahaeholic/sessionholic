@@ -17591,4 +17591,6 @@ test('답변 끝의 👉 줄이 있으면 그 답장을 쓰고, 보드 기능이
   other.show('답변'); await settle();
   assert.equal(other.requests.some((r) => r.url === '/api/chat/suggestions'), false);
   other.c.stopChatPolling();
+  // On a phone they stay one sideways-scrolling row above the editor.
+  assert.match(styleSheet(), /:root\[data-compact-mobile="true"\] \.chat-suggestions \{[^}]*flex-wrap: nowrap;[^}]*overflow-x: auto/);
 });

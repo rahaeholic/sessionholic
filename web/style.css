@@ -218,6 +218,10 @@
 .chat-suggestions[hidden] { display: none; }
 .chat-suggestion { min-height: 36px; max-width: 100%; padding: 6px 12px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); text-align: left; overflow-wrap: anywhere; cursor: pointer; touch-action: manipulation; }
 .chat-suggestion:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* A phone keeps them to one row that scrolls sideways (the next one shows in part), not three rows over the chat. */
+:root[data-compact-mobile="true"] .chat-suggestions { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+:root[data-compact-mobile="true"] .chat-suggestions::-webkit-scrollbar { display: none; }
+:root[data-compact-mobile="true"] .chat-suggestion { flex: none; white-space: nowrap; min-height: 34px; }
 .woni-message-quote { display: block; max-width: 100%; margin-bottom: 8px; padding: 8px 12px; border: 0; border-left: 2px solid var(--accent); background: var(--fill-soft); color: var(--label-2); text-align: left; font: inherit; font-size: var(--fs-sub); cursor: pointer; }
 .woni-work { flex: 1; min-height: 0; padding: 12px 20px; overflow-y: auto; overscroll-behavior: contain; }
 .woni-work h3 { margin: 12px 0; font-size: var(--fs-head); }
