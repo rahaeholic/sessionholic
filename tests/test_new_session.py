@@ -492,6 +492,18 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
         self.assertEqual(self.terms.linked[-1][0], self.terminal['id'])
 
+    def test_ssh_and_agent_view_launchers_neither_take_nor_block_and_an_agent_takes_only_its_own(self):
+        # Waiting beside it since before: one went to another host over SSH, one is Claude's agent view.
+        for letter, program in (('e', 'ssh'), ('d', 'claude-agents')):
+            self.terms.rows.append({'id': letter * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True,
+                                    'closed': False, 'createdAt': 999, 'program': program})
+        self.terminal['program'] = 'codex'
+        self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
+                                          'startedAt': 1001}]
+        self.rows['remote']['codex'] = [codex_row('1', 1003)]
+        self.assertEqual([native['id'] for native in self.link()], [codex_row('1', 0)['id']])
+        self.assertEqual([terminal_id for terminal_id, _ in self.terms.linked], [self.terminal['id']])
+
     def test_a_claude_session_counts_with_its_session_id(self):
         self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
                                           'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'startedAt': 1020}]

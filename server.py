@@ -2346,7 +2346,10 @@ class Workflow:
         The earliest session that appears on its host after it opened (30 seconds of clock
         difference allowed), and no other terminal names, is recorded as its own, once: its
         card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
-        (Codex `exec`, Claude background agents) are never taken."""
+        (Codex `exec`, Claude background agents) are never taken. A launcher seen running an
+        agent takes only that agent's sessions; one seen running SSH (its session is another
+        host's) or Claude's agent view (background sessions only) takes none here and so never
+        makes another launcher's session ambiguous."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2356,6 +2359,7 @@ class Workflow:
             return
         pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
                           and not t.get("closed") and not t.get("nativeSource")
+                          and t.get("program") not in ("ssh", "claude-agents")
                           and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
         if not pending:
             return
@@ -2367,7 +2371,10 @@ class Workflow:
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
             candidates = []
+            program = terminal.get("program")
             for agent in ("codex", "claude"):
+                if program in ("codex", "claude") and agent != program:
+                    continue
                 for row in data.get(agent) or []:
                     native = self._native_of(host, agent, row)
                     started = row.get("startedAt")

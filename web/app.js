@@ -12300,7 +12300,9 @@ async function uploadTerminalFiles(files = []) {
       terminal = state.terminals.find((item) => item.id === entry.terminalId) || terminal;
     }
     const source = terminalAttachmentSource(terminal);
-    if (!source || terminal.alive === false || terminal.closed) throw new Error("이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
+    if (!source || terminal.alive === false || terminal.closed) throw new Error(estimatedConversation(terminal)
+      ? "이 터미널에서는 첨부할 수 없습니다. 채팅 탭의 '이 대화로 채팅 열기'를 누른 뒤 채팅에서 올려 주세요. 첨부는 남겨 두었습니다."
+      : "이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
     if (entry.source && chatKey(entry.source) !== chatKey(source)) throw new Error("터미널의 연결 세션이 바뀌었습니다. 이전 첨부를 제거한 뒤 다시 추가해 주세요.");
     entry.source = source;
     while (entry.uploadQueue.length && retained() && !controller.signal.aborted) {
@@ -12679,6 +12681,22 @@ function agentViewConversation(terminal) {
   const own = launcherChatCandidates(terminal).filter((s) => agentViewSession(info, s));
   return own.length === 1 ? own[0] : null;
 }
+// The listed conversation the server estimated (start time on the terminal's host) as this
+// launcher's own. It is only offered: one press opens it as a list choice would, never as this
+// terminal's input or attachment route.
+function estimatedConversation(terminal) {
+  const info = terminalInfo(terminal);
+  if (!terminalEstimated(terminal) || !info.nativeSource || info.chatSource) return null;
+  return allSessions().find((s) => sameRecoverySource(sourceOf(s), info.nativeSource)) || null;
+}
+function openEstimatedConversation(view) {
+  if (!launcherChatViewCurrent(view)) return;
+  const started = estimatedConversation(launcherWorkspaceTerminal());
+  if (!started) return;
+  state.launcherWorkspace = null;
+  select(started.key);
+  chooseDetailMode("chat");
+}
 function renderLauncherChat() {
   const terminal = launcherWorkspaceTerminal(), root = $("launcher-chat-waiting");
   if (!terminal || !root || !launcherWorkspaceCurrent(terminal.id) || state.inlineTerminal || state.launcherWorkspace.mode !== "chat") return;
@@ -12695,9 +12713,17 @@ function renderLauncherChat() {
     view.refresh = button("기록 새로고침", "secondary", () => readLauncherChat(view));
     view.list = el("div", "messages launcher-chat-messages"); view.list.setAttribute("role", "log");
     view.list.setAttribute("aria-label", "선택한 대화 기록"); view.list.tabIndex = 0;
+    view.estimate = el("div", "launcher-chat-estimate"); view.estimate.hidden = true;
+    view.estimateNote = el("p", "detail-note");
+    view.open = button("이 대화로 채팅 열기", "primary", () => openEstimatedConversation(view));
+    view.estimate.append(view.estimateNote, view.open);
     picker.append(label, view.select, view.connect, view.refresh, view.note);
-    root.className = "launcher-chat"; root.replaceChildren(picker, view.list);
+    root.className = "launcher-chat"; root.replaceChildren(view.estimate, picker, view.list);
   }
+  const started = estimatedConversation(terminal);
+  view.estimate.hidden = !started;
+  if (started) view.estimateNote.textContent =
+    `이 터미널에서 시작한 것으로 보이는 대화: ${started.title || started.initialTitle || started.project || "대화"} · ${started.cwd || ""}`;
   const candidates = launcherChatCandidates(terminal), source = terminalInfo(terminal).chatSource;
   const signature = JSON.stringify(candidates.map((s) => [s.key, s.title, s.account, s.project]));
   if (signature !== view.candidates) {

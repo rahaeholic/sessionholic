@@ -16143,6 +16143,25 @@ test('미확인 터미널은 자동 추정을 열지 않고 선택한 채팅을 
   c.stopChatPolling();
 });
 
+test('추정 연결된 대화는 저절로 열지 않고, 채팅 탭에서 한 번 누르면 목록에서 고른 것처럼 연다', async () => {
+  const { c, s, terminal, selected, calls } = launcherRecoveryClient();
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
+  c.get('detail-mode-chat').events.click(); await settle();
+  const view = c.state.launcherChatView;
+  assert.equal(view.estimate.hidden, true, 'an estimate that is not listed offers nothing');
+  terminal.nativeSource = selected; c.renderLauncherChat();
+  assert.equal(view.estimate.hidden, false);
+  assert.match(view.estimateNote.textContent, /시작한 것으로 보이는 대화: .* · \/fixture\/project/);
+  assert.equal(c.state.selected, null, 'an estimate never opens by itself');
+  view.open.events.click(); await settle();
+  assert.equal(c.state.selected, s.key, 'opened as a list choice would');
+  assert.equal(c.state.launcherWorkspace, null);
+  assert.equal(c.terminalMatchesDetail(terminal, s), false, 'the estimate grants no terminal input route');
+  assert.equal(calls.some((r) => r.url.endsWith('/conversation')), false, 'nothing is linked to the terminal');
+  assert.equal(calls.some((r) => /\/input|\/launch|\/send|\/close|\/api\/new-session/.test(r.url)), false);
+  c.stopChatPolling();
+});
+
 test('기록 연결 저장의 늦은 응답은 다른 터미널 화면을 갱신하지 않는다', async () => {
   const { c, s, terminal, selected } = launcherRecoveryClient();
   await vm.runInContext('openNewSessionTerminal(state.terminals[0], { restoreChat: true })', c.context);
