@@ -17520,6 +17520,7 @@ test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항�
   for (const id of ['terminal-keys', 'terminal-menu', 'draft-type'])
     assert.doesNotMatch(css, new RegExp(`\\[data-compact-mobile="true"\\][^{}]*#${id}[^{}]*\\{[^}]*display: none`), `${id} stays visible on compact screens`);
   assert.doesNotMatch(css, /\[data-compact-mobile="true"\][^{}]*\.terminal-tools[^{}]*\{[^}]*display: none/);
+  assert.match(css, /\[data-compact-mobile="true"\] \.terminal-keys button \{[^}]*white-space: nowrap/, 'Ctrl and ⇧Tab stay on one line on a phone');
   const c = client(undefined, noChatTimers), { s } = selectChat(c);
   assert.equal(findId(c.buildChatComposer(s), 'chat-terminal-keys'), null);
 });

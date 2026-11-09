@@ -8315,7 +8315,9 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] #terminal-screen.compact-connected > .terminal-status-row { display: none; }
 :root[data-compact-mobile="true"] .draft-mode-note { display: none; }
 :root[data-compact-mobile="true"] .terminal-tools { padding: 4px 6px max(4px, env(safe-area-inset-bottom)); }
-:root[data-compact-mobile="true"] .terminal-keys { --key-row: 44px; }
+:root[data-compact-mobile="true"] .terminal-keys { --key-row: 44px; gap: 4px; }
+/* Always shown on a phone: a 412px row leaves ~30px a key, so four-letter labels (Ctrl, ⇧Tab) stay on one line. */
+:root[data-compact-mobile="true"] .terminal-keys button { padding: 0; white-space: nowrap; letter-spacing: -0.06em; }
 :root[data-compact-mobile="true"] .draft-panel { margin: 0; padding: 6px 0 0; border-top: 0; }
 :root[data-compact-mobile="true"] .draft-row { gap: 4px; }
 :root[data-compact-mobile="true"] .draft-row > textarea { flex: 1; min-width: 0; width: 0; }
