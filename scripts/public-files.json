@@ -207,5 +207,7 @@
   "docs/plan/2026-11-06-mobile-back.md",
   "docs/plan/2026-11-07-woni-read-sync-quick-reply.md",
   "docs/plan/2026-11-08-ipad-input-room.md",
-  "docs/plan/2026-11-09-larger-text-and-mobile-settings.md"
+  "docs/plan/2026-11-09-larger-text-and-mobile-settings.md",
+  "suggestions.py",
+  "tests/test_suggestions.py"
 ]

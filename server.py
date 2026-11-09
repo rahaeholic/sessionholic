@@ -3673,7 +3673,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
                                                "authMode": "tailscale" if self.tailscale_authorized() else "token",
                                                # The screen served now: an older open page offers a reload.
-                                               "webVersion": self.server.assets.manifest().get("/app.js")})
+                                               "webVersion": self.server.assets.manifest().get("/app.js"),
+                                               # The page asks for suggested replies only when this board makes them.
+                                               "suggestedReplies": self.server.suggestions.enabled})
                 if url.path == "/api/terminals":
                     # Read before the list: a change in between is announced with a newer
                     # version, so the client reads again rather than missing it.
@@ -4194,6 +4196,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.server.chat.state(data)
                 self.observe_work(result.get("route") or data.get("source"), result)
                 return self.send_json(200, result)
+            if path == "/api/chat/suggestions":
+                return self.send_json(200, self.server.suggestions.request(data))
             if path == "/api/chat/warm":
                 return self.send_json(200, self.server.chat.warm(data))
             if path == "/api/chat/connect":
@@ -4492,9 +4496,11 @@ class BoardHTTPServer(ThreadingHTTPServer):
 
 
 def make_server(bind, port, board, token, terminals=None, workflow=None, state_dir=STATE_DIR, max_terminals=None,
-                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True, cli_monitor=None, termination_worker=False):
+                tailscale_user=None, usage=None, automatic_work=False, push=True, hardware=None, work_list=True, cli_monitor=None, termination_worker=False,
+                suggested_replies=False):
     """`usage` (usage.UsageMeter) serves /api/usage; without it the routes stay 404.
-    `work_list` False answers GET /api/work as retired (the screen no longer has the tab)."""
+    `work_list` False answers GET /api/work as retired (the screen no longer has the tab).
+    `suggested_replies` turns on POST /api/chat/suggestions (suggestions.py); off, it answers "off"."""
     if bind not in ("127.0.0.1", "::1"):
         raise ValueError("서버는 loopback에서만 실행할 수 있습니다.")
     if tailscale_user is not None and (not isinstance(tailscale_user, str) or not tailscale_user
@@ -4507,6 +4513,8 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.usage = usage
     server.hardware = hardware
     server.cli_monitor = cli_monitor
+    from suggestions import Suggestions
+    server.suggestions = Suggestions(Path(state_dir) / "suggestions.json", enabled=suggested_replies)
     server.goals = Goals(state_dir)
     server.session_labels = SessionLabels(state_dir)
     server.preferences = BoardPreferences(state_dir)
@@ -4659,7 +4667,7 @@ def main(argv=None):
                         max_terminals=args.max_terminals, tailscale_user=tailscale_user, usage=meter, hardware=hardware,
                         cli_monitor=cli_monitor, termination_worker=not args.no_termination_worker,
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push,
-                        work_list=args.auto_work and not args.no_auto_work)
+                        work_list=args.auto_work and not args.no_auto_work, suggested_replies=config["suggestedReplies"])
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
     print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)
     if args.open:

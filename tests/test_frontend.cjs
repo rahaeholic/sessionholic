@@ -17524,3 +17524,73 @@ test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항�
   const c = client(undefined, noChatTimers), { s } = selectChat(c);
   assert.equal(findId(c.buildChatComposer(s), 'chat-terminal-keys'), null);
 });
+
+function suggestionClient(reply) {
+  const requests = [], waits = [];
+  const timers = { setTimeout: (callback, ms) => { if (ms === 2500) waits.push(callback); return 1; }, clearTimeout() {} };
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    const json = url === '/api/chat/suggestions' ? reply.current
+      : url === '/api/chat/state' ? { route: entry.source, capability: { supported: true }, phase: 'idle' } : { status: 'accepted' };
+    return { ok: true, status: 200, json: async () => json };
+  }, timers);
+  const { s, entry } = selectChat(c);
+  c.state.capabilities = { ...(c.state.capabilities || {}), suggestedReplies: true };
+  const show = (answer, question = '테스트 고쳐 줘') => {
+    const list = c.get('messages');
+    list.conversationSource = c.chatKey(entry.source);
+    list.conversationRows = [{ message: { role: 'user', text: question } }, { message: { role: 'tool', text: 'ls' } },
+      { message: { role: 'assistant', text: answer } }];
+    c.updateChatComposer(entry);
+  };
+  const chips = () => Array.from(c.get('chat-suggestions').children, (chip) => chip.textContent);
+  return { c, s, entry, requests, waits, show, chips };
+}
+
+test('추천 답변은 답변당 한 번 받아 입력칸 위에 띄우고, 누르면 빠른 답장처럼 바로 보낸다', async () => {
+  const reply = { current: { status: 'pending', replies: [] } };
+  const { c, entry, requests, waits, show, chips } = suggestionClient(reply);
+  show('고쳤습니다. 배포할까요?'); await settle();
+  const asked = requests.filter((r) => r.url === '/api/chat/suggestions');
+  assert.equal(asked.length, 1);
+  assert.deepEqual([asked[0].body.question, asked[0].body.answer], ['테스트 고쳐 줘', '고쳤습니다. 배포할까요?']);
+  assert.equal(c.get('chat-suggestions').hidden, true, 'nothing shows while the board is still asking');
+  reply.current = { status: 'ready', replies: ['네, 배포해 주세요.', '변경 내용부터 보여 주세요.', '테스트 한 번 더', '넷째'] };
+  waits.shift()(); await settle();
+  assert.deepEqual(chips(), ['네, 배포해 주세요.', '변경 내용부터 보여 주세요.', '테스트 한 번 더']);
+  assert.equal(c.get('chat-suggestions').hidden, false);
+  c.updateChatComposer(entry); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/suggestions').length, 2, 'the same answer is never asked again');
+  await c.get('chat-suggestions').children[0].events.click(); await settle();
+  const sent = requests.filter((r) => r.url === '/api/chat/send');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body.text, '네, 배포해 주세요.');
+  // A draft, a working agent or a bot's conversation shows none.
+  show('다음 답변입니다.'); entry.text = '쓰던 초안'; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-suggestions').hidden, true);
+  entry.text = ''; entry.data = { ...entry.data, phase: 'working' }; c.updateChatComposer(entry);
+  assert.equal(c.get('chat-suggestions').hidden, true);
+  c.stopChatPolling();
+});
+
+test('답변 끝의 👉 줄이 있으면 그 답장을 쓰고, 보드 기능이 꺼져 있으면 다시 묻지 않는다', async () => {
+  const reply = { current: { status: 'off', replies: [] } };
+  const { c, requests, show, chips } = suggestionClient(reply);
+  show('정리했습니다.\n👉 진행해 | 요약해 줘 | 다른 방법은?');
+  assert.deepEqual(chips(), ['진행해', '요약해 줘', '다른 방법은?']);
+  assert.equal(requests.some((r) => r.url === '/api/chat/suggestions'), false, "the answer's own replies need no request");
+  show('다른 답변'); await settle();
+  show('또 다른 답변'); await settle();
+  assert.equal(requests.filter((r) => r.url === '/api/chat/suggestions').length, 1, 'a board with the feature off is asked once');
+  assert.equal(c.state.suggestionsOff, true);
+  assert.equal(c.get('chat-suggestions').hidden, true);
+  c.stopChatPolling();
+  // A board that does not make them (capabilities) is never asked at all.
+  const other = suggestionClient({ current: { status: 'ready', replies: ['x'] } });
+  other.c.state.capabilities = { ...other.c.state.capabilities, suggestedReplies: false };
+  other.show('답변'); await settle();
+  assert.equal(other.requests.some((r) => r.url === '/api/chat/suggestions'), false);
+  other.c.stopChatPolling();
+  // On a phone they stay one sideways-scrolling row above the editor.
+  assert.match(styleSheet(), /:root\[data-compact-mobile="true"\] \.chat-suggestions \{[^}]*flex-wrap: nowrap;[^}]*overflow-x: auto/);
+});

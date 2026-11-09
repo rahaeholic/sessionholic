@@ -6760,7 +6760,10 @@ function buildChatComposer(s) {
   referenceInline.title = "다른 대화 참조";
   referenceInline.addEventListener("pointerdown", (event) => event.preventDefault());
   main.append(input, attachInline, mic, quickInline, referenceInline, send);
-  box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
+  const suggestions = el("div", "chat-suggestions");
+  suggestions.id = "chat-suggestions"; suggestions.hidden = true;
+  suggestions.setAttribute("role", "group"); suggestions.setAttribute("aria-label", "추천 답변 · 누르면 바로 전송");
+  box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, suggestions, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
     updateChatComposer(entry);
@@ -7341,6 +7344,7 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   $("chat-mic").disabled = !dictationListening(input) && (input.disabled || input.readOnly || entry.composing);
   for (const id of ["chat-quick", "chat-quick-inline", "chat-delegate"])
     if ($(id)) $(id).disabled = blocked || input.disabled || input.readOnly || entry.composing;
+  renderChatSuggestions(entry, selected, !blocked && !input.disabled && !input.readOnly && !entry.composing);
   for (const id of ["chat-reference", "chat-reference-inline"])
     if ($(id)) $(id).disabled = input.disabled || input.readOnly || entry.composing || draftIsPending(entry);
   renderDictation();
@@ -9424,6 +9428,78 @@ function saveSharedQuickReplies() {
   state.quickRepliesSaving = saving;
   renderQuickReplySettings();
   return saving;
+}
+// 추천 답변: up to three replies the user may send next, above the editor once an answer ends.
+// The answer's own `👉 a | b | c` line (as 원이 writes it) wins; otherwise the board is asked once
+// per answer (suggestions.py, off unless the host turns it on). A tap sends like a quick reply.
+const SUGGESTION_RETRY_MS = 2500;
+const SUGGESTION_TRIES = 12;
+function answerSuggestedReplies(text) {
+  const line = String(text || "").split("\n").find((item) => /^\s*👉/u.test(item));
+  return line ? line.replace(/^\s*👉️?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 3) : [];
+}
+function lastExchange(entry) {
+  const list = $("messages");
+  if (list?.conversationSource !== chatKey(entry.source)) return null;
+  const rows = (list.conversationRows || []).map((row) => row.message).filter((m) => m && ["user", "assistant"].includes(m.role));
+  const answer = rows.at(-1);
+  if (answer?.role !== "assistant" || !String(answer.text || "").trim()) return null;
+  const question = rows.slice(0, -1).reverse().find((m) => m.role === "user");
+  return { question: String(question?.text || ""), answer: String(answer.text) };
+}
+function renderChatSuggestions(entry, selected, ready) {
+  const box = $("chat-suggestions");
+  if (!box) return;
+  const exchange = ready && !entry.text.trim() && !entry.attachments.length &&
+    !["working", "needs_input"].includes(entry.data?.phase) && !!selected && sessionCategoryOf(selected) !== "bot" &&
+    !chatOneShot(entry, selected) ? lastExchange(entry) : null;
+  let replies = [];
+  if (exchange) {
+    replies = answerSuggestedReplies(exchange.answer);
+    const key = JSON.stringify([chatKey(entry.source), exchange.question, exchange.answer]);
+    if (!replies.length && entry.suggestions?.key === key) replies = entry.suggestions.replies;
+    else if (!replies.length && state.capabilities?.suggestedReplies === true && !state.suggestionsOff)
+      requestChatSuggestions(entry, key, exchange);
+  }
+  const signature = JSON.stringify(replies);
+  box.hidden = !replies.length;
+  if (box.dataset.signature === signature) return;
+  box.dataset.signature = signature;
+  box.replaceChildren(...replies.map((reply) => {
+    const chip = button(reply, "chat-suggestion", () => sendSuggestedReply(entry, reply));
+    chip.addEventListener("pointerdown", (event) => event.preventDefault());
+    return chip;
+  }));
+}
+async function requestChatSuggestions(entry, key, exchange) {
+  const job = entry.suggestions = { key, replies: [] };
+  const authEpoch = state.authEpoch;
+  const body = { source: entry.source, question: exchange.question.slice(-2000), answer: exchange.answer.slice(-6000) };
+  for (let tries = 0; tries < SUGGESTION_TRIES; tries++) {
+    let data;
+    try {
+      data = await api("/api/chat/suggestions", { method: "POST", body, authEpoch });
+    } catch {
+      break;
+    }
+    if (entry.suggestions !== job || authEpoch !== state.authEpoch) return;
+    if (data?.status === "off") { state.suggestionsOff = true; break; }
+    if (data?.status === "ready") {
+      job.replies = (Array.isArray(data.replies) ? data.replies : []).filter((item) => typeof item === "string" && item).slice(0, 3);
+      break;
+    }
+    if (data?.status !== "pending") break;
+    await new Promise((resolve) => setTimeout(resolve, SUGGESTION_RETRY_MS));
+    if (entry.suggestions !== job) return;
+  }
+  if (entry.suggestions === job && currentChat(entry)) updateChatComposer(entry);
+}
+function sendSuggestedReply(entry, reply) {
+  const input = $("chat-input");
+  if (!currentChat(entry) || !input || input.disabled || input.readOnly || networkOffline() || !chatCanSend(entry) ||
+      entry.composing || entry.sending || entry.pending || entry.uploads || entry.commandBusy) return;
+  insertChatText(entry, input, reply);
+  return sendChat(entry);
 }
 function openQuickReplies(entry, input, trigger) {
   const ready = () => currentChat(entry) && input === $("chat-input") && !input.disabled && !input.readOnly &&
