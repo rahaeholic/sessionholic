@@ -11,6 +11,8 @@
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
   let pendingState = "uncertain";
   let enabled = false, focusId = null;
+  // The message whose menu (time · reply · copy · stream) is open. The list is rebuilt on every refresh, so it is kept by key.
+  let menuKey = null;
   const pendingKey = "sessionholic:woni:pending";
   const seenKey = "sessionholic:woni:seen";
   let seen = null, unread = new Set();
@@ -18,6 +20,12 @@
   let readThrough = null, serverRead = 0, readPosting = 0;
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
   const answerTimeFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  // Ryan 2026-11-10 (ChatGPT dots): Woni is the only speaker, so its messages carry no name or time.
+  // Ryan's sent time sits beside his bubble; a centered line marks a new day or a message Woni started.
+  const clockFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", hour: "numeric", minute: "2-digit", hour12: true });
+  const dayKeyFormat = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" });
+  const weekdayFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", weekday: "long" });
+  const shortWeekdayFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", weekday: "short" });
 
   function loadSeen() {
     try {
@@ -132,6 +140,38 @@
     node.dateTime = date.toISOString(); node.setAttribute("aria-label", `답변 시각 ${text}`);
     return node;
   }
+  function validSeconds(seconds) { return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0; }
+  function clockLabel(seconds) { return validSeconds(seconds) ? clockFormat.format(new Date(seconds * 1000)) : ""; }
+  function dayNumber(seconds) {
+    const [y, m, d] = dayKeyFormat.format(new Date(seconds * 1000)).split("-").map(Number);
+    return Math.round(Date.UTC(y, m - 1, d) / 86400000);
+  }
+  function dayLabel(seconds, now = Date.now() / 1000) {
+    const date = new Date(seconds * 1000), days = dayNumber(now) - dayNumber(seconds);
+    if (days <= 0) return "오늘";
+    if (days === 1) return "어제";
+    if (days < 7) return weekdayFormat.format(date);
+    const [y, m, d] = dayKeyFormat.format(date).split("-").map(Number);
+    const sameYear = String(y) === dayKeyFormat.format(new Date(now * 1000)).slice(0, 4);
+    return `${sameYear ? "" : `${y}년 `}${m}월 ${d}일 (${shortWeekdayFormat.format(date)})`;
+  }
+  // Chat id -> centered line: the first message of a day shows the day, a message Woni started shows its time.
+  function timeDividers(chats, now = Date.now() / 1000) {
+    const out = new Map(); let lastDay = null;
+    for (const chat of chats) {
+      const at = Number(chat.createdAt);
+      if (!validSeconds(at)) continue;
+      const day = dayNumber(at), newDay = day !== lastDay, alert = chat.kind === "alert";
+      lastDay = day;
+      if (alert) out.set(chat.id, `${newDay ? dayLabel(at, now) + " " : ""}${clockLabel(at)} · 먼저 알림`);
+      else if (newDay) out.set(chat.id, dayLabel(at, now));
+    }
+    return out;
+  }
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); services.toast?.("복사했어요."); }
+    catch (_) { services.toast?.("복사하지 못했어요. 글자를 길게 눌러 선택해 주세요."); }
+  }
   function setView(value) {
     view = value; const isChat = value === "chat";
     messages.hidden = !isChat; form.hidden = !isChat; work.hidden = isChat;
@@ -159,7 +199,8 @@
     } catch (_) { if (current === epoch && dialog.open) original.replaceChildren(el("p", "", "원문을 불러오지 못했어요."), action("닫기", () => { original.hidden = true; })); }
   }
   function row(role, text, files = [], chat = null) {
-    const article = el("article", `woni-message ${role}`), label = el("strong", "", role === "user" ? "라이언" : "원이");
+    // The speaker name stays for screen readers only; the bubble side and colour show who is talking.
+    const article = el("article", `woni-message ${role}`), label = el("span", "sr-only", role === "user" ? "라이언" : "원이");
     const content = el("div", "woni-message-body");
     if (role === "user" && chat?.replyTo) {
       const quote = el("button", "woni-message-quote", `↩ ${chat.replyTo.who || "원문"} · ${chat.replyTo.excerpt || "원문 보기"}`);
@@ -168,23 +209,40 @@
     }
     if (role === "assistant" && typeof MessageFormat !== "undefined") MessageFormat.render(content, text);
     else content.textContent = text;
-    article.append(label, content);
+    article.append(label);
+    const sent = role === "user" ? clockLabel(Number(chat?.createdAt)) : "";
+    if (sent) {
+      const line = el("div", "woni-message-line"), time = el("time", "woni-sent-time", sent);
+      time.dateTime = new Date(Number(chat.createdAt) * 1000).toISOString(); time.setAttribute("aria-label", `보낸 시각 ${sent}`);
+      line.append(time, content); article.append(line);
+    } else article.append(content);
     if (files.length) {
       const list = el("div", "woni-message-files");
       for (const file of files) list.append(el("span", "woni-message-file", file.name || "첨부 파일"));
       article.append(list);
     }
-    if (role === "assistant" && chat?.answer) {
-      const time = answerTime(chat.finishedAt);
-      if (time) article.append(time);
-    }
     if (chat?.id) {
+      // Reply, copy, stream and the answer time are one tap away instead of under every message.
+      const key = `${chat.id}:${role}`, part = role === "user" ? "question" : "answer";
       const actions = el("div", "woni-message-actions");
-      actions.append(action("답글", () => setReply(chat, role === "user" ? "question" : "answer")));
-      if (chat.stream && chat.streamTitle) actions.append(action(chat.streamTitle, () => {
-        filter = { id: chat.stream, title: chat.streamTitle }; setView("chat"); if (latestData) show(latestData);
+      actions.append(action("답글", () => { menuKey = null; setReply(chat, part); }));
+      actions.append(action("복사", () => { copyText(role === "user" ? chat.text || "" : visibleAnswer(chat.answer) || chat.answer || ""); }));
+      if (chat.stream && chat.streamTitle) actions.append(action(`이 흐름만 보기 · ${chat.streamTitle}`, () => {
+        menuKey = null; filter = { id: chat.stream, title: chat.streamTitle }; setView("chat"); if (latestData) show(latestData);
       }));
+      if (role === "assistant" && chat.answer) {
+        const time = answerTime(chat.finishedAt);
+        if (time) actions.append(time);
+      }
       article.append(actions);
+      if (menuKey === key) article.className += " is-open";
+      content.setAttribute("aria-expanded", String(menuKey === key));
+      article.addEventListener("click", (event) => {
+        if (event?.target?.closest?.("a, button")) return;
+        if (globalThis.getSelection?.()?.toString()) return;  // dragging to select text is not a tap
+        menuKey = menuKey === key ? null : key;
+        if (latestData) show(latestData);
+      });
     }
     if (chat?.id) article.dataset.chatId = chat.id;
     return article;
@@ -299,8 +357,10 @@
       savePending(null); renderAttachments();
     }
     const atEnd = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
-    const nodes = [];
-    for (const chat of chats.filter((item) => !filter || item.stream === filter.id)) {
+    const nodes = [], visibleChats = chats.filter((item) => !filter || item.stream === filter.id);
+    const dividers = timeDividers(visibleChats);
+    for (const chat of visibleChats) {
+      if (dividers.has(chat.id)) nodes.push(el("p", "woni-divider", dividers.get(chat.id)));
       if (chat.kind !== "alert" && (chat.text || chat.attachments?.length)) nodes.push(row("user", chat.text || "", chat.attachments || [], chat));
       if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat));
       const replies = chat.answer && chat === chats.at(-1) && !pending ? suggestedReplies(chat.answer) : [];
