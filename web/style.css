@@ -223,6 +223,11 @@
 .woni-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin: -2px 0 18px; }
 .woni-suggestions button { min-height: 40px; padding: 8px 14px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); text-align: left; cursor: pointer; touch-action: manipulation; }
 .woni-suggestions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Ryan 2026-11-10: replying to an earlier answer shows its suggestions under the reply bar, one row that scrolls sideways. */
+.woni-reply-suggestions { flex-wrap: nowrap; margin: -2px 0 8px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+.woni-reply-suggestions::-webkit-scrollbar { display: none; }
+.woni-reply-suggestions button { flex: none; min-height: 36px; max-width: 85%; padding: 6px 12px; white-space: normal; }
+.woni-reply-suggestions[hidden] { display: none; }
 .chat-suggestions { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 2px 2px; }
 .chat-suggestions[hidden] { display: none; }
 .chat-suggestion { min-height: 36px; max-width: 100%; padding: 6px 12px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); text-align: left; overflow-wrap: anywhere; cursor: pointer; touch-action: manipulation; }
