@@ -51,12 +51,51 @@ test('완료된 답변에 기록된 날짜와 시간을 표시하며 누락된 �
   const { nodes, app } = fixture(call);
   await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
   const answers = nodes['woni-messages'].children.filter(item => item.className === 'woni-message assistant');
-  const time = answers[0].children.find(item => item.className === 'woni-message-time');
+  // 2026-11-10: 답한 시각은 말풍선 아래가 아니라 말풍선을 눌러 여는 메뉴 안에 있다.
+  const menuTime = answer => answer.children.find(item => item.className === 'woni-message-actions')?.children.find(item => item.className === 'woni-message-time');
+  assert.equal(answers[0].children.some(item => item.className === 'woni-message-time'), false);
+  const time = menuTime(answers[0]);
   assert.equal(time.dateTime, '2026-11-06T04:23:00.000Z');
   assert.match(time.textContent, /2026\.\s*11\.\s*06\..*13:23/);
   assert.match(time['aria-label'], /답변 시각/);
-  assert.equal(answers[1].children.some(item => item.className === 'woni-message-time'), false);
-  assert.equal(answers[2].children.some(item => item.className === 'woni-message-time'), false);
+  assert.equal(menuTime(answers[1]), undefined);
+  assert.equal(menuTime(answers[2]), undefined);
+});
+
+test('닷츠처럼 원이 말에는 이름·시각을 달지 않고 날짜와 먼저 알림만 가운데 줄로 보인다', async () => {
+  // 라이언 2026-11-10: "말하는 모델이 닷츠니까 굳이 자기 아이디는 안 올리잖아. 깔끔해"
+  const now = Date.now() / 1000;
+  const chats = [
+    { id: 'ask', text: '오늘 할 일 정리해 줘', answer: '세 가지예요.', status: 'complete', createdAt: now - 120, finishedAt: now - 100, stream: 's1', streamTitle: '오늘 정리' },
+    { id: 'alert', kind: 'alert', text: '원이가 먼저 알림', answer: '발주 마감이 오늘이에요.', status: 'complete', createdAt: now - 60, finishedAt: now - 60 },
+  ];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const list = () => nodes['woni-messages'].children;
+  const clock = new Intl.DateTimeFormat('ko-KR', { timeZone: 'Asia/Seoul', hour: 'numeric', minute: '2-digit', hour12: true });
+  const dividers = list().filter(node => node.className === 'woni-divider').map(node => node.textContent);
+  assert.deepEqual(dividers, ['오늘', `${clock.format(new Date((now - 60) * 1000))} · 먼저 알림`]);
+  const [user, answer] = list().filter(node => node.className?.startsWith('woni-message '));
+  // 이름은 화면 읽기 프로그램에만 남는다.
+  assert.equal(user.children.some(node => node.tagName === 'strong' || node.className === ''), false);
+  assert.equal(user.children[0].className, 'sr-only'); assert.equal(answer.children[0].textContent, '원이');
+  const line = user.children.find(node => node.className === 'woni-message-line');
+  assert.equal(line.children[0].className, 'woni-sent-time');
+  assert.equal(line.children[0].textContent, clock.format(new Date((now - 120) * 1000)));
+  assert.equal(answer.children.some(node => node.className === 'woni-sent-time'), false);
+  // 메뉴는 말풍선을 눌러야 열린다(흐름 이름도 그 안에).
+  assert.equal(answer.className, 'woni-message assistant');
+  answer.listeners.click({ target: { closest: () => null } });
+  const opened = list().find(node => node.dataset.chatId === 'ask' && node.className.includes('assistant'));
+  assert.equal(opened.className, 'woni-message assistant is-open');
+  const labels = opened.children.find(node => node.className === 'woni-message-actions').children.map(node => node.textContent);
+  assert.deepEqual(labels.slice(0, 3), ['답글', '복사', '이 흐름만 보기 · 오늘 정리']);
+  opened.listeners.click({ target: { closest: () => null } });
+  assert.equal(list().find(node => node.dataset.chatId === 'ask' && node.className.includes('assistant')).className, 'woni-message assistant');
+  // 말풍선 속 링크·버튼을 누른 것은 메뉴를 열지 않는다.
+  answer.listeners.click({ target: { closest: () => ({}) } });
+  assert.equal(list().some(node => node.className?.includes('is-open')), false);
 });
 
 test('팝업을 닫아도 새 답변 배지를 표시하고 확인하면 지운다', async () => {
