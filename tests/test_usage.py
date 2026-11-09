@@ -205,5 +205,99 @@ class UsageRouteTest(unittest.TestCase):
             self.assertEqual(meter.helpers(), [home / 'helpers/codex-usage.py'])
 
 
+class ClaudeTokenTest(unittest.TestCase):
+    """Claude on the host's long-lived token: one short CLI turn's rate_limit_event."""
+
+    STREAM = b'\n'.join([
+        b'{"type":"system","subtype":"init"}', b'not json',
+        json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {'status': 'allowed', 'unifiedWindows': {
+            'seven_day': {'utilization': 0.31, 'resetsAt': 1794438000, 'status': 'allowed'},
+            'five_hour': {'utilization': 0.075, 'resetsAt': 1794222000}}}}).encode(),
+        b'{"type":"result","subtype":"success"}'])
+
+    def test_the_last_rate_limit_event_becomes_the_helper_shape(self):
+        import usage
+        value = usage.token_usage(self.STREAM)
+        self.assertEqual(value['status'], 'ready')
+        self.assertEqual(value['usage']['windows']['seven_day'], {'used_percentage': 31.0, 'resets_at': '2026-11-11T23:00:00Z'})
+        self.assertAlmostEqual(value['usage']['windows']['five_hour']['used_percentage'], 7.5)
+        self.assertIsNone(usage.token_usage(b'{"type":"result"}\n'), 'no event, no reading')
+        self.assertIsNone(usage.token_usage(json.dumps({'type': 'rate_limit_event', 'rate_limit_info': {
+            'unifiedWindows': {'seven_day': {'utilization': True}}}}).encode()))
+        provider = UsageMeter(config('/nonexistent')).claude_provider(value)
+        self.assertEqual(provider['remaining'], 69)
+        self.assertEqual([w['remaining'] for w in provider['rows'][0]['windows']], [69, 92])
+
+    def meter(self, token_values, now=1000.0):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        for name in ('codex-usage.py', 'claude-usage.py', 'python3'):
+            Path(folder, name).write_text('')
+        helper_calls, token_calls, clock = [], [], [now]
+
+        def runner(argv):
+            helper_calls.append(argv)
+            return CLAUDE if 'claude-usage.py' in argv[1] else None
+
+        def token_reader():
+            token_calls.append(clock[0])
+            return token_values.pop(0) if token_values else None
+        meter = UsageMeter(config(folder, codexHelper=None), runner=runner, clock=lambda: clock[0], threaded=False,
+                           token_reader=token_reader)
+        return meter, helper_calls, token_calls, clock
+
+    def test_the_token_answers_first_and_the_helper_only_when_it_cannot(self):
+        import usage
+        reading = usage.token_usage(self.STREAM)
+        meter, helper_calls, token_calls, clock = self.meter([reading])
+        claude = next(p for p in meter.snapshot(refresh=True)['providers'] if p['id'] == 'claude')
+        self.assertEqual((claude['status'], claude['remaining']), ('ready', 69))
+        self.assertEqual(helper_calls, [], 'the claude.ai login helper is not asked')
+        # A long-lived token that cannot answer (no token, CLI failure): the helper still can.
+        meter, helper_calls, token_calls, clock = self.meter([])
+        claude = next(p for p in meter.snapshot(refresh=True)['providers'] if p['id'] == 'claude')
+        self.assertEqual(claude['status'], 'ready')
+        self.assertEqual(len(helper_calls), 1)
+
+    def test_automatic_reads_are_spaced_and_a_refresh_asks_again(self):
+        import usage
+        reading = usage.token_usage(self.STREAM)
+        meter, helper_calls, token_calls, clock = self.meter([reading, reading, reading])
+        meter.snapshot(refresh=True)
+        clock[0] += 400
+        meter.snapshot(refresh=True)
+        self.assertEqual(len(token_calls), 1, 'a page read inside 15 minutes reuses the reading')
+        clock[0] += 30
+        meter.snapshot(force=True)
+        self.assertEqual(len(token_calls), 2, 'a refresh asks again')
+        clock[0] += usage.CLAUDE_TOKEN_EVERY + 1
+        meter.snapshot(refresh=True)
+        self.assertEqual(len(token_calls), 3)
+
+    def test_the_cli_turn_runs_on_the_token_without_settings_tools_or_a_saved_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            (home / '.claude').mkdir()
+            (home / '.claude/settings.json').write_text(json.dumps({'env': {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}}))
+            cli = home / 'claude'
+            cli.write_text('#!/bin/sh\n')
+            meter = UsageMeter(config('/nonexistent', claude=str(cli)), home=home)
+            with patch('usage.subprocess.run', return_value=subprocess.CompletedProcess([], 0, self.STREAM, b'')) as run:
+                self.assertEqual(meter.read_claude_token()['status'], 'ready')
+            argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+            self.assertEqual(argv[:3], [str(cli), '-p', '.'])
+            for flag, value in (('--model', 'haiku'), ('--tools', ''), ('--setting-sources', ''), ('--output-format', 'stream-json')):
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+            self.assertIn('--no-session-persistence', argv)
+            self.assertEqual(kwargs['env']['CLAUDE_CODE_OAUTH_TOKEN'], 'tok')
+            self.assertEqual(sorted(kwargs['env']), ['CLAUDE_CODE_OAUTH_TOKEN', 'HOME', 'LANG', 'PATH'])
+            with patch('usage.subprocess.run', return_value=subprocess.CompletedProcess([], 1, b'', b'')):
+                self.assertIsNone(meter.read_claude_token())
+            (home / '.claude/settings.json').write_text('{}')
+            with patch('usage.subprocess.run') as run:
+                self.assertIsNone(meter.read_claude_token(), 'no token, no call')
+                run.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
