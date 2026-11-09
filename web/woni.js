@@ -94,7 +94,7 @@
   // Woni's 👉 line holds tap-to-send replies; the 🔊 line is for listening only. Neither is shown as answer text.
   function suggestedReplies(answer) {
     const line = String(answer || "").split("\n").find((item) => /^\s*👉/u.test(item));
-    return line ? line.replace(/^\s*👉\uFE0F?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 2) : [];
+    return line ? line.replace(/^\s*👉\uFE0F?/u, "").split("|").map((item) => item.trim()).filter(Boolean).slice(0, 3) : [];
   }
   function visibleAnswer(answer) {
     return String(answer || "").replace(/^[ \t]*(?:👉|🔊).*$/gmu, "").replace(/\n{3,}/g, "\n\n").trim();

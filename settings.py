@@ -39,7 +39,7 @@ ACCOUNT = re.compile(r"[A-Za-z0-9_-]{1,32}\Z")
 HELPER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 # Optional sections; each may appear only in version 2.
 SECTIONS = ("profileRules", "boundary", "legacy", "codexHomes", "agentRouter", "tmux",
-            "transfer", "attachments", "usage", "launcher", "hardware")
+            "transfer", "attachments", "usage", "launcher", "hardware", "suggestedReplies")
 V1 = {"environment": {"label", "variables"}, "profile": {"agent", "home", "label", "environment"},
       "project": {"id", "label", "root", "environment"}}
 V2 = {"environment": V1["environment"] | {"boundaryGroup", "scope", "description"},
@@ -98,7 +98,8 @@ def defaults():
             "legacy": {}, "codexHomes": {"allowSymlinks": False, "excludeSuspended": False, "requireMarker": False,
                                          "hide": []},
             "agentRouter": None, "tmux": {}, "transfer": {"agentConfig": "exclude-private"},
-            "attachments": {"gitExclude": True}, "usage": None, "launcher": None, "hardware": None}
+            "attachments": {"gitExclude": True}, "usage": None, "launcher": None, "hardware": None,
+            "suggestedReplies": False}
 
 
 def config_path(home=None):
@@ -282,6 +283,9 @@ def _sections(data, config, groups, home):
         hardware = _fields(data["hardware"], ("intervalSeconds", "manualIntervalSeconds"))
         config["hardware"] = {"intervalSeconds": _seconds(hardware.get("intervalSeconds", 30), 30, 3600),
                               "manualIntervalSeconds": _seconds(hardware.get("manualIntervalSeconds", 10), 5, 600)}
+    if "suggestedReplies" in data:
+        # The board's one model call (suggestions.py): off unless this host's owner turns it on.
+        config["suggestedReplies"] = _flag(data["suggestedReplies"])
 
 
 def _launcher(value, home):
