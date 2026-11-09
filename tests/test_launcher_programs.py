@@ -110,7 +110,7 @@ class ExactCodexTest(unittest.TestCase):
             self.assertIsNone(lp.held_codex("../other", rows))
 
     def test_an_ssh_destination_is_named_by_the_board_host_its_alias_reaches_here(self):
-        machines = {"bk": "pc.tail.ts.net", "beaulink": "pc.tail.ts.net", "air15": "air15", "elsewhere": "elsewhere"}
+        machines = {"bk": "pc.example.ts.net", "beaulink": "pc.example.ts.net", "air15": "air15", "elsewhere": "elsewhere"}
         hosts = {"beaulink": "beaulink", "air15": "air15", "local": None}
         self.assertEqual(lp.ssh_board_host("bk", hosts, machines.get), "beaulink")
         self.assertEqual(lp.ssh_board_host("beaulink", hosts, lambda alias: self.fail("asked")), "beaulink")
@@ -121,8 +121,8 @@ class ExactCodexTest(unittest.TestCase):
             self.assertIsNone(lp.ssh_hostname("-oProxyCommand=x"))
             self.assertIsNone(lp.ssh_hostname("-v"))
             run.assert_not_called()
-        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "user r\nhostname PC.Tail.ts.net\n", "")) as run:
-            self.assertEqual(lp.ssh_hostname("bk"), "pc.tail.ts.net")
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, "user r\nhostname PC.Example.ts.net\n", "")) as run:
+            self.assertEqual(lp.ssh_hostname("bk"), "pc.example.ts.net")
             self.assertEqual(run.call_args[0][0], ["ssh", "-G", "bk"])
         # The reply names the board host, or nothing when no board host is that machine.
         terminal = {"id": FIRST, "createdAt": 1}
