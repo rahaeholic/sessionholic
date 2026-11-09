@@ -1135,6 +1135,9 @@ class TerminalManager:
             raise ValueError("실행 프로그램 정보가 올바르지 않습니다.")
         cwd = info.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 4096 and "\0" not in cwd else None
+        # The host an SSH run went to (its destination as typed), so its session is looked for there.
+        ssh_host = info.get("sshHost") if program == "ssh" else None
+        ssh_host = ssh_host if isinstance(ssh_host, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", ssh_host) else None
         # Its host named its launcher and nothing runs below it: the launcher's menu still waits.
         menu = program is None and info.get("launcher") is True
         with self.lock:
@@ -1143,13 +1146,15 @@ class TerminalManager:
                 return False
             previous = terminal.record["metadata"]
             terminal.record["metadata"] = _metadata({**previous, "program": program, "programCwd": cwd,
+                                                     "programHost": ssh_host,
                                                      "programMenu": menu, "programAt": int(time.time())})
             try:
                 self._save()
             except BaseException:
                 terminal.record["metadata"] = previous
                 raise
-        if (previous.get("program"), previous.get("programCwd"), previous.get("programMenu")) != (program, cwd, menu):
+        if ((previous.get("program"), previous.get("programCwd"), previous.get("programHost"), previous.get("programMenu"))
+                != (program, cwd, ssh_host, menu)):
             self._changed()
         return True
 

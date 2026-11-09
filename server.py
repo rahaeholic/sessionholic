@@ -1858,7 +1858,9 @@ class Workflow:
 
     def _describe_host(self, host, rows, wanted=None):
         try:
-            result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows}, timeout=15)
+            # The board's SSH aliases are matched on that host, whose own SSH settings name the machines.
+            ssh_hosts = {h["name"]: h["ssh"] for h in self.board.hosts if isinstance(h.get("ssh"), str)}
+            result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows, "sshHosts": ssh_hosts}, timeout=15)
             asked = {row["id"] for row in rows} if wanted is None else set(wanted)
             for identifier, info in (result.get("terminals") or {}).items():
                 if identifier in asked and isinstance(info, dict):
@@ -2346,7 +2348,11 @@ class Workflow:
         The earliest session that appears on its host after it opened (30 seconds of clock
         difference allowed), and no other terminal names, is recorded as its own, once: its
         card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
-        (Codex `exec`, Claude background agents) are never taken."""
+        (Codex `exec`, Claude background agents) are never taken. A launcher seen running an
+        agent takes only that agent's sessions; one seen running SSH takes its session from the
+        board host its destination names (a PC's), never its own host's; one running Claude's agent
+        view (background sessions only) or SSH to an unknown host takes none and so never makes
+        another launcher's session ambiguous."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2354,8 +2360,16 @@ class Workflow:
             terminals = self.terminals.list()
         except (RuntimeError, OSError, ValueError):
             return
+        def session_host(terminal):
+            if terminal.get("program") == "claude-agents":
+                return None
+            if terminal.get("program") != "ssh":
+                return terminal.get("host")
+            target = terminal.get("programHost")
+            return next((h["name"] for h in self.board.hosts if target and h["name"] != terminal.get("host")
+                         and target in (h["name"], h.get("ssh"))), None)
         pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
-                          and not t.get("closed") and not t.get("nativeSource")
+                          and not t.get("closed") and not t.get("nativeSource") and session_host(t)
                           and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
         if not pending:
             return
@@ -2363,11 +2377,14 @@ class Workflow:
                  if isinstance(t.get("nativeSource"), dict)}
         found = []
         for terminal in pending:
-            host = terminal.get("host")
+            host = session_host(terminal)
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
             candidates = []
+            program = terminal.get("program")
             for agent in ("codex", "claude"):
+                if program in ("codex", "claude") and agent != program:
+                    continue
                 for row in data.get(agent) or []:
                     native = self._native_of(host, agent, row)
                     started = row.get("startedAt")

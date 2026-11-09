@@ -534,7 +534,12 @@ function navTransition(direction, update) {
 }
 // Phone screens: the list or one conversation. State changes at once (chat
 // reads depend on it); only the visible switch may wait for the transition.
-function compactSessionLayout() { return phoneLayout() || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || ""); }
+// A split pane of a board wider than a phone ([data-desktop-pane], theme-init.js and workspace.js)
+// lays out like the board's first pane, not like a phone, whatever its own width.
+function compactSessionLayout() {
+  const desktopPane = !!document.documentElement?.hasAttribute?.("data-desktop-pane");
+  return (phoneLayout() && !desktopPane) || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || "");
+}
 function ryanOneCompact() { return window.RyanOneHost?.compact === true; }
 function compactSessionActions() {
   const actions = [];
@@ -625,13 +630,6 @@ function syncCompactConnection() {
     dot.dataset.connected = String(!!connected); dot.setAttribute("aria-label", status); dot.title = status;
   }
   setClass($("terminal-screen"), "compact-connected", !!state.connected);
-}
-function toggleTerminalKeys() {
-  const open = !$("terminal-screen").classList.contains("compact-keys-open");
-  $("terminal-screen").classList.toggle("compact-keys-open", open);
-  for (const control of document.querySelectorAll(".terminal-keys-toggle")) control.setAttribute("aria-expanded", String(open));
-  if (!open) clearTerminalMods();
-  requestAnimationFrame(fitTerminal);
 }
 window.addEventListener("ryanone-ready", () => {
   if (!ryanOneCompact()) return;
@@ -6761,11 +6759,7 @@ function buildChatComposer(s) {
   referenceInline.setAttribute("aria-haspopup", "dialog");
   referenceInline.title = "다른 대화 참조";
   referenceInline.addEventListener("pointerdown", (event) => event.preventDefault());
-  const keys = button("⌨", "terminal-keys-toggle chat-terminal-keys", toggleTerminalKeys);
-  keys.id = "chat-terminal-keys";
-  keys.setAttribute("aria-label", "터미널 특수키"); keys.setAttribute("aria-expanded", "false"); keys.setAttribute("aria-controls", "terminal-keys");
-  keys.addEventListener("pointerdown", event => event.preventDefault());
-  main.append(input, attachInline, mic, quickInline, referenceInline, keys, send);
+  main.append(input, attachInline, mic, quickInline, referenceInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -12306,7 +12300,9 @@ async function uploadTerminalFiles(files = []) {
       terminal = state.terminals.find((item) => item.id === entry.terminalId) || terminal;
     }
     const source = terminalAttachmentSource(terminal);
-    if (!source || terminal.alive === false || terminal.closed) throw new Error("이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
+    if (!source || terminal.alive === false || terminal.closed) throw new Error(estimatedConversation(terminal)
+      ? "이 터미널에서는 첨부할 수 없습니다. 채팅 탭의 '이 대화로 채팅 열기'를 누른 뒤 채팅에서 올려 주세요. 첨부는 남겨 두었습니다."
+      : "이 터미널의 세션 연결을 확인 중입니다. 첨부는 남겨 두었습니다. 연결 뒤 다시 올려 주세요.");
     if (entry.source && chatKey(entry.source) !== chatKey(source)) throw new Error("터미널의 연결 세션이 바뀌었습니다. 이전 첨부를 제거한 뒤 다시 추가해 주세요.");
     entry.source = source;
     while (entry.uploadQueue.length && retained() && !controller.signal.aborted) {
@@ -12685,6 +12681,23 @@ function agentViewConversation(terminal) {
   const own = launcherChatCandidates(terminal).filter((s) => agentViewSession(info, s));
   return own.length === 1 ? own[0] : null;
 }
+// The listed conversation the server estimated (start time on the terminal's host) as this
+// launcher's own. It is only offered: one press opens it as a list choice would, never as this
+// terminal's input or attachment route.
+function estimatedConversation(terminal) {
+  const info = terminalInfo(terminal);
+  if (info.program === "claude-agents") return agentViewConversation(terminal);
+  if (!terminalEstimated(terminal) || !info.nativeSource || info.chatSource) return null;
+  return allSessions().find((s) => sameRecoverySource(sourceOf(s), info.nativeSource)) || null;
+}
+function openEstimatedConversation(view) {
+  if (!launcherChatViewCurrent(view)) return;
+  const started = estimatedConversation(launcherWorkspaceTerminal());
+  if (!started) return;
+  state.launcherWorkspace = null;
+  select(started.key);
+  chooseDetailMode("chat");
+}
 function renderLauncherChat() {
   const terminal = launcherWorkspaceTerminal(), root = $("launcher-chat-waiting");
   if (!terminal || !root || !launcherWorkspaceCurrent(terminal.id) || state.inlineTerminal || state.launcherWorkspace.mode !== "chat") return;
@@ -12701,9 +12714,17 @@ function renderLauncherChat() {
     view.refresh = button("기록 새로고침", "secondary", () => readLauncherChat(view));
     view.list = el("div", "messages launcher-chat-messages"); view.list.setAttribute("role", "log");
     view.list.setAttribute("aria-label", "선택한 대화 기록"); view.list.tabIndex = 0;
+    view.estimate = el("div", "launcher-chat-estimate"); view.estimate.hidden = true;
+    view.estimateNote = el("p", "detail-note");
+    view.open = button("이 대화로 채팅 열기", "primary", () => openEstimatedConversation(view));
+    view.estimate.append(view.estimateNote, view.open);
     picker.append(label, view.select, view.connect, view.refresh, view.note);
-    root.className = "launcher-chat"; root.replaceChildren(picker, view.list);
+    root.className = "launcher-chat"; root.replaceChildren(view.estimate, picker, view.list);
   }
+  const started = estimatedConversation(terminal);
+  view.estimate.hidden = !started;
+  if (started) view.estimateNote.textContent =
+    `이 터미널에서 시작한 것으로 보이는 대화: ${started.title || started.initialTitle || started.project || "대화"} · ${started.cwd || ""}`;
   const candidates = launcherChatCandidates(terminal), source = terminalInfo(terminal).chatSource;
   const signature = JSON.stringify(candidates.map((s) => [s.key, s.title, s.account, s.project]));
   if (signature !== view.candidates) {
@@ -12716,7 +12737,8 @@ function renderLauncherChat() {
     view.select.replaceChildren(placeholder, ...options);
     // The one conversation an agent view started is offered ready to connect (still a press).
     const own = candidates.filter((s) => agentViewSession(terminalInfo(terminal), s));
-    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : source && candidates.some((s) => s.key === chatKey(source)) ? chatKey(source)
+    const linked = source && candidates.find((s) => sameRecoverySource(sourceOf(s), source));
+    view.select.value = candidates.some((s) => s.key === chosen) ? chosen : linked ? linked.key
       : own.length === 1 ? own[0].key : "";
     view.candidates = signature;
   }
@@ -16378,8 +16400,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
   bindDraftInput($("terminal-draft"));
-  $("terminal-keys-toggle").addEventListener("pointerdown", event => event.preventDefault());
-  $("terminal-keys-toggle").addEventListener("click", toggleTerminalKeys);
   // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
   $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
   $("draft-attach").addEventListener("click", () => $("terminal-files").click());

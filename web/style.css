@@ -7752,6 +7752,9 @@ input.switch:focus-visible {
 .launcher-chat-picker label { flex: 0 0 100%; font-weight: 600; }
 .launcher-chat-picker select { flex: 1 1 220px; min-width: 0; max-width: 100%; min-height: 44px; font: inherit; color: var(--label); background: var(--surface); border: 1px solid var(--sep); border-radius: 10px; padding: 8px 32px 8px 10px; }
 .launcher-chat-picker .detail-note { flex: 0 0 100%; margin: 0; }
+.launcher-chat-estimate { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px var(--detail-pad); border-bottom: 1px solid var(--sep); background: var(--accent-tint); }
+.launcher-chat-estimate[hidden] { display: none; }
+.launcher-chat-estimate .detail-note { flex: 1 1 220px; margin: 0; overflow-wrap: anywhere; }
 .launcher-chat-messages { min-height: 0; padding-top: 14px; }
 /* Native choices and their uncertain delivery receipts stay in the chat view.
    The visible terminal already owns that menu and its keyboard controls. */
@@ -8266,7 +8269,7 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] .top .quick-reload { width: 44px; padding: 0; }
 :root[data-compact-mobile="true"] .top .quick-reload svg { display: block; }
 :root[data-compact-mobile="true"] .top .workspace-split-open { min-height: 44px; }
-.terminal-keys-toggle, .compact-terminal-menu, .compact-connection, .ryan-recording, .compact-launcher-actions { display: none; }
+.compact-terminal-menu, .compact-connection, .ryan-recording, .compact-launcher-actions { display: none; }
 :root[data-compact-mobile="true"] .compact-session:not(.workspace-split) #app > .top { display: none; }
 :root[data-compact-mobile="true"] .compact-session #session-layout { display: flex; flex-direction: column; min-height: 0; }
 :root[data-compact-mobile="true"] .compact-session #task-list-pane { display: none; }
@@ -8310,26 +8313,14 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] .terminal-status-row > :not(#terminal-status):not(#terminal-reconnect):not(#terminal-reopen),
 :root[data-compact-mobile="true"] #terminal-screen.compact-connected > .terminal-context,
 :root[data-compact-mobile="true"] #terminal-screen.compact-connected > .terminal-status-row { display: none; }
-:root[data-compact-mobile="true"] #terminal-screen:not(.compact-keys-open) #terminal-keys,
-:root[data-compact-mobile="true"] #terminal-screen:not(.compact-keys-open) #terminal-menu,
-:root[data-compact-mobile="true"] #terminal-screen:not(.compact-keys-open) #draft-type,
-:root[data-compact-mobile="true"] #terminal-screen.has-session-composer:not(.compact-keys-open) .terminal-tools,
 :root[data-compact-mobile="true"] .draft-mode-note { display: none; }
 :root[data-compact-mobile="true"] .terminal-tools { padding: 4px 6px max(4px, env(safe-area-inset-bottom)); }
-:root[data-compact-mobile="true"] .terminal-keys { --key-row: 44px; }
-:root[data-compact-mobile="true"] .draft-panel { margin: 0; padding: 0; border-top: 0; }
-:root[data-compact-mobile="true"] .compact-keys-open .draft-panel { padding-top: 6px; }
+:root[data-compact-mobile="true"] .terminal-keys { --key-row: 44px; gap: 4px; }
+/* Always shown on a phone: a 412px row leaves ~30px a key, so four-letter labels (Ctrl, ⇧Tab) stay on one line. */
+:root[data-compact-mobile="true"] .terminal-keys button { padding: 0; white-space: nowrap; letter-spacing: -0.06em; }
+:root[data-compact-mobile="true"] .draft-panel { margin: 0; padding: 6px 0 0; border-top: 0; }
 :root[data-compact-mobile="true"] .draft-row { gap: 4px; }
 :root[data-compact-mobile="true"] .draft-row > textarea { flex: 1; min-width: 0; width: 0; }
-:root[data-compact-mobile="true"] .terminal-keys-toggle {
-  display: inline-flex; flex: none; align-items: center; justify-content: center;
-  min-width: 44px; min-height: 44px; padding: 0 6px; border: 0; border-radius: 8px;
-  color: var(--label); background: var(--fill); font-size: 20px;
-}
-:root[data-compact-mobile="true"] .terminal-keys-toggle[aria-expanded="true"] { background: var(--accent-tint); color: var(--accent-strong); }
-:root[data-compact-mobile="true"] .terminal-keys-toggle:active { opacity: .7; }
-:root[data-compact-mobile="true"] .chat-terminal-keys { display: none; }
-:root[data-compact-mobile="true"] #detail.is-terminal-mode .chat-terminal-keys { display: inline-flex; }
 :root[data-compact-mobile="true"] #detail .chat-composer { padding: 6px 8px max(6px, env(safe-area-inset-bottom)); gap: 4px; }
 :root[data-compact-mobile="true"] #detail .chat-main { flex-wrap: nowrap; gap: 4px; }
 :root[data-compact-mobile="true"] #detail .chat-main > .chat-input { flex: 1; width: 0; min-width: 0; order: 1; padding: 10px; }

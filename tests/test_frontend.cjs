@@ -5397,12 +5397,32 @@ test('분할 창(휴대폰 폭의 데스크톱 창)에서 우클릭 메뉴는 1�
   }
 });
 
+test('데스크톱 보드의 분할 창은 칸 폭이 좁아도 휴대폰 압축 화면이 아니고, 빠른 답장도 1번 창처럼 시트로 연다', () => {
+  for (const desktopPane of [true, false]) {
+    const c = client(undefined, noChatTimers);
+    c.context.window.matchMedia = (query) => ({ matches: query === '(max-width: 700px)' });
+    c.context.window.innerWidth = 450; c.context.window.innerHeight = 900;
+    c.context.document.documentElement.hasAttribute = (name) => desktopPane && name === 'data-desktop-pane';
+    assert.equal(vm.runInContext('compactSessionLayout()', c.context), !desktopPane);
+    const { entry } = selectChat(c); const input = c.get('chat-input');
+    const composer = node(); composer.append = function (panel) { this.children.push(panel); };
+    input.closest = () => composer;
+    c.openQuickReplies(entry, input, null);
+    assert.equal(c.get('action-sheet').open === true, desktopPane, desktopPane ? 'a desktop pane opens the sheet' : 'a phone keeps the inline list');
+    assert.equal(composer.children.length, desktopPane ? 0 : 1);
+  }
+  const android = client(undefined, noChatTimers);
+  android.context.window.matchMedia = () => ({ matches: false });
+  android.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  assert.equal(vm.runInContext('compactSessionLayout()', android.context), true, 'Android stays compact at any width');
+});
+
 test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, 입력이 막히면 비활성이다', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-terminal-keys', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -16120,6 +16140,27 @@ test('미확인 터미널은 자동 추정을 열지 않고 선택한 채팅을 
   c.get('detail-mode-chat').events.click(); await settle();
   view = c.state.launcherChatView;
   assert.match(textOf(view.list), /선택한 실제 대화의 답변/);
+  view.candidates = null; c.renderLauncherChat();
+  assert.equal(view.select.value, s.key, 'a redrawn picker keeps the conversation chosen for this terminal');
+  c.stopChatPolling();
+});
+
+test('추정 연결된 대화는 저절로 열지 않고, 채팅 탭에서 한 번 누르면 목록에서 고른 것처럼 연다', async () => {
+  const { c, s, terminal, selected, calls } = launcherRecoveryClient();
+  await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
+  c.get('detail-mode-chat').events.click(); await settle();
+  const view = c.state.launcherChatView;
+  assert.equal(view.estimate.hidden, true, 'an estimate that is not listed offers nothing');
+  terminal.nativeSource = selected; c.renderLauncherChat();
+  assert.equal(view.estimate.hidden, false);
+  assert.match(view.estimateNote.textContent, /시작한 것으로 보이는 대화: .* · \/fixture\/project/);
+  assert.equal(c.state.selected, null, 'an estimate never opens by itself');
+  view.open.events.click(); await settle();
+  assert.equal(c.state.selected, s.key, 'opened as a list choice would');
+  assert.equal(c.state.launcherWorkspace, null);
+  assert.equal(c.terminalMatchesDetail(terminal, s), false, 'the estimate grants no terminal input route');
+  assert.equal(calls.some((r) => r.url.endsWith('/conversation')), false, 'nothing is linked to the terminal');
+  assert.equal(calls.some((r) => /\/input|\/launch|\/send|\/close|\/api\/new-session/.test(r.url)), false);
   c.stopChatPolling();
 });
 
@@ -16165,6 +16206,8 @@ test('Claude 에이전트 뷰 터미널의 채팅 탭은 그 뒤 같은 폴더(�
     assert.equal(c.launcherChatCandidates({ ...terminal, program: 'claude' }).some((item) => item.id === 'own'), false);
     await vm.runInContext('openNewSessionTerminal(state.terminals[0])', c.context);
     assert.equal(c.state.launcherWorkspace.terminalId, terminal.id, 'the terminal tab is never left by itself');
+    assert.equal(vm.runInContext('estimatedConversation(state.terminals[0])', c.context)?.id, 'own',
+      'terminal attachments point to the chat of the conversation it started');
     c.get('detail-mode-chat').events.click(); await settle();
     assert.equal(c.state.selected, keyOf(c, 'own'), 'opened as a list choice would');
     assert.equal(c.state.launcherWorkspace, null);
@@ -17469,4 +17512,15 @@ test('iPad room belongs to the top-level screen; desktop, Android and child pane
   c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true };
   c.context.window.innerHeight = 779; c.context.window.visualViewport.height = 779;
   c.updateViewport(); assert.equal(vars['--app-height'], '779px', 'parent already reserved the room');
+});
+
+test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항상 보인다', () => {
+  const css = styleSheet(), html = indexPage();
+  assert.doesNotMatch(html, /terminal-keys-toggle/, 'no ⌨ toggle in the terminal input row');
+  for (const id of ['terminal-keys', 'terminal-menu', 'draft-type'])
+    assert.doesNotMatch(css, new RegExp(`\\[data-compact-mobile="true"\\][^{}]*#${id}[^{}]*\\{[^}]*display: none`), `${id} stays visible on compact screens`);
+  assert.doesNotMatch(css, /\[data-compact-mobile="true"\][^{}]*\.terminal-tools[^{}]*\{[^}]*display: none/);
+  assert.match(css, /\[data-compact-mobile="true"\] \.terminal-keys button \{[^}]*white-space: nowrap/, 'Ctrl and ⇧Tab stay on one line on a phone');
+  const c = client(undefined, noChatTimers), { s } = selectChat(c);
+  assert.equal(findId(c.buildChatComposer(s), 'chat-terminal-keys'), null);
 });
