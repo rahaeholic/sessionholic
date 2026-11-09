@@ -631,13 +631,6 @@ function syncCompactConnection() {
   }
   setClass($("terminal-screen"), "compact-connected", !!state.connected);
 }
-function toggleTerminalKeys() {
-  const open = !$("terminal-screen").classList.contains("compact-keys-open");
-  $("terminal-screen").classList.toggle("compact-keys-open", open);
-  for (const control of document.querySelectorAll(".terminal-keys-toggle")) control.setAttribute("aria-expanded", String(open));
-  if (!open) clearTerminalMods();
-  requestAnimationFrame(fitTerminal);
-}
 window.addEventListener("ryanone-ready", () => {
   if (!ryanOneCompact()) return;
   syncCompactSessionLayout();
@@ -6766,11 +6759,7 @@ function buildChatComposer(s) {
   referenceInline.setAttribute("aria-haspopup", "dialog");
   referenceInline.title = "다른 대화 참조";
   referenceInline.addEventListener("pointerdown", (event) => event.preventDefault());
-  const keys = button("⌨", "terminal-keys-toggle chat-terminal-keys", toggleTerminalKeys);
-  keys.id = "chat-terminal-keys";
-  keys.setAttribute("aria-label", "터미널 특수키"); keys.setAttribute("aria-expanded", "false"); keys.setAttribute("aria-controls", "terminal-keys");
-  keys.addEventListener("pointerdown", event => event.preventDefault());
-  main.append(input, attachInline, mic, quickInline, referenceInline, keys, send);
+  main.append(input, attachInline, mic, quickInline, referenceInline, send);
   box.append(heading, status, recovery, gate, evidence, attachmentsLabel, attachments, main, files, actions, hint);
   queueMicrotask(() => {
     if (!editorCurrent()) return;
@@ -16383,8 +16372,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
   bindDraftInput($("terminal-draft"));
-  $("terminal-keys-toggle").addEventListener("pointerdown", event => event.preventDefault());
-  $("terminal-keys-toggle").addEventListener("click", toggleTerminalKeys);
   // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
   $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
   $("draft-attach").addEventListener("click", () => $("terminal-files").click());

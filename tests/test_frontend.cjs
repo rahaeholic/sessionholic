@@ -5422,7 +5422,7 @@ test('입력창 다음의 주요 동작 줄은 같은 빠른 답장을 열고, �
   const { s, entry } = selectChat(c);
   const composer = c.buildChatComposer(s);
   const main = byClass(composer, 'chat-main')[0];
-  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-terminal-keys', 'chat-send']);
+  assert.deepEqual(main.children.map((child) => child.id), ['chat-input', 'chat-attach-inline', 'chat-mic', 'chat-quick-inline', 'chat-reference-inline', 'chat-send']);
   const quick = findId(composer, 'chat-quick-inline');
   assert.equal(quick.attributes['aria-label'], '빠른 답장');
   quick.events.click({ currentTarget: quick });
@@ -17489,4 +17489,14 @@ test('iPad room belongs to the top-level screen; desktop, Android and child pane
   c.context.window.SessionholicWorkspace = { embedded: true, visible: () => true };
   c.context.window.innerHeight = 779; c.context.window.visualViewport.height = 779;
   c.updateViewport(); assert.equal(vars['--app-height'], '779px', 'parent already reserved the room');
+});
+
+test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항상 보인다', () => {
+  const css = styleSheet(), html = indexPage();
+  assert.doesNotMatch(html, /terminal-keys-toggle/, 'no ⌨ toggle in the terminal input row');
+  for (const id of ['terminal-keys', 'terminal-menu', 'draft-type'])
+    assert.doesNotMatch(css, new RegExp(`\\[data-compact-mobile="true"\\][^{}]*#${id}[^{}]*\\{[^}]*display: none`), `${id} stays visible on compact screens`);
+  assert.doesNotMatch(css, /\[data-compact-mobile="true"\][^{}]*\.terminal-tools[^{}]*\{[^}]*display: none/);
+  const c = client(undefined, noChatTimers), { s } = selectChat(c);
+  assert.equal(findId(c.buildChatComposer(s), 'chat-terminal-keys'), null);
 });
