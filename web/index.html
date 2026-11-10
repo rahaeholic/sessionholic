@@ -157,8 +157,10 @@
         <button id="workspace-split-open" class="quiet workspace-split-open" type="button" title="현재 창 오른쪽에 새 창 열기" hidden>＋ 분할 추가</button>
         <button id="logout" class="quiet" type="button">잠그기</button>
       </header>
-      <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title">
-        <header class="woni-head"><div><h2 id="woni-title">원이</h2><p id="woni-status" class="woni-status" role="status"></p></div><div class="woni-head-actions"><button id="woni-find-open" type="button" class="icon-button woni-find-open" aria-label="대화 찾기·흐름 목록" aria-pressed="false" title="대화 찾기"><svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="5.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M11 11l3.6 3.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button><button id="woni-close" type="button" class="icon-button" aria-label="원이 닫기">×</button></div></header>
+      <dialog id="woni-dialog" class="woni-dialog" aria-labelledby="woni-title" data-drawer="closed">
+        <nav id="woni-side" class="woni-side" aria-label="원이 메뉴"></nav>
+        <div id="woni-main" class="woni-main">
+        <header class="woni-head"><button id="woni-menu" type="button" class="icon-button woni-menu" aria-label="원이 메뉴 열기" aria-expanded="false" aria-controls="woni-side" title="메뉴"><svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true" focusable="false"><path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button><div class="woni-head-title"><h2 id="woni-title">원이</h2><p id="woni-status" class="woni-status" role="status"></p></div><div class="woni-head-actions"><button id="woni-find-open" type="button" class="icon-button woni-find-open" aria-label="대화 찾기·흐름 목록" aria-pressed="false" title="대화 찾기"><svg viewBox="0 0 16 16" width="17" height="17" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="5.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M11 11l3.6 3.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button><button id="woni-close" type="button" class="icon-button" aria-label="원이 닫기">×</button></div></header>
         <nav class="woni-tabs" aria-label="원이 화면">
           <button id="woni-chat-tab" type="button" aria-pressed="true">대화</button>
           <button id="woni-tasks-tab" type="button" aria-pressed="false">할 일<span id="woni-tasks-badge" class="woni-tab-badge" hidden></span></button>
@@ -172,7 +174,7 @@
         <div id="woni-find" class="woni-panel" aria-label="원이 대화 찾기" hidden></div>
         <div id="woni-work" class="woni-work" aria-label="원이 작업 현황" hidden></div>
         <div id="woni-original" class="woni-original" hidden></div>
-        <div id="woni-notice" class="woni-notice" role="status" hidden></div>
+        <div class="woni-notice-anchor"><div id="woni-notice" class="woni-notice" role="status" hidden></div></div>
         <form id="woni-form" class="woni-form">
           <div id="woni-reply" class="woni-reply" hidden><span id="woni-reply-label"></span><button id="woni-reply-clear" type="button" class="quiet" aria-label="답글 취소">×</button></div>
           <div id="woni-reply-suggestions" class="woni-suggestions woni-reply-suggestions" aria-label="이 답의 추천 답장" hidden></div>
@@ -188,11 +190,13 @@
             <button id="woni-mic" type="button" class="woni-tool" aria-label="음성 입력" aria-pressed="false" title="음성 입력" hidden>
               <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="7" y="2.5" width="6" height="10" rx="3"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/></svg>
             </button>
-            <span id="woni-hint" class="woni-hint">⌘ Enter로 보내기</span>
-            <button id="woni-send" type="submit" class="primary" aria-keyshortcuts="Meta+Enter Control+Enter">보내기</button>
+            <span id="woni-hint" class="woni-hint">Enter 보내기 · Shift+Enter 줄바꿈</span>
+            <button id="woni-send" type="submit" class="primary" aria-keyshortcuts="Enter Meta+Enter Control+Enter">보내기</button>
           </div>
           </div>
         </form>
+        </div>
+        <div id="woni-scrim" class="woni-scrim" aria-hidden="true"></div>
       </dialog>
       <div
         id="connection-notice"
