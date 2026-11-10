@@ -47,7 +47,8 @@ test('원이 답 말풍선 끝에 답한 시각만 작게 달고, 메뉴에는 �
   const finishedAt = Date.UTC(2026, 10, 6, 4, 23) / 1000;
   const chats = [
     { id: 'known', text: '질문', answer: '기록된 답변', status: 'complete', createdAt: finishedAt - 600, finishedAt },
-    { id: 'missing', text: '다른 질문', answer: '시각 없는 답변', status: 'complete', createdAt: finishedAt - 30 },
+    // known의 답(finishedAt) 뒤에 물은 질문이다. 앞에 두면 known의 답이 떨어진 답이 되어 맨 아래로 간다(2026-11-11 줄 규칙).
+    { id: 'missing', text: '다른 질문', answer: '시각 없는 답변', status: 'complete', createdAt: finishedAt + 30 },
     { id: 'invalid', text: '질문', answer: '잘못된 시각', status: 'complete', finishedAt: 0 },
   ];
   const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
@@ -528,7 +529,7 @@ test('원이 답의 추천 답장(👉)을 버튼으로 보여 주고 누르면 
   ];
   const call = async (url, options) => {
     if (url.includes('availability')) return { enabled: true };
-    if (url === '/api/woni' && options?.method === 'POST') { sent.push({ ...options.body }); return { id: options.body.requestId, status: 'queued' }; }
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push(JSON.parse(JSON.stringify(options.body))); return { id: options.body.requestId, status: 'queued' }; }
     if (options?.method === 'POST') return {};
     return { chats, activity: {} };
   };
@@ -542,7 +543,8 @@ test('원이 답의 추천 답장(👉)을 버튼으로 보여 주고 누르면 
   assert.deepEqual(boxes[0].children.map(button => button.textContent), ['응, 정리해 줘', '장소 후보부터 봐 줘']);
   assert.equal(boxes[0].children[0].type, 'button');
   await boxes[0].children[0].click();
-  assert.deepEqual(sent, [{ text: '응, 정리해 줘', requestId: 'request-123456' }]);
+  // 추천은 늘 그 답에 단 답글로 보낸다(2026-11-11 늦게 끝난 답이 맨 아래로 — 앱 1.44.0과 같게)
+  assert.deepEqual(sent, [{ text: '응, 정리해 줘', requestId: 'request-123456', replyTo: { id: 'latest', part: 'answer' } }]);
   assert.equal(nodes['woni-input'].value, '쓰던 초안');
   assert.equal(nodes['woni-messages'].children.some(node => node.className === 'woni-suggestions'), false);  // 확인 전 두 번 보내지 않게 숨긴다
 });
@@ -1284,4 +1286,210 @@ test('잠그면 이어 받은 대화·흐름·찾기 결과를 모두 버리고 
   assert.equal(textOf(nodes['woni-find']).includes('비밀 흐름'), false);
   await app.check(call); nodes['woni-open'].click(); await settle();
   assert.equal(ids().includes('late'), false); assert.equal(ids()[0], 'c40');
+});
+
+// ---- 늦게 온 답은 맨 아래에, 그 질문에 단 답글로 (라이언 2026-11-11 08:10) ----
+// "작업 중인 게 위에 있다고 해서 거기에 최종 답 가져와 버리면은 … 위에 온 답변을 내가 놓치게 되잖아"
+const plainRows = rows => JSON.parse(JSON.stringify(rows));
+const shape = rows => plainRows(rows).map(row => `${row.id}:${row.kind}${row.detached ? '(떨어짐)' : ''}`);
+
+test('줄 함수: 질문과 바로 붙은 답은 한 덩어리, 작업 중이면 질문 줄만', () => {
+  const { app } = fixture(async () => ({}));
+  assert.deepEqual(plainRows(app.chatRows([{ id: 'a', seq: 1, text: '질문', answer: '답', status: 'complete', createdAt: 100, finishedAt: 160 }])),
+    [{ kind: 'merged', id: 'a', at: 100, detached: false, key: 'a:merged' }]);
+  assert.deepEqual(plainRows(app.chatRows([{ id: 'a', seq: 1, text: '질문', status: 'running', progress: '찾는 중', createdAt: 100 }])),
+    [{ kind: 'question', id: 'a', at: 100, detached: false, key: 'a:question' }]);
+  assert.deepEqual(plainRows(app.chatRows([{ id: 'a', seq: 1, text: '질문', status: 'queued', createdAt: 100 }])).map(row => row.kind), ['question']);
+  assert.deepEqual(plainRows(app.chatRows([])), []);
+});
+
+test('줄 함수: 먼저 보낸 질문의 답이 늦게 끝나면 다른 대화 아래로 떨어져 맨 아래에 온다', () => {
+  const { app } = fixture(async () => ({}));
+  const at = (h, m) => Date.UTC(2026, 10, 11, h - 9, m) / 1000;  // KST
+  const chats = [
+    { id: 'A', seq: 1, text: 'A 질문', answer: 'A 답', status: 'complete', createdAt: at(10, 0), finishedAt: at(10, 5) },
+    { id: 'B', seq: 2, text: 'B 질문', answer: 'B 답', status: 'complete', createdAt: at(10, 1), finishedAt: at(10, 2) },
+  ];
+  const rows = plainRows(app.chatRows(chats));
+  assert.deepEqual(rows, [
+    { kind: 'question', id: 'A', at: at(10, 0), detached: true, key: 'A:question' },
+    { kind: 'merged', id: 'B', at: at(10, 1), detached: false, key: 'B:merged' },
+    { kind: 'answer', id: 'A', at: at(10, 5), detached: true, key: 'A:answer' },
+  ]);
+  // A가 아직 작업 중이면 A 질문 줄만 위에 남는다.
+  assert.deepEqual(shape(app.chatRows([{ ...chats[0], status: 'running', answer: '', finishedAt: undefined }, chats[1]])), ['A:question', 'B:merged']);
+});
+
+test('줄 함수: 알림·실패·중단·시각 없는 답·같은 시각을 규칙대로 놓는다', () => {
+  const { app } = fixture(async () => ({}));
+  // 알림은 답 줄 하나(finishedAt, 없으면 createdAt)이고 떨어지지 않는다.
+  assert.deepEqual(plainRows(app.chatRows([{ id: 'n', seq: 1, kind: 'alert', answer: '발주 마감', status: 'complete', createdAt: 50, finishedAt: 70 }])),
+    [{ kind: 'answer', id: 'n', at: 70, detached: false, key: 'n:answer' }]);
+  assert.equal(plainRows(app.chatRows([{ id: 'n', seq: 1, kind: 'alert', answer: '발주 마감', status: 'complete', createdAt: 50 }]))[0].at, 50);
+  assert.deepEqual(shape(app.chatRows([{ id: 'n', seq: 1, kind: 'alert', status: 'running', createdAt: 50 }])), ['n:answer']);
+  // 실패·중단은 답이 없어도 답 줄(실패 안내)이다. 끼어든 줄이 있으면 떨어진다.
+  assert.deepEqual(shape(app.chatRows([
+    { id: 'f', seq: 1, text: '실패할 질문', status: 'failed', createdAt: 100, finishedAt: 400 },
+    { id: 'i', seq: 2, text: '중단될 질문', status: 'interrupted', createdAt: 200, finishedAt: 210 },
+    { id: 'n', seq: 3, kind: 'alert', answer: '알림', status: 'complete', createdAt: 300, finishedAt: 300 },
+  ])), ['f:question(떨어짐)', 'i:merged', 'n:answer', 'f:answer(떨어짐)']);
+  // 답이 없는 complete는 질문 줄만이다(지금 화면과 같다).
+  assert.deepEqual(shape(app.chatRows([{ id: 'e', seq: 1, text: '질문', status: 'complete', createdAt: 100, finishedAt: 120 }])), ['e:question']);
+  // finishedAt이 없거나 0이면 createdAt: 질문에 붙는다(뒤 대화보다 앞).
+  assert.deepEqual(shape(app.chatRows([
+    { id: 'x', seq: 1, text: 'x', answer: 'x 답', status: 'complete', createdAt: 100, finishedAt: 0 },
+    { id: 'y', seq: 2, text: 'y', answer: 'y 답', status: 'complete', createdAt: 150 },
+  ])), ['x:merged', 'y:merged']);
+  // 시각이 아예 없는 옛 대화는 0으로 끌어올리지 않고 자기 답 시각·앞 줄 시각을 써서 제자리에 붙는다.
+  assert.deepEqual(shape(app.chatRows([
+    { id: 'old', status: 'complete', answer: '옛 답', finishedAt: 10 },
+    { id: 'bare', status: 'complete', answer: '시각 없음' },
+    { id: 'last', status: 'complete', answer: '새 답', finishedAt: 20 },
+  ])), ['old:merged', 'bare:merged', 'last:merged']);
+});
+
+test('줄 함수: 같은 시각은 질문이 자기 답보다 앞, 그다음 seq 순서로 늘 같게 놓는다', () => {
+  const { app } = fixture(async () => ({}));
+  const chats = [
+    { id: 'p', seq: 7, text: 'p', answer: 'p 답', status: 'complete', createdAt: 100, finishedAt: 100 },
+    { id: 'q', seq: 8, text: 'q', answer: 'q 답', status: 'complete', createdAt: 100, finishedAt: 100 },
+    { id: 'r', seq: 9, text: 'r', answer: 'r 답', status: 'complete', createdAt: 100, finishedAt: 100 },
+  ];
+  assert.deepEqual(shape(app.chatRows(chats)), ['p:merged', 'q:merged', 'r:merged']);
+  // 받은 순서가 달라도 seq가 있으면 seq 순서
+  assert.deepEqual(shape(app.chatRows([chats[2], chats[0], chats[1]])), ['p:merged', 'q:merged', 'r:merged']);
+  // seq가 없으면 받은 순서를 지킨다.
+  const bare = chats.map(({ seq, ...chat }) => chat);
+  assert.deepEqual(shape(app.chatRows([bare[1], bare[0], bare[2]])), ['q:merged', 'p:merged', 'r:merged']);
+  // c0 답과 c1 질문이 같은 시각이어도 c0은 붙은 채로 남는다(이전 대화 fixture와 같은 모양).
+  assert.deepEqual(shape(app.chatRows([
+    { id: 'c0', seq: 0, text: '0', answer: '0', status: 'complete', createdAt: 1000, finishedAt: 1001 },
+    { id: 'c1', seq: 1, text: '1', answer: '1', status: 'complete', createdAt: 1001, finishedAt: 1002 },
+  ])), ['c0:merged', 'c1:merged']);
+  // 답 시각이 질문보다 앞서 찍혀도 답이 질문 위로 가지 않는다.
+  assert.deepEqual(shape(app.chatRows([{ id: 's', seq: 1, text: 's', answer: 's 답', status: 'complete', createdAt: 100, finishedAt: 90 }])), ['s:merged']);
+});
+
+test('줄 함수: 흐름으로 거른 뒤 다시 계산하면 떨어졌던 답이 그 흐름 안에서는 붙는다', () => {
+  const { app } = fixture(async () => ({}));
+  const chats = [
+    { id: 'A', seq: 1, stream: 'flow-a', text: 'A', answer: 'A 답', status: 'complete', createdAt: 100, finishedAt: 500 },
+    { id: 'B', seq: 2, stream: 'flow-b', text: 'B', answer: 'B 답', status: 'complete', createdAt: 200, finishedAt: 300 },
+  ];
+  assert.deepEqual(shape(app.chatRows(chats)), ['A:question(떨어짐)', 'B:merged', 'A:answer(떨어짐)']);
+  assert.deepEqual(shape(app.chatRows(chats.filter(chat => chat.stream === 'flow-a'))), ['A:merged']);
+});
+
+function replyOrderChats(aDone) {
+  const at = (h, m) => Date.UTC(2026, 10, 11, h - 9, m) / 1000;  // KST 오늘이 아니어도 시각 글자만 본다
+  return [
+    { id: 'A', seq: 1, text: 'A 질문: 재입고 일정 확인해 줘\n둘째 줄', stream: 'flow-a', streamTitle: '재입고',
+      ...(aDone ? { status: 'complete', answer: 'A 답이에요.\n\n👉 일정 공유해 줘 | 다시 확인해 줘', finishedAt: at(20, 32) } : { status: 'running', progress: '재입고 일정 찾는 중' }),
+      createdAt: at(20, 0) },
+    { id: 'B', seq: 2, text: 'B 질문', stream: 'flow-b', streamTitle: '보고', status: 'complete', answer: 'B 답이에요.\n\n👉 B 추천', createdAt: at(20, 10), finishedAt: at(20, 12) },
+  ];
+}
+
+test('늦게 끝난 A 답은 B 대화 아래 맨 아래에 인용을 달고, A 질문 자리에는 답으로 가는 링크만 남는다', async () => {
+  let aDone = false;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') return {};
+    return { chats: replyOrderChats(aDone), activity: {} };
+  };
+  const { nodes, app, tick } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  const list = () => nodes['woni-messages'].children.filter(node => node.className?.startsWith('woni-message') || node.className === 'woni-suggestions');
+  const label = node => node.className === 'woni-suggestions' ? '추천' : `${node.dataset.chatId || '-'}:${node.className.includes('user') ? '질문' : node.dataset.state || '답'}`;
+  // A 작업 중: 진행 문장은 A 질문 바로 아래(지금 자리 그대로)
+  assert.deepEqual(list().map(label), ['A:질문', '-:working', 'B:질문', 'B:답', '추천']);
+  assert.equal(textOf(list()[1]).includes('재입고 일정 찾는 중'), true);
+  aDone = true; await tick(); await settle();
+  assert.deepEqual(list().map(label), ['A:질문', 'B:질문', 'B:답', 'A:답', '추천']);
+  const [askA, askB, answerB, answerA] = list();
+  // A 질문 아래 링크: 답한 시각과 ↓, 접근성 이름은 '답으로 이동'
+  const link = byClass(askA, 'woni-answer-link')[0];
+  assert.equal(link.textContent, '답은 아래에 · 오후 8:32 ↓');
+  assert.equal(link['aria-label'], '답으로 이동'); assert.equal(link.type, 'button');
+  // A 답 맨 위 인용: 질문 첫 줄, 접근성 이름은 '원래 질문으로 이동'
+  const quote = answerA.children[0];
+  assert.equal(quote.className, 'woni-message-quote is-ask');
+  assert.equal(quote.textContent, '↩ 라이언 · A 질문: 재입고 일정 확인해 줘');
+  assert.equal(quote['aria-label'], '원래 질문으로 이동');
+  // 답한 시각·흐름 이름·메뉴는 지금 답 말풍선과 같다.
+  assert.equal(byClass(answerA, 'woni-answer-time')[0].textContent, '오후 8:32');
+  assert.equal(byClass(answerA, 'woni-stream-tag').length, 1);
+  assert.equal(byClass(answerA, 'woni-message-actions').length, 1);
+  // 붙은 B 대화에는 인용·링크가 없다.
+  for (const node of [askB, answerB]) { assert.equal(byClass(node, 'woni-message-quote').length, 0); assert.equal(byClass(node, 'woni-answer-link').length, 0); }
+  // 추천 칩은 맨 아래 답(A)에만
+  const boxes = nodes['woni-messages'].children.filter(node => node.className === 'woni-suggestions');
+  assert.equal(boxes.length, 1); assert.deepEqual(boxes[0].children.map(button => button.textContent), ['일정 공유해 줘', '다시 확인해 줘']);
+  // 줄 키는 첫 말풍선에 남는다.
+  assert.equal(askA.dataset.rowKey, 'A:question'); assert.equal(askB.dataset.rowKey, 'B:merged'); assert.equal(answerA.dataset.rowKey, 'A:answer');
+  // 인용을 누르면 A 질문 줄만, 링크를 누르면 A 답 줄만 잠깐 강조한다.
+  const found = () => list().filter(node => node.className.includes('is-found')).map(label);
+  quote.listeners.click(); assert.deepEqual(found(), ['A:질문']);
+  byClass(list()[0], 'woni-answer-link')[0].listeners.click(); assert.deepEqual(found(), ['A:답']);
+  await tick(); assert.deepEqual(found(), []);  // 2.4초 뒤 강조를 지운다
+});
+
+test('추천 칩·답글 띠 추천은 맨 아래 답 줄 기준이고, 흐름으로 거르면 같은 규칙으로 다시 붙는다', async () => {
+  const sent = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push(JSON.parse(JSON.stringify(options.body))); return { id: options.body.requestId, status: 'queued' }; }
+    if (options?.method === 'POST') return {};
+    if (url.startsWith('/api/woni/chats?stream=flow-a')) return { chats: replyOrderChats(true).filter(chat => chat.stream === 'flow-a'), hasMore: false, total: 1, streamTitle: '재입고' };
+    return { chats: replyOrderChats(true), activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  const message = (id, role) => nodes['woni-messages'].children.find(node => node.dataset.chatId === id && node.className.includes(role));
+  const reply = (id, role) => byClass(message(id, role), 'woni-message-actions')[0].children[0].click();
+  const picks = nodes['woni-reply-suggestions'];
+  // B는 seq상 마지막이지만 맨 아래 답이 아니라서 답글을 고르면 띠 아래에 추천이 뜬다.
+  reply('B', 'assistant'); assert.equal(picks.hidden, false); assert.deepEqual(picks.children.map(button => button.textContent), ['B 추천']);
+  // A가 맨 아래 답이라 말풍선 아래 칩이 이미 있어 띠 아래에는 두지 않는다.
+  reply('A', 'assistant'); assert.equal(picks.hidden, true);
+  const box = nodes['woni-messages'].children.find(node => node.className === 'woni-suggestions');
+  await box.children[0].click();
+  assert.deepEqual(sent, [{ text: '일정 공유해 줘', requestId: 'request-123456', replyTo: { id: 'A', part: 'answer' } }]);
+  // A의 흐름만 보면 A 답은 자기 질문 바로 아래에 붙고 인용·링크가 없다.
+  // (보낸 칩은 확인 전 말풍선으로 남으니 새 창에서 본다)
+  const fresh = fixture(call);
+  await fresh.app.check(call); fresh.nodes['woni-open'].click(); await settle();
+  byClass(fresh.nodes['woni-messages'].children.find(node => node.dataset.chatId === 'A' && node.className.includes('assistant')), 'woni-stream-tag')[0].click(); await settle();
+  assert.equal(fresh.nodes['woni-filter-label'].textContent, '흐름: 재입고');
+  const shown = fresh.nodes['woni-messages'].children.filter(node => node.className?.startsWith('woni-message '));
+  assert.deepEqual(shown.map(node => `${node.dataset.chatId}:${node.className.includes('user') ? '질문' : '답'}`), ['A:질문', 'A:답']);
+  assert.equal(byClass(fresh.nodes['woni-messages'], 'woni-answer-link').length, 0);
+  assert.equal(byClass(fresh.nodes['woni-messages'], 'is-ask').length, 0);
+  assert.equal(shown[0].dataset.rowKey, 'A:merged');
+});
+
+test('떨어진 답이 다른 날 끝나면 그 앞에 날짜 줄이 서고, 질문 자리 링크도 그 날짜를 붙인다', async () => {
+  const day1 = Date.UTC(2026, 10, 9, 14, 0) / 1000;  // KST 11/9 오후 11:00
+  const chats = [
+    { id: 'A', seq: 1, text: '밤 질문', answer: '다음 날 답', status: 'complete', createdAt: day1, finishedAt: day1 + 7200 },
+    { id: 'B', seq: 2, text: '곧 끝난 질문', answer: '바로 답', status: 'complete', createdAt: day1 + 600, finishedAt: day1 + 700 },
+  ];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  const seen = nodes['woni-messages'].children.filter(node => node.className === 'woni-divider' || node.className?.startsWith('woni-message '))
+    .map(node => node.className === 'woni-divider' ? '날짜' : `${node.dataset.chatId}:${node.className.includes('user') ? '질문' : '답'}`);
+  assert.deepEqual(seen, ['날짜', 'A:질문', 'B:질문', 'B:답', '날짜', 'A:답']);
+  // 다른 날 끝난 답의 링크는 앱처럼 날짜를 붙인다.
+  assert.equal(byClass(nodes['woni-messages'], 'woni-answer-link')[0].textContent, '답은 아래에 · 11/10 오전 1:00 ↓');
+});
+
+test('만드는 중인 먼저 알림은 질문 줄이 없어도 진행 말풍선을 그대로 보인다', async () => {
+  const chats = [{ id: 'n', seq: 1, kind: 'alert', status: 'running', progress: '알림 쓰는 중', createdAt: 100 }];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  const shown = nodes['woni-messages'].children.filter(node => node.className?.startsWith('woni-message '));
+  assert.equal(shown.length, 1); assert.equal(shown[0].dataset.state, 'working'); assert.equal(textOf(shown[0]).includes('알림 쓰는 중'), true);
+  assert.equal(shown[0].dataset.rowKey, 'n:answer');
 });
