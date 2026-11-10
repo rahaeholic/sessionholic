@@ -14,6 +14,14 @@
   let enabled = false, focusId = null;
   // The message whose menu (time · reply · copy · stream) is open. The list is rebuilt on every refresh, so it is kept by key.
   let menuKey = null;
+  // Ryan One 1.40.0 ("여러개를 병렬로 지시하니까 이전 대화 찾기가 어렵네"): /api/woni holds Woni's latest 60 chats
+  // (latestData, which the read mark and badges use). Earlier pages and an opened stream are kept apart and merged
+  // by seq, Woni's position in its whole list, only to draw and to find a chat.
+  const findBox = $("woni-find"), findOpen = $("woni-find-open");
+  const chatIdPattern = /^[A-Za-z0-9_-]{1,100}$/, streamPattern = /^[a-z0-9-]{1,40}$/;
+  let olderChats = [], streamChats = [], streamChatsFor = null, streamHasMore = false;
+  let olderLoading = false, olderError = "", olderRetry = null, olderGen = 0, streamBackTo = null;
+  let highlightId = null, highlightTimer = 0;
   const pendingKey = "sessionholic:woni:pending";
   const seenKey = "sessionholic:woni:seen";
   let seen = null, unread = new Set();
@@ -114,7 +122,7 @@
     const reply = target?.part === "answer" ? { id: target.id, part: "answer" } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(reply ? { replyTo: reply } : {}) });
     if (reply) replyBox.hidden = true;
-    filter = null;
+    leaveStream();
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
   }
@@ -187,14 +195,15 @@
   function setView(value) {
     view = value; const isChat = value === "chat";
     messages.hidden = !isChat; form.hidden = !isChat; work.hidden = value !== "work";
-    tasksBox.hidden = value !== "tasks"; notesBox.hidden = value !== "notes";
+    tasksBox.hidden = value !== "tasks"; notesBox.hidden = value !== "notes"; findBox.hidden = value !== "find";
     filterBox.hidden = !isChat || !filter;
-    for (const [tab, name] of [[chatTab, "chat"], [tasksTab, "tasks"], [notesTab, "notes"], [workTab, "work"]]) tab.setAttribute("aria-pressed", String(value === name));
+    for (const [tab, name] of [[chatTab, "chat"], [tasksTab, "tasks"], [notesTab, "notes"], [workTab, "work"], [findOpen, "find"]]) tab.setAttribute("aria-pressed", String(value === name));
     original.hidden = true;
     if (isChat && dialog.open) markVisibleRead();
     if (value === "work") { renderWork(); clearTimeout(timer); refresh(); }
     if (value === "tasks") { renderTasks(); loadTasks(); }
     if (value === "notes") { renderNotes(); if (!notes && !notesLoading) loadNotes(); }
+    if (value === "find") { renderFind(); loadStreams(); }
   }
   function setReply(chat, part) {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
@@ -221,13 +230,14 @@
     const current = epoch;
     original.hidden = false; original.replaceChildren(el("p", "", "원문을 불러오고 있어요."));
     try {
-      const chat = latestData?.chats?.find((item) => item.id === id) || await api(`/api/woni/chat?${new URLSearchParams({ id })}`);
+      const chat = loadedChats().find((item) => item.id === id) || await api(`/api/woni/chat?${new URLSearchParams({ id })}`);
       if (current !== epoch || !dialog.open) return;
       const block = el("div", "", [chat.text, chat.answer].filter(Boolean).join("\n\n"));
       original.replaceChildren(el("strong", "", "원문"), block, action("답글 달기", () => setReply(chat, chat.answer ? "answer" : "question")), action("닫기", () => { original.hidden = true; }));
     } catch (_) { if (current === epoch && dialog.open) original.replaceChildren(el("p", "", "원문을 불러오지 못했어요."), action("닫기", () => { original.hidden = true; })); }
   }
-  function row(role, text, files = [], chat = null) {
+  // tagFor: the chat whose stream name goes under this Woni bubble (also under a working or failed one, which has no menu).
+  function row(role, text, files = [], chat = null, tagFor = null) {
     // The speaker name stays for screen readers only; the bubble side and colour show who is talking.
     const article = el("article", `woni-message ${role}`), label = el("span", "sr-only", role === "user" ? "라이언" : "원이");
     const content = el("div", "woni-message-body");
@@ -245,6 +255,8 @@
       time.dateTime = new Date(Number(chat.createdAt) * 1000).toISOString(); time.setAttribute("aria-label", `보낸 시각 ${sent}`);
       line.append(time, content); article.append(line);
     } else article.append(content);
+    const tag = tagFor && streamTag(tagFor);
+    if (tag) article.append(tag);
     if (files.length) {
       const list = el("div", "woni-message-files");
       for (const file of files) list.append(el("span", "woni-message-file", file.name || "첨부 파일"));
@@ -256,15 +268,14 @@
       const actions = el("div", "woni-message-actions");
       actions.append(action("답글", () => { menuKey = null; setReply(chat, part); }));
       actions.append(action("복사", () => { copyText(role === "user" ? chat.text || "" : visibleAnswer(chat.answer) || chat.answer || ""); }));
-      if (chat.stream && chat.streamTitle) actions.append(action(`이 흐름만 보기 · ${chat.streamTitle}`, () => {
-        menuKey = null; filter = { id: chat.stream, title: chat.streamTitle }; setView("chat"); if (latestData) show(latestData);
-      }));
+      if (chat.stream && chat.streamTitle) actions.append(action(`이 흐름만 보기 · ${chat.streamTitle}`, () => openStream(chat.stream, chat.streamTitle)));
       if (role === "assistant" && chat.answer) {
         const time = answerTime(chat.finishedAt);
         if (time) actions.append(time);
       }
       article.append(actions);
       if (menuKey === key) article.className += " is-open";
+      if (highlightId === chat.id) article.className += " is-found";
       content.setAttribute("aria-expanded", String(menuKey === key));
       article.addEventListener("click", (event) => {
         if (event?.target?.closest?.("a, button")) return;
@@ -363,12 +374,7 @@
           if (task.status === "ok") card.append(action(label + " · 결과 보기", () => showWorkerResult(batch, task)));
           else card.append(el("p", "", label));
         }
-        if (item.id) card.append(action("대화에서 이어보기 →", () => {
-          filter = null; setView("chat"); if (latestData) show(latestData);
-          const found = latestData?.chats?.find((chat) => chat.id === item.id);
-          if (found) messages.querySelector?.(`[data-chat-id="${CSS.escape(item.id)}"]`)?.scrollIntoView?.({ block: "center" });
-          else showOriginal(item.id);
-        }));
+        if (item.id) card.append(action("대화에서 이어보기 →", () => { leaveStream(); jumpTo(item.id); }));
         nodes.push(card);
       }
     }
@@ -464,7 +470,8 @@
     const kind = kindOf(task), done = isDone(task), saving = taskSaving.has(task.id), title = task.title || "제목 없는 할 일";
     const row = el("div", `woni-task${done ? " is-done" : ""}`); row.dataset.taskId = task.id;
     const check = action("", () => setTaskStatus(task, done ? reopenStatus(task) : "done"));
-    check.className = "woni-check"; check.disabled = saving || kind === "unassigned";
+    // Ryan One 1.40.1: a to-do whose owner is unknown can be checked too (finished, or not needed).
+    check.className = "woni-check"; check.disabled = saving;
     check.setAttribute("aria-pressed", String(done));
     check.setAttribute("aria-label", done ? `완료 취소: ${title}` : kind === "delegated" ? `결과 확인 완료: ${title}` : `완료 처리: ${title}`);
     const open = button("", "woni-task-open", () => openTask(task.id));
@@ -482,11 +489,12 @@
     for (const node of viewButtons) node.setAttribute("aria-pressed", String(taskFilter === node.dataset.view));
     const archive = viewButtons[2];
     archive.hidden = !(Number(counts.archived) > 0 || taskFilter === "archived"); archive.children[0].textContent = `보관 ${Number(counts.archived) || 0}`;
-    taskHint.textContent = taskFilter === "archived" ? "녹음한 지 14일이 넘고 마감이 없거나 지난 일이라 목록과 알림에서 뺐어요."
+    const rows = shownTasks();
+    taskHint.textContent = taskFilter === "archived" ? "녹음한 지 14일이 넘은 일, 담당 확인에서 며칠 지난 일이라 목록과 알림에서 뺐어요(마감이 남은 일은 그대로 둬요). 아직 필요한 일이면 앱에서 열어 '담당 구분 수정'으로 꺼내 주세요."
+      : taskFilter === "open" && taskKind === "unassigned" && rows.length ? "누가 할지 모르는 일이에요. 라이언 일로 보이는 것부터 보여줘요. 끝났거나 필요 없으면 체크하세요. 그냥 두면 모르는 일은 3일, 라이언 일로 보이는 일은 7일 뒤 보관으로 옮겨요."
       : taskFilter === "open" && taskKind === "delegated" ? `확인 필요 ${Number(counts.followup) || 0}개 · 완료 보고와 마감이 된 일을 먼저 보여줘요. 홀릭이·뷰링이 같은 에이전트에게 시킨 일은 넣지 않아요.`
       : taskFilter === "done" && Number(counts.autoDone) > 0 ? "'원이 확인' 표시는 끝낸 근거(Slack 글·보낸 메일·원이가 한 일)를 원이가 확인해 체크한 일이에요. 틀리면 열어서 되돌려 주세요." : "";
     taskHint.hidden = !tasks || !taskHint.textContent;
-    const rows = shownTasks();
     // Redraw rows only when what they show changed, so a 30-second refresh keeps focus and scroll.
     const key = JSON.stringify([!!tasks, tasksError, tasks?.error || "", taskKind, taskFilter, taskSearch.input.value, [...taskSaving], rows]);
     if (key !== taskRowsKey) {
@@ -562,11 +570,9 @@
         el("p", "woni-note-hint", `추정 근거: ${task.guessBasis}`), el("p", "woni-note-hint", "담당 구분은 Ryan One 앱에서 확정할 수 있어요."));
       nodes.push(group);
     }
-    if (kind !== "unassigned") {
-      const main = button(saving ? "저장 중…" : done ? "완료 되돌리기" : kind === "delegated" ? "결과 확인 완료" : "완료로 표시",
-        done ? "secondary" : "primary", () => setTaskStatus(task, done ? reopenStatus(task) : "done"));
-      main.disabled = saving; actions.append(main);
-    }
+    const main = button(saving ? "저장 중…" : done ? "완료 되돌리기" : kind === "delegated" ? "결과 확인 완료" : "완료로 표시",
+      done ? "secondary" : "primary", () => setTaskStatus(task, done ? reopenStatus(task) : "done"));
+    main.disabled = saving; actions.append(main);
     if (kind === "delegated" && !done && task.taskStatus === "open") {
       const reported = button("완료 보고 받음", "secondary", () => setTaskStatus(task, "reported")); reported.disabled = saving; actions.append(reported);
     }
@@ -832,7 +838,318 @@
   }
   renderTasks(); renderNotes();
 
-  function show(data) {
+  // Earlier chats, streams and chat search (Ryan One 1.40.0, assistant/ChatHistory.kt and WoniModel.kt).
+  // Parts fetched apart become one list: the same chat from a later part wins, and with seq on every chat they
+  // follow Woni's list order (an older Woni server without seq keeps the order they arrived in).
+  function mergeChats(...parts) {
+    const byId = new Map();
+    for (const part of parts) for (const chat of part || []) if (typeof chat?.id === "string" && chat.id) byId.set(chat.id, chat);
+    const list = [...byId.values()];
+    return list.every((chat) => Number.isInteger(chat.seq)) ? list.sort((a, b) => a.seq - b.seq) : list;
+  }
+  // Finished chats the new 60-chat window no longer holds (a working one comes back in its new state with a page).
+  function slidOut(previous, fetched) {
+    const first = fetched[0]?.seq;
+    if (!Number.isInteger(first)) return [];
+    const ids = new Set(fetched.map((chat) => chat.id));
+    return previous.filter((chat) => Number.isInteger(chat.seq) && chat.seq < first && !ids.has(chat.id) && !["queued", "running"].includes(chat.status));
+  }
+  function mergedChats(windowChats) {
+    return mergeChats(olderChats, filter && streamChatsFor === filter.id ? streamChats : [], windowChats);
+  }
+  function loadedChats() { return mergedChats(Array.isArray(latestData?.chats) ? latestData.chats : []); }
+  // Whether Woni holds chats above the first one shown. An older Woni server (no chatsHasMore or seq) has none to give.
+  function canLoadOlder() {
+    if (filter) return streamChatsFor === filter.id && streamHasMore;
+    const first = loadedChats()[0];
+    return latestData?.chatsHasMore === true && Number.isInteger(first?.seq) && first.seq > 0;
+  }
+  // The line at the top of the list: loading, a failure with its retry, more to fetch, or the start of a stream.
+  function olderRow(shown) {
+    if (olderLoading) { const line = el("p", "woni-older", "이전 대화를 불러오고 있어요."); line.setAttribute("role", "status"); return [line]; }
+    if (olderError) {
+      const box = el("div", "woni-older is-error"), text = el("span", "", olderError);
+      text.setAttribute("role", "alert");
+      box.append(text, button("다시 시도", "quiet", () => { const retry = olderRetry || loadOlder; olderError = ""; olderRetry = null; retry(); }));
+      return [box];
+    }
+    if (canLoadOlder()) return [button("이전 대화 더 보기", "quiet woni-older-more", () => loadOlder())];
+    if (filter && streamChatsFor === filter.id && shown) return [el("p", "woni-divider", `이 흐름의 첫 대화 · 모두 ${shown}개`)];
+    return [];
+  }
+  function redraw(keepPlace = false) {
+    if (dialog.open && (latestData || pending)) show(latestData || { chats: [], activity: {} }, keepPlace);
+  }
+  async function loadOlder() {
+    if (!api || olderLoading) return;
+    const scope = filter, oldest = loadedChats().filter((chat) => !scope || chat.stream === scope.id)[0]?.id;
+    if (!oldest) return;
+    const query = new URLSearchParams(scope ? { stream: scope.id, before: oldest, limit: "100" } : { before: oldest, limit: "40" });
+    const current = authEpoch, generation = ++olderGen;
+    olderLoading = true; olderError = ""; olderRetry = null; redraw(true);
+    try {
+      const page = await api(`/api/woni/chats?${query}`);
+      if (current !== authEpoch || generation !== olderGen) return;
+      if (!Array.isArray(page?.chats)) throw new Error("not a chat page");
+      if (!scope) olderChats = mergeChats(page.chats, olderChats);
+      else if (streamChatsFor === scope.id) { streamChats = mergeChats(page.chats, streamChats); streamHasMore = page.hasMore === true; }
+      olderLoading = false;
+    } catch (error) {
+      if (current !== authEpoch || generation !== olderGen) return;
+      olderLoading = false; olderError = serverMessage(error, "이전 대화를 불러오지 못했어요.");
+    }
+    redraw(true);
+  }
+  // '# 흐름 이름' under Woni's answer (working and failed ones too); not on an alert, a chat with no stream, or inside a stream.
+  function streamTag(chat) {
+    if (filter || chat.kind === "alert" || !chat.stream || !chat.streamTitle) return null;
+    const tag = action("", () => openStream(chat.stream, chat.streamTitle));
+    tag.append(el("span", "", `# ${chat.streamTitle}`)); tag.className = "woni-stream-tag"; tag.setAttribute("aria-label", `흐름 ${chat.streamTitle}만 보기`);
+    return tag;
+  }
+  // One stream from its first chat (the stream list, a stream name, '이 흐름만 보기'). from: where its back goes.
+  // then: the chat to show once it has arrived. A stream name Woni would refuse is only filtered on this screen.
+  async function openStream(slug, title, from = null, then = null) {
+    if (typeof slug !== "string" || !slug) return;
+    menuKey = null; original.hidden = true;
+    filter = { id: slug, title: title || "작업 흐름" }; streamBackTo = from;
+    const known = streamPattern.test(slug);
+    if (streamChatsFor !== slug) { streamChats = []; streamHasMore = false; streamChatsFor = known ? slug : null; }
+    const generation = ++olderGen, current = authEpoch;
+    olderLoading = known && !!api; olderError = ""; olderRetry = null;
+    setView("chat"); redraw(); messages.scrollTop = messages.scrollHeight;
+    // The row or name pressed is gone from view: focus moves to the stream bar, so Esc still reaches this window.
+    $("woni-filter-clear").focus?.({ preventScroll: true });
+    if (!olderLoading) { if (then) jumpTo(then); return; }
+    try {
+      const page = await api(`/api/woni/chats?${new URLSearchParams({ stream: slug, limit: "200" })}`);
+      if (current !== authEpoch || generation !== olderGen || streamChatsFor !== slug) return;
+      if (!Array.isArray(page?.chats)) throw new Error("not a chat page");
+      streamChats = page.chats; streamHasMore = page.hasMore === true;
+      if (typeof page.streamTitle === "string" && page.streamTitle && filter?.id === slug) filter = { id: slug, title: page.streamTitle };
+      olderLoading = false; redraw(true);
+      if (then) jumpTo(then);
+    } catch (error) {
+      if (current !== authEpoch || generation !== olderGen) return;
+      olderLoading = false; olderError = serverMessage(error, "이 흐름의 지난 대화를 불러오지 못했어요.");
+      olderRetry = () => openStream(slug, filter?.title || title, streamBackTo, then);
+      redraw();
+    }
+  }
+  // Leaves a stream without moving (sending, a notification); closeStream also goes back to the stream list it came from.
+  function leaveStream() {
+    streamBackTo = null;
+    if (!filter) return;
+    filter = null; olderGen++; olderLoading = false; olderError = ""; olderRetry = null;
+  }
+  function closeStream() {
+    const back = streamBackTo, slug = filter?.id || ""; leaveStream();
+    if (back !== "find") { redraw(); input.focus?.({ preventScroll: true }); return; }
+    setView("find");  // back on the list, the stream that was opened keeps the focus
+    (findList.querySelector?.(`[data-stream="${CSS.escape(slug)}"]`) || findSearch.input).focus?.({ preventScroll: true });
+  }
+  // Esc or the phone's back: close the stream, or leave the find screen. False when there is nothing to step out of.
+  function stepBack() {
+    if (!dialog.open) return false;
+    if (view === "chat" && filter) { closeStream(); return true; }
+    if (view === "find") { setView("chat"); input.focus?.({ preventScroll: true }); return true; }
+    return false;
+  }
+  // Shows a chat already received in place (leaving a stream that hides it) and marks it for a moment.
+  function jumpTo(id) {
+    const chat = loadedChats().find((item) => item.id === id);
+    if (!chat) { setView("chat"); showOriginal(id); return; }
+    if (filter && chat.stream !== filter.id) leaveStream();
+    if (view !== "chat") setView("chat");
+    highlightId = id; clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => { highlightId = null; redraw(); }, 2400);
+    redraw();
+    messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
+    // What was pressed (a search result, a work card) is out of view now; the composer takes the focus.
+    if (!messages.contains?.(globalThis.document?.activeElement)) input.focus?.({ preventScroll: true });
+  }
+
+  // The find screen: with no words, the streams (latest first); with words, matching streams and chats.
+  let streamsData = null, streamsError = "", streamsGen = 0;
+  let hits = null, hitsFor = "", hitsError = "", hitsLoading = false, hitsGen = 0, findTimer = 0;
+  const findSearch = searchField("대화·흐름 이름으로 찾기", () => { clearTimeout(findTimer); findTimer = setTimeout(() => searchChats(), 300); });
+  findSearch.input.maxLength = 100;
+  const findList = el("div", "woni-find-list"), findMore = button("더 보기", "secondary woni-wide", () => searchChats(true));
+  const findPane = el("div", "woni-pane");
+  findPane.append(findSearch.box, findList, findMore);
+  findBox.append(findPane);
+
+  function listTime(seconds) {
+    if (!validSeconds(seconds)) return "";
+    const date = new Date(seconds * 1000), days = dayNumber(Date.now() / 1000) - dayNumber(seconds);
+    if (days <= 0) return clockLabel(seconds);
+    if (days === 1) return "어제";
+    if (days < 7) return weekdayFormat.format(date);
+    const [y, m, d] = dayKeyFormat.format(date).split("-").map(Number);
+    return String(y) === dayKeyFormat.format(new Date()).slice(0, 4) ? `${m}월 ${d}일` : `${y}. ${m}. ${d}.`;
+  }
+  // Where the search words sit in a text (any case, overlaps joined), to show them in bold.
+  function matchRanges(text, query) {
+    const words = String(query || "").trim().toLowerCase().split(/\s+/).filter(Boolean), lower = String(text || "").toLowerCase();
+    if (!words.length || !lower) return [];
+    const found = [];
+    for (const word of words) for (let at = lower.indexOf(word); at >= 0; at = lower.indexOf(word, at + word.length)) found.push([at, at + word.length]);
+    const merged = [];
+    for (const range of found.sort((a, b) => a[0] - b[0])) {
+      const last = merged.at(-1);
+      if (last && range[0] <= last[1]) last[1] = Math.max(last[1], range[1]); else merged.push([...range]);
+    }
+    return merged;
+  }
+  function highlighted(className, text, query) {
+    const node = el("span", className), value = String(text || "");
+    let at = 0;
+    for (const [start, end] of matchRanges(value, query)) {
+      if (start > at) node.append(el("span", "", value.slice(at, start)));
+      node.append(el("strong", "woni-match", value.slice(start, end))); at = end;
+    }
+    if (at < value.length || !value) node.append(el("span", "", value.slice(at)));
+    return node;
+  }
+  // A stream row's preview: what was asked while it works, otherwise the first line of the last answer.
+  function streamPreview(row) {
+    if (Number(row.running) > 0) return row.lastText || "";
+    if (["failed", "interrupted"].includes(row.lastStatus)) return `답을 받지 못했어요 · ${row.lastText || ""}`;
+    return row.lastAnswer || row.lastText || "";
+  }
+  function streamRow(row, query) {
+    const card = button("", "woni-find-row", () => openStream(row.id, row.title, "find"));
+    const top = el("span", "woni-find-top");
+    top.append(highlighted("woni-find-title", row.title || row.id || "작업 흐름", query), el("span", "woni-find-time", listTime(Number(row.lastAt))));
+    const bottom = el("span", "woni-find-bottom");
+    bottom.append(el("span", "woni-find-preview", streamPreview(row) || `대화 ${Number(row.count) || 0}개`));
+    if (Number(row.running) > 0) bottom.append(el("span", "woni-find-running", "진행 중"));
+    if (Number(row.unread) > 0) {
+      const unreadCount = el("span", "woni-find-unread");
+      unreadCount.append(el("span", "sr-only", "새 답 "), el("span", "", String(row.unread)), el("span", "sr-only", "개"));
+      bottom.append(unreadCount);
+    }
+    card.append(top, bottom); card.dataset.stream = String(row.id || "");
+    return card;
+  }
+  function hitRow(hit, query) {
+    const card = button("", "woni-find-row", () => openSearchResult(hit)), top = el("span", "woni-find-top");
+    top.append(el("span", "woni-find-stream", hit.streamTitle || (hit.kind === "alert" ? "먼저 알림" : "흐름 없음")),
+      el("span", "woni-find-time", listTime(Number(hit.createdAt))));
+    card.append(top);
+    if (hit.question) card.append(highlighted("woni-find-question", `나: ${hit.question}`, query));
+    if (hit.snippet) card.append(highlighted("woni-find-snippet", hit.snippet, query));
+    card.dataset.chatId = String(hit.id || "");
+    return card;
+  }
+  function findStatus(text, error = false, retry = null) {
+    const line = el("p", error ? "woni-note-hint is-error" : "woni-note-hint", text);
+    line.setAttribute("role", error ? "alert" : "status");
+    return retry ? [line, button("다시 시도", "quiet", retry)] : [line];
+  }
+  function renderFind() {
+    const query = findSearch.input.value.trim(), nodes = [];
+    const data = query && hitsFor === query ? hits : null;
+    if (!query) {
+      const rows = Array.isArray(streamsData?.items) ? streamsData.items : [];
+      nodes.push(el("h3", "woni-find-heading", "흐름"));
+      if (streamsError) nodes.push(...findStatus(streamsError, true, () => { streamsError = ""; renderFind(); loadStreams(); }));
+      else if (!streamsData) nodes.push(...findStatus("흐름 목록을 불러오고 있어요."));
+      else nodes.push(el("p", "woni-note-hint", rows.length ? `최근 순 · ${rows.length}개 · 누르면 그 흐름을 처음부터 봐요` : "원이가 일을 흐름별로 나눠 기억해요."));
+      nodes.push(...rows.filter((row) => typeof row?.id === "string").map((row) => streamRow(row, "")));
+    } else {
+      if (hitsLoading) nodes.push(...findStatus("대화를 찾고 있어요."));
+      if (hitsError && !hitsLoading) nodes.push(...findStatus(hitsError, true, () => searchChats()));
+      if (data) {
+        const streams = (Array.isArray(data.streams) ? data.streams : []).filter((row) => typeof row?.id === "string");
+        if (streams.length) nodes.push(el("h3", "woni-find-heading", `흐름 ${streams.length}`), ...streams.map((row) => streamRow(row, query)));
+        const items = Array.isArray(data.items) ? data.items : [];
+        nodes.push(el("h3", "woni-find-heading", `대화 ${Number(data.total) || items.length}건`));
+        if (!items.length) {
+          const empty = el("div", "woni-empty");
+          empty.append(el("strong", "", "찾는 대화가 없어요"), el("p", "", "다른 낱말로 찾아 보세요. 흐름 이름과 원이 답도 함께 찾아요."));
+          nodes.push(empty);
+        }
+        nodes.push(...items.filter((hit) => typeof hit?.id === "string").map((hit) => hitRow(hit, query)));
+      }
+    }
+    findList.replaceChildren(...nodes);
+    findMore.hidden = !(data && data.nextOffset != null);
+    findMore.disabled = hitsLoading; findMore.textContent = hitsLoading ? "불러오는 중…" : "더 보기";
+  }
+  async function loadStreams() {
+    if (!api) return;
+    const current = authEpoch, generation = ++streamsGen;
+    try {
+      const data = await api("/api/woni/streams");
+      if (current !== authEpoch || generation !== streamsGen) return;
+      if (!Array.isArray(data?.items)) throw new Error("not a stream list");
+      streamsData = data; streamsError = "";
+    } catch (error) {
+      if (current !== authEpoch || generation !== streamsGen) return;
+      streamsError = serverMessage(error, "흐름 목록을 불러오지 못했어요.");
+    }
+    if (view === "find") renderFind();
+  }
+  async function searchChats(more = false) {
+    if (!api) return;
+    const query = findSearch.input.value.trim().slice(0, 100);
+    if (more && (hitsLoading || hitsFor !== query || hits?.nextOffset == null)) return;
+    const current = authEpoch, generation = ++hitsGen, previous = hits;
+    clearTimeout(findTimer);
+    if (!query) { hits = null; hitsFor = ""; hitsError = ""; hitsLoading = false; renderFind(); return; }
+    hitsLoading = true; hitsError = ""; renderFind();
+    try {
+      const offset = more ? previous.nextOffset : 0;
+      const data = await api(`/api/woni/chat-search?${new URLSearchParams({ q: query, offset: String(offset), limit: "20" })}`);
+      if (current !== authEpoch || generation !== hitsGen) return;
+      if (!Array.isArray(data?.items)) throw new Error("not a search result");
+      if (more) { const ids = new Set(previous.items.map((item) => item.id)); data.items = [...previous.items, ...data.items.filter((item) => !ids.has(item.id))]; data.streams = previous.streams; }
+      hits = data; hitsFor = query;
+    } catch (error) {
+      if (current !== authEpoch || generation !== hitsGen) return;
+      hitsError = serverMessage(error, "대화를 찾지 못했어요. 연결을 확인해 주세요.");
+      if (!more) { hits = null; hitsFor = ""; }
+    }
+    hitsLoading = false; renderFind();
+  }
+  // A found chat: in place if it is already here, else fetched up to it; too far back, its stream from the start.
+  async function openSearchResult(hit) {
+    const id = hit?.id;
+    if (typeof id !== "string" || !chatIdPattern.test(id)) return;
+    leaveStream();
+    const loaded = mergeChats(olderChats, Array.isArray(latestData?.chats) ? latestData.chats : []);
+    if (loaded.some((chat) => chat.id === id)) { jumpTo(id); return; }
+    const oldest = loaded[0]?.id, current = authEpoch, generation = ++olderGen;
+    olderLoading = true; olderError = ""; olderRetry = null;
+    setView("chat"); redraw();
+    try {
+      const page = await api(`/api/woni/chats?${new URLSearchParams({ through: id, ...(oldest ? { before: oldest } : {}) })}`);
+      if (current !== authEpoch || generation !== olderGen) return;
+      olderLoading = false;
+      if (page?.tooFar === true) {
+        if (typeof hit.stream === "string" && streamPattern.test(hit.stream)) openStream(hit.stream, hit.streamTitle || "작업 흐름", null, id);
+        else { redraw(); showOriginal(id); }
+        return;
+      }
+      if (!Array.isArray(page?.chats)) throw new Error("not a chat page");
+      olderChats = mergeChats(olderChats, page.chats);
+      jumpTo(id);
+    } catch (_) {
+      if (current !== authEpoch || generation !== olderGen) return;
+      olderLoading = false; redraw(); showOriginal(id);  // the chat itself still opens in the original window
+    }
+  }
+  function resetHistory() {
+    olderChats = []; streamChats = []; streamChatsFor = null; streamHasMore = false; olderGen++;
+    olderLoading = false; olderError = ""; olderRetry = null; streamBackTo = null; highlightId = null; clearTimeout(highlightTimer);
+    streamsData = null; streamsError = ""; streamsGen++; hits = null; hitsFor = ""; hitsError = ""; hitsLoading = false; hitsGen++;
+    clearTimeout(findTimer); findSearch.input.value = ""; findList.replaceChildren(); findMore.hidden = true; findBox.hidden = true;
+  }
+  renderFind();
+
+  // keepPlace: chats were added above the ones being read, so the view stays on them instead of jumping.
+  function show(data, keepPlace = false) {
     latestData = data;
     const chats = Array.isArray(data.chats) ? data.chats : [];
     if (pending && chats.some((chat) => chat.id === pending.requestId)) {
@@ -844,13 +1161,15 @@
       savePending(null); renderAttachments();
     }
     const atEnd = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
-    const nodes = [], visibleChats = chats.filter((item) => !filter || item.stream === filter.id);
-    const dividers = timeDividers(visibleChats);
+    const oldHeight = messages.scrollHeight, oldTop = messages.scrollTop;
+    const nodes = [], visibleChats = mergedChats(chats).filter((item) => !filter || item.stream === filter.id);
+    nodes.push(...olderRow(visibleChats.length));
+    const dividers = timeDividers(visibleChats), latestId = chats.at(-1)?.id;
     for (const chat of visibleChats) {
       if (dividers.has(chat.id)) nodes.push(el("p", "woni-divider", dividers.get(chat.id)));
       if (chat.kind !== "alert" && (chat.text || chat.attachments?.length)) nodes.push(row("user", chat.text || "", chat.attachments || [], chat));
-      if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat));
-      const replies = chat.answer && chat === chats.at(-1) && !pending ? suggestedReplies(chat.answer) : [];
+      if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat));
+      const replies = chat.answer && chat.id === latestId && !pending ? suggestedReplies(chat.answer) : [];
       if (replies.length) {
         const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
         // While Ryan is replying to this answer (checked at tap time), a suggestion goes as a reply to it as well.
@@ -858,8 +1177,8 @@
         for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply, target())));
         nodes.push(box);
       }
-      else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…"));
-      else if (["failed", "interrupted"].includes(chat.status)) nodes.push(row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요."));
+      else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat));
+      else if (["failed", "interrupted"].includes(chat.status)) nodes.push(row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat));
     }
     if (pending) {
       const sentFiles = (pending.attachments || []).map((id) => attachments.find((item) => item.id === id) || { name: "첨부 파일" });
@@ -873,6 +1192,7 @@
     }
     messages.replaceChildren(...nodes);
     if (atEnd || !messages.dataset.loaded) messages.scrollTop = messages.scrollHeight;
+    else if (keepPlace) messages.scrollTop = oldTop + messages.scrollHeight - oldHeight;
     messages.dataset.loaded = "1";
     filterBox.hidden = view !== "chat" || !filter;
     $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
@@ -886,6 +1206,9 @@
     try {
       const data = await api("/api/woni");
       if (current !== authEpoch || !enabled) return;
+      // A finished chat pushed out of the 60-chat window stays as an earlier chat, so the list keeps no gap.
+      const left = slidOut(latestData?.chats || [], Array.isArray(data?.chats) ? data.chats : []);
+      if (left.length) olderChats = mergeChats(olderChats, left);
       latestData = data; observeReplies(data);
       if (dialog.open) {
         show(data);
@@ -893,7 +1216,7 @@
         if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
         if (focusId) {
           const id = focusId; focusId = null;
-          if (data.chats?.some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
+          if (loadedChats().some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
           else showOriginal(id);
         }
       }
@@ -945,7 +1268,23 @@
   workTab.addEventListener("click", () => setView("work"));
   tasksTab.addEventListener("click", () => setView("tasks"));
   notesTab.addEventListener("click", () => setView("notes"));
-  $("woni-filter-clear").addEventListener("click", () => { filter = null; if (latestData) show(latestData); });
+  // '전체 대화' shows every chat here; only Esc or back returns to the stream list a stream was opened from.
+  $("woni-filter-clear").addEventListener("click", () => { leaveStream(); redraw(); });
+  findOpen.addEventListener("click", () => {
+    if (view === "find") { setView("chat"); return; }
+    setView("find"); findSearch.input.focus?.({ preventScroll: true });
+  });
+  // Esc and the phone's back (app.js sends a cancelable "cancel") step back out of a stream or the find screen first.
+  // Esc is taken at keydown: Chrome stops honouring a second cancel in a row without a click in between.
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !event.isComposing && stepBack()) event.preventDefault();
+  });
+  dialog.addEventListener("cancel", (event) => { if (stepBack()) event.preventDefault(); });
+  // Reaching the top of the list fetches the chats before it. A failure waits for '다시 시도' (no automatic repeat).
+  messages.addEventListener("scroll", () => {
+    if (view !== "chat" || !messages.dataset.loaded || olderLoading || olderError || messages.scrollTop > 120) return;
+    if (canLoadOlder()) loadOlder();
+  });
   $("woni-reply-clear").addEventListener("click", () => {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
     replyTarget = null; replyBox.hidden = true; renderReplyPicks();
@@ -993,7 +1332,7 @@
     const ids = attachments.map((item) => item.id);
     const reply = replyTarget ? { id: replyTarget.id, part: replyTarget.part } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(ids.length ? { attachments: ids } : {}), ...(reply ? { replyTo: reply } : {}) });
-    input.value = ""; replyBox.hidden = true; filter = null; renderReplyPicks();
+    input.value = ""; replyBox.hidden = true; leaveStream(); renderReplyPicks();
     services.voice?.stop(input);
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -1012,7 +1351,7 @@
     },
     openFromNotification(id) {
       if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) return false;
-      focusId = id; filter = null;
+      focusId = id; leaveStream();
       if (enabled) { open.click(); clearTimeout(timer); refresh(); }
       return true;
     },
@@ -1020,7 +1359,7 @@
       enabled = false; epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; replyPicks.replaceChildren(); replyPicks.hidden = true;
-      filter = null; latestData = null; workData = null;
+      filter = null; latestData = null; workData = null; resetHistory();
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       readThrough = null; serverRead = 0; readPosting = 0;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();

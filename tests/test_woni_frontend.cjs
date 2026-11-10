@@ -20,7 +20,7 @@ function fixture(call, storage = new Map(), host = undefined, extra = {}) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open']) nodes[id] = element();
   nodes['woni-form'].submit = element();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
@@ -603,7 +603,10 @@ test('할 일 탭은 종류·보기·찾기로 나누고 앱과 같은 줄과 �
   assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^확인 필요 1개 · 완료 보고와 마감이 된 일을 먼저 보여줘요/);
   assert.equal(rows()[0].children[0]['aria-label'], '결과 확인 완료: 촬영 견적 받기');
   toggle('담당 확인').click();
-  assert.equal(rows()[0].children[0].disabled, true);  // 담당 확인은 체크하지 않는다
+  // Ryan One 1.40.1: 담당 확인도 끝났거나 필요 없으면 체크한다. 목록 위에 보관 기준 안내.
+  assert.equal(rows()[0].children[0].disabled, false);
+  assert.equal(rows()[0].children[0]['aria-label'], '완료 처리: 샘플 발송');
+  assert.equal(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), '누가 할지 모르는 일이에요. 라이언 일로 보이는 것부터 보여줘요. 끝났거나 필요 없으면 체크하세요. 그냥 두면 모르는 일은 3일, 라이언 일로 보이는 일은 7일 뒤 보관으로 옮겨요.');
   assert.equal(textOf(byClass(rows()[0], 'woni-task-line')[0]), '박매니저일 가능성');
   toggle('내가 할 일').click(); toggle('완료').click();
   assert.deepEqual(titles(), ['세금계산서 발행']);
@@ -612,7 +615,7 @@ test('할 일 탭은 종류·보기·찾기로 나누고 앱과 같은 줄과 �
   assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^'원이 확인' 표시는/);
   toggle('보관 1').click();
   assert.deepEqual(titles(), ['오래된 맡긴 일']);  // 보관은 종류와 상관없이 모두
-  assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^녹음한 지 14일이 넘고/);
+  assert.equal(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), "녹음한 지 14일이 넘은 일, 담당 확인에서 며칠 지난 일이라 목록과 알림에서 뺐어요(마감이 남은 일은 그대로 둬요). 아직 필요한 일이면 앱에서 열어 '담당 구분 수정'으로 꺼내 주세요.");
   toggle('남은 일').click();
   const search = walk(nodes['woni-tasks'], node => node.type === 'search')[0];
   search.value = '없는 말'; search.listeners.input();
@@ -904,4 +907,247 @@ test('녹취 원문은 화자·분:초·전사 불확실을 보이고 찾기·�
   buttonOf(nodes['woni-notes'], '녹취 원문 보기').click(); await settle();
   assert.ok(textOf(nodes['woni-notes']).includes('Slack에서 온 기록이라 녹취 원문이 없어요.'));
   assert.equal(metas().length, 0);
+});
+
+// ---- 담당 확인 체크 (Ryan One 1.40.1) ----
+test('담당 확인도 목록 체크와 상세의 완료 버튼으로 끝낼 수 있다', async () => {
+  const sent = [], toasts = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/tasks') return taskData();
+    if (url === '/api/woni/task-status') { sent.push({ ...options.body }); return { actionId: options.body.actionId, taskStatus: 'done', stateEvent: 'u1:done', result: 'saved' }; }
+    return { chats: [], activity: {} };
+  };
+  const { nodes, rows, toggle } = await openTasks(call, { toasts });
+  toggle('담당 확인').click();
+  byClass(rows()[0], 'woni-task-open')[0].click();
+  const detail = nodes['woni-tasks'].children[1];
+  assert.ok(buttonOf(detail, '완료로 표시'));
+  assert.ok(textOf(detail).includes('추정 근거: 박매니저가 보내겠다고 말함'));
+  byClass(detail, 'woni-back')[0].click();
+  rows()[0].children[0].click(); await settle();
+  assert.deepEqual(sent, [{ actionId: 'u1', status: 'done', expectedEvent: '', requestId: 'req-1-abcdef' }]);
+  assert.equal(toasts.at(-1), '‘샘플 발송’ 완료');
+});
+
+// ---- 이전 대화·흐름·대화 찾기 (Ryan One 1.40.0) ----
+// A synthetic Woni list of `total` chats; the state holds the last 60, like the server.
+function history(total = 100, streamOf = () => null) {
+  const all = Array.from({ length: total }, (_, seq) => {
+    const stream = streamOf(seq);
+    return { id: `c${seq}`, seq, text: `질문 ${seq}`, answer: `답 ${seq}`, status: 'complete', createdAt: 1000 + seq, finishedAt: 1001 + seq,
+             ...(stream ? { stream, streamTitle: '합성 흐름' } : {}) };
+  });
+  return { all, state: () => ({ chats: all.slice(-60), chatTotal: all.length, chatsHasMore: all.length > 60, activity: {} }) };
+}
+async function openHistory(call) {
+  const f = fixture(call);
+  // The list's height follows what it holds, so keeping the reading place can be measured.
+  Object.defineProperty(f.nodes['woni-messages'], 'scrollHeight', { get() { return this.children.length * 100; } });
+  await f.app.check(call); f.nodes['woni-open'].click(); await settle();
+  const ids = () => f.nodes['woni-messages'].children.filter(node => node.className?.startsWith('woni-message user')).map(node => node.dataset.chatId);
+  const top = () => f.nodes['woni-messages'].children[0];
+  return { ...f, ids, top };
+}
+
+test('대화 목록 맨 위에 닿으면 앞 40건을 이어 받아 순서대로 합치고 보던 자리를 지킨다', async () => {
+  const data = history(100), urls = [];
+  let fail = false;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url.startsWith('/api/woni/chats?')) {
+      urls.push(url);
+      if (fail) { const error = new Error('원이에 연결하지 못했어요.'); error.status = 409; throw error; }
+      const before = data.all.findIndex(chat => chat.id === new URLSearchParams(url.split('?')[1]).get('before'));
+      return { chats: data.all.slice(Math.max(0, before - 40), before), hasMore: before > 40, total: 100 };
+    }
+    return url === '/api/woni' ? data.state() : { chats: [], activity: {} };
+  };
+  const { nodes, ids, top, tick } = await openHistory(call);
+  assert.deepEqual(ids().slice(0, 2), ['c40', 'c41']);
+  assert.equal(urls.length, 0);  // 창을 열기만 해서는 부르지 않는다
+  assert.equal(textOf(top()), '이전 대화 더 보기');
+  const messages = nodes['woni-messages'], place = () => messages.children.findIndex(node => node.dataset.chatId === 'c40');
+  const before = place();
+  messages.scrollTop = 30; messages.listeners.scroll(); await settle();
+  assert.deepEqual(urls, ['/api/woni/chats?before=c40&limit=40']);
+  assert.deepEqual(ids().slice(0, 3), ['c0', 'c1', 'c2']); assert.equal(ids().length, 100);
+  assert.equal(ids().at(-1), 'c99');
+  assert.equal(place() - before, 79);  // 말풍선 80개가 위에 붙고 '더 보기' 줄이 빠졌다
+  assert.equal(messages.scrollTop, 30 + 79 * 100);  // 그만큼 내려 보던 대화(c40)에 머문다
+  // c0까지 받았으면 더 부르지 않는다.
+  messages.scrollTop = 0; messages.listeners.scroll(); await settle();
+  assert.equal(urls.length, 1); assert.equal(top().className, 'woni-divider');
+  // 60건 창에서 밀려난 대화도 남는다.
+  data.all.push({ id: 'c100', seq: 100, text: '새 질문', answer: '새 답', status: 'complete', createdAt: 2000, finishedAt: 2001 });
+  await tick(); await settle();
+  assert.equal(ids().length, 101); assert.ok(ids().includes('c40'));
+});
+
+test('이전 대화를 못 받으면 다시 시도 버튼만 두고 스크롤로 저절로 다시 부르지 않는다', async () => {
+  const data = history(100), urls = [];
+  let fail = true;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url.startsWith('/api/woni/chats?')) {
+      urls.push(url);
+      if (fail) { const error = new Error('대화를 찾지 못했어요'); error.status = 400; throw error; }
+      return { chats: data.all.slice(20, 40), hasMore: true, total: 100 };
+    }
+    return url === '/api/woni' ? data.state() : { chats: [], activity: {} };
+  };
+  const { nodes, ids, top } = await openHistory(call);
+  const messages = nodes['woni-messages'];
+  messages.scrollTop = 0; messages.listeners.scroll(); await settle();
+  assert.equal(top().className, 'woni-older is-error');
+  assert.equal(textOf(top()), '대화를 찾지 못했어요다시 시도');
+  messages.listeners.scroll(); messages.listeners.scroll(); await settle();
+  assert.equal(urls.length, 1);
+  fail = false;
+  buttonOf(top(), '다시 시도').click(); await settle();
+  assert.equal(urls.length, 2); assert.equal(ids()[0], 'c20');
+  assert.equal(textOf(top()), '이전 대화 더 보기');
+});
+
+test('원이 답 아래 흐름 이름을 달고 누르면 그 흐름을 처음부터 열며 Esc는 흐름만 닫는다', async () => {
+  const now = Date.now() / 1000, urls = [];
+  const flow = { stream: 'fixture-flow', streamTitle: '합성 흐름' };
+  const early = Array.from({ length: 3 }, (_, n) => ({ id: `f${n}`, seq: n, text: `처음 질문 ${n}`, answer: `처음 답 ${n}`, status: 'complete', createdAt: now - 900 + n, ...flow }));
+  const chats = [
+    { id: 'w1', seq: 10, text: '흐름 질문', answer: '흐름 답', status: 'complete', createdAt: now - 300, finishedAt: now - 290, ...flow },
+    { id: 'n1', seq: 11, text: '흐름 없는 질문', answer: '흐름 없는 답', status: 'complete', createdAt: now - 200 },
+    { id: 'a1', seq: 12, kind: 'alert', text: '알림', answer: '먼저 알린 말', status: 'complete', createdAt: now - 150, ...flow },
+    { id: 'r1', seq: 13, text: '일하는 질문', status: 'running', progress: '찾는 중', createdAt: now - 100, ...flow },
+    { id: 'x1', seq: 14, text: '실패 질문', status: 'failed', createdAt: now - 50, ...flow },
+  ];
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url.startsWith('/api/woni/chats?')) { urls.push(url); return { chats: [...early, chats[0], chats[2], chats[3], chats[4]], hasMore: false, total: 7, streamTitle: '합성 흐름' }; }
+    return url === '/api/woni' ? { chats, chatTotal: 15, chatsHasMore: true, activity: {} } : { chats: [], activity: {} };
+  };
+  const { nodes, ids } = await openHistory(call);
+  const tags = () => byClass(nodes['woni-messages'], 'woni-stream-tag');
+  const owner = tag => walk(nodes['woni-messages'], node => node.children?.includes(tag))[0];
+  assert.deepEqual(tags().map(textOf), ['# 합성 흐름', '# 합성 흐름', '# 합성 흐름']);
+  assert.deepEqual(tags().map(tag => owner(tag).className), ['woni-message assistant', 'woni-message assistant', 'woni-message assistant']);
+  assert.deepEqual(tags().map(tag => textOf(byClass(owner(tag), 'woni-message-body')[0])), ['흐름 답', '찾는 중', '답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.']);
+  assert.equal(tags()[0]['aria-label'], '흐름 합성 흐름만 보기');
+  tags()[0].click(); await settle();
+  assert.deepEqual(urls, ['/api/woni/chats?stream=fixture-flow&limit=200']);
+  assert.equal(nodes['woni-filter-clear'].focused, true);  // 누른 이름이 사라져도 Esc가 창에 닿게
+  assert.deepEqual(ids(), ['f0', 'f1', 'f2', 'w1', 'r1', 'x1']);
+  assert.equal(tags().length, 0);  // 흐름 안에서는 달지 않는다
+  assert.equal(nodes['woni-messages'].children[0].textContent, '이 흐름의 첫 대화 · 모두 7개');
+  assert.equal(nodes['woni-filter'].hidden, false); assert.equal(nodes['woni-filter-label'].textContent, '흐름: 합성 흐름');
+  let prevented = 0;
+  nodes['woni-dialog'].listeners.keydown({ key: 'Escape', preventDefault: () => prevented++ });
+  assert.equal(prevented, 1); assert.equal(nodes['woni-filter'].hidden, true); assert.equal(nodes['woni-dialog'].open, true);
+  assert.deepEqual(ids(), ['w1', 'n1', 'r1', 'x1']);
+  nodes['woni-dialog'].listeners.keydown({ key: 'Escape', preventDefault: () => prevented++ });
+  assert.equal(prevented, 1);  // 닫을 흐름이 없으면 원래대로 창이 닫힌다
+  // '이 흐름만 보기' 메뉴도 같은 흐름을 처음부터 연다.
+  const answer = nodes['woni-messages'].children.find(node => node.dataset.chatId === 'w1' && node.className.includes('assistant'));
+  buttonOf(answer, '이 흐름만 보기 · 합성 흐름').click(); await settle();
+  assert.equal(urls.length, 2); assert.equal(ids()[0], 'f0');
+  // '전체 대화'는 대화 화면에 남아 모든 대화를 보인다.
+  nodes['woni-filter-clear'].click();
+  assert.equal(nodes['woni-filter'].hidden, true); assert.equal(nodes['woni-messages'].hidden, false); assert.deepEqual(ids(), ['w1', 'n1', 'r1', 'x1']);
+});
+
+test('찾기 화면은 흐름 목록과 대화 찾기를 보여 주고 결과를 누르면 그 자리로 간다', async () => {
+  const data = history(100, seq => seq % 2 ? 'fixture-flow' : null), urls = [];
+  let far = false;
+  const streams = { items: [
+    { id: 'fixture-flow', title: '합성 흐름', count: 50, running: 1, unread: 0, lastAt: Date.now() / 1000, lastText: '맡긴 말', lastAnswer: '답 첫 줄', lastStatus: 'running' },
+    { id: 'other-flow', title: '다른 흐름', count: 2, running: 0, unread: 2, lastAt: 1000, lastText: '질문', lastAnswer: '', lastStatus: 'failed' },
+    { id: 'third-flow', title: '세 번째', count: 1, running: 0, unread: 0, lastAt: 1000, lastText: '질문', lastAnswer: '끝난 답', lastStatus: 'complete' }], total: 3 };
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    urls.push(url);
+    if (url === '/api/woni/streams') return streams;
+    if (url.startsWith('/api/woni/chat-search?')) return { q: '재고 확인', total: 3, nextOffset: null,
+      streams: [{ id: 'fixture-flow', title: '재고 흐름', count: 4, lastAt: 1 }],
+      items: [{ id: 'c70', stream: 'fixture-flow', streamTitle: '합성 흐름', createdAt: 1070, question: '재고 확인 부탁', snippet: '…재고 3개 확인했어요…' },
+              { id: 'c5', kind: 'chat', createdAt: 1005, question: '오래된 재고', snippet: '' },
+              { id: 'c3', stream: 'fixture-flow', streamTitle: '합성 흐름', createdAt: 1003, question: '아주 오래된 재고', snippet: '' }] };
+    if (url.startsWith('/api/woni/chats?through=')) {
+      if (far) return { chats: [], hasMore: true, total: 500, tooFar: true };
+      return { chats: data.all.slice(4, 40), hasMore: true, total: 100 };  // the server adds the 3 chats before it
+    }
+    if (url.startsWith('/api/woni/chats?stream=')) return { chats: data.all.filter(chat => chat.stream), hasMore: false, total: 50 };
+    return url === '/api/woni' ? data.state() : { chats: [], activity: {} };
+  };
+  const { nodes, ids, tick } = await openHistory(call);
+  nodes['woni-find-open'].click(); await settle();
+  assert.equal(nodes['woni-find'].hidden, false); assert.equal(nodes['woni-messages'].hidden, true); assert.equal(nodes['woni-form'].hidden, true);
+  assert.equal(nodes['woni-find-open']['aria-pressed'], 'true');
+  const find = nodes['woni-find'];
+  const rows = () => byClass(find, 'woni-find-row');
+  assert.ok(urls.includes('/api/woni/streams'));
+  assert.equal(textOf(byClass(find, 'woni-find-heading')[0]), '흐름');
+  assert.deepEqual(rows().map(row => textOf(byClass(row, 'woni-find-preview')[0])), ['맡긴 말', '답을 받지 못했어요 · 질문', '끝난 답']);
+  assert.equal(byClass(rows()[0], 'woni-find-running').length, 1);
+  assert.equal(textOf(byClass(rows()[1], 'woni-find-unread')[0]), '새 답 2개');
+  assert.equal(textOf(byClass(rows()[1], 'woni-find-time')[0]).length > 0, true);
+  // 흐름을 열고 뒤로 가면 흐름 목록으로 돌아온다.
+  rows()[0].click(); await settle();
+  assert.equal(nodes['woni-messages'].hidden, false); assert.equal(ids().length, 50);
+  let cancelled = 0;
+  nodes['woni-dialog'].listeners.cancel({ preventDefault: () => cancelled++ });
+  assert.equal(cancelled, 1); assert.equal(nodes['woni-find'].hidden, false); assert.equal(nodes['woni-filter'].hidden, true);
+  assert.equal(walk(nodes['woni-find'], node => node.type === 'search')[0].focused, true);
+  // 찾기 화면에서 한 번 더 뒤로 가면 대화로, 그다음에야 창이 닫힌다.
+  nodes['woni-dialog'].listeners.cancel({ preventDefault: () => cancelled++ });
+  assert.equal(cancelled, 2); assert.equal(nodes['woni-find'].hidden, true); assert.equal(nodes['woni-messages'].hidden, false);
+  nodes['woni-dialog'].listeners.cancel({ preventDefault: () => cancelled++ });
+  assert.equal(cancelled, 2);
+  nodes['woni-find-open'].click(); await settle();
+  // 낱말을 적으면 0.3초 뒤 찾는다(흐름 이름 일치 먼저, 찾은 말은 굵게).
+  const input = walk(find, node => node.type === 'search')[0];
+  input.value = '재고 확인'; input.listeners.input();
+  assert.equal(urls.some(url => url.startsWith('/api/woni/chat-search')), false);
+  await tick(); await settle();
+  assert.ok(urls.includes('/api/woni/chat-search?q=%EC%9E%AC%EA%B3%A0+%ED%99%95%EC%9D%B8&offset=0&limit=20'));
+  assert.deepEqual(byClass(find, 'woni-find-heading').map(textOf), ['흐름 1', '대화 3건']);
+  assert.deepEqual(byClass(rows()[1], 'woni-match').map(textOf), ['재고', '확인', '재고', '확인']);
+  assert.equal(textOf(byClass(rows()[1], 'woni-find-question')[0]), '나: 재고 확인 부탁');
+  assert.equal(textOf(byClass(rows()[2], 'woni-find-stream')[0]), '흐름 없음');
+  // 받아 둔 대화면 그 자리로 가서 강조한다.
+  rows()[1].click(); await settle();
+  assert.equal(nodes['woni-messages'].hidden, false);
+  assert.ok(nodes['woni-messages'].children.find(node => node.dataset.chatId === 'c70').className.includes('is-found'));
+  // 받지 않은 대화는 그 대화까지 이어 받는다.
+  nodes['woni-find-open'].click(); await settle();
+  rows()[2].click(); await settle();
+  assert.ok(urls.includes('/api/woni/chats?through=c5&before=c40'));
+  assert.equal(ids()[0], 'c4'); assert.ok(nodes['woni-messages'].children.find(node => node.dataset.chatId === 'c5').className.includes('is-found'));
+  // 너무 멀면 그 흐름을 처음부터 열어 그 자리로.
+  far = true;
+  nodes['woni-find-open'].click(); await settle();
+  rows()[3].click(); await settle(); await settle();
+  assert.ok(urls.includes('/api/woni/chats?through=c3&before=c4'));
+  assert.ok(urls.includes('/api/woni/chats?stream=fixture-flow&limit=200'));
+  assert.equal(nodes['woni-filter-label'].textContent, '흐름: 합성 흐름');
+  assert.ok(nodes['woni-messages'].children.find(node => node.dataset.chatId === 'c3').className.includes('is-found'));
+});
+
+test('잠그면 이어 받은 대화·흐름·찾기 결과를 모두 버리고 늦은 응답도 남기지 않는다', async () => {
+  const data = history(100);
+  let finish;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url.startsWith('/api/woni/chats?')) return new Promise(resolve => { finish = resolve; });
+    if (url === '/api/woni/streams') return { items: [{ id: 'secret-flow', title: '비밀 흐름', count: 1 }], total: 1 };
+    return url === '/api/woni' ? data.state() : { chats: [], activity: {} };
+  };
+  const { nodes, app, ids } = await openHistory(call);
+  nodes['woni-find-open'].click(); await settle();
+  assert.ok(textOf(nodes['woni-find']).includes('비밀 흐름'));
+  nodes['woni-chat-tab'].click();
+  nodes['woni-messages'].scrollTop = 0; nodes['woni-messages'].listeners.scroll(); await settle();
+  app.lock(); finish({ chats: [{ id: 'late', seq: 0, text: '늦은 비밀', answer: '늦은 답' }], hasMore: false });
+  await settle();
+  assert.equal(textOf(nodes['woni-find']).includes('비밀 흐름'), false);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  assert.equal(ids().includes('late'), false); assert.equal(ids()[0], 'c40');
 });
