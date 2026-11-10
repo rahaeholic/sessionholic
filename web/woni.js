@@ -21,7 +21,8 @@
   const chatIdPattern = /^[A-Za-z0-9_-]{1,100}$/, streamPattern = /^[a-z0-9-]{1,40}$/;
   let olderChats = [], streamChats = [], streamChatsFor = null, streamHasMore = false;
   let olderLoading = false, olderError = "", olderRetry = null, olderGen = 0, streamBackTo = null;
-  let highlightId = null, highlightTimer = 0;
+  // highlight: the row a jump marked for a moment ({ id, part }); shownRows: the rows drawn last, to find a row's place.
+  let highlight = null, highlightTimer = 0, shownRows = [];
   const pendingKey = "sessionholic:woni:pending";
   const seenKey = "sessionholic:woni:seen";
   let seen = null, unread = new Set();
@@ -123,7 +124,8 @@
     if (pending || sending || uploading) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
     const reply = target?.part === "answer" ? { id: target.id, part: "answer" } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(reply ? { replyTo: reply } : {}) });
-    if (reply) replyBox.hidden = true;
+    // The reply bar closes only when it was on this answer; a bar on another message stays for the composer.
+    if (reply && replyTarget?.id === reply.id && replyTarget.part === "answer") replyBox.hidden = true;
     leaveStream();
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -169,16 +171,61 @@
     const sameYear = String(y) === dayKeyFormat.format(new Date(now * 1000)).slice(0, 4);
     return `${sameYear ? "" : `${y}년 `}${m}월 ${d}일 (${shortWeekdayFormat.format(date)})`;
   }
-  // Chat id -> centered line: the first message of a day shows the day, a message Woni started shows its time.
-  function timeDividers(chats, now = Date.now() / 1000) {
+  // Ryan 2026-11-11 08:10 ("답이 가장 최신으로 왔으면 … 위에 온 답변을 내가 놓치게 되잖아"): Woni works on several
+  // asks at once, so the list is drawn in rows, not chats. Ryan's ask is a row at createdAt, Woni's finished
+  // answer (or failure) a row at finishedAt, a Woni alert only an answer row. An answer right after its own ask
+  // is drawn with it as now ('merged'); one with other rows between is 'detached': it sits at its own time
+  // (usually the bottom) quoting the ask, and the ask gets a link down to it. A working chat has only its ask row.
+  // chats: oldest first (Woni's list order). Rows: { kind: question|answer|merged, id, at, detached, key }.
+  function chatRows(chats) {
+    const list = (Array.isArray(chats) ? chats : []).filter((chat) => typeof chat?.id === "string" && chat.id);
+    const bySeq = list.every((chat) => Number.isInteger(chat.seq));
+    const rows = []; let last = 0;
+    list.forEach((chat, index) => {
+      const order = bySeq ? chat.seq : index, alert = chat.kind === "alert";
+      const finished = !["queued", "running"].includes(chat.status) && (!!chat.answer || ["failed", "interrupted"].includes(chat.status));
+      const created = Number(chat.createdAt), done = Number(chat.finishedAt);
+      // A missing time is not 0 (that would lift the row to the top): the ask without one takes its answer's time,
+      // else the row before it; an answer is never before its ask.
+      const asked = validSeconds(created) ? created : finished && validSeconds(done) ? done : last;
+      if (!alert) rows.push({ kind: "question", id: chat.id, at: asked, order, part: 0 });
+      if (alert || finished) rows.push({ kind: "answer", id: chat.id, at: Math.max(validSeconds(done) ? done : asked, asked), order, part: 1 });
+      last = Math.max(last, asked);
+    });
+    // Time, then Woni's order, then a chat's own ask before its answer: the same list always gives the same rows.
+    rows.sort((a, b) => a.at - b.at || a.order - b.order || a.part - b.part);
+    const out = [];
+    for (const row of rows) {
+      const before = out.at(-1), own = row.kind === "answer" && before?.id === row.id && before.kind === "question";
+      if (own) { before.kind = "merged"; before.key = `${row.id}:merged`; continue; }
+      out.push({ kind: row.kind, id: row.id, at: row.at, detached: false, key: `${row.id}:${row.kind}` });
+    }
+    // Both halves of an ask whose answer went below other rows are marked: the ask shows the link, the answer the quote.
+    const asks = new Map(out.filter((row) => row.kind === "question").map((row) => [row.id, row]));
+    for (const row of out) if (row.kind === "answer" && asks.has(row.id)) { row.detached = true; asks.get(row.id).detached = true; }
+    return out;
+  }
+  // The row a jump lands on: the ask (an alert has only its answer), or the answer when asked for and apart.
+  function rowFor(rows, id, part = "question") {
+    const own = rows.filter((row) => row.id === id);
+    return own.find((row) => row.kind === part || row.kind === "merged") || own[0] || null;
+  }
+  // The bottom answer row (the answer that finished last) of the rows on screen carries the 👉 suggestions
+  // (a stream shows its own bottom answer's, as in the Ryan One app).
+  function latestRowId(rows) {
+    return rows.filter((row) => row.kind !== "question").at(-1)?.id || null;
+  }
+  function latestAnswerId(chats) { return latestRowId(chatRows(chats)); }
+  // Row key -> centered line: the first row of a day shows the day, a message Woni started shows its time.
+  function timeDividers(rows, chats, now = Date.now() / 1000) {
     const out = new Map(); let lastDay = null;
-    for (const chat of chats) {
-      const at = Number(chat.createdAt);
+    for (const row of rows) {
+      const at = row.at;
       if (!validSeconds(at)) continue;
-      const day = dayNumber(at), newDay = day !== lastDay, alert = chat.kind === "alert";
+      const day = dayNumber(at), newDay = day !== lastDay, alert = chats.get(row.id)?.kind === "alert";
       lastDay = day;
-      if (alert) out.set(chat.id, `${newDay ? dayLabel(at, now) + " " : ""}${clockLabel(at)} · 먼저 알림`);
-      else if (newDay) out.set(chat.id, dayLabel(at, now));
+      if (alert) out.set(row.key, `${newDay ? dayLabel(at, now) + " " : ""}${clockLabel(at)} · 먼저 알림`);
+      else if (newDay) out.set(row.key, dayLabel(at, now));
     }
     return out;
   }
@@ -240,8 +287,7 @@
   // Replying to an earlier Woni answer shows its 👉 suggestions under the reply bar; a tap sends one as a reply to it.
   // The latest answer already has them under its bubble, so they are not repeated here.
   function renderReplyPicks() {
-    const chats = Array.isArray(latestData?.chats) ? latestData.chats : [];
-    const target = replyTarget, latest = chats.at(-1)?.id;
+    const target = replyTarget, latest = shownRows.length ? latestRowId(shownRows) : latestAnswerId(latestData?.chats);
     const picks = target?.part === "answer" && !pending && !replyBox.hidden && target.id !== latest ? target.suggestions || [] : [];
     replyPicks.replaceChildren(...picks.map((text) => action(text, () => sendSuggestion(text, target))));
     replyPicks.hidden = !picks.length;
@@ -256,14 +302,35 @@
       original.replaceChildren(el("strong", "", "원문"), block, action("답글 달기", () => setReply(chat, chat.answer ? "answer" : "question")), action("닫기", () => { original.hidden = true; }));
     } catch (_) { if (current === epoch && dialog.open) original.replaceChildren(el("p", "", "원문을 불러오지 못했어요."), action("닫기", () => { original.hidden = true; })); }
   }
+  // The ask's first line for a detached answer's quote (the line is cut to one row by style.css).
+  function firstLine(chat) {
+    const line = String(chat?.text || "").split("\n").map((item) => item.trim()).find(Boolean);
+    return line || (chat?.attachments?.length ? "첨부 파일" : "질문");
+  }
+  // Under an ask whose answer is further down: '답은 아래에 · 오후 8:32 ↓', a tap goes to that answer.
+  function answerLink(chat) {
+    const at = answerClock(chat) || clockLabel(Number(chat.finishedAt));
+    const link = el("button", "woni-answer-link", `답은 아래에${at ? ` · ${at}` : ""} ↓`);
+    link.type = "button"; link.setAttribute("aria-label", "답으로 이동");
+    link.addEventListener("click", () => jumpTo(chat.id, "answer", true));
+    return link;
+  }
   // tagFor: the chat whose stream name goes under this Woni bubble (also under a working or failed one, which has no menu).
-  function row(role, text, files = [], chat = null, tagFor = null) {
+  // askOf: a detached answer's chat, quoted above the bubble. link: the line under an ask whose answer went below.
+  function row(role, text, files = [], chat = null, tagFor = null, { askOf = null, link = null } = {}) {
     // The speaker name stays for screen readers only; the bubble side and colour show who is talking.
     const article = el("article", `woni-message ${role}`), label = el("span", "sr-only", role === "user" ? "라이언" : "원이");
     const content = el("div", "woni-message-body");
     if (role === "user" && chat?.replyTo) {
       const quote = el("button", "woni-message-quote", `↩ ${chat.replyTo.who || "원문"} · ${chat.replyTo.excerpt || "원문 보기"}`);
       quote.type = "button"; quote.addEventListener("click", () => showOriginal(chat.replyTo.id));
+      article.append(quote);
+    }
+    if (askOf) {
+      // The same quote as a reply's, one line: it goes back up to the ask this answer belongs to.
+      const quote = el("button", "woni-message-quote is-ask", `↩ 라이언 · ${firstLine(askOf)}`);
+      quote.type = "button"; quote.setAttribute("aria-label", "원래 질문으로 이동");
+      quote.addEventListener("click", () => jumpTo(askOf.id, "question", true));
       article.append(quote);
     }
     if (role === "assistant" && typeof MessageFormat !== "undefined") MessageFormat.render(content, text);
@@ -275,6 +342,7 @@
       time.dateTime = new Date(Number(chat.createdAt) * 1000).toISOString(); time.setAttribute("aria-label", `보낸 시각 ${sent}`);
       line.append(time, content); article.append(line);
     } else article.append(content);
+    if (link) article.append(link);
     const answered = role === "assistant" ? answerClock(chat) : "";
     if (answered) {
       const time = el("time", "woni-answer-time", answered);
@@ -301,7 +369,6 @@
       }
       article.append(actions);
       if (menuKey === key) article.className += " is-open";
-      if (highlightId === chat.id) article.className += " is-found";
       content.setAttribute("aria-expanded", String(menuKey === key));
       article.addEventListener("click", (event) => {
         if (event?.target?.closest?.("a, button")) return;
@@ -982,18 +1049,28 @@
     if (view === "find") { setView("chat"); input.focus?.({ preventScroll: true }); return true; }
     return false;
   }
-  // Shows a chat already received in place (leaving a stream that hides it) and marks it for a moment.
-  function jumpTo(id) {
+  // Shows a chat already received in place (leaving a stream that hides it) and marks its row for a moment.
+  // part: the ask's row (an alert's only row) or, from the link under an ask, its answer's row.
+  // paired: pressed from that link or a detached answer's quote; the focus goes to the other one, to come back.
+  function jumpTo(id, part = "question", paired = false) {
     const chat = loadedChats().find((item) => item.id === id);
     if (!chat) { setView("chat"); showOriginal(id); return; }
     if (filter && chat.stream !== filter.id) leaveStream();
     if (view !== "chat") setView("chat");
-    highlightId = id; clearTimeout(highlightTimer);
-    highlightTimer = setTimeout(() => { highlightId = null; redraw(); }, 2400);
+    highlight = { id, part }; clearTimeout(highlightTimer);
+    highlightTimer = setTimeout(() => { highlight = null; redraw(); }, 2400);
     redraw();
-    messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
+    const target = rowNode(id, part);
+    target?.scrollIntoView?.({ block: "center" });
+    const other = paired ? target?.querySelector?.(part === "answer" ? ".woni-message-quote.is-ask" : ".woni-answer-link") : null;
+    if (other) other.focus?.({ preventScroll: true });
     // What was pressed (a search result, a work card) is out of view now; the composer takes the focus.
-    if (!messages.contains?.(globalThis.document?.activeElement)) input.focus?.({ preventScroll: true });
+    else if (!messages.contains?.(globalThis.document?.activeElement)) input.focus?.({ preventScroll: true });
+  }
+  // The first node drawn for a chat's row (its day line is left above it).
+  function rowNode(id, part = "question") {
+    const key = rowFor(shownRows, id, part)?.key;
+    return key ? messages.querySelector?.(`[data-row-key="${CSS.escape(key)}"]`) : null;
   }
 
   // The find screen: with no words, the streams (latest first); with words, matching streams and chats.
@@ -1171,7 +1248,7 @@
   }
   function resetHistory() {
     olderChats = []; streamChats = []; streamChatsFor = null; streamHasMore = false; olderGen++;
-    olderLoading = false; olderError = ""; olderRetry = null; streamBackTo = null; highlightId = null; clearTimeout(highlightTimer);
+    olderLoading = false; olderError = ""; olderRetry = null; streamBackTo = null; highlight = null; clearTimeout(highlightTimer);
     streamsData = null; streamsError = ""; streamsGen++; hits = null; hitsFor = ""; hitsError = ""; hitsLoading = false; hitsGen++;
     clearTimeout(findTimer); findSearch.input.value = ""; findList.replaceChildren(); findMore.hidden = true; findBox.hidden = true;
   }
@@ -1279,21 +1356,20 @@
     const oldHeight = messages.scrollHeight, oldTop = messages.scrollTop;
     const nodes = [], visibleChats = mergedChats(chats).filter((item) => !filter || item.stream === filter.id);
     nodes.push(...olderRow(visibleChats.length));
-    const dividers = timeDividers(visibleChats), latestId = chats.at(-1)?.id;
-    for (const chat of visibleChats) {
-      if (dividers.has(chat.id)) nodes.push(el("p", "woni-divider", dividers.get(chat.id)));
-      if (chat.kind !== "alert" && (chat.text || chat.attachments?.length)) nodes.push(row("user", chat.text || "", chat.attachments || [], chat));
-      if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat));
-      const replies = chat.answer && chat.id === latestId && !pending ? suggestedReplies(chat.answer) : [];
-      if (replies.length) {
-        const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
-        // While Ryan is replying to this answer (checked at tap time), a suggestion goes as a reply to it as well.
-        const target = () => replyTarget?.id === chat.id && replyTarget.part === "answer" ? replyTarget : null;
-        for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply, target())));
-        nodes.push(box);
-      }
-      else if (["queued", "running"].includes(chat.status)) nodes.push(stateRow("working", row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat)));
-      else if (["failed", "interrupted"].includes(chat.status)) nodes.push(stateRow("failed", row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat)));
+    // Rows, not chats (chatRows): a stream shows its own chats by the same rule, so an answer apart in the whole
+    // list may sit right under its ask there. The 👉 suggestions go under the bottom answer of the rows shown.
+    const rows = chatRows(visibleChats), byId = new Map(visibleChats.map((chat) => [chat.id, chat]));
+    const dividers = timeDividers(rows, byId), latestId = latestRowId(rows);
+    const found = highlight && rowFor(rows, highlight.id, highlight.part)?.key;
+    shownRows = rows;
+    for (const item of rows) {
+      const chat = byId.get(item.id);
+      if (dividers.has(item.key)) nodes.push(el("p", "woni-divider", dividers.get(item.key)));
+      const first = nodes.length;
+      if (item.kind !== "answer") askRow(nodes, chat, item);
+      if (item.kind !== "question") answerRow(nodes, chat, item, latestId);
+      if (nodes[first]) nodes[first].dataset.rowKey = item.key;
+      if (found === item.key) for (const node of nodes.slice(first)) if (node.className.startsWith("woni-message ")) node.className += " is-found";
     }
     // An empty chat says what Woni is for and offers the same first ask as the menu.
     if (!visibleChats.length && !pending && !filter && !olderLoading) {
@@ -1305,7 +1381,12 @@
     if (pending) {
       const sentFiles = (pending.attachments || []).map((id) => attachments.find((item) => item.id === id) || { name: "첨부 파일" });
       const outgoing = row("user", pending.text, sentFiles);
-      if (pending.replyTo) outgoing.append(el("div", "woni-send-status", `↩ 답글 · ${replyTarget?.excerpt || "이전 메시지"}`));
+      if (pending.replyTo) {
+        const own = replyTarget?.id === pending.replyTo.id ? replyTarget.excerpt : "";
+        const quoted = loadedChats().find((chat) => chat.id === pending.replyTo.id);
+        const excerpt = own || (!quoted ? "" : pending.replyTo.part === "answer" ? visibleAnswer(quoted.answer || "") || quoted.answer : quoted.text);
+        outgoing.append(el("div", "woni-send-status", `↩ 답글 · ${excerpt || "이전 메시지"}`));
+      }
       const message = pendingState === "sending" ? "전송 중…" : pendingState === "checking" ? "전달됨 · 대화 확인 중…" : "전송 여부를 확인하지 못했어요.";
       const indicator = el("div", "woni-send-status", message);
       indicator.setAttribute("role", "status");
@@ -1325,6 +1406,30 @@
   }
   // A working answer shows quiet dots, a failed one the failure colour (style.css); the class stays as before.
   function stateRow(state, node) { node.dataset.state = state; return node; }
+  // Ryan's ask. While Woni works on it, what it is doing stays right under it (as before); once its answer has
+  // gone below other rows, a link down to it takes that place.
+  function askRow(nodes, chat, item) {
+    if (chat.text || chat.attachments?.length) nodes.push(row("user", chat.text || "", chat.attachments || [], chat, null, { link: item.detached ? answerLink(chat) : null }));
+    if (item.kind !== "question" || item.detached) return;
+    if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat));
+    if (["queued", "running"].includes(chat.status)) nodes.push(stateRow("working", row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat)));
+  }
+  // Woni's answer, an alert or a failure; a detached one quotes the ask above its bubble.
+  function answerRow(nodes, chat, item, latestId) {
+    const askOf = item.detached ? chat : null;
+    if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat, { askOf }));
+    const replies = chat.answer && chat.id === latestId && !pending ? suggestedReplies(chat.answer) : [];
+    if (replies.length) {
+      const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
+      // A suggestion always goes as a reply to this answer (Ryan One app 1.44.0): the answer that finished last can be
+      // many asks back, so the reply tells Woni which work it follows instead of a guess from the last few chats.
+      for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply, { id: chat.id, part: "answer" })));
+      nodes.push(box);
+    }
+    // An alert has no ask row, so one still being made shows its working line here (as before).
+    else if (["queued", "running"].includes(chat.status)) nodes.push(stateRow("working", row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat)));
+    else if (["failed", "interrupted"].includes(chat.status)) nodes.push(stateRow("failed", row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat, { askOf: chat.answer ? null : askOf })));
+  }
   async function refresh() {
     if (!enabled || reading || !api) return;
     reading = true; const current = authEpoch;
@@ -1343,7 +1448,7 @@
         if (Date.now() - streamsAt >= 60000) loadStreams();
         if (focusId) {
           const id = focusId; focusId = null;
-          if (loadedChats().some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
+          if (loadedChats().some((chat) => chat.id === id)) rowNode(id)?.scrollIntoView?.({ block: "center" });
           else showOriginal(id);
         }
       }
@@ -1505,6 +1610,7 @@
       streamsAt = 0; renderSide(true);
     },
     toastMs,
+    chatRows,
   };
   renderSide();
 })();
