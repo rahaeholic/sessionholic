@@ -172,18 +172,29 @@
     }
     return out;
   }
+  // The board's toast sits under the modal window, so while it is open the same words also show inside it.
+  let noticeTimer = 0;
+  function notify(text) {
+    services.toast?.(text);
+    if (!dialog.open) return;
+    const node = $("woni-notice"); node.textContent = text; node.hidden = false;
+    clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { node.hidden = true; }, 3500);
+  }
   async function copyText(text) {
-    try { await navigator.clipboard.writeText(text); services.toast?.("복사했어요."); }
-    catch (_) { services.toast?.("복사하지 못했어요. 글자를 길게 눌러 선택해 주세요."); }
+    try { await navigator.clipboard.writeText(text); notify("복사했어요."); }
+    catch (_) { notify("복사하지 못했어요. 글자를 길게 눌러 선택해 주세요."); }
   }
   function setView(value) {
     view = value; const isChat = value === "chat";
-    messages.hidden = !isChat; form.hidden = !isChat; work.hidden = isChat;
+    messages.hidden = !isChat; form.hidden = !isChat; work.hidden = value !== "work";
+    tasksBox.hidden = value !== "tasks"; notesBox.hidden = value !== "notes";
     filterBox.hidden = !isChat || !filter;
-    chatTab.setAttribute("aria-pressed", String(isChat)); workTab.setAttribute("aria-pressed", String(!isChat));
+    for (const [tab, name] of [[chatTab, "chat"], [tasksTab, "tasks"], [notesTab, "notes"], [workTab, "work"]]) tab.setAttribute("aria-pressed", String(value === name));
     original.hidden = true;
     if (isChat && dialog.open) markVisibleRead();
-    if (!isChat) { renderWork(); clearTimeout(timer); refresh(); }
+    if (value === "work") { renderWork(); clearTimeout(timer); refresh(); }
+    if (value === "tasks") { renderTasks(); loadTasks(); }
+    if (value === "notes") { renderNotes(); if (!notes && !notesLoading) loadNotes(); }
   }
   function setReply(chat, part) {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
@@ -363,6 +374,464 @@
     }
     work.replaceChildren(...nodes);
   }
+
+  // Ryan 2026-11-10: "할일, 시킨일 등. 기록 노트 원문 정도는 볼 필요도 있고" — the Ryan One app's to-do and record
+  // screens inside this window. Rules: docs/plan/2026-11-10-woni-panels.md. Inputs and switches stay in place
+  // across refreshes; only rows that changed are drawn again.
+  const tasksBox = $("woni-tasks"), notesBox = $("woni-notes"), tasksTab = $("woni-tasks-tab"), notesTab = $("woni-notes-tab");
+  const tasksBadge = $("woni-tasks-badge");
+  const taskRequestsKey = "sessionholic:woni:task-requests";
+  const taskKinds = [["mine", "내가 할 일"], ["delegated", "내가 맡긴 일"], ["unassigned", "담당 확인"]];
+  const emptyTaskHint = { mine: "라이언이 직접 실행하는 일이 모여요.", delegated: "다른 사람이 실행하고 라이언이 확인하는 일이 모여요.", unassigned: "담당자를 확정할 근거가 부족한 일이 모여요." };
+  const uncertainTask = "저장 여부를 확인하지 못했어요. 다시 누르면 같은 요청으로 확인해요.";
+  let tasks = null, tasksError = "", tasksAt = 0, tasksGen = 0, taskKind = "mine", taskFilter = "open", taskId = null;
+  let taskListScroll = 0, taskRowsKey = "", taskDetailKey = "";
+  const taskSaving = new Map();
+  let notes = null, notesQuery = "", notesError = "", notesLoading = false, notesGen = 0, notesTimer = 0, notesScroll = 0;
+  let note = null, noteBodyText = null, passagesTimer = 0;
+
+  function serverMessage(error, fallback) {
+    // A 4xx carries the server's own reason (state changed elsewhere, a Slack record has no transcript);
+    // no status means the connection failed and nothing is known.
+    return error?.status >= 400 && error.status < 500 && error.message ? error.message : fallback;
+  }
+  function button(label, className, fn) { const node = action(label, fn); node.className = className; return node; }
+  function searchField(label, onInput) {
+    const box = el("label", "woni-search"), input = el("input");
+    input.type = "search"; input.placeholder = label; input.autocomplete = "off"; input.maxLength = 300;
+    input.setAttribute("aria-label", label); input.setAttribute("enterkeyhint", "search");
+    input.addEventListener("input", onInput);
+    box.append(input); return { box, input };
+  }
+  function toggle(label, pressed, fn, count) {
+    const node = action("", fn); node.setAttribute("aria-pressed", String(pressed));
+    node.append(el("span", "", label));
+    if (count != null) node.append(el("span", "woni-count", String(count)));
+    return node;
+  }
+  function clock(seconds) {
+    if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return "";
+    const s = Math.floor(seconds), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), pad = (n) => String(n).padStart(2, "0");
+    return h ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+  }
+
+  const taskKindBox = el("div", "woni-segment woni-kinds"), taskViewBox = el("div", "woni-chips");
+  taskKindBox.setAttribute("role", "group"); taskKindBox.setAttribute("aria-label", "할 일 종류");
+  taskViewBox.setAttribute("role", "group"); taskViewBox.setAttribute("aria-label", "할 일 보기");
+  const taskSearch = searchField("할 일·담당자·프로젝트 찾기", () => renderTasks());
+  taskSearch.input.placeholder = "할 일 찾기";  // the full hint stays as its label; a phone row has room for a short one
+  const taskTools = el("div", "woni-tools"), taskHint = el("p", "woni-note-hint"), taskRows = el("div", "woni-task-list");
+  const taskList = el("div", "woni-pane"), taskDetail = el("div", "woni-pane woni-detail");
+  // The switches are made once and only change state, so a keyboard user keeps focus on the one pressed.
+  const kindButtons = taskKinds.map(([kind, label]) => toggle(label, kind === taskKind, () => { taskKind = kind; renderTasks(); }, 0));
+  const viewButtons = [["open", "남은 일"], ["done", "완료"], ["archived", "보관"]].map(([value, label]) => {
+    const node = toggle(label, value === taskFilter, () => { taskFilter = value; renderTasks(); }); node.dataset.view = value; return node;
+  });
+  taskKindBox.append(...kindButtons); taskViewBox.append(...viewButtons);
+  taskTools.append(taskViewBox, taskSearch.box);
+  taskList.append(taskKindBox, taskTools, taskHint, taskRows);
+  taskDetail.hidden = true;
+  tasksBox.append(taskList, taskDetail);
+
+  function allTasks() { return [...(tasks?.actions || []), ...(tasks?.completedActions || []), ...(tasks?.archivedActions || [])]; }
+  function findTask(id) { return allTasks().find((item) => item.id === id) || null; }
+  function kindOf(task) { return ["delegated", "unassigned"].includes(task.kind) ? task.kind : "mine"; }
+  function isDone(task) { return (taskSaving.get(task.id) || task.taskStatus) === "done"; }
+  function reopenStatus(task) { return kindOf(task) === "delegated" && task.previousStatus === "reported" ? "reported" : "open"; }
+  function attentionClass(text) { return String(text || "").includes("확인 필요") ? " is-attention" : ""; }
+  function taskBadge() {
+    const counts = tasks?.counts || {}, count = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
+    tasksBadge.hidden = !(count > 0); tasksBadge.textContent = count > 99 ? "99+" : String(count);
+    tasksBadge.setAttribute("aria-hidden", "true");
+    tasksTab.setAttribute("aria-label", count > 0 ? `할 일, 확인 필요 ${count}개` : "할 일");
+  }
+  function shownTasks() {
+    const list = (taskFilter === "done" ? tasks?.completedActions : taskFilter === "archived" ? tasks?.archivedActions : tasks?.actions) || [];
+    const query = taskSearch.input.value.trim().toLowerCase();
+    // The archive mixes every kind (as in the app); the other views follow the kind switch.
+    return list.filter((task) => taskFilter === "archived" || kindOf(task) === taskKind)
+      .filter((task) => !query || ["title", "project", "recordTitle", "assignee"].some((key) => String(task[key] || "").toLowerCase().includes(query)));
+  }
+  function taskLines(task) {
+    const kind = kindOf(task), saving = taskSaving.has(task.id), attention = String(task.attention || ""), lines = [];
+    if (kind === "delegated") lines.push([`woni-task-line${attentionClass(attention)}`, `담당: ${task.assignee || "담당 미정"}${attention ? ` · ${attention}` : ""}`]);
+    else if (kind === "unassigned" && task.guessBasis) lines.push(["woni-task-line is-guess", attention.replace(/^담당 확인 · /, "")]);
+    if (isDone(task) && !saving && task.autoBasis?.quote) lines.push(["woni-task-auto", `원이 확인 · “${task.autoBasis.quote}”`]);
+    lines.push(saving ? ["woni-task-meta is-saving", "저장 중…"] : ["woni-task-meta", [task.project, task.due].filter(Boolean).join(" · ")]);
+    return lines.filter(([, text]) => text);
+  }
+  function taskRow(task) {
+    const kind = kindOf(task), done = isDone(task), saving = taskSaving.has(task.id), title = task.title || "제목 없는 할 일";
+    const row = el("div", `woni-task${done ? " is-done" : ""}`); row.dataset.taskId = task.id;
+    const check = action("", () => setTaskStatus(task, done ? reopenStatus(task) : "done"));
+    check.className = "woni-check"; check.disabled = saving || kind === "unassigned";
+    check.setAttribute("aria-pressed", String(done));
+    check.setAttribute("aria-label", done ? `완료 취소: ${title}` : kind === "delegated" ? `결과 확인 완료: ${title}` : `완료 처리: ${title}`);
+    const open = button("", "woni-task-open", () => openTask(task.id));
+    open.append(el("span", "woni-task-title", title));
+    for (const [className, text] of taskLines(task)) open.append(el("span", className, text));
+    row.append(check, open); return row;
+  }
+  function renderTasks() {
+    const counts = tasks?.counts || {};
+    taskBadge();
+    kindButtons.forEach((node, index) => {
+      const kind = taskKinds[index][0];
+      node.setAttribute("aria-pressed", String(taskKind === kind)); node.children[1].textContent = String(Number(counts[kind]) || 0);
+    });
+    for (const node of viewButtons) node.setAttribute("aria-pressed", String(taskFilter === node.dataset.view));
+    const archive = viewButtons[2];
+    archive.hidden = !(Number(counts.archived) > 0 || taskFilter === "archived"); archive.children[0].textContent = `보관 ${Number(counts.archived) || 0}`;
+    taskHint.textContent = taskFilter === "archived" ? "녹음한 지 14일이 넘고 마감이 없거나 지난 일이라 목록과 알림에서 뺐어요."
+      : taskFilter === "open" && taskKind === "delegated" ? `확인 필요 ${Number(counts.followup) || 0}개 · 완료 보고와 마감이 된 일을 먼저 보여줘요. 홀릭이·뷰링이 같은 에이전트에게 시킨 일은 넣지 않아요.`
+      : taskFilter === "done" && Number(counts.autoDone) > 0 ? "'원이 확인' 표시는 끝낸 근거(Slack 글·보낸 메일·원이가 한 일)를 원이가 확인해 체크한 일이에요. 틀리면 열어서 되돌려 주세요." : "";
+    taskHint.hidden = !tasks || !taskHint.textContent;
+    const rows = shownTasks();
+    // Redraw rows only when what they show changed, so a 30-second refresh keeps focus and scroll.
+    const key = JSON.stringify([!!tasks, tasksError, tasks?.error || "", taskKind, taskFilter, taskSearch.input.value, [...taskSaving], rows]);
+    if (key !== taskRowsKey) {
+      taskRowsKey = key;
+      const nodes = [];
+      if (!tasks) nodes.push(el("p", tasksError ? "woni-note-hint is-error" : "woni-note-hint", tasksError || "할 일을 불러오고 있어요."));
+      else {
+        if (tasksError) nodes.push(el("p", "woni-note-hint is-error", "연결을 확인하지 못해 이전 할 일을 보여 줍니다."));
+        if (tasks.error) nodes.push(el("p", "woni-note-hint is-error", tasks.error));
+        if (!rows.length) {
+          const empty = el("div", "woni-empty");
+          empty.append(el("strong", "", taskSearch.input.value.trim() ? "찾는 할 일이 없어요" : "표시할 일이 없어요"),
+            el("p", "", taskFilter === "archived" ? "보관한 일이 없어요." : emptyTaskHint[taskKind]));
+          nodes.push(empty);
+        }
+        nodes.push(...rows.map(taskRow));
+      }
+      const focus = focusedIn(taskRows, "[data-task-id]");
+      taskRows.replaceChildren(...nodes);
+      if (focus) taskRows.querySelector?.(`[data-task-id="${CSS.escape(focus.key)}"] .${focus.className}`)?.focus?.({ preventScroll: true });
+    }
+    if (taskId) renderTaskDetail();
+  }
+  // Which row control had focus before a redraw: the same control of the same row gets it back.
+  function focusedIn(box, rowSelector) {
+    const active = globalThis.document?.activeElement, row = active?.closest?.(rowSelector);
+    if (!row || !box.contains?.(row)) return null;
+    return { key: row.dataset.taskId, className: String(active.className).split(" ")[0] };
+  }
+  function openTask(id) {
+    taskListScroll = tasksBox.scrollTop || 0; taskId = id; taskDetailKey = "";
+    taskList.hidden = true; taskDetail.hidden = false;
+    renderTaskDetail(); tasksBox.scrollTop = 0;
+    taskDetail.children[0]?.focus?.({ preventScroll: true });
+  }
+  function closeTask() {
+    const id = taskId; taskId = null; taskDetailKey = "";
+    taskDetail.hidden = true; taskDetail.replaceChildren(); taskList.hidden = false;
+    renderTasks(); tasksBox.scrollTop = taskListScroll;
+    tasksBox.querySelector?.(`[data-task-id="${CSS.escape(id || "")}"] .woni-task-open`)?.focus?.({ preventScroll: true });
+  }
+  function renderTaskDetail() {
+    const task = findTask(taskId), saving = task ? taskSaving.has(task.id) : false;
+    const key = JSON.stringify([task, saving, taskSaving.get(taskId) || ""]);
+    if (key === taskDetailKey) return;
+    taskDetailKey = key;
+    const nodes = [button("할 일", "woni-back", closeTask)];
+    if (!task) {
+      nodes.push(el("p", "woni-note-hint", tasks ? "목록이 바뀌어 이 할 일을 찾지 못했어요. 뒤로 가서 다시 열어 주세요." : "할 일을 불러오고 있어요."));
+      taskDetail.replaceChildren(...nodes); return;
+    }
+    const kind = kindOf(task), done = isDone(task), attention = String(task.attention || "");
+    nodes.push(el("h3", "woni-detail-title", task.title || "제목 없는 할 일"),
+      el("p", "woni-detail-meta", [task.project, task.due, done ? "완료" : "남은 일"].filter(Boolean).join(" · ")));
+    if (done && task.autoBasis?.quote) {
+      const box = el("section", "woni-auto");
+      box.append(el("strong", "", "원이가 끝낸 근거를 확인해 완료로 체크했어요"), el("p", "woni-quote", `“${task.autoBasis.quote}”`));
+      if (task.autoBasis.source) box.append(el("p", "woni-note-hint", task.autoBasis.source));
+      box.append(el("p", "woni-note-hint", "틀렸으면 아래 '완료 되돌리기'를 눌러 주세요. 되돌린 일은 다시 자동으로 체크하지 않아요."));
+      nodes.push(box);
+    }
+    const actions = el("div", "woni-detail-actions");
+    if (kind === "delegated") {
+      const group = el("section", "woni-group");
+      group.append(el("p", "woni-group-title", `담당: ${task.assignee || "담당 미정"}`));
+      if (attention) group.append(el("p", `woni-note-hint${attentionClass(attention)}`, attention));
+      if (task.reportQuote) group.append(el("p", "", `완료 보고 근거: ${task.reportQuote}`));
+      nodes.push(group);
+    }
+    if (kind === "unassigned" && task.guessBasis) {
+      const group = el("section", "woni-group");
+      group.append(el("p", "woni-group-title", attention.replace(/^담당 확인 · /, "") || "담당 확인"),
+        el("p", "woni-note-hint", `추정 근거: ${task.guessBasis}`), el("p", "woni-note-hint", "담당 구분은 Ryan One 앱에서 확정할 수 있어요."));
+      nodes.push(group);
+    }
+    if (kind !== "unassigned") {
+      const main = button(saving ? "저장 중…" : done ? "완료 되돌리기" : kind === "delegated" ? "결과 확인 완료" : "완료로 표시",
+        done ? "secondary" : "primary", () => setTaskStatus(task, done ? reopenStatus(task) : "done"));
+      main.disabled = saving; actions.append(main);
+    }
+    if (kind === "delegated" && !done && task.taskStatus === "open") {
+      const reported = button("완료 보고 받음", "secondary", () => setTaskStatus(task, "reported")); reported.disabled = saving; actions.append(reported);
+    }
+    if (task.taskStatus === "reported") {
+      const wait = button("다시 기다리는 중으로", "quiet", () => setTaskStatus(task, "open")); wait.disabled = saving; actions.append(wait);
+    }
+    if (actions.children.length) nodes.push(actions);
+    const basis = el("section", "woni-group");
+    basis.append(el("h4", "woni-group-heading", "근거"));
+    if (task.quote) basis.append(el("p", "woni-quote", `“${task.quote}”`));
+    if (task.requestQuote) basis.append(el("p", "", `요청 근거: ${task.requestQuote}`));
+    const source = [task.recordTitle, task.recordedAt, task.counterpart].filter(Boolean).join(" · ");
+    if (source) basis.append(el("p", "woni-note-hint", source));
+    if (task.sourceId) basis.append(button("노트 읽기", "secondary woni-wide", () => openNote(task.sourceId, "tasks")));
+    if (basis.children.length > 1) nodes.push(basis);
+    const controls = () => Array.from(taskDetail.querySelectorAll?.("button") || []);
+    const active = globalThis.document?.activeElement, at = taskDetail.contains?.(active) ? controls().indexOf(active) : -1;
+    taskDetail.replaceChildren(...nodes);
+    if (at >= 0) (controls()[at] || controls()[0])?.focus?.({ preventScroll: true });
+  }
+  function taskRequests() {
+    try { const value = JSON.parse(sessionStorage.getItem(taskRequestsKey) || "{}"); return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+    catch (_) { return {}; }
+  }
+  function saveTaskRequests(value) { try { sessionStorage.setItem(taskRequestsKey, JSON.stringify(value)); } catch (_) {} }
+  // The app's withTaskStatus: move the item between lists at once; the next read decides the rest.
+  function withTaskStatus(data, id, status, event) {
+    if (!data || !["open", "reported", "done"].includes(status)) return data;
+    const open = data.actions || [], done = data.completedActions || [], archived = data.archivedActions || [];
+    const stored = archived.find((item) => item.id === id);
+    if (stored && status !== "done") return data;
+    const target = [...open, ...done].find((item) => item.id === id) || stored;
+    if (!target) return data;
+    const updated = { ...target, taskStatus: status, stateEvent: event, previousStatus: target.taskStatus || "open" };
+    const restOpen = open.filter((item) => item.id !== id), restDone = done.filter((item) => item.id !== id);
+    const counts = { ...(data.counts || {}) }, kind = kindOf(target), isOpen = status !== "done";
+    counts[kind] = (Number(counts[kind]) || 0) - (restOpen.length !== open.length ? 1 : 0) + (isOpen ? 1 : 0);
+    counts.completed = (Number(counts.completed) || 0) - (restDone.length !== done.length ? 1 : 0) + (isOpen ? 0 : 1);
+    if (stored) counts.archived = Math.max(0, (Number(counts.archived) || 0) - 1);
+    return { ...data, counts, actions: isOpen ? [updated, ...restOpen] : restOpen, completedActions: isOpen ? restDone : [updated, ...restDone],
+      archivedActions: archived.filter((item) => item.id !== id) };
+  }
+  function statusNotice(task, status) {
+    const title = `‘${String(task.title || "").slice(0, 24)}’`;
+    if (status === "done") return kindOf(task) === "delegated" ? `${title} 결과 확인 완료` : `${title} 완료`;
+    return status === "reported" ? `${title} 완료 보고 · 결과 확인 필요` : `${title} 남은 일로 되돌렸어요`;
+  }
+  async function setTaskStatus(task, status) {
+    if (!api || taskSaving.has(task.id)) return;
+    const body = { actionId: task.id, status, expectedEvent: typeof task.stateEvent === "string" ? task.stateEvent : "" };
+    // The same change pressed again (after an unknown result) reuses its request ID, so Woni returns the first outcome.
+    const payload = JSON.stringify(body), requests = taskRequests(), saved = requests[task.id];
+    const requestId = saved?.payload === payload && typeof saved.id === "string" ? saved.id : crypto.randomUUID();
+    requests[task.id] = { payload, id: requestId }; saveTaskRequests(requests);
+    const current = authEpoch; tasksGen++;  // a list read that left before this change must not undo it
+    taskSaving.set(task.id, status); renderTasks();
+    let notice = "";
+    try {
+      const result = await api("/api/woni/task-status", { method: "POST", body: { ...body, requestId } });
+      if (current !== authEpoch) return;
+      if (!["saved", "unconfirmed"].includes(result?.result)) throw new Error("unknown result");
+      const left = taskRequests(); delete left[task.id]; saveTaskRequests(left);
+      if (result.result === "unconfirmed") notice = "이전 변경은 저장을 확인하지 못했어요. 현재 상태를 불러왔으니 필요하면 다시 눌러 주세요.";
+      else {
+        tasks = withTaskStatus(tasks, task.id, result.taskStatus, typeof result.stateEvent === "string" ? result.stateEvent : "");
+        notice = statusNotice(task, result.taskStatus);
+      }
+    } catch (error) {
+      if (current !== authEpoch) return;
+      // 409 is the board's "outcome unknown" (Woni unreachable or no readable answer): never a verdict on the save.
+      notice = error?.status === 409 ? uncertainTask : serverMessage(error, uncertainTask);
+    } finally {
+      if (current === authEpoch) { taskSaving.delete(task.id); renderTasks(); loadTasks(); }
+    }
+    if (notice) notify(notice);
+  }
+  async function loadTasks() {
+    if (!api || !enabled) return;
+    const current = authEpoch, generation = ++tasksGen; tasksAt = Date.now();
+    try {
+      const data = await api("/api/woni/tasks");
+      if (current !== authEpoch || generation !== tasksGen) return;
+      if (!Array.isArray(data?.actions)) throw new Error("not a task list");
+      tasks = data; tasksError = "";
+    } catch (_) {
+      if (current !== authEpoch || generation !== tasksGen) return;
+      tasksError = "할 일을 불러오지 못했어요. 잠시 후 다시 확인해 주세요.";
+    }
+    renderTasks();
+  }
+
+  const noteSearch = searchField("이름·원문·요약으로 찾기", () => { clearTimeout(notesTimer); notesTimer = setTimeout(() => loadNotes(), 250); });
+  const noteCount = el("p", "woni-note-hint"), noteCards = el("div", "woni-note-list"), noteMore = button("노트 더 보기", "secondary woni-wide", () => loadNotes(true));
+  const noteList = el("div", "woni-pane"), noteView = el("div", "woni-pane woni-detail");
+  noteList.append(noteSearch.box, noteCount, noteCards, noteMore);
+  const noteBack = button("기록", "woni-back", closeNote), noteHead = el("header", "woni-note-head"), noteBody = el("div", "woni-note-body");
+  const noteStatus = el("div", "woni-note-status"), noteContinue = button("이어 읽기", "secondary woni-wide", () => readNote(true));
+  const transcriptOpen = button("녹취 원문 보기", "secondary woni-wide", () => { if (note) { note.transcript = true; readPassages(); } });
+  const passagesBox = el("section", "woni-passages"), passageCaption = el("h4", "woni-group-heading");
+  const passageSearch = searchField("이 기록의 원문 찾기", () => { clearTimeout(passagesTimer); passagesTimer = setTimeout(() => readPassages(), 250); });
+  const passageList = el("div", "woni-passage-list"), passageStatus = el("div", "woni-note-status");
+  const passageMore = button("원문 더 보기", "secondary woni-wide", () => readPassages(true));
+  passagesBox.append(passageCaption, passageSearch.box, passageList, passageStatus, passageMore);
+  noteView.append(noteBack, noteHead, noteBody, noteStatus, noteContinue, transcriptOpen, passagesBox);
+  noteView.hidden = true;
+  notesBox.append(noteList, noteView);
+
+  function statusBlock(box, text, error, retry) {
+    const nodes = text ? [el("p", error ? "woni-note-hint is-error" : "woni-note-hint", text)] : [];
+    if (text && retry) nodes.push(button("다시 시도", "quiet", retry));
+    box.replaceChildren(...nodes); box.hidden = !nodes.length;
+    box.setAttribute("role", error ? "alert" : "status");
+  }
+  function renderNotes() {
+    noteList.hidden = !!note; noteView.hidden = !note;
+    if (note) { renderNote(); return; }
+    const items = notes?.items || [];
+    noteCount.textContent = items.length ? `정리 노트 ${Number.isFinite(Number(notes.total)) ? Number(notes.total) : items.length}개` : "";
+    const nodes = [];
+    if (notesError) {
+      nodes.push(el("p", "woni-note-hint is-error", notesError), button("다시 시도", "quiet", () => loadNotes()));
+    } else if (!notes) nodes.push(el("p", "woni-note-hint", "노트를 불러오고 있어요."));
+    else {
+      if (notes.error) nodes.push(el("p", "woni-note-hint is-error", notes.error));
+      if (!items.length && !notesLoading) {
+        const empty = el("div", "woni-empty");
+        empty.append(el("strong", "", "찾는 노트가 없어요"), el("p", "", "녹음을 정리하면 이곳에서 바로 읽을 수 있어요."));
+        nodes.push(empty);
+      }
+    }
+    for (const item of items) {
+      const card = button("", "woni-note-card", () => openNote(item.id, "notes"));
+      if (item.recordedAt) card.append(el("span", "woni-note-date", String(item.recordedAt)));
+      card.append(el("span", "woni-note-title", item.title || "제목 없는 기록"));
+      if (item.preview) card.append(el("span", "woni-note-preview", item.preview));
+      nodes.push(card);
+    }
+    noteCards.replaceChildren(...nodes);
+    noteMore.hidden = notes?.nextOffset == null;
+    noteMore.disabled = notesLoading; noteMore.textContent = notesLoading ? "불러오는 중…" : "노트 더 보기";
+  }
+  async function loadNotes(more = false) {
+    if (!api) return;
+    if (more && (notesLoading || notes?.nextOffset == null)) return;
+    const current = authEpoch, generation = ++notesGen, previous = notes;
+    if (!more) notesQuery = noteSearch.input.value.trim().slice(0, 300);
+    notesLoading = true; notesError = ""; renderNotes();
+    try {
+      const query = new URLSearchParams({ q: notesQuery, offset: String(more ? previous.nextOffset : 0) });
+      const data = await api(`/api/woni/notes?${query}`);
+      if (current !== authEpoch || generation !== notesGen) return;
+      if (!Array.isArray(data?.items)) throw new Error("not a note list");
+      if (more) { const ids = new Set(previous.items.map((item) => item.id)); data.items = [...previous.items, ...data.items.filter((item) => !ids.has(item.id))]; }
+      notes = data;
+    } catch (error) {
+      if (current !== authEpoch || generation !== notesGen) return;
+      notesError = serverMessage(error, "노트를 불러오지 못했어요. 연결을 확인하고 다시 시도해 주세요.");
+    }
+    notesLoading = false; renderNotes();
+  }
+  function openNote(id, back) {
+    if (back === "notes") notesScroll = notesBox.scrollTop || 0;
+    note = { id, back, data: null, error: "", loading: false, gen: 0, transcript: false, passages: null, passagesError: "", passagesLoading: false, passagesGen: 0, query: "" };
+    noteBodyText = null; passageSearch.input.value = ""; clearTimeout(passagesTimer);
+    if (view !== "notes") setView("notes"); else renderNotes();
+    notesBox.scrollTop = 0; noteBack.focus?.({ preventScroll: true });
+    readNote();
+  }
+  function closeNote() {
+    const back = note?.back; note = null; noteBodyText = null; clearTimeout(passagesTimer);
+    if (back === "tasks") { setView("tasks"); return; }
+    renderNotes(); notesBox.scrollTop = notesScroll;
+    if (!notes && !notesLoading) loadNotes();
+  }
+  function renderNote() {
+    const data = note.data;
+    noteBack.textContent = note.back === "tasks" ? "할 일" : "기록";
+    const head = [];
+    if (data) {
+      head.push(el("h3", "woni-detail-title", data.title || "제목 없는 기록"));
+      if (data.recordedAt) head.push(el("p", "woni-detail-meta", String(data.recordedAt)));
+      if (typeof data.url === "string" && /^https:\/\//.test(data.url)) {
+        const link = el("a", "woni-link", "Drive에서 열기"); link.href = data.url; link.target = "_blank"; link.rel = "noopener noreferrer";
+        head.push(link);
+      }
+    }
+    noteHead.replaceChildren(...head);
+    const text = data ? String(data.text || "") : null;
+    if (text !== noteBodyText) {
+      noteBodyText = text;
+      if (text == null) noteBody.replaceChildren();
+      else if (typeof MessageFormat !== "undefined") MessageFormat.render(noteBody, text);  // the same renderer as Woni's answers
+      else noteBody.textContent = text;
+    }
+    noteBody.hidden = !data || !text;
+    statusBlock(noteStatus, note.loading ? (data ? "이어서 불러오고 있어요." : "노트를 불러오고 있어요.") : note.error || (data && !text ? "노트 본문이 비어 있어요." : ""),
+      !!note.error && !note.loading, note.error ? () => readNote() : null);
+    noteContinue.hidden = !data || data.nextOffset == null || !!note.error; noteContinue.disabled = note.loading;
+    transcriptOpen.hidden = !data || note.transcript;
+    passagesBox.hidden = !note.transcript;
+    if (!note.transcript) return;
+    const result = note.passages, rows = result?.passages || [];
+    const total = Number(result?.total);
+    passageCaption.textContent = `${result?.label || "녹취 원문"}${Number.isFinite(total) && result ? ` · ${note.query ? "찾은 구간" : "구간"} ${total}개` : ""}`;
+    passageList.replaceChildren(...rows.map((passage) => {
+      const row = el("article", "woni-passage"), meta = el("p", "woni-passage-meta", [passage.speaker || "화자 미상", clock(passage.start)].filter(Boolean).join(" · "));
+      if (passage.transcriptDoubt) meta.append(el("span", "woni-doubt", "전사 불확실"));
+      row.append(meta, el("p", "woni-passage-text", passage.text || ""));
+      return row;
+    }));
+    const empty = result && !rows.length ? (note.query ? "해당 원문이 없어요. 검색어를 바꿔 보세요." : "이 기록에는 볼 수 있는 녹취 원문이 없어요.") : "";
+    statusBlock(passageStatus, note.passagesLoading ? "원문을 불러오고 있어요." : note.passagesError || empty, !!note.passagesError && !note.passagesLoading);
+    passageMore.hidden = !result || result.nextOffset == null || !!note.passagesError; passageMore.disabled = note.passagesLoading;
+    // A record with no transcript at all (a Slack record) has nothing to search in.
+    passageSearch.box.hidden = !result && !!note.passagesError && !note.passagesLoading;
+  }
+  async function readNote(more = false) {
+    const target = note;
+    if (!target || !api || (more && (target.loading || target.data?.nextOffset == null))) return;
+    const current = authEpoch, generation = ++target.gen, previous = target.data;
+    target.loading = true; target.error = ""; renderNotes();
+    try {
+      const query = new URLSearchParams({ id: target.id, offset: String(more ? previous.nextOffset : 0) });
+      const data = await api(`/api/woni/note?${query}`);
+      if (current !== authEpoch || note !== target || generation !== target.gen) return;
+      if (more && data?.revision !== previous.revision) target.error = "읽는 사이 노트가 변경됐어요. 새로고침해 주세요.";
+      else target.data = more ? { ...data, text: String(previous.text || "") + String(data?.text || "") } : data;
+    } catch (error) {
+      if (current !== authEpoch || note !== target || generation !== target.gen) return;
+      target.error = serverMessage(error, "노트를 읽지 못했어요. 연결을 확인하고 다시 시도해 주세요.");
+    }
+    target.loading = false; renderNotes();
+  }
+  async function readPassages(more = false) {
+    const target = note, previous = target?.passages;
+    if (!target || !api || (more && (target.passagesLoading || previous?.nextOffset == null))) return;
+    if (!more) target.query = passageSearch.input.value.trim().slice(0, 300);
+    const current = authEpoch, generation = ++target.passagesGen;
+    target.passagesLoading = true; target.passagesError = ""; renderNotes();
+    try {
+      const query = new URLSearchParams({ id: target.id, format: "passages", q: target.query, offset: String(more ? previous.nextOffset : 0) });
+      const data = await api(`/api/woni/transcript?${query}`);
+      if (current !== authEpoch || note !== target || generation !== target.passagesGen) return;
+      if (!Array.isArray(data?.passages)) throw new Error("no passages");
+      if (more && data.revision !== previous.revision) target.passagesError = "읽는 사이 원문이 변경됐어요. 다시 불러와 주세요.";
+      else {
+        if (more) { const ids = new Set(previous.passages.map((item) => item.id)); data.passages = [...previous.passages, ...data.passages.filter((item) => !ids.has(item.id))]; }
+        target.passages = data;
+      }
+    } catch (error) {
+      if (current !== authEpoch || note !== target || generation !== target.passagesGen) return;
+      // A record without a transcript (Slack) answers 409 with its own message; it is shown as is.
+      target.passagesError = serverMessage(error, "원문을 불러오지 못했어요. 연결 후 다시 시도해 주세요.");
+    }
+    target.passagesLoading = false; renderNotes();
+  }
+  function resetPanels() {
+    tasks = null; tasksError = ""; tasksAt = 0; tasksGen++; taskKind = "mine"; taskFilter = "open"; taskId = null; taskSaving.clear();
+    taskRowsKey = ""; taskDetailKey = ""; taskSearch.input.value = ""; taskDetail.hidden = true; taskDetail.replaceChildren(); taskList.hidden = false;
+    notes = null; notesQuery = ""; notesError = ""; notesLoading = false; notesGen++; clearTimeout(notesTimer); clearTimeout(passagesTimer);
+    note = null; noteBodyText = null; noteSearch.input.value = ""; passageSearch.input.value = ""; noteBody.replaceChildren();
+    renderTasks(); renderNotes();
+  }
+  renderTasks(); renderNotes();
+
   function show(data) {
     latestData = data;
     const chats = Array.isArray(data.chats) ? data.chats : [];
@@ -420,6 +889,8 @@
       latestData = data; observeReplies(data);
       if (dialog.open) {
         show(data);
+        // The to-do list is read when its tab opens and every 30 seconds while it stays open.
+        if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
         if (focusId) {
           const id = focusId; focusId = null;
           if (data.chats?.some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
@@ -462,6 +933,7 @@
       replyBox.hidden = true;
     }
     renderAttachments(); dialog.showModal(); setView("chat");
+    loadTasks();  // once on opening, for the count on the to-do tab
     if (latestData || pending) show(latestData || { chats: [], activity: {} });
     markVisibleRead();
     input.focus({ preventScroll: true });
@@ -471,6 +943,8 @@
   dialog.addEventListener("close", () => { clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
+  tasksTab.addEventListener("click", () => setView("tasks"));
+  notesTab.addEventListener("click", () => setView("notes"));
   $("woni-filter-clear").addEventListener("click", () => { filter = null; if (latestData) show(latestData); });
   $("woni-reply-clear").addEventListener("click", () => {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
@@ -549,7 +1023,8 @@
       filter = null; latestData = null; workData = null;
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       readThrough = null; serverRead = 0; readPosting = 0;
-      original.replaceChildren(); original.hidden = true; work.replaceChildren(); renderAttachments();
+      original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();
+      clearTimeout(noticeTimer); $("woni-notice").hidden = true; $("woni-notice").textContent = "";
     }
   };
 })();

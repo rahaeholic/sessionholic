@@ -47,10 +47,122 @@ def read_through(value):
     return value if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else None
 
 
+def validate_task_status(data):
+    # Exactly what the Woni server's task-status takes; the screen never sends more.
+    if not isinstance(data, dict) or set(data) != {"actionId", "status", "expectedEvent", "requestId"}:
+        raise ValueError("할 일 상태 요청을 확인해 주세요.")
+    if not isinstance(data["actionId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", data["actionId"]):
+        raise ValueError("할 일을 다시 선택해 주세요.")
+    if data["status"] not in ("done", "open", "reported"):
+        raise ValueError("변경할 상태를 확인해 주세요.")
+    event = data["expectedEvent"]
+    if not isinstance(event, str) or len(event) > 300 or any(ord(c) < 32 or ord(c) == 127 for c in event):
+        raise ValueError("할 일 상태 기준을 확인해 주세요.")
+    if not isinstance(data["requestId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", data["requestId"]):
+        raise ValueError("요청 ID를 확인해 주세요.")
+    return data
+
+
+NOTE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
+EVIDENCE_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
+OFFSET = re.compile(r"[0-9]{1,7}")
+READ_QUERY_KEYS = {"notes": {"q", "offset"}, "note": {"id", "offset"},
+                   "transcript": {"id", "offset", "format", "q", "evidenceId", "context"}}
+CONNECT_ERROR = "원이에 연결하지 못했어요. Air15 연결을 확인해 주세요."
+
+
+def read_query(operation, query):
+    """Query of the note and transcript reads: only known keys, each a bounded string."""
+    if not isinstance(query, dict) or set(query) - READ_QUERY_KEYS[operation]:
+        raise ValueError("원이 요청을 다시 확인해 주세요.")
+    query = {key: str(value) if isinstance(value, int) and not isinstance(value, bool) else value for key, value in query.items()}
+    if any(not isinstance(value, str) for value in query.values()):
+        raise ValueError("원이 요청을 다시 확인해 주세요.")
+    if "offset" in query and (not OFFSET.fullmatch(query["offset"]) or int(query["offset"]) > 1000000):
+        raise ValueError("페이지 위치를 확인해 주세요.")
+    if "q" in query and (len(query["q"]) > 300 or any(ord(c) < 32 or ord(c) == 127 for c in query["q"])):
+        raise ValueError("검색어를 확인해 주세요.")
+    if operation == "notes":
+        return query
+    if not NOTE_ID.fullmatch(query.get("id", "")):
+        raise ValueError("기록을 다시 선택해 주세요.")
+    if operation == "note":
+        return query
+    if "evidenceId" in query:
+        # One passage with its neighbours: nothing that selects a page or a search.
+        if set(query) - {"id", "evidenceId", "context"} or not EVIDENCE_ID.fullmatch(query["evidenceId"]) or query.get("context", "1") not in ("0", "1", "2"):
+            raise ValueError("원문 구간을 다시 선택해 주세요.")
+    elif "context" in query or query.get("format", "passages") != "passages" or "q" in query and "format" not in query:
+        # A full page takes only id and offset; a search or the passage list needs format=passages.
+        raise ValueError("원이 요청을 다시 확인해 주세요.")
+    return query
+
+
+def pick(row, keys):
+    return {key: row[key] for key in keys if key in row}
+
+
+def clean_tasks(result):
+    text = ("id", "kind", "title", "project", "due", "assignee", "attention", "taskStatus", "previousStatus", "stateEvent", "quote",
+            "requestQuote", "reportQuote", "recordTitle", "recordedAt", "counterpart", "sourceId", "guessBasis", "ownerGuess")
+    def clean(row):
+        item = {key: row[key] for key in text if isinstance(row.get(key), str)}
+        if isinstance(row.get("archived"), bool):
+            item["archived"] = row["archived"]
+        if isinstance(row.get("autoBasis"), dict):
+            item["autoBasis"] = {key: row["autoBasis"][key] for key in ("quote", "source", "at", "reason") if key in row["autoBasis"]}
+        return item
+    def count(key):
+        value = result.get(key)
+        return value if type(value) is int and value >= 0 else 0
+    output = {key: [clean(row) for row in result.get(key) or [] if isinstance(row, dict)] for key in ("actions", "completedActions", "archivedActions")}
+    output["counts"] = {name: count(key) for name, key in (
+        ("mine", "actionCount"), ("delegated", "delegatedCount"), ("unassigned", "unassignedCount"), ("followup", "followupCount"),
+        ("due", "dueCount"), ("autoDone", "autoDoneCount"), ("completed", "completedActionCount"), ("archived", "archivedCount"))}
+    synced = result.get("syncedAt")
+    output["syncedAt"] = synced if type(synced) in (int, float) and math.isfinite(synced) else None
+    output["error"] = result.get("driveError") if isinstance(result.get("driveError"), str) else ""
+    return output
+
+
+def clean_notes(result):
+    output = {"items": [pick(row, ("id", "title", "recordedAt", "preview")) for row in result.get("items") or [] if isinstance(row, dict)],
+              "total": result.get("total") if type(result.get("total")) is int else 0,
+              "nextOffset": result.get("nextOffset") if type(result.get("nextOffset")) is int else None,
+              "query": result.get("query") if isinstance(result.get("query"), str) else "",
+              "error": result.get("error") if isinstance(result.get("error"), str) else ""}
+    return output
+
+
+def clean_note(result):
+    output = pick(result, ("id", "title", "recordedAt", "text", "nextOffset", "revision"))
+    if isinstance(result.get("url"), str) and result["url"].startswith("https://drive.google.com/"):
+        output["url"] = result["url"]
+    return output
+
+
+def clean_transcript(result, query):
+    segment = ("id", "kind", "label", "text", "start", "end", "speaker", "transcriptDoubt")
+    if "evidenceId" in query:
+        output = pick(result, segment + ("sourceId", "revision"))
+        if isinstance(result.get("context"), list):
+            output["context"] = [pick(row, segment) for row in result["context"] if isinstance(row, dict)]
+        return output
+    if query.get("format") == "passages":
+        output = pick(result, ("sourceId", "total", "nextOffset", "query", "label", "revision"))
+        output["passages"] = [pick(row, segment + ("position",)) for row in result.get("passages") or [] if isinstance(row, dict)]
+        return output
+    return pick(result, ("sourceId", "text", "truncated", "offset", "nextOffset", "revision", "label"))
+
+
+WRITE_VALIDATORS = {"state": validate, "read": validate_read, "task-status": validate_task_status}
+WRITE_PATHS = {"state": "chat", "read": "read", "task-status": "task-status"}
+
+
 def local_call(data=None, home=None, operation="state", query=None):
-    # A write is either a chat message (operation "state") or the shared read mark ("read").
-    if (operation not in ("state", "activity", "chat", "worker-result", "read") or
-            data is not None and operation not in ("state", "read") or data is None and operation == "read"):
+    # A write is a chat message (operation "state"), the shared read mark ("read") or a task status ("task-status").
+    if (operation not in ("state", "activity", "chat", "worker-result", "read", "tasks", "notes", "note", "transcript", "task-status") or
+            data is not None and operation not in WRITE_VALIDATORS or data is None and operation in ("read", "task-status")):
         raise ValueError("원이 요청을 다시 확인해 주세요.")
     query = query or {}
     if operation == "chat":
@@ -59,17 +171,19 @@ def local_call(data=None, home=None, operation="state", query=None):
     elif operation == "worker-result":
         if set(query) != {"batch", "n"} or not re.fullmatch(r"\d{8}-\d{6}-[0-9a-f]{4}", str(query["batch"])) or str(query["n"]) not in tuple("12345678"):
             raise ValueError("작업 결과를 다시 선택해 주세요.")
+    elif operation in READ_QUERY_KEYS:
+        query = read_query(operation, query)
     elif query:
         raise ValueError("원이 요청을 다시 확인해 주세요.")
     config = json.loads(((home or Path.home()) / ".local/share/ryan-one/config.json").read_text())
     token = config["token"] if data is not None else config.get("readToken") or config["token"]
     headers = {"Authorization": "Bearer " + token, "X-Woni-Task-Roles": "1"}
     if data is not None:
-        body = json.dumps(validate_read(data) if operation == "read" else validate(data), ensure_ascii=False).encode()
+        body = json.dumps(WRITE_VALIDATORS[operation](data), ensure_ascii=False).encode()
         headers.update({"Content-Type": "application/json", "X-Woni": "1"})
-        request = Request("http://127.0.0.1:18772/v1/" + ("read" if operation == "read" else "chat"), data=body, headers=headers)
+        request = Request("http://127.0.0.1:18772/v1/" + WRITE_PATHS[operation], data=body, headers=headers)
     else:
-        url = "http://127.0.0.1:18772/v1/" + operation
+        url = "http://127.0.0.1:18772/v1/" + ("state" if operation == "tasks" else operation)
         request = Request(url + ("?" + urlencode(query) if query else ""), headers=headers)
     try:
         with urlopen(request, timeout=15) as response:
@@ -79,9 +193,26 @@ def local_call(data=None, home=None, operation="state", query=None):
             message = json.load(exc).get("error")
         except (ValueError, OSError):
             message = None
+        if operation == "task-status" and exc.code >= 500:
+            raise RuntimeError(message or CONNECT_ERROR) from None  # the change may have been saved
         raise ValueError(message or "원이 요청을 처리하지 못했어요.") from None
     except (URLError, OSError, ValueError):
-        raise RuntimeError("원이에 연결하지 못했어요. Air15 연결을 확인해 주세요.") from None
+        raise RuntimeError(CONNECT_ERROR) from None
+    if operation in ("tasks", "notes", "note", "transcript", "task-status") and not isinstance(result, dict):
+        raise RuntimeError(CONNECT_ERROR)
+    if operation == "tasks":
+        return clean_tasks(result)
+    if operation == "notes":
+        return clean_notes(result)
+    if operation == "note":
+        return clean_note(result)
+    if operation == "transcript":
+        return clean_transcript(result, query)
+    if operation == "task-status":
+        output = pick(result, ("actionId", "taskStatus", "stateEvent", "result"))
+        if set(output) != {"actionId", "taskStatus", "stateEvent", "result"} or output["result"] not in ("saved", "unconfirmed"):
+            raise RuntimeError(CONNECT_ERROR)  # an answer this screen cannot read is not a verdict on the save
+        return output
     if data is None and operation in ("state", "chat"):
         keys = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo")
         chats = []
@@ -173,7 +304,9 @@ class WoniBridge:
                 raise ValueError("원이가 연결되지 않았어요.")
             return {"enabled": False}
         if data is not None:
-            validate_read(data) if operation == "read" else validate(data)
+            if operation not in WRITE_VALIDATORS:
+                raise ValueError("원이 요청을 다시 확인해 주세요.")
+            WRITE_VALIDATORS[operation](data)
         if host.get("local"):
             return local_call(data, operation=operation, query=query)
         from server import collector_command
@@ -185,11 +318,12 @@ class WoniBridge:
             if result.returncode or len(result.stdout) > 8 * 1024 * 1024:
                 raise RuntimeError()
             payload = json.loads(result.stdout)
-            if "error" in payload:
-                raise ValueError(payload["error"])
-            return payload
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, RuntimeError):
             raise RuntimeError("원이에 연결하지 못했어요. 전송했다면 기존 대화를 확인해 주세요.") from None
+        if isinstance(payload, dict) and payload.get("failed"):  # not "error": the task and note replies carry their own error text
+            # Only a status change whose outcome is unknown stays an unknown outcome across SSH.
+            raise (RuntimeError if operation == "task-status" and payload.get("unknown") else ValueError)(payload.get("error") or CONNECT_ERROR)
+        return payload
 
     def upload(self, stream, length, name, mime):
         host = self.host()
@@ -236,6 +370,6 @@ if __name__ == "__main__" and "REMOTE_REQUEST" in globals():
     try:
         print(json.dumps(local_call(REMOTE_REQUEST, operation=REMOTE_OPERATION, query=REMOTE_QUERY), ensure_ascii=True))
     except ValueError as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=True))
+        print(json.dumps({"failed": True, "error": str(exc)}, ensure_ascii=True))
     except Exception:
-        print(json.dumps({"error": "원이에 연결하지 못했어요. Air15 연결을 확인해 주세요."}, ensure_ascii=True))
+        print(json.dumps({"failed": True, "error": CONNECT_ERROR, "unknown": True}, ensure_ascii=True))

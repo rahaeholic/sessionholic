@@ -3619,7 +3619,8 @@ class Handler(BaseHTTPRequestHandler):
                     if query.get("availability") == "1":
                         return self.send_json(200, {"enabled": self.server.woni.host() is not None})
                     return self.send_json(200, scrub_payload(self.server.woni.call()))
-                if url.path in ("/api/woni/activity", "/api/woni/chat", "/api/woni/worker-result"):
+                if url.path in ("/api/woni/activity", "/api/woni/chat", "/api/woni/worker-result", "/api/woni/tasks",
+                                "/api/woni/notes", "/api/woni/note", "/api/woni/transcript"):
                     operation = url.path.rsplit("/", 1)[-1]
                     return self.send_json(200, scrub_payload(self.server.woni.call(operation=operation, query=query)))
                 if url.path == "/api/bot-requests/conversation":
@@ -4128,6 +4129,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, scrub_payload(self.server.woni.call(data)))
             if path == "/api/woni/read":
                 return self.send_json(200, scrub_payload(self.server.woni.call(data, operation="read")))
+            if path == "/api/woni/task-status":
+                return self.send_json(200, scrub_payload(self.server.woni.call(data, operation="task-status")))
             if path == "/api/push/subscribe":
                 return self.send_json(200, self.server.push.subscribe(data))
             if path == "/api/push/unsubscribe":
