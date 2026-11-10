@@ -3680,10 +3680,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, self.server.cli_monitor.snapshot(refresh=True))
                 if url.path == "/api/capabilities":
                     result = self.server.workflow.capabilities()
+                    served = self.server.assets.manifest()
                     return self.send_json(200, {**result, "csrfToken": self.server.csrf,
                                                "authMode": "tailscale" if self.tailscale_authorized() else "token",
                                                # The screen served now: an older open page offers a reload.
-                                               "webVersion": self.server.assets.manifest().get("/app.js"),
+                                               "webVersion": served.get("/app.js"),
+                                               # Every screen file: a deploy of woni.js or style.css alone is a newer screen too.
+                                               "webAssets": served,
                                                # The page asks for suggested replies only when this board makes them.
                                                "suggestedReplies": self.server.suggestions.enabled})
                 if url.path == "/api/terminals":
