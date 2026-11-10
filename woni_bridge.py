@@ -65,14 +65,19 @@ def validate_task_status(data):
 
 NOTE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,200}")
 EVIDENCE_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
+CHAT_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
+STREAM_ID = re.compile(r"[a-z0-9-]{1,40}")
 OFFSET = re.compile(r"[0-9]{1,7}")
 READ_QUERY_KEYS = {"notes": {"q", "offset"}, "note": {"id", "offset"},
-                   "transcript": {"id", "offset", "format", "q", "evidenceId", "context"}}
+                   "transcript": {"id", "offset", "format", "q", "evidenceId", "context"},
+                   "chats": {"before", "stream", "through", "limit"}, "chat-search": {"q", "offset", "limit"}}
+# The Woni server's own bounds: a chat page takes 1-200, a search page 1-50.
+READ_LIMITS = {"chats": 200, "chat-search": 50}
 CONNECT_ERROR = "원이에 연결하지 못했어요. Air15 연결을 확인해 주세요."
 
 
 def read_query(operation, query):
-    """Query of the note and transcript reads: only known keys, each a bounded string."""
+    """Query of the note, transcript and chat-history reads: only known keys, each a bounded string."""
     if not isinstance(query, dict) or set(query) - READ_QUERY_KEYS[operation]:
         raise ValueError("원이 요청을 다시 확인해 주세요.")
     query = {key: str(value) if isinstance(value, int) and not isinstance(value, bool) else value for key, value in query.items()}
@@ -82,6 +87,19 @@ def read_query(operation, query):
         raise ValueError("페이지 위치를 확인해 주세요.")
     if "q" in query and (len(query["q"]) > 300 or any(ord(c) < 32 or ord(c) == 127 for c in query["q"])):
         raise ValueError("검색어를 확인해 주세요.")
+    if "limit" in query and (not re.fullmatch(r"[0-9]{1,3}", query["limit"]) or not 1 <= int(query["limit"]) <= READ_LIMITS[operation]):
+        raise ValueError("불러올 개수를 확인해 주세요.")
+    if operation == "chats":
+        # Earlier chats before one, one stream from its start, or up to a found chat: chat IDs and a stream slug only.
+        if any(key in query and not CHAT_ID.fullmatch(query[key]) for key in ("before", "through")):
+            raise ValueError("대화를 다시 선택해 주세요.")
+        if "stream" in query and not STREAM_ID.fullmatch(query["stream"]):
+            raise ValueError("작업 흐름을 다시 선택해 주세요.")
+        return query
+    if operation == "chat-search":
+        if not 1 <= len(query.get("q", "").strip()) <= 100:
+            raise ValueError("찾을 말을 1~100자로 적어 주세요.")
+        return query
     if operation == "notes":
         return query
     if not NOTE_ID.fullmatch(query.get("id", "")):
@@ -155,13 +173,61 @@ def clean_transcript(result, query):
     return pick(result, ("sourceId", "text", "truncated", "offset", "nextOffset", "revision", "label"))
 
 
+CHAT_KEYS = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo")
+
+
+def clean_chat(chat):
+    item = {key: chat[key] for key in CHAT_KEYS if key in chat}
+    if type(chat.get("seq")) is int and chat["seq"] >= 0:
+        item["seq"] = chat["seq"]  # the chat's place in Woni's whole list: pages fetched apart are merged by it
+    item["attachments"] = [{key: file[key] for key in ("id", "name", "size", "mime") if key in file}
+                           for file in (chat.get("attachments") or []) if isinstance(file, dict)]
+    return item
+
+
+def count_of(value):
+    return value if type(value) is int and value >= 0 else 0
+
+
+def clean_chats(result):
+    output = {"chats": [clean_chat(chat) for chat in result.get("chats") or [] if isinstance(chat, dict)],
+              "hasMore": result.get("hasMore") is True, "total": count_of(result.get("total"))}
+    if result.get("tooFar") is True:
+        output["tooFar"] = True  # the found chat is too far back to fetch up to: the screen opens its stream instead
+    if isinstance(result.get("streamTitle"), str):
+        output["streamTitle"] = result["streamTitle"]
+    return output
+
+
+def clean_chat_search(result):
+    hit = ("id", "kind", "status", "createdAt", "finishedAt", "stream", "streamTitle", "question", "snippet")
+    def clean(row):
+        item = pick(row, hit)
+        if type(row.get("seq")) is int:
+            item["seq"] = row["seq"]
+        return item
+    return {"q": result.get("q") if isinstance(result.get("q"), str) else "",
+            "items": [clean(row) for row in result.get("items") or [] if isinstance(row, dict)],
+            "total": count_of(result.get("total")),
+            "nextOffset": result.get("nextOffset") if type(result.get("nextOffset")) is int else None,
+            "streams": [pick(row, ("id", "title", "count", "lastAt")) for row in result.get("streams") or [] if isinstance(row, dict)]}
+
+
+def clean_streams(result):
+    keys = ("id", "title", "count", "running", "unread", "lastAt", "lastId", "lastText", "lastAnswer", "lastStatus")
+    return {"items": [pick(row, keys) for row in result.get("items") or [] if isinstance(row, dict)],
+            "total": count_of(result.get("total"))}
+
+
+HISTORY_CLEANERS = {"chats": clean_chats, "chat-search": clean_chat_search, "streams": clean_streams}
 WRITE_VALIDATORS = {"state": validate, "read": validate_read, "task-status": validate_task_status}
 WRITE_PATHS = {"state": "chat", "read": "read", "task-status": "task-status"}
 
 
 def local_call(data=None, home=None, operation="state", query=None):
     # A write is a chat message (operation "state"), the shared read mark ("read") or a task status ("task-status").
-    if (operation not in ("state", "activity", "chat", "worker-result", "read", "tasks", "notes", "note", "transcript", "task-status") or
+    if (operation not in ("state", "activity", "chat", "worker-result", "read", "tasks", "notes", "note", "transcript", "task-status",
+                          "chats", "chat-search", "streams") or
             data is not None and operation not in WRITE_VALIDATORS or data is None and operation in ("read", "task-status")):
         raise ValueError("원이 요청을 다시 확인해 주세요.")
     query = query or {}
@@ -198,8 +264,10 @@ def local_call(data=None, home=None, operation="state", query=None):
         raise ValueError(message or "원이 요청을 처리하지 못했어요.") from None
     except (URLError, OSError, ValueError):
         raise RuntimeError(CONNECT_ERROR) from None
-    if operation in ("tasks", "notes", "note", "transcript", "task-status") and not isinstance(result, dict):
+    if operation in ("tasks", "notes", "note", "transcript", "task-status", "chats", "chat-search", "streams") and not isinstance(result, dict):
         raise RuntimeError(CONNECT_ERROR)
+    if operation in HISTORY_CLEANERS:
+        return HISTORY_CLEANERS[operation](result)
     if operation == "tasks":
         return clean_tasks(result)
     if operation == "notes":
@@ -214,18 +282,15 @@ def local_call(data=None, home=None, operation="state", query=None):
             raise RuntimeError(CONNECT_ERROR)  # an answer this screen cannot read is not a verdict on the save
         return output
     if data is None and operation in ("state", "chat"):
-        keys = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo")
-        chats = []
-        for chat in (result.get("chats", []) if operation == "state" else [result]):
-            if not isinstance(chat, dict):
-                continue
-            item = {key: chat[key] for key in keys if key in chat}
-            item["attachments"] = [{key: file[key] for key in ("id", "name", "size", "mime") if key in file}
-                                   for file in (chat.get("attachments") or []) if isinstance(file, dict)]
-            chats.append(item)
+        chats = [clean_chat(chat) for chat in (result.get("chats", []) if operation == "state" else [result]) if isinstance(chat, dict)]
         if operation == "chat":
             return chats[0] if chats else {}
         output = {"enabled": True, "chats": chats, "activity": result.get("activity", {})}
+        # The state holds Woni's latest 60 chats; these say whether earlier ones can be fetched with /v1/chats.
+        if isinstance(result.get("chatsHasMore"), bool):
+            output["chatsHasMore"] = result["chatsHasMore"]
+        if type(result.get("chatTotal")) is int and result["chatTotal"] >= 0:
+            output["chatTotal"] = result["chatTotal"]
         if read_through(result.get("readThrough")) is not None:
             output["readThrough"] = result["readThrough"]  # 원이앱·하던일이 함께 쓰는 '이 시각까지 끝난 답은 읽음'
         return output

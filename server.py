@@ -3620,9 +3620,18 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_json(200, {"enabled": self.server.woni.host() is not None})
                     return self.send_json(200, scrub_payload(self.server.woni.call()))
                 if url.path in ("/api/woni/activity", "/api/woni/chat", "/api/woni/worker-result", "/api/woni/tasks",
-                                "/api/woni/notes", "/api/woni/note", "/api/woni/transcript"):
+                                "/api/woni/notes", "/api/woni/note", "/api/woni/transcript",
+                                "/api/woni/chats", "/api/woni/chat-search", "/api/woni/streams"):
                     operation = url.path.rsplit("/", 1)[-1]
-                    return self.send_json(200, scrub_payload(self.server.woni.call(operation=operation, query=query)))
+                    result = scrub_payload(self.server.woni.call(operation=operation, query=query))
+                    if operation in ("chat-search", "streams") and isinstance(result, dict):
+                        # A found question and a stream's last question are excerpts of chat text, scrubbed like it.
+                        from launch import scrub_text
+                        for row in result.get("items") or []:
+                            for key in ("question", "lastText"):
+                                if isinstance(row, dict) and isinstance(row.get(key), str):
+                                    row[key] = scrub_text(row[key])
+                    return self.send_json(200, result)
                 if url.path == "/api/bot-requests/conversation":
                     # A listed request's conversation, watch-only: a bounded read-only read,
                     # at most two at once. Nothing is sent to, or resumed in, the bot.

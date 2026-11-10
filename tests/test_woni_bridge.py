@@ -187,6 +187,64 @@ class WoniBridgeTest(unittest.TestCase):
                     {'id': 's1', 'evidenceId': '../e'}, {'id': 's1', 'evidenceId': 'e' * 101}, {'id': 's1', 'other': '1'}):
             with self.assertRaises(ValueError, msg=bad): woni_bridge.local_call(home=self.home, operation='transcript', query=bad)
 
+    def test_state_passes_the_list_position_and_whether_earlier_chats_exist(self):
+        value = {'chats': [{'id': 'c60', 'seq': 60, 'text': '질문', 'streamTitle': '흐름', 'tools': 3}, {'id': 'x', 'seq': '1'}, {'id': 'y', 'seq': True}],
+                 'chatTotal': 61, 'chatsHasMore': True, 'activity': {}, 'actions': ['private']}
+        result, urlopen = self.call('state', value)
+        self.assertEqual(result['chats'], [{'id': 'c60', 'seq': 60, 'text': '질문', 'streamTitle': '흐름', 'attachments': []},
+                                           {'id': 'x', 'attachments': []}, {'id': 'y', 'attachments': []}])
+        self.assertEqual((result['chatTotal'], result['chatsHasMore']), (61, True))
+        older = self.call('state', {'chats': [], 'chatTotal': -1, 'chatsHasMore': 'yes'})[0]
+        self.assertNotIn('chatTotal', older); self.assertNotIn('chatsHasMore', older)
+
+    def test_chat_history_reads_take_only_known_bounded_keys(self):
+        # Ryan One 1.40.0: earlier chats, a stream from its start, a search and the stream list. Reads only, with the read token.
+        (self.woni / 'config.json').write_text(json.dumps({'token': 'write-credential', 'readToken': 'read-credential'}))
+        page = {'chats': [{'id': 'c1', 'seq': 1, 'text': '앞 질문', 'answer': '답', 'stream': 'fixture-flow', 'streamTitle': '합성 흐름',
+                           'steps': [{'tool': 'x'}], 'reference': {'a': 1}}, 'bad'],
+                'hasMore': True, 'total': 120, 'streamTitle': '합성 흐름', 'secret': 'x'}
+        result, urlopen = self.call('chats', page, {'before': 'c2', 'stream': 'fixture-flow', 'limit': '200'})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, 'http://127.0.0.1:18772/v1/chats?before=c2&stream=fixture-flow&limit=200')
+        self.assertEqual(request.get_method(), 'GET')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer read-credential')
+        self.assertEqual(result, {'chats': [{'id': 'c1', 'seq': 1, 'text': '앞 질문', 'answer': '답', 'stream': 'fixture-flow',
+                                             'streamTitle': '합성 흐름', 'attachments': []}], 'hasMore': True, 'total': 120, 'streamTitle': '합성 흐름'})
+        far = self.call('chats', {'chats': [], 'hasMore': True, 'total': 500, 'tooFar': True}, {'through': 'c-9', 'before': 'c-300'})[0]
+        self.assertEqual(far, {'chats': [], 'hasMore': True, 'total': 500, 'tooFar': True})
+        self.assertNotIn('tooFar', self.call('chats', {'chats': [], 'tooFar': 'yes'}, {})[0])
+        search = {'q': '재고', 'items': [{'id': 'c1', 'seq': 1, 'kind': 'chat', 'status': 'complete', 'createdAt': 1.0, 'finishedAt': 2.0,
+                                       'stream': 'fixture-flow', 'streamTitle': '합성 흐름', 'question': '재고 확인', 'snippet': '…재고 3개…', 'answer': '전체'}],
+                  'total': 21, 'nextOffset': 20, 'streams': [{'id': 'fixture-flow', 'title': '재고 흐름', 'count': 4, 'lastAt': 3.0, 'x': 1}]}
+        result, urlopen = self.call('chat-search', search, {'q': '재고', 'offset': '20', 'limit': '20'})
+        self.assertEqual(urlopen.call_args.args[0].full_url, 'http://127.0.0.1:18772/v1/chat-search?q=%EC%9E%AC%EA%B3%A0&offset=20&limit=20')
+        self.assertEqual(result['items'], [{key: value for key, value in search['items'][0].items() if key != 'answer'}])
+        self.assertEqual((result['q'], result['total'], result['nextOffset']), ('재고', 21, 20))
+        self.assertEqual(result['streams'], [{'id': 'fixture-flow', 'title': '재고 흐름', 'count': 4, 'lastAt': 3.0}])
+        streams = {'items': [{'id': 'fixture-flow', 'title': '합성 흐름', 'count': 3, 'running': 1, 'unread': 2, 'lastAt': 5.0, 'lastId': 'c3',
+                              'lastText': '마지막 질문', 'lastAnswer': '마지막 답', 'lastStatus': 'running', 'brief': '비공개'}], 'total': 1, 'readThrough': 4}
+        result, urlopen = self.call('streams', streams)
+        self.assertEqual(urlopen.call_args.args[0].full_url, 'http://127.0.0.1:18772/v1/streams')
+        self.assertEqual(result, {'items': [{key: value for key, value in streams['items'][0].items() if key != 'brief'}], 'total': 1})
+        refused = {'chats': [{'before': '../c'}, {'through': 'a b'}, {'before': 'c' * 101}, {'stream': 'Upper'}, {'stream': 'a' * 41},
+                             {'stream': 'a/b'}, {'limit': '0'}, {'limit': '201'}, {'limit': '1.5'}, {'limit': True}, {'offset': '0'},
+                             {'q': 'x'}, {'id': 'c1'}, {'before': ['c1']}],
+                   'chat-search': [{}, {'q': ''}, {'q': '   '}, {'q': 'x' * 101}, {'q': 'a\nb'}, {'q': 'a', 'limit': '51'},
+                                   {'q': 'a', 'limit': '0'}, {'q': 'a', 'offset': '-1'}, {'q': 'a', 'stream': 's'}],
+                   'streams': [{'q': 'a'}, {'offset': '0'}]}
+        for operation, cases in refused.items():
+            for bad in cases:
+                with self.assertRaises(ValueError, msg=(operation, bad)):
+                    woni_bridge.local_call(home=self.home, operation=operation, query=bad)
+        for operation in refused:
+            with self.assertRaises(ValueError):  # history reads are never writes
+                woni_bridge.local_call({'text': 'x', 'requestId': 'request-123456'}, self.home, operation=operation)
+        with self.assertRaises(RuntimeError):  # an answer that is not an object is no page
+            self.call('streams', ['not', 'a', 'page'])
+        with self.assertRaises(ValueError) as caught:  # Woni's own refusal (409) keeps its message
+            self.call('chats', {'error': '대화를 찾지 못했어요'}, {'before': 'gone'}, status=409)
+        self.assertEqual(str(caught.exception), '대화를 찾지 못했어요')
+
     def test_unavailable_slack_transcript_keeps_the_server_message(self):
         with self.assertRaises(ValueError) as caught:
             self.call('transcript', {'error': '원문 전사 파일이 없어요'}, {'id': 'slack-1'}, status=409)
@@ -289,6 +347,11 @@ class WoniBridgeTest(unittest.TestCase):
             self.assertEqual((unknown['failed'], unknown['unknown']), (True, True))
             saved = {'actionId': 'a' * 24, 'taskStatus': 'done', 'stateEvent': 'woni:x', 'result': 'saved', 'owner': None}
             self.assertEqual(remote('task-status', None, data, 200, saved), {key: saved[key] for key in saved if key != 'owner'})
+            self.assertEqual(remote('chats', {'stream': '../x'}), {'failed': True, 'error': '작업 흐름을 다시 선택해 주세요.'})
+            page = remote('chats', {'stream': 'fixture-flow', 'limit': '200'}, value={'chats': [{'id': 'c1', 'seq': 4}], 'hasMore': False, 'total': 1})
+            self.assertEqual(page, {'chats': [{'id': 'c1', 'seq': 4, 'attachments': []}], 'hasMore': False, 'total': 1})
+            self.assertEqual(remote('chat-search', {'q': 'a', 'limit': '20'}, value={'q': 'a', 'items': [], 'total': 0})['total'], 0)
+            self.assertEqual(remote('streams', {}, value={'items': [], 'total': 0}), {'items': [], 'total': 0})
         finally:
             httpd.shutdown(); worker.join(); httpd.server_close()
 

@@ -28,11 +28,15 @@ class WoniHTTPTest(unittest.TestCase):
     def test_task_and_note_reads_require_login_and_forward_only_their_query(self):
         secret = 'client_secret=abcdefgh12345678'
         self.httpd.woni = SimpleNamespace(host=Mock(return_value={'name': 'fixture'}),
-                                          call=Mock(return_value={'items': [], 'title': secret, 'text': secret, 'error': '', 'label': secret}))
+                                          call=Mock(return_value={'items': [{'question': secret, 'lastText': secret, 'lastAnswer': secret}],
+                                                                  'title': secret, 'text': secret, 'error': '', 'label': secret}))
         paths = {'/api/woni/tasks': ('tasks', {}), '/api/woni/notes?q=%EC%9E%AC%EC%9E%85%EA%B3%A0&offset=40': ('notes', {'q': '재입고', 'offset': '40'}),
                  '/api/woni/note?id=slack-1&offset=0': ('note', {'id': 'slack-1', 'offset': '0'}),
                  '/api/woni/transcript?id=s1&format=passages&q=a': ('transcript', {'id': 's1', 'format': 'passages', 'q': 'a'}),
-                 '/api/woni/transcript?id=s1&evidenceId=e1&context=1': ('transcript', {'id': 's1', 'evidenceId': 'e1', 'context': '1'})}
+                 '/api/woni/transcript?id=s1&evidenceId=e1&context=1': ('transcript', {'id': 's1', 'evidenceId': 'e1', 'context': '1'}),
+                 '/api/woni/chats?before=c2&stream=fixture-flow&limit=40': ('chats', {'before': 'c2', 'stream': 'fixture-flow', 'limit': '40'}),
+                 '/api/woni/chat-search?q=%EC%9E%AC%EA%B3%A0&offset=0&limit=20': ('chat-search', {'q': '재고', 'offset': '0', 'limit': '20'}),
+                 '/api/woni/streams': ('streams', {})}
         for path in paths:
             self.assertEqual(self.request('GET', path, authenticated=False)[0].status, 401)
         self.httpd.woni.call.assert_not_called()
@@ -42,6 +46,11 @@ class WoniHTTPTest(unittest.TestCase):
             self.httpd.woni.call.assert_called_with(operation=operation, query=query)
             # Scrubbed like every other Woni reply: text, title and error, and no other key.
             self.assertEqual((body['title'], body['text'], body['label']), ('[redacted]', '[redacted]', secret))
+            # A found question and a stream's last question are chat text excerpts: scrubbed on those two reads.
+            scrubbed = operation in ('chat-search', 'streams')
+            self.assertEqual(body['items'][0]['question'] == '[redacted]', scrubbed, path)
+            self.assertEqual(body['items'][0]['lastText'] == '[redacted]', scrubbed, path)
+            self.assertEqual(body['items'][0]['lastAnswer'], secret)
         self.assertEqual(self.request('GET', '/api/woni/other')[0].status, 404)
 
     def test_read_errors_keep_the_bridge_messages_and_status(self):
