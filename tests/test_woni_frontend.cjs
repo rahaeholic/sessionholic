@@ -3,9 +3,10 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function fixture(call, storage = new Map(), host = undefined) {
+function fixture(call, storage = new Map(), host = undefined, extra = {}) {
   const nodes = {};
-  let scheduled;
+  // Timers by id: the chat refresh and a search delay can wait at once; tick() runs all that are waiting.
+  const timers = new Map(); let timerId = 0;
   function element() {
     return { hidden: false, value: '', textContent: '', dataset: {}, children: [], listeners: {},
       scrollHeight: 0, scrollTop: 0, clientHeight: 0, disabled: false,
@@ -19,14 +20,15 @@ function fixture(call, storage = new Map(), host = undefined) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice']) nodes[id] = element();
   nodes['woni-form'].submit = element();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
-    setTimeout: fn => { scheduled = fn; return 1; }, clearTimeout: () => { scheduled = null; }, AbortController, URLSearchParams, CSS: { escape: value => value } };
+    setTimeout: fn => { timers.set(++timerId, fn); return timerId; }, clearTimeout: id => { timers.delete(id); }, AbortController, URLSearchParams, CSS: { escape: value => value }, ...extra };
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
-  return { nodes, storage, app: context.window.SessionholicWoni, call, tick: async () => { const fn = scheduled; scheduled = null; if (fn) await fn(); } };
+  const tick = async () => { const waiting = [...timers.values()]; timers.clear(); for (const fn of waiting) await fn(); };
+  return { nodes, storage, app: context.window.SessionholicWoni, call, tick };
 }
 
 test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포커스한다', async () => {
@@ -542,4 +544,364 @@ test('답글 대상만 남은 웹 입력도 호스트로 이동시키지 않는�
   nodes['woni-open'].click();
   assert.equal(nodes['woni-dialog'].open, true);
   assert.deepEqual(calls, []);
+});
+
+// ---- 할 일·기록 (docs/plan/2026-11-10-woni-panels.md) ----
+function walk(node, pred, out = []) {
+  if (!node || typeof node !== 'object') return out;
+  if (pred(node)) out.push(node);
+  for (const child of node.children || []) walk(child, pred, out);
+  return out;
+}
+const textOf = node => [node.textContent || '', ...(node.children || []).map(textOf)].join('');
+const byClass = (root, name) => walk(root, node => typeof node.className === 'string' && node.className.split(' ').includes(name));
+const buttonOf = (root, label) => walk(root, node => node.type === 'button' && textOf(node) === label)[0];
+const settle = () => new Promise(setImmediate);
+function taskData() {
+  return {
+    actions: [
+      { id: 'a1', kind: 'mine', title: '재입고 일정 공유하기', project: '물류', due: '11/12', taskStatus: 'open', stateEvent: 'e1', quote: '목요일까지 공유할게요', recordTitle: '주간 회의', recordedAt: '2026-11-08 10:00', counterpart: '김팀장', sourceId: 'rec-1' },
+      { id: 'd1', kind: 'delegated', title: '촬영 견적 받기', assignee: '박매니저', attention: '완료 보고 · 확인 필요', taskStatus: 'reported', previousStatus: 'open', stateEvent: 'd1:completion-reported', reportQuote: '견적 받았어요', project: '마케팅' },
+      { id: 'd2', kind: 'delegated', title: '상세페이지 수정', attention: '기다리는 중', taskStatus: 'open', stateEvent: '' },
+      { id: 'u1', kind: 'unassigned', title: '샘플 발송', attention: '담당 확인 · 박매니저일 가능성', guessBasis: '박매니저가 보내겠다고 말함', taskStatus: 'open', stateEvent: '' },
+    ],
+    completedActions: [
+      { id: 'c1', kind: 'mine', title: '세금계산서 발행', taskStatus: 'done', previousStatus: 'open', stateEvent: 'c1:done', autoBasis: { quote: '발행했습니다', source: 'Slack 재무 채널', at: 1, reason: '보낸 글' } },
+      { id: 'c2', kind: 'delegated', title: '박스 발주', taskStatus: 'done', previousStatus: 'reported', stateEvent: 'c2:done' },
+    ],
+    archivedActions: [{ id: 'r1', kind: 'delegated', title: '오래된 맡긴 일', taskStatus: 'open', stateEvent: '' }],
+    counts: { mine: 1, delegated: 2, unassigned: 1, followup: 1, due: 1, autoDone: 1, completed: 2, archived: 1 }, syncedAt: 1, error: '',
+  };
+}
+async function openTasks(call, options = {}) {
+  let n = 0;
+  const f = fixture(call, options.storage || new Map(), undefined, { crypto: { randomUUID: () => `req-${++n}-abcdef` }, ...(options.extra || {}) });
+  await f.app.check(call, { toast: text => (options.toasts || []).push(text) }); f.nodes['woni-open'].click(); await settle();
+  f.nodes['woni-tasks-tab'].click(); await settle();
+  const rows = () => byClass(f.nodes['woni-tasks'], 'woni-task');
+  const titles = () => rows().map(row => textOf(byClass(row, 'woni-task-title')[0]));
+  const toggle = label => walk(f.nodes['woni-tasks'], node => node['aria-pressed'] !== undefined && textOf(node).startsWith(label))[0];
+  return { ...f, rows, titles, toggle };
+}
+
+test('할 일 탭은 종류·보기·찾기로 나누고 앱과 같은 줄과 안내를 보여 준다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : url === '/api/woni/tasks' ? taskData() : { chats: [], activity: {} };
+  const { nodes, rows, titles, toggle } = await openTasks(call);
+  assert.equal(nodes['woni-tasks'].hidden, false); assert.equal(nodes['woni-messages'].hidden, true);
+  assert.equal(nodes['woni-tasks-tab']['aria-pressed'], 'true');
+  assert.equal(nodes['woni-tasks-badge'].hidden, false); assert.equal(nodes['woni-tasks-badge'].textContent, '2');  // due 1 + followup 1
+  assert.equal(nodes['woni-tasks-tab']['aria-label'], '할 일, 확인 필요 2개');
+  assert.deepEqual(byClass(nodes['woni-tasks'], 'woni-kinds')[0].children.map(textOf), ['내가 할 일1', '내가 맡긴 일2', '담당 확인1']);
+  assert.deepEqual(titles(), ['재입고 일정 공유하기']);
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-meta')[0]), '물류 · 11/12');
+  assert.equal(rows()[0].children[0]['aria-label'], '완료 처리: 재입고 일정 공유하기');
+  toggle('내가 맡긴 일').click();
+  assert.deepEqual(titles(), ['촬영 견적 받기', '상세페이지 수정']);
+  const lines = byClass(nodes['woni-tasks'], 'woni-task-line');
+  assert.deepEqual(lines.map(textOf), ['담당: 박매니저 · 완료 보고 · 확인 필요', '담당: 담당 미정 · 기다리는 중']);
+  assert.equal(lines[0].className.includes('is-attention'), true); assert.equal(lines[1].className.includes('is-attention'), false);
+  assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^확인 필요 1개 · 완료 보고와 마감이 된 일을 먼저 보여줘요/);
+  assert.equal(rows()[0].children[0]['aria-label'], '결과 확인 완료: 촬영 견적 받기');
+  toggle('담당 확인').click();
+  assert.equal(rows()[0].children[0].disabled, true);  // 담당 확인은 체크하지 않는다
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-line')[0]), '박매니저일 가능성');
+  toggle('내가 할 일').click(); toggle('완료').click();
+  assert.deepEqual(titles(), ['세금계산서 발행']);
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-auto')[0]), '원이 확인 · “발행했습니다”');
+  assert.equal(rows()[0].children[0]['aria-label'], '완료 취소: 세금계산서 발행');
+  assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^'원이 확인' 표시는/);
+  toggle('보관 1').click();
+  assert.deepEqual(titles(), ['오래된 맡긴 일']);  // 보관은 종류와 상관없이 모두
+  assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^녹음한 지 14일이 넘고/);
+  toggle('남은 일').click();
+  const search = walk(nodes['woni-tasks'], node => node.type === 'search')[0];
+  search.value = '없는 말'; search.listeners.input();
+  assert.equal(rows().length, 0);
+  assert.ok(textOf(nodes['woni-tasks']).includes('찾는 할 일이 없어요'));
+  search.value = '물류'; search.listeners.input();
+  assert.deepEqual(titles(), ['재입고 일정 공유하기']);
+});
+
+test('완료 체크는 정확한 본문을 보내고, 결과를 모르면 같은 변경을 같은 requestId로 다시 보낸다', async () => {
+  let data = taskData(), reads = 0;
+  const sent = [], toasts = [];
+  let answer = async () => { throw Error('timeout'); };
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/tasks') { reads++; return data; }
+    if (url === '/api/woni/task-status') { sent.push(JSON.parse(JSON.stringify(options.body))); return answer(options.body); }
+    return { chats: [], activity: {} };
+  };
+  const storage = new Map();
+  const { rows, titles, toggle } = await openTasks(call, { toasts, storage });
+  let release;
+  answer = () => new Promise((_, reject) => { release = () => reject(Error('network')); });
+  rows()[0].children[0].click();
+  assert.deepEqual(Object.keys(sent[0]).sort(), ['actionId', 'expectedEvent', 'requestId', 'status']);
+  assert.deepEqual({ ...sent[0], requestId: undefined }, { actionId: 'a1', status: 'done', expectedEvent: 'e1', requestId: undefined });
+  assert.match(sent[0].requestId, /^[A-Za-z0-9_-]{8,100}$/);
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-meta')[0]), '저장 중…');
+  assert.equal(rows()[0].children[0].disabled, true);
+  rows()[0].children[0].click(); assert.equal(sent.length, 1);  // 저장 중에는 그 항목 조작을 막는다
+  release(); await settle();
+  assert.deepEqual(toasts, ['저장 여부를 확인하지 못했어요. 다시 누르면 같은 요청으로 확인해요.']);
+  assert.ok(JSON.parse(storage.get('sessionholic:woni:task-requests')).a1);
+  answer = async body => { data = taskData(); const [task] = data.actions.splice(0, 1); data.completedActions.unshift({ ...task, taskStatus: 'done', stateEvent: 'a1:done', previousStatus: 'open' });
+    return { actionId: body.actionId, taskStatus: 'done', stateEvent: 'a1:done', result: 'saved' }; };
+  const before = reads;
+  rows()[0].children[0].click(); await settle();
+  assert.equal(sent[1].requestId, sent[0].requestId);
+  assert.equal(toasts.at(-1), '‘재입고 일정 공유하기’ 완료');
+  assert.equal(JSON.parse(storage.get('sessionholic:woni:task-requests')).a1, undefined);
+  assert.ok(reads > before);  // 성공하면 목록을 다시 받는다
+  assert.equal(titles().length, 0);
+  toggle('완료').click();
+  assert.deepEqual(titles(), ['재입고 일정 공유하기', '세금계산서 발행']);
+  answer = async () => { throw Object.assign(Error('다른 곳에서 할 일 상태가 바뀌었어요. 새로고침 후 다시 선택해 주세요'), { status: 400 }); };
+  rows()[0].children[0].click(); await settle();
+  assert.deepEqual({ ...sent[2], requestId: undefined }, { actionId: 'a1', status: 'open', expectedEvent: 'a1:done', requestId: undefined });
+  assert.notEqual(sent[2].requestId, sent[0].requestId);  // 다른 변경은 새 요청
+  assert.equal(toasts.at(-1), '다른 곳에서 할 일 상태가 바뀌었어요. 새로고침 후 다시 선택해 주세요');
+  answer = async body => ({ actionId: body.actionId, taskStatus: 'done', stateEvent: 'x', result: 'unconfirmed' });
+  rows()[1].children[0].click(); await settle();
+  assert.equal(toasts.at(-1), '이전 변경은 저장을 확인하지 못했어요. 현재 상태를 불러왔으니 필요하면 다시 눌러 주세요.');
+});
+
+test('할 일 상세는 근거·담당·버튼을 보여 주고 노트 읽기 뒤 뒤로 가면 같은 상세로 돌아온다', async () => {
+  const sent = [], toasts = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/tasks') return taskData();
+    if (url === '/api/woni/task-status') { sent.push({ ...options.body }); return { actionId: options.body.actionId, taskStatus: options.body.status, stateEvent: 'n', result: 'saved' }; }
+    if (url.startsWith('/api/woni/note?')) return { id: 'rec-1', title: '주간 회의', recordedAt: '2026-11-08 10:00', text: '## 요약\n재입고는 목요일', nextOffset: null, revision: 'v1', url: '' };
+    return { chats: [], activity: {} };
+  };
+  const { nodes, rows, toggle } = await openTasks(call, { toasts });
+  const detail = () => nodes['woni-tasks'].children[1];
+  nodes['woni-tasks'].scrollTop = 120;
+  byClass(rows()[0], 'woni-task-open')[0].click();
+  assert.equal(detail().hidden, false); assert.equal(nodes['woni-tasks'].children[0].hidden, true);
+  assert.equal(textOf(byClass(detail(), 'woni-detail-title')[0]), '재입고 일정 공유하기');
+  assert.equal(textOf(byClass(detail(), 'woni-detail-meta')[0]), '물류 · 11/12 · 남은 일');
+  assert.ok(buttonOf(detail(), '완료로 표시'));
+  assert.ok(textOf(detail()).includes('“목요일까지 공유할게요”'));
+  assert.ok(textOf(detail()).includes('주간 회의 · 2026-11-08 10:00 · 김팀장'));
+  buttonOf(detail(), '노트 읽기').click(); await settle();
+  assert.equal(nodes['woni-notes'].hidden, false); assert.equal(nodes['woni-notes-tab']['aria-pressed'], 'true');
+  assert.equal(textOf(byClass(nodes['woni-notes'], 'woni-detail-title')[0]), '주간 회의');
+  const back = byClass(nodes['woni-notes'], 'woni-back')[0];
+  assert.equal(back.textContent, '할 일');
+  back.click();
+  assert.equal(nodes['woni-tasks'].hidden, false); assert.equal(detail().hidden, false);
+  assert.equal(textOf(byClass(detail(), 'woni-detail-title')[0]), '재입고 일정 공유하기');
+  byClass(detail(), 'woni-back')[0].click();
+  assert.equal(detail().hidden, true); assert.equal(nodes['woni-tasks'].scrollTop, 120);  // 목록 스크롤 유지
+  toggle('내가 맡긴 일').click();
+  byClass(rows()[0], 'woni-task-open')[0].click();  // 완료 보고된 맡긴 일
+  assert.ok(textOf(detail()).includes('담당: 박매니저'));
+  assert.ok(textOf(detail()).includes('완료 보고 근거: 견적 받았어요'));
+  assert.equal(buttonOf(detail(), '완료 보고 받음'), undefined);
+  buttonOf(detail(), '다시 기다리는 중으로').click(); await settle();
+  assert.deepEqual([sent[0].actionId, sent[0].status], ['d1', 'open']);
+  assert.equal(toasts.at(-1), '‘촬영 견적 받기’ 남은 일로 되돌렸어요');
+  byClass(detail(), 'woni-back')[0].click();
+  byClass(rows().find(row => row.dataset.taskId === 'd2'), 'woni-task-open')[0].click();
+  buttonOf(detail(), '완료 보고 받음').click(); await settle();
+  assert.deepEqual([sent[1].actionId, sent[1].status], ['d2', 'reported']);
+  assert.equal(toasts.at(-1), '‘상세페이지 수정’ 완료 보고 · 결과 확인 필요');
+  byClass(detail(), 'woni-back')[0].click();
+  toggle('완료').click();
+  byClass(rows()[0], 'woni-task-open')[0].click();  // 보고를 받았다가 완료한 맡긴 일
+  buttonOf(detail(), '완료 되돌리기').click(); await settle();
+  assert.deepEqual([sent[2].actionId, sent[2].status], ['c2', 'reported']);
+  byClass(detail(), 'woni-back')[0].click();
+  toggle('내가 할 일').click();
+  byClass(rows()[0], 'woni-task-open')[0].click();
+  const auto = byClass(detail(), 'woni-auto')[0];
+  assert.match(textOf(auto), /원이가 끝낸 근거를 확인해 완료로 체크했어요“발행했습니다”Slack 재무 채널틀렸으면 아래 '완료 되돌리기'를 눌러 주세요/);
+  buttonOf(detail(), '완료 되돌리기').click(); await settle();
+  assert.deepEqual([sent[3].actionId, sent[3].status], ['c1', 'open']);
+});
+
+test('변경 전에 떠난 목록 응답과 잠금 뒤 늦은 응답은 화면에 남지 않는다', async () => {
+  const waiting = [], toasts = [];
+  let post;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/task-status') return new Promise(resolve => { post = resolve; });
+    if (url === '/api/woni/tasks' || url.startsWith('/api/woni/notes?')) return new Promise(resolve => waiting.push({ url, resolve }));
+    return { chats: [], activity: {} };
+  };
+  const answer = (url, value) => waiting.splice(0).forEach(item => item.url.startsWith(url) ? item.resolve(value) : waiting.push(item));
+  let n = 0;
+  const f = fixture(call, new Map(), undefined, { crypto: { randomUUID: () => `req-${++n}-abcdef` } });
+  await f.app.check(call, { toast: text => toasts.push(text) }); f.nodes['woni-open'].click(); await settle();
+  f.nodes['woni-tasks-tab'].click(); await settle();
+  answer('/api/woni/tasks', taskData()); await settle();
+  const rows = () => byClass(f.nodes['woni-tasks'], 'woni-task');
+  assert.equal(rows()[0].dataset.taskId, 'a1');
+  f.nodes['woni-tasks-tab'].click(); await settle();  // 다시 읽는 중
+  const stale = waiting.splice(0);
+  rows()[0].children[0].click();
+  post({ actionId: 'a1', taskStatus: 'done', stateEvent: 'a1:done', result: 'saved' }); await settle();
+  stale.forEach(item => item.resolve(taskData())); await settle();  // a1이 아직 남은 일이던 이전 응답
+  assert.equal(rows().some(row => row.dataset.taskId === 'a1'), false);
+  // 잠금 뒤 늦게 온 할 일·노트·상태 변경 응답은 버린다.
+  waiting.splice(0);
+  f.nodes['woni-notes-tab'].click(); f.nodes['woni-tasks-tab'].click(); await settle();
+  assert.equal(waiting.length, 2);
+  answer('/api/woni/tasks', taskData()); await settle();
+  walk(f.nodes['woni-tasks'], node => node['aria-pressed'] !== undefined && textOf(node).startsWith('내가 맡긴 일'))[0].click();
+  rows()[0].children[0].click();  // 맡긴 일 상태 변경이 진행 중
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-meta')[0]), '저장 중…');
+  const count = toasts.length;
+  f.app.lock();
+  const secret = taskData(); secret.actions[1].title = '이전 비밀 할 일'; secret.counts.due = 5;
+  answer('/api/woni/tasks', secret);
+  answer('/api/woni/notes', { items: [{ id: 'n1', title: '이전 비밀 노트' }], total: 1, nextOffset: null });
+  post({ actionId: 'd1', taskStatus: 'done', stateEvent: 'd1:done', result: 'saved' });
+  await settle();
+  assert.equal(toasts.length, count);  // 늦은 상태 변경 결과는 알리지 않는다
+  assert.equal(f.nodes['woni-notice'].hidden, true);
+  await f.app.check(call, { toast: text => toasts.push(text) }); f.nodes['woni-open'].click(); await settle();
+  assert.equal(JSON.stringify(f.nodes['woni-tasks'].children).includes('이전 비밀'), false);
+  assert.equal(JSON.stringify(f.nodes['woni-notes'].children).includes('이전 비밀'), false);
+  assert.equal(f.nodes['woni-tasks-badge'].hidden, true);
+  assert.equal(toasts.length, count);
+});
+
+test('원이 창을 열기만 해도 할 일 배지를 받고, 창이 열린 동안 알림은 창 안에도 띄운다', async () => {
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/tasks') return taskData();
+    if (url === '/api/woni/task-status') return { actionId: options.body.actionId, taskStatus: 'done', stateEvent: 'n', result: 'saved' };
+    return { chats: [], activity: {} };
+  };
+  const toasts = [];
+  const f = fixture(call, new Map(), undefined, { crypto: { randomUUID: () => 'req-only-abcdef' } });
+  await f.app.check(call, { toast: text => toasts.push(text) });
+  assert.equal(f.nodes['woni-tasks-badge'].hidden, true);
+  f.nodes['woni-open'].click(); await settle();
+  assert.equal(f.nodes['woni-tasks-badge'].hidden, false);  // 할 일 탭을 열기 전에도
+  assert.equal(f.nodes['woni-tasks-badge'].textContent, '2');
+  f.nodes['woni-tasks-tab'].click(); await settle();
+  byClass(f.nodes['woni-tasks'], 'woni-task')[0].children[0].click(); await settle();
+  assert.equal(toasts.at(-1), '‘재입고 일정 공유하기’ 완료');
+  assert.equal(f.nodes['woni-notice'].hidden, false);  // 보드 알림은 모달 아래에 깔리므로
+  assert.equal(f.nodes['woni-notice'].textContent, '‘재입고 일정 공유하기’ 완료');
+  await f.tick();
+  assert.equal(f.nodes['woni-notice'].hidden, true);
+});
+
+function noteCall(log, overrides = {}) {
+  return async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (!url.startsWith('/api/woni/note') && !url.startsWith('/api/woni/transcript')) return { chats: [], activity: {} };
+    log.push(url);
+    const query = Object.fromEntries(new URL(url, 'http://x').searchParams);
+    if (url.startsWith('/api/woni/notes?')) {
+      if (query.q) return { items: [{ id: 'rec-9', title: '재입고 회의', recordedAt: '11월 9일', preview: '재입고 일정' }], total: 1, nextOffset: null, query: query.q, error: '' };
+      return query.offset === '0'
+        ? { items: [{ id: 'rec-1', title: '주간 회의', recordedAt: '11월 8일', preview: '재고 · 촬영' }, { id: 'slack-1', title: 'Slack 대화', recordedAt: '11월 7일', preview: '샘플' }], total: 3, nextOffset: 2, query: '', error: '' }
+        : { items: [{ id: 'rec-3', title: '거래처 통화', recordedAt: '11월 6일', preview: '견적' }], total: 3, nextOffset: null, query: '', error: '' };
+    }
+    if (url.startsWith('/api/woni/note?')) {
+      if (overrides.note) return overrides.note(query);
+      return query.offset === '0'
+        ? { id: query.id, title: '주간 회의', recordedAt: '11월 8일', text: '## 요약\n첫 부분', nextOffset: 10, revision: 'v1', url: 'https://drive.google.com/file/d/fake' }
+        : { id: query.id, title: '주간 회의', recordedAt: '11월 8일', text: '\n이어진 부분', nextOffset: null, revision: overrides.revision || 'v1', url: 'https://drive.google.com/file/d/fake' };
+    }
+    if (query.id.startsWith('slack-')) throw Object.assign(Error('Slack에서 온 기록이라 녹취 원문이 없어요.'), { status: 409 });
+    const all = [
+      { id: 'p1', kind: 'transcript', label: '전사', text: '재입고는 목요일이에요.', start: 65, speaker: '김팀장' },
+      { id: 'p2', kind: 'transcript', label: '전사', text: '촬영은 다음 주', start: 3723, transcriptDoubt: true },
+      { id: 'p3', kind: 'transcript', label: '전사', text: '견적은 받았어요', start: 4000, speaker: '라이언' },
+    ];
+    const rows = query.q ? all.filter(row => row.text.includes(query.q)) : query.offset === '0' ? all.slice(0, 2) : all.slice(2);
+    return { sourceId: query.id, passages: rows, total: query.q ? rows.length : 3, nextOffset: !query.q && query.offset === '0' ? 2 : null, query: query.q, label: '전사 원문', revision: 'r1' };
+  };
+}
+async function openNotes(call, extra = {}) {
+  const f = fixture(call, new Map(), undefined, extra);
+  await f.app.check(call); f.nodes['woni-open'].click(); await settle();
+  f.nodes['woni-notes-tab'].click(); await settle();
+  return { ...f, cards: () => byClass(f.nodes['woni-notes'], 'woni-note-card').map(card => textOf(byClass(card, 'woni-note-title')[0])) };
+}
+
+test('기록 탭은 정리 노트를 보여 주고 찾기는 늦춰 요청하며 더 보기로 이어 받는다', async () => {
+  const log = [];
+  const { nodes, cards, tick } = await openNotes(noteCall(log));
+  assert.deepEqual(log, ['/api/woni/notes?q=&offset=0']);
+  assert.equal(textOf(nodes['woni-notes']).includes('정리 노트 3개'), true);
+  assert.deepEqual(cards(), ['주간 회의', 'Slack 대화']);
+  const card = byClass(nodes['woni-notes'], 'woni-note-card')[0];
+  assert.deepEqual(card.children.map(textOf), ['11월 8일', '주간 회의', '재고 · 촬영']);
+  const more = buttonOf(nodes['woni-notes'], '노트 더 보기');
+  assert.equal(more.hidden, false);
+  more.click(); await settle();
+  assert.equal(log.at(-1), '/api/woni/notes?q=&offset=2');
+  assert.deepEqual(cards(), ['주간 회의', 'Slack 대화', '거래처 통화']);
+  assert.equal(more.hidden, true);
+  const search = walk(nodes['woni-notes'], node => node.type === 'search')[0];
+  search.value = '재입'; search.listeners.input(); search.value = '재입고'; search.listeners.input();
+  assert.equal(log.length, 2);  // 입력 중에는 아직 요청하지 않는다
+  await tick(); await settle();
+  assert.deepEqual(log.slice(2), ['/api/woni/notes?q=%EC%9E%AC%EC%9E%85%EA%B3%A0&offset=0']);
+  assert.deepEqual(cards(), ['재입고 회의']);
+});
+
+test('노트 본문은 대화와 같은 렌더러로 그리고 이어 읽기는 같은 판일 때만 붙인다', async () => {
+  const log = [], rendered = [];
+  const MessageFormat = { render(node, text) { rendered.push(text); node.replaceChildren({ textContent: `MF:${text}`, children: [] }); } };
+  const { nodes } = await openNotes(noteCall(log), { MessageFormat });
+  byClass(nodes['woni-notes'], 'woni-note-card')[0].click(); await settle();
+  assert.equal(log.at(-1), '/api/woni/note?id=rec-1&offset=0');
+  assert.equal(nodes['woni-notes'].children[0].hidden, true);
+  assert.deepEqual(rendered, ['## 요약\n첫 부분']);
+  const link = walk(nodes['woni-notes'], node => node.className === 'woni-link')[0];
+  assert.equal(link.href, 'https://drive.google.com/file/d/fake'); assert.equal(link.target, '_blank'); assert.match(link.rel, /noopener/);
+  const back = byClass(nodes['woni-notes'], 'woni-back')[0];
+  assert.equal(back.textContent, '기록');
+  buttonOf(nodes['woni-notes'], '이어 읽기').click(); await settle();
+  assert.equal(log.at(-1), '/api/woni/note?id=rec-1&offset=10');
+  assert.equal(rendered.at(-1), '## 요약\n첫 부분\n이어진 부분');
+  assert.equal(buttonOf(nodes['woni-notes'], '이어 읽기').hidden, true);
+  back.click();
+  assert.equal(nodes['woni-notes'].children[0].hidden, false);
+  // 읽는 사이 판이 바뀌면 붙이지 않고 알린다. https가 아닌 주소는 링크로 만들지 않는다.
+  const changed = await openNotes(noteCall([], { revision: 'v2' }), { MessageFormat });
+  byClass(changed.nodes['woni-notes'], 'woni-note-card')[0].click(); await settle();
+  buttonOf(changed.nodes['woni-notes'], '이어 읽기').click(); await settle();
+  assert.ok(textOf(changed.nodes['woni-notes']).includes('읽는 사이 노트가 변경됐어요. 새로고침해 주세요.'));
+  const unsafe = await openNotes(noteCall([], { note: query => ({ id: query.id, title: '노트', text: '본문', nextOffset: null, revision: 'v1', url: 'javascript:alert(1)' }) }));
+  byClass(unsafe.nodes['woni-notes'], 'woni-note-card')[0].click(); await settle();
+  assert.equal(walk(unsafe.nodes['woni-notes'], node => node.className === 'woni-link').length, 0);
+});
+
+test('녹취 원문은 화자·분:초·전사 불확실을 보이고 찾기·더 보기를 하며 원문이 없으면 서버 문구를 보여 준다', async () => {
+  const log = [];
+  const { nodes, tick } = await openNotes(noteCall(log));
+  byClass(nodes['woni-notes'], 'woni-note-card')[0].click(); await settle();
+  buttonOf(nodes['woni-notes'], '녹취 원문 보기').click(); await settle();
+  assert.equal(log.at(-1), '/api/woni/transcript?id=rec-1&format=passages&q=&offset=0');
+  const metas = () => byClass(nodes['woni-notes'], 'woni-passage-meta').map(textOf);
+  assert.deepEqual(metas(), ['김팀장 · 1:05', '화자 미상 · 1:02:03전사 불확실']);
+  assert.deepEqual(byClass(nodes['woni-notes'], 'woni-passage-text').map(textOf), ['재입고는 목요일이에요.', '촬영은 다음 주']);
+  assert.equal(textOf(byClass(nodes['woni-notes'], 'woni-passages')[0].children[0]), '전사 원문 · 구간 3개');
+  assert.equal(buttonOf(nodes['woni-notes'], '녹취 원문 보기').hidden, true);
+  buttonOf(nodes['woni-notes'], '원문 더 보기').click(); await settle();
+  assert.equal(log.at(-1), '/api/woni/transcript?id=rec-1&format=passages&q=&offset=2');
+  assert.equal(metas().length, 3);
+  const search = walk(byClass(nodes['woni-notes'], 'woni-passages')[0], node => node.type === 'search')[0];
+  search.value = '견적'; search.listeners.input(); await tick(); await settle();
+  assert.equal(log.at(-1), '/api/woni/transcript?id=rec-1&format=passages&q=%EA%B2%AC%EC%A0%81&offset=0');
+  assert.deepEqual(metas(), ['라이언 · 1:06:40']);
+  search.value = '없는 말'; search.listeners.input(); await tick(); await settle();
+  assert.ok(textOf(nodes['woni-notes']).includes('해당 원문이 없어요.'));
+  byClass(nodes['woni-notes'], 'woni-back')[0].click();
+  byClass(nodes['woni-notes'], 'woni-note-card')[1].click(); await settle();  // Slack 기록
+  assert.equal(search.value, '');  // 다른 노트는 새로 찾는다
+  buttonOf(nodes['woni-notes'], '녹취 원문 보기').click(); await settle();
+  assert.ok(textOf(nodes['woni-notes']).includes('Slack에서 온 기록이라 녹취 원문이 없어요.'));
+  assert.equal(metas().length, 0);
 });
