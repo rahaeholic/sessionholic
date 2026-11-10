@@ -29,8 +29,10 @@
   let readThrough = null, serverRead = 0, readPosting = 0;
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
   const answerTimeFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
-  // Ryan 2026-11-10 (ChatGPT dots): Woni is the only speaker, so its messages carry no name or time.
-  // Ryan's sent time sits beside his bubble; a centered line marks a new day or a message Woni started.
+  // Ryan 2026-11-10 (ChatGPT dots): Woni is the only speaker, so its messages carry no name.
+  // Ryan 2026-11-10 17:25 ("원이 답변 시간도 표시", reversing the 00:26 no-time choice): Woni's answer shows its
+  // finish time small at the bubble's end, as Ryan's sent time sits beside his. A centered line marks a new day
+  // or a message Woni started (that line already has its time, so the alert bubble has none).
   const clockFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", hour: "numeric", minute: "2-digit", hour12: true });
   const dayKeyFormat = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit" });
   const weekdayFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", weekday: "long" });
@@ -180,13 +182,30 @@
     }
     return out;
   }
-  // The board's toast sits under the modal window, so while it is open the same words also show inside it.
+  // Woni's answer time: the clock only (a day line above already names the day). An answer finished on another
+  // day than its question (the day line follows the question) also says that day, as in the app: '11/9 오후 9:31'.
+  function answerClock(chat) {
+    const at = Number(chat?.finishedAt);
+    if (!chat || chat.kind === "alert" || !chat.answer || !validSeconds(at)) return "";
+    const asked = Number(chat.createdAt), clock = clockLabel(at);
+    if (!validSeconds(asked) || dayNumber(asked) === dayNumber(at)) return clock;
+    const [, m, d] = dayKeyFormat.format(new Date(at * 1000)).split("-").map(Number);
+    return `${m}/${d} ${clock}`;
+  }
+  // Ryan 2026-11-10 ("토스트가 채팅창을 가려서 거슬림 … 더 빨리"): 2.5 seconds, 3.5 for more than 40 characters,
+  // 5 when the notice offers an undo (none does in this window yet; the app's do).
+  function toastMs(text, undo = false) {
+    if (undo) return 5000;
+    return [...String(text || "")].length > 40 ? 3500 : 2500;
+  }
+  // The board's toast sits under the modal window, so while it is open the same words also show inside it,
+  // just above the composer (it moves up as the composer grows) instead of over the chat's last lines.
   let noticeTimer = 0;
   function notify(text) {
     services.toast?.(text);
     if (!dialog.open) return;
     const node = $("woni-notice"); node.textContent = text; node.hidden = false;
-    clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { node.hidden = true; }, 3500);
+    clearTimeout(noticeTimer); noticeTimer = setTimeout(() => { node.hidden = true; }, toastMs(text));
   }
   async function copyText(text) {
     try { await navigator.clipboard.writeText(text); notify("복사했어요."); }
@@ -204,6 +223,7 @@
     if (value === "tasks") { renderTasks(); loadTasks(); }
     if (value === "notes") { renderNotes(); if (!notes && !notesLoading) loadNotes(); }
     if (value === "find") { renderFind(); loadStreams(); }
+    renderSide();
   }
   function setReply(chat, part) {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
@@ -255,6 +275,12 @@
       time.dateTime = new Date(Number(chat.createdAt) * 1000).toISOString(); time.setAttribute("aria-label", `보낸 시각 ${sent}`);
       line.append(time, content); article.append(line);
     } else article.append(content);
+    const answered = role === "assistant" ? answerClock(chat) : "";
+    if (answered) {
+      const time = el("time", "woni-answer-time", answered);
+      time.dateTime = new Date(Number(chat.finishedAt) * 1000).toISOString(); time.setAttribute("aria-label", `답한 시각 ${answered}`);
+      article.append(time);
+    }
     const tag = tagFor && streamTag(tagFor);
     if (tag) article.append(tag);
     if (files.length) {
@@ -661,7 +687,7 @@
       if (current !== authEpoch || generation !== tasksGen) return;
       tasksError = "할 일을 불러오지 못했어요. 잠시 후 다시 확인해 주세요.";
     }
-    renderTasks();
+    renderTasks(); renderSide();
   }
 
   const noteSearch = searchField("이름·원문·요약으로 찾기", () => { clearTimeout(notesTimer); notesTimer = setTimeout(() => loadNotes(), 250); });
@@ -951,6 +977,7 @@
   // Esc or the phone's back: close the stream, or leave the find screen. False when there is nothing to step out of.
   function stepBack() {
     if (!dialog.open) return false;
+    if (drawerOpen) { closeDrawer(); return true; }
     if (view === "chat" && filter) { closeStream(); return true; }
     if (view === "find") { setView("chat"); input.focus?.({ preventScroll: true }); return true; }
     return false;
@@ -970,7 +997,7 @@
   }
 
   // The find screen: with no words, the streams (latest first); with words, matching streams and chats.
-  let streamsData = null, streamsError = "", streamsGen = 0;
+  let streamsData = null, streamsError = "", streamsGen = 0, streamsAt = 0;
   let hits = null, hitsFor = "", hitsError = "", hitsLoading = false, hitsGen = 0, findTimer = 0;
   const findSearch = searchField("대화·흐름 이름으로 찾기", () => { clearTimeout(findTimer); findTimer = setTimeout(() => searchChats(), 300); });
   findSearch.input.maxLength = 100;
@@ -1089,7 +1116,9 @@
       if (current !== authEpoch || generation !== streamsGen) return;
       streamsError = serverMessage(error, "흐름 목록을 불러오지 못했어요.");
     }
+    streamsAt = Date.now();
     if (view === "find") renderFind();
+    renderSide();
   }
   async function searchChats(more = false) {
     if (!api) return;
@@ -1148,6 +1177,92 @@
   }
   renderFind();
 
+  // Ryan 2026-11-10 ("햄버거 버튼 누르면 옆으로 화면이 밀리면서 사이드 메뉴가 좀 더 큼지막하게"), as Ryan One 1.42.0:
+  // one menu with the screens, the five latest streams, '오늘 정리 부탁', refresh and the board settings.
+  // From 900px wide it stays open on the left; narrower, ≡ pushes the window right and slides it in (style.css).
+  const side = $("woni-side"), main = $("woni-main"), menuButton = $("woni-menu"), scrim = $("woni-scrim");
+  const todayAsk = "지금 하던일에서 진행 중인 작업과 내가 챙길 일을 정리해 줘.";  // the app's '오늘 정리 부탁'
+  const sideScreens = [["chat", "대화"], ["tasks", "할 일"], ["notes", "기록"], ["work", "작업 현황"], ["find", "대화 찾기"]];
+  let drawerOpen = false, sideKey = "";
+  function sideItem(key, label, fn, extra = null) {
+    const node = button("", "woni-side-item", fn); node.dataset.side = key;
+    node.append(el("span", "woni-side-label", label));
+    if (extra) node.append(extra);
+    return node;
+  }
+  function sideCount(text, label) {
+    const count = el("span", "woni-side-count"); count.append(el("span", "sr-only", label), el("span", "", text));
+    return count;
+  }
+  function renderSide(force = false) {
+    const counts = tasks?.counts || {}, due = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
+    const streams = (Array.isArray(streamsData?.items) ? streamsData.items : []).filter((row) => typeof row?.id === "string" && row.id).slice(0, 5);
+    const busy = !!pending || sending || uploading;
+    // Redrawn only when what it shows changed, so the 4-second refresh keeps focus and hover.
+    const key = JSON.stringify([view, filter?.id || "", due, busy, streamsError, !!streamsData, streams.map((row) => [row.id, row.title, Number(row.running) || 0, Number(row.unread) || 0])]);
+    if (key === sideKey && !force) return;
+    sideKey = key;
+    const nodes = [el("p", "woni-side-heading", "화면")];
+    for (const [name, label] of sideScreens) {
+      const item = sideItem(`view:${name}`, label, () => goSide(name), name === "tasks" && due > 0 ? sideCount(due > 99 ? "99+" : String(due), "확인 필요 ") : null);
+      if (view === name && !(name === "chat" && filter)) item.setAttribute("aria-current", "page");
+      nodes.push(item);
+    }
+    nodes.push(el("p", "woni-side-heading", "최근 작업 흐름"));
+    if (!streamsData) nodes.push(el("p", "woni-side-note", streamsError || "흐름을 불러오고 있어요."));
+    else if (!streams.length) nodes.push(el("p", "woni-side-note", "아직 흐름이 없어요."));
+    for (const row of streams) {
+      const extra = Number(row.running) > 0 ? el("span", "woni-side-running", "진행 중")
+        : Number(row.unread) > 0 ? sideCount(String(row.unread), "새 답 ") : null;
+      const item = sideItem(`stream:${row.id}`, row.title || "작업 흐름", () => { closeDrawer(false); openStream(row.id, row.title); }, extra);
+      item.className += " is-stream";
+      if (view === "chat" && filter?.id === row.id) item.setAttribute("aria-current", "true");
+      nodes.push(item);
+    }
+    if (streamsData && Number(streamsData.total) > streams.length) nodes.push(sideItem("streams:all", "모든 흐름 보기", () => goSide("find")));
+    nodes.push(el("p", "woni-side-heading", "바로 하기"));
+    const today = sideItem("do:today", "오늘 정리 부탁", () => { closeDrawer(false); setView("chat"); input.focus?.({ preventScroll: true }); sendSuggestion(todayAsk); });
+    today.disabled = busy;
+    nodes.push(today, sideItem("do:refresh", "새로고침", reloadAll),
+      sideItem("do:settings", "하던일 설정", () => { dialog.close(); globalThis.document?.getElementById?.("settings")?.click?.(); }));
+    const active = globalThis.document?.activeElement, at = side.contains?.(active) ? active.dataset?.side : null;
+    side.replaceChildren(...nodes);
+    if (at) nodes.find((node) => node.dataset?.side === at)?.focus?.({ preventScroll: true });
+  }
+  // The item pressed in a narrow drawer slides out of reach, so the focus goes to the composer, the find field,
+  // or (for a panel, which has no field of its own) back to ≡.
+  function goSide(name) {
+    closeDrawer(name !== "chat" && name !== "find");
+    if (name === "chat") { leaveStream(); setView("chat"); redraw(); input.focus?.({ preventScroll: true }); return; }
+    setView(name);
+    if (name === "find") findSearch.input.focus?.({ preventScroll: true });
+  }
+  function reloadAll() {
+    closeDrawer();
+    clearTimeout(timer); refresh(); loadStreams();
+    if (view === "tasks") loadTasks();
+    if (view === "notes" && !note) loadNotes();
+    notify("새로 불러오고 있어요.");
+  }
+  // The drawer of a narrow window: the window's own content is pushed right and cannot be reached until it closes.
+  function openDrawer() {
+    drawerOpen = true; dialog.dataset.drawer = "open"; menuButton.setAttribute("aria-expanded", "true");
+    main.inert = true; renderSide(true); loadStreams();
+    // ≡ itself is now out of reach: the current screen or stream (else the first item) takes the focus.
+    (side.querySelector?.("[aria-current]") || side.querySelector?.(".woni-side-item"))?.focus?.({ preventScroll: true });
+  }
+  function closeDrawer(returnFocus = true) {
+    if (!drawerOpen) return;
+    drawerOpen = false; dialog.dataset.drawer = "closed"; menuButton.setAttribute("aria-expanded", "false");
+    main.inert = false;
+    if (returnFocus) menuButton.focus?.({ preventScroll: true });
+  }
+  menuButton.addEventListener("click", () => { if (drawerOpen) closeDrawer(); else openDrawer(); });
+  scrim.addEventListener("click", () => closeDrawer());
+  // A window widened past 900px shows the menu beside the chat; a drawer left open would keep the chat inert.
+  globalThis.matchMedia?.("(min-width: 900px)")?.addEventListener?.("change", (event) => { if (event.matches) closeDrawer(false); });
+  function touchDevice() { return !!globalThis.matchMedia?.("(pointer: coarse)")?.matches; }
+
   // keepPlace: chats were added above the ones being read, so the view stays on them instead of jumping.
   function show(data, keepPlace = false) {
     latestData = data;
@@ -1177,8 +1292,15 @@
         for (const reply of replies) box.append(action(reply, () => sendSuggestion(reply, target())));
         nodes.push(box);
       }
-      else if (["queued", "running"].includes(chat.status)) nodes.push(row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat));
-      else if (["failed", "interrupted"].includes(chat.status)) nodes.push(row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat));
+      else if (["queued", "running"].includes(chat.status)) nodes.push(stateRow("working", row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat)));
+      else if (["failed", "interrupted"].includes(chat.status)) nodes.push(stateRow("failed", row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat)));
+    }
+    // An empty chat says what Woni is for and offers the same first ask as the menu.
+    if (!visibleChats.length && !pending && !filter && !olderLoading) {
+      const welcome = el("div", "woni-welcome");
+      const ask = action("오늘 정리 부탁", () => sendSuggestion(todayAsk));
+      welcome.append(el("strong", "", "무엇을 도와드릴까요?"), el("p", "", "하던 일 정리, 할 일 확인, 기록 찾기를 원이에게 맡겨 보세요."), ask);
+      nodes.push(welcome);
     }
     if (pending) {
       const sentFiles = (pending.attachments || []).map((id) => attachments.find((item) => item.id === id) || { name: "첨부 파일" });
@@ -1199,7 +1321,10 @@
     renderReplyPicks();
     const running = data.activity?.running || 0;
     status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.") : running ? `작업 중 ${running}건` : "나의 개인 비서";
+    renderSide();
   }
+  // A working answer shows quiet dots, a failed one the failure colour (style.css); the class stays as before.
+  function stateRow(state, node) { node.dataset.state = state; return node; }
   async function refresh() {
     if (!enabled || reading || !api) return;
     reading = true; const current = authEpoch;
@@ -1214,6 +1339,8 @@
         show(data);
         // The to-do list is read when its tab opens and every 30 seconds while it stays open.
         if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
+        // The menu's latest streams are read on opening and once a minute while the window stays open.
+        if (Date.now() - streamsAt >= 60000) loadStreams();
         if (focusId) {
           const id = focusId; focusId = null;
           if (loadedChats().some((chat) => chat.id === id)) messages.querySelector?.(`[data-chat-id="${CSS.escape(id)}"]`)?.scrollIntoView?.({ block: "center" });
@@ -1257,13 +1384,14 @@
     }
     renderAttachments(); dialog.showModal(); setView("chat");
     loadTasks();  // once on opening, for the count on the to-do tab
+    loadStreams();  // the menu's latest streams
     if (latestData || pending) show(latestData || { chats: [], activity: {} });
     markVisibleRead();
     input.focus({ preventScroll: true });
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
+  dialog.addEventListener("close", () => { closeDrawer(false); clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
   tasksTab.addEventListener("click", () => setView("tasks"));
@@ -1274,7 +1402,8 @@
     if (view === "find") { setView("chat"); return; }
     setView("find"); findSearch.input.focus?.({ preventScroll: true });
   });
-  // Esc and the phone's back (app.js sends a cancelable "cancel") step back out of a stream or the find screen first.
+  // Esc and the phone's back (app.js sends a cancelable "cancel") step back out of the menu drawer, a stream or the
+  // find screen first, in that order; with nothing left, they close the window.
   // Esc is taken at keydown: Chrome stops honouring a second cancel in a row without a click in between.
   dialog.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !event.isComposing && stepBack()) event.preventDefault();
@@ -1298,10 +1427,18 @@
   input.addEventListener("input", (event) => services.voice?.typed(input, event));
   input.addEventListener("compositionstart", () => { composing = true; });
   input.addEventListener("compositionend", () => { composing = false; compositionEndedAt = Date.now(); });
+  // The board's rule (app.js terminal draft): on a computer Enter sends and Shift+Enter keeps a newline; a phone's
+  // Enter is a newline (its send button sends). Cmd/Ctrl+Enter sends everywhere. The Enter that commits Korean
+  // composition (isComposing or 229) neither sends nor is held back; macOS Chrome then repeats it once composition
+  // has ended, and that one sends. Only the shortcut keeps its old 80ms guard after composition.
+  if (touchDevice() && $("woni-hint")) $("woni-hint").textContent = "보내기 버튼으로 보내요";
   input.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" || !(event.metaKey || event.ctrlKey)) return;
+    if (event.key !== "Enter") return;
+    const shortcut = event.metaKey || event.ctrlKey;
+    if (!shortcut && (event.shiftKey || event.altKey || touchDevice())) return;
+    if (event.isComposing || composing || event.keyCode === 229) { if (shortcut) event.preventDefault(); return; }
     event.preventDefault();
-    if (event.isComposing || composing || event.keyCode === 229 || Date.now() - compositionEndedAt < 80) return;
+    if (shortcut && Date.now() - compositionEndedAt < 80) return;
     form.requestSubmit();
   });
   mic.addEventListener("click", () => services.voice?.toggle(input, (text) => { if (text) status.textContent = text; }));
@@ -1357,6 +1494,7 @@
     },
     lock() {
       enabled = false; epoch++; authEpoch++; clearTimeout(timer); uploadAbort?.abort(); services.voice?.stop(input);
+      closeDrawer(false);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; replyPicks.replaceChildren(); replyPicks.hidden = true;
       filter = null; latestData = null; workData = null; resetHistory();
@@ -1364,6 +1502,9 @@
       readThrough = null; serverRead = 0; readPosting = 0;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();
       clearTimeout(noticeTimer); $("woni-notice").hidden = true; $("woni-notice").textContent = "";
-    }
+      streamsAt = 0; renderSide(true);
+    },
+    toastMs,
   };
+  renderSide();
 })();

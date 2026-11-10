@@ -6,7 +6,7 @@ const vm = require('node:vm');
 function fixture(call, storage = new Map(), host = undefined, extra = {}) {
   const nodes = {};
   // Timers by id: the chat refresh and a search delay can wait at once; tick() runs all that are waiting.
-  const timers = new Map(); let timerId = 0;
+  const timers = new Map(), delays = new Map(); let timerId = 0;
   function element() {
     return { hidden: false, value: '', textContent: '', dataset: {}, children: [], listeners: {},
       scrollHeight: 0, scrollTop: 0, clientHeight: 0, disabled: false,
@@ -20,15 +20,15 @@ function fixture(call, storage = new Map(), host = undefined, extra = {}) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
   nodes['woni-form'].submit = element();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
-    setTimeout: fn => { timers.set(++timerId, fn); return timerId; }, clearTimeout: id => { timers.delete(id); }, AbortController, URLSearchParams, CSS: { escape: value => value }, ...extra };
+    setTimeout: (fn, ms) => { timers.set(++timerId, fn); delays.set(timerId, ms); return timerId; }, clearTimeout: id => { timers.delete(id); }, AbortController, URLSearchParams, CSS: { escape: value => value }, ...extra };
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
   const tick = async () => { const waiting = [...timers.values()]; timers.clear(); for (const fn of waiting) await fn(); };
-  return { nodes, storage, app: context.window.SessionholicWoni, call, tick };
+  return { nodes, storage, app: context.window.SessionholicWoni, call, tick, delays };
 }
 
 test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포커스한다', async () => {
@@ -42,7 +42,8 @@ test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포
   assert.equal(nodes['woni-input'].value, '작성 중인 초안');
 });
 
-test('완료된 답변에 기록된 날짜와 시간을 표시하며 누락된 시간은 추측하지 않는다', async () => {
+test('원이 답 말풍선 끝에 답한 시각만 작게 달고, 메뉴에는 날짜까지 남기며 누락된 시각은 추측하지 않는다', async () => {
+  // 라이언 2026-11-10 17:25 "원이 답변 시간도 표시" — 00:26의 '원이 답에 시각 없음'을 뒤집었다(앱 1.42.0과 같음).
   const finishedAt = Date.UTC(2026, 10, 6, 4, 23) / 1000;
   const chats = [
     { id: 'known', text: '질문', answer: '기록된 답변', status: 'complete', createdAt: finishedAt - 600, finishedAt },
@@ -53,15 +54,50 @@ test('완료된 답변에 기록된 날짜와 시간을 표시하며 누락된 �
   const { nodes, app } = fixture(call);
   await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
   const answers = nodes['woni-messages'].children.filter(item => item.className === 'woni-message assistant');
-  // 2026-11-10: 답한 시각은 말풍선 아래가 아니라 말풍선을 눌러 여는 메뉴 안에 있다.
-  const menuTime = answer => answer.children.find(item => item.className === 'woni-message-actions')?.children.find(item => item.className === 'woni-message-time');
-  assert.equal(answers[0].children.some(item => item.className === 'woni-message-time'), false);
-  const time = menuTime(answers[0]);
+  const bubbleTime = answer => answer.children.find(item => item.className === 'woni-answer-time');
+  const time = bubbleTime(answers[0]);
   assert.equal(time.dateTime, '2026-11-06T04:23:00.000Z');
-  assert.match(time.textContent, /2026\.\s*11\.\s*06\..*13:23/);
-  assert.match(time['aria-label'], /답변 시각/);
+  assert.equal(time.textContent, '오후 1:23');  // 시각만(KST), 흐름 이름 없음
+  assert.equal(time['aria-label'], '답한 시각 오후 1:23');
+  assert.equal(answers[0].children.indexOf(time), 2);  // 이름(화면 읽기용)·말풍선 바로 뒤
+  assert.equal(bubbleTime(answers[1]), undefined);
+  assert.equal(bubbleTime(answers[2]), undefined);
+  // 날짜까지 든 시각은 말풍선을 눌러 여는 메뉴에 그대로 있다.
+  const menuTime = answer => answer.children.find(item => item.className === 'woni-message-actions')?.children.find(item => item.className === 'woni-message-time');
+  assert.match(menuTime(answers[0]).textContent, /2026\.\s*11\.\s*06\..*13:23/);
   assert.equal(menuTime(answers[1]), undefined);
-  assert.equal(menuTime(answers[2]), undefined);
+});
+
+test('답 시각은 먼저 알림·진행 중·실패 줄에는 달지 않고, 질문과 다른 날 끝난 답은 날짜를 붙인다', async () => {
+  const asked = Date.UTC(2026, 10, 9, 14, 50) / 1000;  // KST 11/9 오후 11:50
+  const chats = [
+    { id: 'late', text: '밤 질문', answer: '자정 넘어 답', status: 'complete', createdAt: asked, finishedAt: asked + 1200 },
+    { id: 'alert', kind: 'alert', answer: '발주 마감이에요.', status: 'complete', createdAt: asked + 1300, finishedAt: asked + 1300 },
+    { id: 'work', text: '진행 중 질문', status: 'running', createdAt: asked + 1400 },
+    { id: 'fail', text: '실패 질문', status: 'failed', createdAt: asked + 1500, finishedAt: asked + 1600 },
+  ];
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats, activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const answers = nodes['woni-messages'].children.filter(item => item.className === 'woni-message assistant');
+  const times = answers.map(answer => answer.children.find(item => item.className === 'woni-answer-time')?.textContent ?? null);
+  assert.deepEqual(times, ['11/10 오전 12:10', null, null, null]);
+  assert.deepEqual(answers.map(answer => answer.dataset.state ?? null), [null, null, 'working', 'failed']);
+});
+
+test('창 안 알림은 2.5초(40자 넘으면 3.5초, 되돌리기는 5초) 뒤 사라진다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  const { nodes, app, delays } = fixture(call);
+  assert.equal(app.toastMs('복사했어요.'), 2500);
+  assert.equal(app.toastMs('가'.repeat(40)), 2500);
+  assert.equal(app.toastMs('가'.repeat(41)), 3500);
+  assert.equal(app.toastMs('짧은 알림', true), 5000);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  // 메뉴의 새로고침은 창 안 알림을 띄운다.
+  nodes['woni-side'].children.find(node => node.dataset.side === 'do:refresh').click();
+  assert.equal([...delays.values()].at(-1), 2500);  // 누른 즉시 건 타이머가 알림을 닫는다
+  assert.equal(nodes['woni-notice'].hidden, false);
+  assert.equal(nodes['woni-notice'].textContent, '새로 불러오고 있어요.');
 });
 
 test('닷츠처럼 원이 말에는 이름·시각을 달지 않고 날짜와 먼저 알림만 가운데 줄로 보인다', async () => {
@@ -292,7 +328,7 @@ test('잠금 후 늦게 온 연결 응답은 원이 버튼을 다시 표시하�
   assert.equal(nodes['woni-open'].hidden, true);
 });
 
-test('Cmd/Ctrl+Enter는 보내고 한글 조합 중 Enter는 보내지 않는다', async () => {
+test('Cmd/Ctrl+Enter도 보내고 한글 조합 중 Enter는 보내지 않는다', async () => {
   const sent = [];
   const call = async (url, options) => {
     if (url.includes('availability')) return { enabled: true };
@@ -313,6 +349,104 @@ test('Cmd/Ctrl+Enter는 보내고 한글 조합 중 Enter는 보내지 않는다
   await new Promise(setImmediate);
   assert.equal(prevented, true);
   assert.equal(sent.length, 1);
+});
+
+test('컴퓨터에서는 Enter로 보내고 Shift+Enter·한글 조합 중 Enter·폰의 Enter는 줄바꿈으로 둔다', async () => {
+  const run = async (extra = {}) => {
+    const sent = [];
+    const call = async (url, options) => {
+      if (url.includes('availability')) return { enabled: true };
+      if (options?.method === 'POST') { sent.push(options.body); return {}; }
+      return { chats: [], activity: {} };
+    };
+    const f = fixture(call, new Map(), undefined, extra);
+    f.nodes['woni-form'].requestSubmit = () => f.nodes['woni-form'].listeners.submit({ preventDefault() {} });
+    await f.app.check(call); f.nodes['woni-open'].click(); await new Promise(setImmediate);
+    f.nodes['woni-input'].value = '안녕';
+    const press = (props) => { let prevented = false; f.nodes['woni-input'].listeners.keydown({ key: 'Enter', preventDefault() { prevented = true; }, ...props }); return prevented; };
+    return { sent, press, input: f.nodes['woni-input'] };
+  };
+  const desk = await run();
+  assert.equal(desk.press({ shiftKey: true }), false);  // 줄바꿈은 그대로
+  assert.equal(desk.press({ isComposing: true }), false);  // 한글 확정용 Enter는 막지도 보내지도 않는다
+  assert.equal(desk.press({ keyCode: 229 }), false);
+  assert.equal(desk.sent.length, 0);
+  assert.equal(desk.press({}), true);
+  await new Promise(setImmediate);
+  assert.equal(desk.sent.length, 1);
+  // 한글 확정 Enter: 조합 중 keydown → compositionend → 다시 온 Enter keydown이 정확히 한 번 보낸다.
+  const ime = await run();
+  ime.input.listeners.compositionstart();
+  assert.equal(ime.press({ isComposing: true, keyCode: 229 }), false);
+  ime.input.listeners.compositionend();
+  assert.equal(ime.press({}), true);
+  await new Promise(setImmediate);
+  assert.equal(ime.sent.length, 1);
+  const phone = await run({ matchMedia: query => ({ matches: query === '(pointer: coarse)' }) });
+  assert.equal(phone.press({}), false);
+  assert.equal(phone.sent.length, 0);
+  assert.equal(phone.press({ ctrlKey: true }), true);  // 단축키는 어디서나 보낸다
+  await new Promise(setImmediate);
+  assert.equal(phone.sent.length, 1);
+});
+
+test('≡ 메뉴는 화면·최근 흐름 5개·오늘 정리·새로고침·설정을 담고, 막·Esc로 닫으며 ≡로 초점을 돌려준다', async () => {
+  const now = Date.now() / 1000, sent = [];
+  const items = Array.from({ length: 7 }, (_, n) => ({ id: `flow-${n}`, title: `흐름 ${n}`, count: 3, running: n === 0 ? 1 : 0, unread: n === 1 ? 2 : 0, lastAt: now - n * 60 }));
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') { sent.push(options.body); return {}; }
+    if (url === '/api/woni/streams') return { items, total: items.length };
+    if (url.startsWith('/api/woni/chats?')) return { chats: [], hasMore: false };
+    if (url === '/api/woni/tasks') return { actions: [], completedActions: [], archivedActions: [], counts: { due: 2, followup: 1 } };
+    return { chats: [{ id: 'c1', text: '질문', answer: '답', status: 'complete', createdAt: now - 60, finishedAt: now - 50 }], activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate); await new Promise(setImmediate);
+  const dialog = nodes['woni-dialog'], menu = nodes['woni-menu'];
+  const sideKeys = () => nodes['woni-side'].children.filter(node => node.dataset?.side).map(node => node.dataset.side);
+  assert.deepEqual(sideKeys(), ['view:chat', 'view:tasks', 'view:notes', 'view:work', 'view:find',
+    'stream:flow-0', 'stream:flow-1', 'stream:flow-2', 'stream:flow-3', 'stream:flow-4', 'streams:all', 'do:today', 'do:refresh', 'do:settings']);
+  const item = key => nodes['woni-side'].children.find(node => node.dataset?.side === key);
+  assert.equal(item('view:chat')['aria-current'], 'page');
+  assert.equal(item('view:tasks').children[1].children[1].textContent, '3');  // 확인 필요 수
+  assert.equal(item('stream:flow-0').children[1].textContent, '진행 중');
+  // 열기: 창 내용은 밀리고(CSS) 닫힐 때까지 누를 수 없다.
+  menu.click();
+  assert.equal(dialog.dataset.drawer, 'open'); assert.equal(menu['aria-expanded'], 'true'); assert.equal(nodes['woni-main'].inert, true);
+  // Esc는 흐름·찾기·창보다 메뉴를 먼저 닫는다.
+  let prevented = false;
+  dialog.listeners.keydown({ key: 'Escape', preventDefault() { prevented = true; } });
+  assert.equal(prevented, true); assert.equal(dialog.dataset.drawer, 'closed'); assert.equal(nodes['woni-main'].inert, false);
+  assert.equal(menu.focused, true); assert.equal(dialog.open, true);
+  menu.click(); nodes['woni-scrim'].click();
+  assert.equal(dialog.dataset.drawer, 'closed');
+  // 흐름을 누르면 메뉴를 닫고 그 흐름을 연다.
+  menu.click(); item('stream:flow-2').click(); await new Promise(setImmediate);
+  assert.equal(dialog.dataset.drawer, 'closed');
+  assert.equal(nodes['woni-filter-label'].textContent, '흐름: 흐름 2');
+  assert.equal(item('stream:flow-2')['aria-current'], 'true');
+  // 화면 이동: 할 일로, 다시 대화로(흐름도 풀린다).
+  item('view:tasks').click();
+  assert.equal(nodes['woni-tasks'].hidden, false); assert.equal(item('view:tasks')['aria-current'], 'page');
+  item('view:chat').click();
+  assert.equal(nodes['woni-messages'].hidden, false); assert.equal(nodes['woni-filter'].hidden, true);
+  // 오늘 정리 부탁은 앱과 같은 말을 보낸다.
+  item('do:today').click(); await new Promise(setImmediate);
+  assert.equal(sent.at(-1).text, '지금 하던일에서 진행 중인 작업과 내가 챙길 일을 정리해 줘.');
+  // 잠그면 메뉴도 닫히고 흐름 목록을 비운다.
+  menu.click(); app.lock();
+  assert.equal(dialog.dataset.drawer, 'closed');
+  assert.equal(sideKeys().some(key => key.startsWith('stream:')), false);
+});
+
+test('대화가 하나도 없으면 빈 화면 안내와 오늘 정리 버튼을 보여 준다', async () => {
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  const welcome = nodes['woni-messages'].children.find(node => node.className === 'woni-welcome');
+  assert.equal(welcome.children[0].textContent, '무엇을 도와드릴까요?');
+  assert.equal(welcome.children[2].textContent, '오늘 정리 부탁');
 });
 
 test('붙여 넣은 첨부를 올리고 전송 실패 후 같은 파일과 요청 ID로 재시도한다', async () => {

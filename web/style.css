@@ -185,10 +185,40 @@
 /* Woni window. Ryan 2026-11-10: "UIUX와 디자인이 좀 더 세련되면 좋겠어" — an Apple sheet: a quiet header,
    one segmented control for the four screens, grouped lists on soft fills, and a single rounded composer. */
 .woni-dialog { width: min(720px, calc(100% - 32px)); height: min(800px, calc(var(--app-height, 100dvh) - 32px)); max-width: none; max-height: none; padding: 0; border: 0; border-radius: var(--radius-l); background: var(--surface); color: var(--label); box-shadow: var(--shadow-dialog); overflow: hidden; }
-.woni-dialog[open] { display: flex; flex-direction: column; }
+.woni-dialog[open] { display: flex; }
 .woni-dialog::backdrop { background: var(--backdrop); }
-.woni-head { display: flex; flex: none; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 10px 4px 20px; }
+/* Ryan 2026-11-10: the menu (screens, latest streams, today, refresh, settings) is a drawer that pushes the window
+   right on a narrow screen and a fixed column from 900px. The window's own parts stay in .woni-main. */
+.woni-main { position: relative; z-index: 1; display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface); transition: transform var(--dur-edge) var(--ease-out), box-shadow var(--dur-edge) ease; }
+.woni-side { display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 14px 10px max(16px, env(safe-area-inset-bottom)); background: var(--bg); }
+.woni-side-heading { margin: 18px 12px 6px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 600; line-height: 1.4; }
+.woni-side-heading:first-child { margin-top: 4px; }
+.woni-side-item { position: relative; display: flex; flex: none; align-items: center; gap: 10px; width: 100%; min-height: 52px; padding: 0 12px; border: 0; border-radius: var(--radius); background: transparent; color: var(--label); font: inherit; font-size: 1.0625rem; line-height: 1.3; text-align: left; cursor: pointer; }
+.woni-side-item.is-stream .woni-side-label::before { content: "# "; color: var(--label-3); }
+@media (hover: hover) { .woni-side-item:hover:not(:disabled) { background: var(--fill-soft); } }
+.woni-side-item:active:not(:disabled) { background: var(--fill); }
+.woni-side-item[aria-current] { background: var(--accent-tint); color: var(--accent-strong); font-weight: 600; }
+.woni-side-item:disabled { color: var(--disabled-label); cursor: default; }
+.woni-side-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.woni-side-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.woni-side-count { flex: none; display: inline-grid; grid-auto-flow: column; place-items: center; min-width: 22px; height: 22px; padding: 0 7px; border-radius: 11px; background: var(--accent-fill); color: var(--on-accent); font-size: var(--fs-cap); font-weight: 700; font-variant-numeric: tabular-nums; }
+.woni-side-running { flex: none; padding: 2px 8px; border-radius: 999px; background: var(--accent-tint); color: var(--accent-strong); font-size: var(--fs-cap); font-weight: 600; }
+.woni-side-item[aria-current] .woni-side-running { background: var(--surface); }
+.woni-side-note { margin: 4px 12px 8px; color: var(--label-2); font-size: var(--fs-sub); line-height: 1.45; }
+/* The scrim is outside .woni-main (which is inert while the drawer is open) and moves with it. */
+.woni-scrim { position: absolute; inset: 0; z-index: 2; background: var(--backdrop); opacity: 0; visibility: hidden; cursor: pointer; transition: opacity var(--dur-edge) ease, visibility 0s linear var(--dur-edge), transform var(--dur-edge) var(--ease-out); }
+@media (max-width: 899px) {
+  .woni-side { position: absolute; inset: 0 auto 0 0; width: min(82%, 360px); visibility: hidden; transform: translateX(-30%); transition: transform var(--dur-edge) var(--ease-out), visibility 0s linear var(--dur-edge); }
+  .woni-dialog[data-drawer="open"] .woni-side { visibility: visible; transform: none; transition: transform var(--dur-edge) var(--ease-out); }
+  .woni-dialog[data-drawer="open"] .woni-main { transform: translateX(min(82%, 360px)); box-shadow: var(--shadow-nav); }
+  .woni-dialog[data-drawer="open"] .woni-scrim { opacity: 1; visibility: visible; transform: translateX(min(82%, 360px)); transition: opacity var(--dur-edge) ease, transform var(--dur-edge) var(--ease-out); }
+}
+.woni-head { display: flex; flex: none; align-items: center; gap: 4px; padding: 10px 10px 4px 6px; }
 .woni-head > div { min-width: 0; }
+.woni-head-title { flex: 1; padding-left: 4px; }
+.woni-head .icon-button.woni-menu { color: var(--label); background: transparent; }
+@media (hover: hover) { .woni-head .icon-button.woni-menu:hover { background: var(--fill-soft); } }
+.woni-head .icon-button.woni-menu:active { background: var(--fill); }
 .woni-head h2 { margin: 0; font-size: var(--fs-title); font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; }
 .woni-status { margin: 2px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
 /* The close button keeps a 44px target around a small grey disc, as in iOS sheets. */
@@ -219,7 +249,24 @@
 .woni-message.user { max-width: 85%; margin-left: auto; }
 .woni-message.assistant { margin-right: auto; }
 .woni-message-body { white-space: pre-wrap; padding: 9px 14px; border-radius: 20px; }
-.woni-message.assistant .woni-message-body { white-space: normal; padding: 11px 15px; border-bottom-left-radius: 6px; background: var(--bubble); }
+.woni-message.assistant .woni-message-body { white-space: normal; padding: 11px 15px; border-bottom-left-radius: 6px; background: var(--bubble); line-height: 1.6; }
+/* Ryan 2026-11-10 "원이 답변 시간도 표시": the finish time sits small at the end of Woni's bubble, as Ryan's sent
+   time sits beside his. Bubble and time share the bottom line; the stream name and menu go under them. */
+.woni-message.assistant > .woni-message-body { display: inline-block; max-width: 100%; vertical-align: bottom; }
+.woni-message.assistant > .woni-message-body:has(+ .woni-answer-time) { max-width: calc(100% - 5.75rem); }
+.woni-answer-time { display: inline-block; margin-left: 6px; padding-bottom: 2px; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; vertical-align: bottom; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.woni-message.assistant > .woni-stream-tag { display: flex; width: fit-content; }
+/* An answer being made breathes quietly; one that failed says so in the failure colour. */
+.woni-message[data-state="working"] .woni-message-body { color: var(--label-2); animation: woni-breathe 1.6s ease-in-out infinite; }
+@keyframes woni-breathe { 50% { opacity: 0.55; } }
+.woni-message[data-state="failed"] .woni-message-body { background: var(--red-tint); color: var(--red); }
+/* An empty chat: what Woni is for and one first ask. */
+.woni-welcome { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: clamp(32px, 12vh, 96px) 16px 24px; text-align: center; }
+.woni-welcome strong { font-size: var(--fs-head); font-weight: 650; line-height: 1.35; }
+.woni-welcome p { max-width: 32ch; margin: 0; color: var(--label-2); font-size: var(--fs-sub); line-height: 1.5; }
+.woni-welcome button { min-height: 44px; margin-top: 12px; padding: 0 18px; border: 0; border-radius: 999px; background: var(--accent-tint); color: var(--accent-strong); font: inherit; font-size: var(--fs-sub); font-weight: 600; cursor: pointer; }
+@media (hover: hover) { .woni-welcome button:hover { background: var(--accent-tint-press); } }
+.woni-welcome button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .woni-message.assistant .woni-message-body > :first-child { margin-top: 0; }
 .woni-message.assistant .woni-message-body > :last-child { margin-bottom: 0; }
 .woni-message.user .woni-message-body { border-bottom-right-radius: 6px; background: var(--accent-tint); }
@@ -303,7 +350,13 @@
 
 /* To-do and records (docs/plan/2026-11-10-woni-panels.md): grouped rows on a soft fill, details pushed in place. */
 .woni-panel { padding: 12px 20px max(20px, env(safe-area-inset-bottom)); overflow-x: hidden; }
-.woni-notice { position: absolute; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; z-index: 2; width: max-content; max-width: calc(100% - 32px); padding: 10px 16px; border-radius: var(--radius); background: var(--toast-bg); color: var(--toast-text); box-shadow: var(--shadow-toast); font-size: var(--fs-sub); line-height: 1.4; text-align: center; translate: -50% 0; pointer-events: none; }
+/* Ryan 2026-11-10 ("토스트가 채팅창을 가려서 거슬림"): the notice sits just above the composer and moves up with it
+   (a reply bar, attachments, a taller draft); on a screen without the composer, just above the bottom edge. */
+.woni-notice-anchor { position: relative; z-index: 3; flex: none; height: 0; }
+.woni-notice { position: absolute; bottom: 10px; left: 50%; width: max-content; max-width: calc(100% - 48px); padding: 9px 16px; border-radius: var(--radius); background: var(--toast-bg); color: var(--toast-text); box-shadow: var(--shadow-toast); font-size: var(--fs-sub); line-height: 1.4; text-align: center; translate: -50% 0; pointer-events: none; animation: woni-toast-in var(--dur-fast) var(--ease-out); }
+.woni-notice[hidden] { display: none; }
+.woni-notice-anchor:has(+ .woni-form[hidden]) .woni-notice { bottom: max(16px, env(safe-area-inset-bottom)); }
+@keyframes woni-toast-in { from { opacity: 0; transform: translateY(6px); } }
 .woni-pane { display: flex; flex-direction: column; gap: 12px; }
 .woni-segment button { display: grid; align-content: center; justify-items: center; gap: 1px; min-height: 44px; padding: 4px 6px; color: var(--label-2); text-align: center; }
 .woni-segment button[aria-pressed="true"] { color: var(--label); }
@@ -422,13 +475,12 @@
 .woni-passage-text { margin: 0; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .woni-doubt { padding: 1px 6px; border-radius: 6px; background: var(--orange-tint); color: var(--orange); font-weight: 600; }
 @media (prefers-reduced-motion: reduce) {
-  .woni-detail { animation: none; }
-  .woni-check::before, .woni-composer, .woni-message-body { transition: none; }
+  .woni-detail, .woni-notice, .woni-message[data-state="working"] .woni-message-body { animation: none; }
+  .woni-check::before, .woni-composer, .woni-message-body, .woni-main, .woni-side, .woni-scrim { transition: none !important; }
   .woni-message-actions button:active, .woni-suggestions button:active, .woni-chips button:active, .woni-note-card:active, .woni-find-row:active, .woni-check:active:not(:disabled)::before { transform: none; }
 }
 @media (max-width: 600px) {
   .woni-dialog { width: calc(100% - 16px); height: calc(var(--app-height, 100dvh) - 16px); }
-  .woni-head { padding-left: 16px; }
   .woni-tabs { margin-inline: 12px; }
   .woni-messages { padding-inline: 16px; }
   .woni-panel { padding-inline: 16px; }
@@ -436,6 +488,18 @@
 }
 @media (min-width: 601px) {
   .woni-segment button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+}
+/* From 900px: a large window with the menu fixed on the left (it replaces ≡ and the screen tabs) and the
+   conversation in a readable column of about 760px. */
+@media (min-width: 900px) {
+  .woni-dialog { width: min(1240px, calc(100% - 48px)); height: calc(var(--app-height, 100dvh) - 48px); }
+  .woni-side { flex: none; width: 248px; border-right: 1px solid var(--sep); }
+  .woni-side-item { min-height: 44px; font-size: var(--fs-body); }
+  .woni-head .icon-button.woni-menu, .woni-scrim, .woni-tabs { display: none; }
+  .woni-head { padding: 14px 12px 8px 20px; }
+  .woni-messages, .woni-work, .woni-panel { padding-inline: max(24px, calc((100% - 760px) / 2)); }
+  .woni-form { padding-inline: max(16px, calc((100% - 792px) / 2)); }
+  .woni-filter, .woni-original { margin-inline: max(16px, calc((100% - 760px) / 2)); }
 }
 @supports (transition-timing-function: linear(0, 1)) {
   :root {
