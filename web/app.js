@@ -15858,9 +15858,19 @@ function settleViewport() {
 // "오프라인 · 다시 연결 중" at the top while the browser is offline or the
 // board failed to answer twice in a row; it goes away by itself once a read
 // succeeds. The terminal shows its own connection state instead.
+// A screen file the page loaded (its sessionholic-assets list) that the board now serves
+// another way. app.js alone missed a deploy of woni.js or style.css: an open page kept the
+// old Woni window (2026-11-10, no stream names under answers until a manual reload).
+function assetsBehind() {
+  const served = state.capabilities?.webAssets;
+  if (!served || typeof served !== "object" || Array.isArray(served)) return false;
+  const valid = (value) => typeof value === "string" && /^[0-9a-f]{8}$/.test(value);
+  return Object.entries(assetVersions()).some(([path, version]) =>
+    valid(version) && valid(served[path]) && served[path] !== version);
+}
 function checkWebVersion() {
   const served = state.capabilities?.webVersion;
-  const behind = !!APP_VERSION && typeof served === "string" && !!served && served !== APP_VERSION;
+  const behind = (!!APP_VERSION && typeof served === "string" && !!served && served !== APP_VERSION) || assetsBehind();
   const found = behind && !state.updateAvailable;
   state.updateAvailable = behind;
   if (found && Date.now() - (state.shownAt || 0) < UPDATE_RETURN_MS && reloadForUpdate()) return;

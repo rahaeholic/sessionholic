@@ -160,6 +160,11 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(res.status, 200)
         version = json.loads(data)["webVersion"]
         self.assertEqual(version, self.httpd.assets.manifest()["/app.js"])
+        # Every screen file too: a deploy of woni.js or style.css alone is a newer screen.
+        assets = json.loads(data)["webAssets"]
+        self.assertEqual(assets, self.httpd.assets.manifest())
+        self.assertRegex(assets["/woni.js"], r"^[0-9a-f]{8}$")
+        self.assertRegex(assets["/style.css"], r"^[0-9a-f]{8}$")
         res, page = self.request("GET", "/", headers={"Cookie": cookie})
         self.assertIn(('/app.js?v=%s"' % version).encode(), page, "the page loads the same app.js it names")
 

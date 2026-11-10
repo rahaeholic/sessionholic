@@ -4722,6 +4722,33 @@ test('a page older than the screen the board serves offers a reload, and reloads
   assert.equal(unknown.state.updateAvailable, false);
 });
 
+test('a deploy of woni.js or style.css alone is a newer screen too, though app.js is the same', async () => {
+  // 2026-11-10: only woni.js and style.css changed, the open page compared app.js and kept the old Woni window.
+  const loaded = { '/app.js': 'aaaa1111', '/woni.js': 'cccc3333', '/style.css': 'eeee5555' };
+  const page = (assets) => {
+    const c = client(async () => ({ ok: true, status: 200, json: async () => ({ csrfToken: 'x', webVersion: 'aaaa1111', webAssets: assets }) }),
+      noChatTimers, { currentScript: { src: 'https://board.test/app.js?v=aaaa1111' } });
+    c.state.assetVersions = { ...loaded };
+    c.state.shownAt = 0;
+    return c;
+  };
+  const changed = page({ ...loaded, '/woni.js': 'dddd4444' });
+  await changed.loadCapabilities(changed.state.authEpoch, { refreshView: false });
+  assert.equal(changed.state.updateAvailable, true);
+  assert.equal(changed.get('update-banner').hidden, false);
+  // The same files, a file this page never loaded, or a value that is not a version: nothing to offer.
+  for (const assets of [{ ...loaded }, { ...loaded, '/goals.js': 'ffff6666' }, { ...loaded, '/woni.js': 'not-a-sha' },
+    ['/woni.js'], null, 'dddd4444']) {
+    const c = page(assets);
+    await c.loadCapabilities(c.state.authEpoch, { refreshView: false });
+    assert.equal(c.state.updateAvailable, false, JSON.stringify(assets));
+  }
+  // An older board without webAssets still compares app.js only.
+  const older = page(undefined);
+  await older.loadCapabilities(older.state.authEpoch, { refreshView: false });
+  assert.equal(older.state.updateAvailable, false);
+});
+
 test('a device that lost its connection comes first among the header chips, and a tap says each one\'s state', () => {
   const c = client(undefined, noChatTimers);
   c.state.snapshot = { serverTime: 1000, hosts: [
