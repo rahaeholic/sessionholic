@@ -441,6 +441,53 @@ test('≡ 메뉴는 화면·최근 흐름 5개·오늘 정리·새로고침·설
   assert.equal(sideKeys().some(key => key.startsWith('stream:')), false);
 });
 
+// 라이언 2026-11-11 "하던일에서 최근작업흐름에 새로고침을 안하면 진행중 딱지가 바로바로 안붙는다"
+test('최근 작업 흐름의 진행 중 딱지는 새로고침 없이 질문이 시작·끝날 때 바로 붙고 떨어진다', async () => {
+  const now = Date.now() / 1000;
+  const flows = running => [
+    { id: 'flow-a', title: '흐름 A', count: 2, running, unread: running ? 0 : 1, lastAt: now },
+    { id: 'flow-b', title: '흐름 B', count: 1, running: 0, unread: 0, lastAt: now - 60 }];
+  let serverRunning = 0, chats = [{ id: 'c1', stream: 'flow-a', text: '질문', answer: '답', status: 'complete', createdAt: now - 120, finishedAt: now - 110 }];
+  const reads = [];
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/streams') { reads.push(serverRunning); return { items: flows(serverRunning), total: 2 }; }
+    if (url === '/api/woni/tasks') return { actions: [], completedActions: [], archivedActions: [], counts: {} };
+    return { chats, activity: {} };
+  };
+  const { nodes, app, tick } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate); await new Promise(setImmediate);
+  const item = key => nodes['woni-side'].children.find(node => node.dataset?.side === key);
+  const text = node => [node?.textContent || '', ...(node?.children || []).map(text)].join('');
+  const badge = key => text(item(key).children[1]).replace('새 답 ', '');
+  assert.equal(badge('stream:flow-a'), '1');  // 새 답 1개, 진행 중 아님
+  const before = reads.length;
+  // 새 질문이 흐름 A에서 돌기 시작: 흐름 목록을 다시 읽기 전(목록은 아직 0)에도 4초 갱신의 대화로 바로 딱지가 붙는다.
+  chats = [...chats, { id: 'c2', stream: 'flow-a', text: '새 질문', status: 'running', createdAt: now }];
+  await tick();
+  assert.equal(badge('stream:flow-a'), '진행 중');
+  assert.equal(badge('stream:flow-b'), '');
+  // 1분을 기다리지 않고 흐름 목록도 바로 다시 읽는다.
+  assert.equal(reads.length, before + 1);
+  // 같은 상태가 이어지면 매 갱신마다 다시 읽지 않는다.
+  serverRunning = 1; await tick(); await new Promise(setImmediate);
+  assert.equal(reads.length, before + 1);
+  assert.equal(badge('stream:flow-a'), '진행 중');
+  // 답이 끝나면 바로 다시 읽어 딱지를 떼고 새 답 수를 단다.
+  serverRunning = 0;
+  chats = [chats[0], { ...chats[1], answer: '새 답', status: 'complete', finishedAt: now + 5 }];
+  await tick(); await new Promise(setImmediate);
+  assert.equal(reads.length, before + 2);
+  assert.equal(badge('stream:flow-a'), '1');
+  // 찾기 화면의 흐름 줄도 같은 기준으로 진행 중을 보인다.
+  chats = [...chats, { id: 'c3', stream: 'flow-b', text: '또 질문', status: 'queued', createdAt: now + 6 }];
+  nodes['woni-find-open'].click(); await new Promise(setImmediate);
+  await tick(); await new Promise(setImmediate);
+  assert.equal(badge('stream:flow-b'), '진행 중');
+  const findRow = nodes['woni-find'].children[0].children[1].children.find(row => row.dataset?.stream === 'flow-b');
+  assert.ok(findRow.children[1].children.some(node => node.className === 'woni-find-running'));
+});
+
 test('대화가 하나도 없으면 빈 화면 안내와 오늘 정리 버튼을 보여 준다', async () => {
   const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
   const { nodes, app } = fixture(call);
