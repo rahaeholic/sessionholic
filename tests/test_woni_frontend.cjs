@@ -1493,3 +1493,11 @@ test('만드는 중인 먼저 알림은 질문 줄이 없어도 진행 말풍선
   assert.equal(shown.length, 1); assert.equal(shown[0].dataset.state, 'working'); assert.equal(textOf(shown[0]).includes('알림 쓰는 중'), true);
   assert.equal(shown[0].dataset.rowKey, 'n:answer');
 });
+
+test('원이 입력창은 다른 입력칸처럼 맞춤법 검사·자동 보정이 꺼져 한글 입력 중 밑줄이 깜빡이지 않는다', () => {
+  const html = fs.readFileSync(require('node:path').join(__dirname, '..', 'web', 'index.html'), 'utf8');
+  const tag = html.match(/<textarea id="woni-input"[^>]*>/)?.[0];
+  assert.ok(tag, '원이 입력창이 있어야 한다');
+  for (const [key, val] of [['spellcheck', 'false'], ['autocorrect', 'off'], ['autocomplete', 'off'], ['autocapitalize', 'off']])
+    assert.match(tag, new RegExp(`\\s${key}="${val}"`));
+});
