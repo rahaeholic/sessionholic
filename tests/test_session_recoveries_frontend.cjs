@@ -83,6 +83,18 @@ test("목록 밖 복귀는 exact GET 하나 뒤 같은 native ID를 열고 새 �
   const recovered = c.allSessions()[0]; assert.equal(recovered.recoverySource, true); assert.equal(recovered.nativeSource, false);
   assert.ok(c.calls.every((call) => call.url.startsWith("/api/session/recover?") || call.url === "/api/session/opened"));
 });
+test("원본 대화가 기기에 없어 서버가 정리한 참조는 오류로 남기지 않고 목록을 다시 읽는다", async () => {
+  const gone = { error: "원래 대화 기록이 기기에 남아 있지 않아 목록에서 정리했습니다.", code: "recovery_session_gone" };
+  const c = client(async (url) => url.startsWith("/api/session/recover?")
+    ? { ok: false, status: 410, json: async () => gone }
+    : response({ serverTime: NOW, hosts: [], recoverySessions: [] }));
+  await c.openRecovery(ref());
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.selected, null); assert.equal(c.state.nativeSessions.size, 0);
+  assert.equal(c.state.recoveryError || "", "");
+  assert.ok(c.calls.some((call) => call.url.startsWith("/api/snapshot")), "the list is read again");
+  assert.ok(c.calls.every((call) => call.method === "GET"), "nothing is launched or sent");
+});
 test("resolver가 다른 home·host·id 또는 Claude 대화 ID를 반환하면 선택하지 않는다", async () => {
   for (const changed of [{ home: ".codex-other" }, { host: "other-pc" }, { id: "other-thread" }]) {
     const c = client(async () => response({ session: row(changed) }));
