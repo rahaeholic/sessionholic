@@ -29,6 +29,10 @@
   let seen = null, unread = new Set();
   // Woni's shared read mark: answers finished at or before it were seen in the Woni app or a board.
   let readThrough = null, serverRead = 0, readPosting = 0;
+  // Ryan 2026-11-11 ("최근작업흐름에 옆에 1이 뜨는데 클릭해도 안 없어지는데"): one mark cannot pass an older unread answer of
+  // another stream, so a stream opened alone gets its own mark ({stream: time}). Sent only to a Woni server that keeps them
+  // (streamMarks): an older one would take the stream's time as everything read.
+  let streamRead = Object.create(null), streamMarks = false, streamPosting = Object.create(null);
   const maxFile = 100 * 1024 * 1024, maxFiles = 10;
   const answerTimeFormat = new Intl.DateTimeFormat("ko-KR", { timeZone: "Asia/Seoul", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   // Ryan 2026-11-10 (ChatGPT dots): Woni is the only speaker, so its messages carry no name.
@@ -60,12 +64,21 @@
     const at = Number(chat.finishedAt) > 0 ? Number(chat.finishedAt) : Number(chat.createdAt);
     return Number.isFinite(at) ? at : 0;
   }
+  function readAt(chat) { return Math.max(readThrough ?? 0, Number(streamRead[chat?.stream]) || 0); }
+  function takeStreamMarks(marks) {
+    if (!marks || typeof marks !== "object" || Array.isArray(marks)) return;
+    streamMarks = true;
+    for (const [slug, at] of Object.entries(marks)) {
+      if (streamPattern.test(slug) && Number.isFinite(at)) streamRead[slug] = Math.max(Number(streamRead[slug]) || 0, at);
+    }
+    for (const slug of Object.keys(streamRead)) if (streamRead[slug] <= (readThrough ?? 0)) delete streamRead[slug];
+  }
   function observeReplies(data) {
     const chats = Array.isArray(data.chats) ? data.chats : [];
     const first = seen === null, next = Object.create(null), visible = dialog.open && view === "chat" && !document.hidden;
     // With Woni's shared mark an answer read in the Woni app is not new here; older Woni servers keep the per-tab baseline.
     const shared = typeof data.readThrough === "number" && Number.isFinite(data.readThrough);
-    if (shared) { serverRead = Math.max(serverRead, data.readThrough); readThrough = Math.max(readThrough ?? 0, data.readThrough); }
+    if (shared) { serverRead = Math.max(serverRead, data.readThrough); readThrough = Math.max(readThrough ?? 0, data.readThrough); takeStreamMarks(data.streamRead); }
     if (shared) unread = new Set();
     let arrived = false;
     for (const chat of chats) {
@@ -74,7 +87,7 @@
       const shown = visible && (!filter || chat.stream === filter.id);
       next[chat.id] = complete;
       if (shared) {
-        if (complete && !shown && finishedAt(chat) > readThrough) {
+        if (complete && !shown && finishedAt(chat) > readAt(chat)) {
           unread.add(chat.id);
           if (!first && seen[chat.id] !== true) arrived = true;
         }
@@ -95,22 +108,36 @@
     for (const chat of latestData.chats || []) if (!filter || chat.stream === filter.id) unread.delete(chat.id);
     badge(); saveSeen();
     if (readThrough === null) return;
-    // Advance through answers in finish order; stop before an unread one hidden by a stream filter.
+    // Advance through answers in finish order; stop before an unread one hidden by a stream filter
+    // (an answer its own stream's mark already covers is read, so it does not stop the walk).
     let through = readThrough;
     const finished = (latestData.chats || []).filter((chat) => !["queued", "running"].includes(chat.status))
-      .map((chat) => [finishedAt(chat), !filter || chat.stream === filter.id]).sort((a, b) => a[0] - b[0]);
+      .map((chat) => [finishedAt(chat), !filter || chat.stream === filter.id || finishedAt(chat) <= (Number(streamRead[chat.stream]) || 0)])
+      .sort((a, b) => a[0] - b[0]);
     for (const [at, shown] of finished) { if (at <= through) continue; if (!shown) break; through = at; }
     readThrough = through;
     if (through > serverRead && through > readPosting) postRead(through);
+    // The stream on screen: everything in it that has finished is read, whatever other streams still hold.
+    if (!filter || !streamMarks || !streamPattern.test(filter.id)) return;
+    const mark = Math.max(0, ...loadedChats().filter((chat) => chat.stream === filter.id && !["queued", "running"].includes(chat.status)).map(finishedAt));
+    if (mark > readAt({ stream: filter.id }) && mark > (Number(streamPosting[filter.id]) || 0)) postRead(mark, filter.id);
   }
-  async function postRead(through) {
+  async function postRead(through, stream = null) {
     if (!api) return;
-    const current = authEpoch; readPosting = through;
+    const current = authEpoch;
+    if (stream) streamPosting[stream] = through; else readPosting = through;
     try {
-      const result = await api("/api/woni/read", { method: "POST", body: { through } });
-      if (current === authEpoch && typeof result?.readThrough === "number") serverRead = Math.max(serverRead, result.readThrough);
+      const result = await api("/api/woni/read", { method: "POST", body: stream ? { through, stream } : { through } });
+      if (current !== authEpoch) return;
+      if (typeof result?.readThrough === "number") { serverRead = Math.max(serverRead, result.readThrough); readThrough = Math.max(readThrough ?? 0, result.readThrough); }
+      takeStreamMarks(result?.streamRead);
+      // The menu's new-answer counts come from the stream list: read it again now rather than within the minute.
+      loadStreams();
     } catch (_) { /* the next check while the chat is open records it again */ }
-    finally { if (readPosting === through) readPosting = 0; }
+    finally {
+      if (stream) { if (streamPosting[stream] === through) delete streamPosting[stream]; }
+      else if (readPosting === through) readPosting = 0;
+    }
   }
   // Woni's 👉 line holds tap-to-send replies; the 🔊 line is for listening only. Neither is shown as answer text.
   function suggestedReplies(answer) {
@@ -1034,6 +1061,7 @@
       streamChats = page.chats; streamHasMore = page.hasMore === true;
       if (typeof page.streamTitle === "string" && page.streamTitle && filter?.id === slug) filter = { id: slug, title: page.streamTitle };
       olderLoading = false; redraw(true);
+      markVisibleRead();  // the stream's earlier answers are on screen now too
       if (then) jumpTo(then);
     } catch (error) {
       if (current !== authEpoch || generation !== olderGen) return;
@@ -1139,6 +1167,8 @@
     return counts;
   }
   function runningOf(row, live = liveRunning()) { return Math.max(Number(row?.running) || 0, live.get(row?.id) || 0); }
+  // The stream open on screen is being read (markVisibleRead), so its count goes at once instead of after the next list.
+  function unreadOf(row) { return dialog.open && view === "chat" && filter?.id === row?.id && !document.hidden ? 0 : Number(row?.unread) || 0; }
   function runningKey(chats) {
     return (Array.isArray(chats) ? chats : []).filter((chat) => ["queued", "running"].includes(chat?.status))
       .map((chat) => `${chat.id}:${chat.stream || ""}`).sort().join(",");
@@ -1156,9 +1186,9 @@
     const bottom = el("span", "woni-find-bottom");
     bottom.append(el("span", "woni-find-preview", streamPreview(row) || `대화 ${Number(row.count) || 0}개`));
     if (runningOf(row) > 0) bottom.append(el("span", "woni-find-running", "진행 중"));
-    if (Number(row.unread) > 0) {
+    if (unreadOf(row) > 0) {
       const unreadCount = el("span", "woni-find-unread");
-      unreadCount.append(el("span", "sr-only", "새 답 "), el("span", "", String(row.unread)), el("span", "sr-only", "개"));
+      unreadCount.append(el("span", "sr-only", "새 답 "), el("span", "", String(unreadOf(row))), el("span", "sr-only", "개"));
       bottom.append(unreadCount);
     }
     card.append(top, bottom); card.dataset.stream = String(row.id || "");
@@ -1304,7 +1334,7 @@
     const streams = (Array.isArray(streamsData?.items) ? streamsData.items : []).filter((row) => typeof row?.id === "string" && row.id).slice(0, 5);
     const busy = !!pending || sending || uploading, live = liveRunning();
     // Redrawn only when what it shows changed, so the 4-second refresh keeps focus and hover.
-    const key = JSON.stringify([view, filter?.id || "", due, busy, streamsError, !!streamsData, streams.map((row) => [row.id, row.title, runningOf(row, live), Number(row.unread) || 0])]);
+    const key = JSON.stringify([view, filter?.id || "", due, busy, streamsError, !!streamsData, streams.map((row) => [row.id, row.title, runningOf(row, live), unreadOf(row)])]);
     if (key === sideKey && !force) return;
     sideKey = key;
     const nodes = [el("p", "woni-side-heading", "화면")];
@@ -1318,7 +1348,7 @@
     else if (!streams.length) nodes.push(el("p", "woni-side-note", "아직 흐름이 없어요."));
     for (const row of streams) {
       const extra = runningOf(row, live) > 0 ? el("span", "woni-side-running", "진행 중")
-        : Number(row.unread) > 0 ? sideCount(String(row.unread), "새 답 ") : null;
+        : unreadOf(row) > 0 ? sideCount(String(unreadOf(row)), "새 답 ") : null;
       const item = sideItem(`stream:${row.id}`, row.title || "작업 흐름", () => { closeDrawer(false); openStream(row.id, row.title); }, extra);
       item.className += " is-stream";
       if (view === "chat" && filter?.id === row.id) item.setAttribute("aria-current", "true");
@@ -1664,7 +1694,7 @@
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; replyPicks.replaceChildren(); replyPicks.hidden = true;
       filter = null; latestData = null; workData = null; resetHistory();
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
-      readThrough = null; serverRead = 0; readPosting = 0;
+      readThrough = null; serverRead = 0; readPosting = 0; streamRead = Object.create(null); streamMarks = false; streamPosting = Object.create(null);
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();
       clearTimeout(noticeTimer); $("woni-notice").hidden = true; $("woni-notice").textContent = "";
       streamsAt = 0; runKey = ""; renderSide(true);

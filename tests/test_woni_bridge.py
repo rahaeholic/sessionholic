@@ -104,6 +104,21 @@ class WoniBridgeTest(unittest.TestCase):
         with self.assertRaises(ValueError): woni_bridge.local_call(home=self.home, operation='read')
         with self.assertRaises(ValueError): woni_bridge.local_call({'through': 1.0}, self.home, operation='activity')
 
+    def test_stream_read_mark_is_passed_and_written_narrowly(self):
+        # 라이언 2026-11-11 "최근작업흐름에 옆에 1이 뜨는데 클릭해도 안 없어지는데": 흐름만 열어 읽은 답은 그 흐름의 읽음으로.
+        marks = {'won-app': 1794000002.0, '../bad': 1, 'ok-flow': 'x', 'Upper': 3}
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'chats': [], 'activity': {}, 'readThrough': 1794000000.5, 'streamRead': marks})):
+            self.assertEqual(woni_bridge.local_call(home=self.home)['streamRead'], {'won-app': 1794000002.0})
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'chats': [], 'activity': {}, 'readThrough': 1794000000.5})):
+            self.assertNotIn('streamRead', woni_bridge.local_call(home=self.home))  # 이전 원이 서버
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'readThrough': 1794000001.0, 'streamRead': {'won-app': 1794000003.0}, 'private': 'x'})) as urlopen:
+            self.assertEqual(woni_bridge.local_call({'through': 1794000003.0, 'stream': 'won-app'}, self.home, operation='read'),
+                             {'readThrough': 1794000001.0, 'streamRead': {'won-app': 1794000003.0}})
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data), {'through': 1794000003.0, 'stream': 'won-app'})
+        for invalid in ({'through': 1, 'stream': '../x'}, {'through': 1, 'stream': 'A'}, {'through': 1, 'stream': 3}, {'through': 1, 'stream': ''},
+                        {'stream': 'won-app'}, {'through': 1, 'stream': 'won-app', 'extra': 1}):
+            with self.assertRaises(ValueError): woni_bridge.local_call(invalid, self.home, operation='read')
+
     def test_activity_removes_unneeded_worker_details(self):
         value = {'running': [{'id': 'chat-1', 'text': '질문', 'steps': [{'tool': '읽기', 'private': 'x'}],
                   'batches': [{'id': '20261106-010101-abcd', 'tasks': [{'n': 1, 'title': '작업', 'status': 'ok', 'pid': 123}]}], 'secret': 'x'}], 'recent': []}
