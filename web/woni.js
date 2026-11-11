@@ -1087,7 +1087,7 @@
   }
 
   // The find screen: with no words, the streams (latest first); with words, matching streams and chats.
-  let streamsData = null, streamsError = "", streamsGen = 0, streamsAt = 0;
+  let streamsData = null, streamsError = "", streamsGen = 0, streamsAt = 0, runKey = "";
   let hits = null, hitsFor = "", hitsError = "", hitsLoading = false, hitsGen = 0, findTimer = 0;
   const findSearch = searchField("대화·흐름 이름으로 찾기", () => { clearTimeout(findTimer); findTimer = setTimeout(() => searchChats(), 300); });
   findSearch.input.maxLength = 100;
@@ -1128,9 +1128,24 @@
     if (at < value.length || !value) node.append(el("span", "", value.slice(at)));
     return node;
   }
+  // Ryan 2026-11-11 ("새로고침을 안하면 진행중 딱지가 바로바로 안붙는다"): the stream list is read once a minute, so a
+  // stream also counts as working while the chats of the 4-second refresh show a queued or running ask in it.
+  // When that set of working asks changes, refresh() reads the list again at once (and the badge goes with it).
+  function liveRunning() {
+    const counts = new Map();
+    for (const chat of latestData?.chats || []) {
+      if (typeof chat?.stream === "string" && chat.stream && ["queued", "running"].includes(chat.status)) counts.set(chat.stream, (counts.get(chat.stream) || 0) + 1);
+    }
+    return counts;
+  }
+  function runningOf(row, live = liveRunning()) { return Math.max(Number(row?.running) || 0, live.get(row?.id) || 0); }
+  function runningKey(chats) {
+    return (Array.isArray(chats) ? chats : []).filter((chat) => ["queued", "running"].includes(chat?.status))
+      .map((chat) => `${chat.id}:${chat.stream || ""}`).sort().join(",");
+  }
   // A stream row's preview: what was asked while it works, otherwise the first line of the last answer.
   function streamPreview(row) {
-    if (Number(row.running) > 0) return row.lastText || "";
+    if (runningOf(row) > 0) return row.lastText || "";
     if (["failed", "interrupted"].includes(row.lastStatus)) return `답을 받지 못했어요 · ${row.lastText || ""}`;
     return row.lastAnswer || row.lastText || "";
   }
@@ -1140,7 +1155,7 @@
     top.append(highlighted("woni-find-title", row.title || row.id || "작업 흐름", query), el("span", "woni-find-time", listTime(Number(row.lastAt))));
     const bottom = el("span", "woni-find-bottom");
     bottom.append(el("span", "woni-find-preview", streamPreview(row) || `대화 ${Number(row.count) || 0}개`));
-    if (Number(row.running) > 0) bottom.append(el("span", "woni-find-running", "진행 중"));
+    if (runningOf(row) > 0) bottom.append(el("span", "woni-find-running", "진행 중"));
     if (Number(row.unread) > 0) {
       const unreadCount = el("span", "woni-find-unread");
       unreadCount.append(el("span", "sr-only", "새 답 "), el("span", "", String(row.unread)), el("span", "sr-only", "개"));
@@ -1287,9 +1302,9 @@
   function renderSide(force = false) {
     const counts = tasks?.counts || {}, due = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
     const streams = (Array.isArray(streamsData?.items) ? streamsData.items : []).filter((row) => typeof row?.id === "string" && row.id).slice(0, 5);
-    const busy = !!pending || sending || uploading;
+    const busy = !!pending || sending || uploading, live = liveRunning();
     // Redrawn only when what it shows changed, so the 4-second refresh keeps focus and hover.
-    const key = JSON.stringify([view, filter?.id || "", due, busy, streamsError, !!streamsData, streams.map((row) => [row.id, row.title, Number(row.running) || 0, Number(row.unread) || 0])]);
+    const key = JSON.stringify([view, filter?.id || "", due, busy, streamsError, !!streamsData, streams.map((row) => [row.id, row.title, runningOf(row, live), Number(row.unread) || 0])]);
     if (key === sideKey && !force) return;
     sideKey = key;
     const nodes = [el("p", "woni-side-heading", "화면")];
@@ -1302,7 +1317,7 @@
     if (!streamsData) nodes.push(el("p", "woni-side-note", streamsError || "흐름을 불러오고 있어요."));
     else if (!streams.length) nodes.push(el("p", "woni-side-note", "아직 흐름이 없어요."));
     for (const row of streams) {
-      const extra = Number(row.running) > 0 ? el("span", "woni-side-running", "진행 중")
+      const extra = runningOf(row, live) > 0 ? el("span", "woni-side-running", "진행 중")
         : Number(row.unread) > 0 ? sideCount(String(row.unread), "새 답 ") : null;
       const item = sideItem(`stream:${row.id}`, row.title || "작업 흐름", () => { closeDrawer(false); openStream(row.id, row.title); }, extra);
       item.className += " is-stream";
@@ -1483,12 +1498,14 @@
       const left = slidOut(latestData?.chats || [], Array.isArray(data?.chats) ? data.chats : []);
       if (left.length) olderChats = mergeChats(olderChats, left);
       latestData = data; observeReplies(data);
+      const key = runningKey(data?.chats), started = key !== runKey; runKey = key;
       if (dialog.open) {
         show(data);
         // The to-do list is read when its tab opens and every 30 seconds while it stays open.
         if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
-        // The menu's latest streams are read on opening and once a minute while the window stays open.
-        if (Date.now() - streamsAt >= 60000) loadStreams();
+        // The menu's latest streams are read on opening, once a minute while the window stays open, and at once when an
+        // ask starts, gets its stream or ends (the badge, the order and the new-answer count follow without a reload).
+        if (started || Date.now() - streamsAt >= 60000) loadStreams();
         if (focusId) {
           const id = focusId; focusId = null;
           if (loadedChats().some((chat) => chat.id === id)) rowNode(id)?.scrollIntoView?.({ block: "center" });
@@ -1650,7 +1667,7 @@
       readThrough = null; serverRead = 0; readPosting = 0;
       original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();
       clearTimeout(noticeTimer); $("woni-notice").hidden = true; $("woni-notice").textContent = "";
-      streamsAt = 0; renderSide(true);
+      streamsAt = 0; runKey = ""; renderSide(true);
     },
     toastMs,
     chatRows,
