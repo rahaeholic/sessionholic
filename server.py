@@ -1692,6 +1692,8 @@ class Workflow:
         # Terminal id -> when the sweep first found its unused run resting at an empty prompt
         # (close_idle_runs); a sweep that finds it otherwise forgets it.
         self.runs_at_rest = {}
+        # prune_recoveries: when each saved locator (by its native identity) was last asked of its host.
+        self.recovery_asked = {}
 
     # How long a repeat of a request id waits for the same request still running.
     REQUEST_WAIT = 660
@@ -1780,7 +1782,15 @@ class Workflow:
         if verify:
             if not online:
                 raise RuntimeError("기기가 다시 연결되면 원래 작업을 확인할 수 있습니다.")
-            result = self.transfers.rpc(host, "recover_session", {"source": source}, timeout=20)
+            from transfer import WorkerError
+            try:
+                result = self.transfers.rpc(host, "recover_session", {"source": source}, timeout=20)
+            except WorkerError as exc:
+                if self._forget_missing(record, exc):
+                    from session_recovery import RecoveryError
+                    raise RecoveryError("원래 대화 기록이 기기에 남아 있지 않아 목록에서 정리했습니다.",
+                                        "recovery_session_gone", 410) from None
+                raise
             fresh = result.get("source") if isinstance(result, dict) else None
             if not isinstance(fresh, dict) or any(fresh.get(k) != source.get(k) for k in ("agent", "id")):
                 raise ValueError("원래 세션의 신원을 확인하지 못했습니다.")
@@ -1812,6 +1822,75 @@ class Workflow:
                 entry[1] -= 1
                 if not entry[1] and self.route_locks.get(key) is entry:
                     del self.route_locks[key]
+
+    # Saved recovery locators whose conversation is gone on its host are forgotten, so
+    # 목록에서 빠진 대화 offers only conversations that can still be opened.
+    RECOVERY_SWEEP = 600        # seconds between sweeps (start_hold_sweep's loop; a list read never asks a host)
+    RECOVERY_RECHECK = 6 * 3600  # an unlisted locator that still resolves is asked again after this
+    RECOVERY_GRACE = 3600       # a locator opened more recently may belong to a run still starting
+    RECOVERY_BATCH = 4          # host lookups per sweep
+
+    def _forget_missing(self, record, error, now=None):
+        """Forget `record` only when its host reported the saved conversation absent
+        (`recover-missing`), the locator is past its grace and no terminal record would save
+        it again. A changed folder or account, a timeout or an offline host keeps it."""
+        from launch import SavedSessionMissing
+        if getattr(error, "stage", None) != SavedSessionMissing.transfer_stage:
+            return False
+        now = time.time() if now is None else now
+        if now - (record.get("openedAt") or now) < self.RECOVERY_GRACE:
+            return False
+        held = record.get("provenance", {}).get("terminalId")
+        try:
+            if held and any(terminal.get("id") == held for terminal in self.terminals.list()):
+                return False
+            return self.recoveries.forget(record["source"])
+        except (ValueError, RuntimeError, OSError):
+            return False
+
+    def prune_recoveries(self, now=None):
+        """Ask hosts about saved locators that left the list; forget the ones whose saved
+        conversation is gone. Read-only on the hosts (`recover_session`). Returns how many
+        were forgotten."""
+        from transfer import WorkerError
+        now = time.time() if now is None else now
+        forgotten = asked = 0
+        try:
+            records = self.recoveries.snapshot()["sessions"]
+        except (ValueError, RuntimeError, OSError):
+            return 0
+        for record in records:
+            if asked >= self.RECOVERY_BATCH:
+                break
+            source = record["source"]
+            if record.get("provenance", {}).get("closure") in ("explicit_termination", "legacy_user_close"):
+                continue
+            if now - (record.get("openedAt") or now) < self.RECOVERY_GRACE:
+                continue
+            key = json.dumps([source.get(k) for k in ("host", "agent", "home", "id")])
+            if now - self.recovery_asked.get(key, 0) < self.RECOVERY_RECHECK:
+                continue
+            host = next((h for h in self.board.hosts if h["name"] == source["host"]), None)
+            if host is None or self.board.state.get(host["name"], {}).get("ok") is not True:
+                continue
+            try:
+                self.board.source(source)
+                continue  # listed: the list shows it, nothing to recover
+            except ValueError:
+                pass
+            asked += 1
+            self.recovery_asked[key] = now
+            try:
+                self.transfers.rpc(host, "recover_session", {"source": source}, timeout=20)
+            except WorkerError as exc:
+                if self._forget_missing(record, exc, now):
+                    forgotten += 1
+                    self.recovery_asked.pop(key, None)
+            except (ValueError, RuntimeError, OSError):
+                pass
+        if forgotten:
+            sys.stderr.write("목록에서 빠진 대화 %d건은 원본 대화가 기기에 없어 정리했습니다.\n" % forgotten)
+        return forgotten
 
     PROGRAM_REFRESH = 60   # seconds between launcher reads on one host
     PROGRAM_STALE = 300    # a named program is read again after this long (the launcher may switch)
@@ -2319,7 +2398,7 @@ class Workflow:
     def start_hold_sweep(self):
         def run():
             time.sleep(self.HOLD_SWEEP_FIRST)
-            swept = None
+            swept = recovered = None
             while True:
                 try:
                     self.close_idle_launchers()
@@ -2338,6 +2417,12 @@ class Workflow:
                         self.sweep_leftovers()
                     except Exception as exc:
                         sys.stderr.write("테스트 잔여물 정리에 실패했습니다: %s\n" % type(exc).__name__)
+                if recovered is None or time.monotonic() - recovered >= self.RECOVERY_SWEEP:
+                    recovered = time.monotonic()
+                    try:
+                        self.prune_recoveries()
+                    except Exception as exc:  # The sweep never stops the board.
+                        sys.stderr.write("목록에서 빠진 대화 정리에 실패했습니다: %s\n" % type(exc).__name__)
                 time.sleep(self.HOLD_SWEEP_SECONDS)
         threading.Thread(target=run, name="hold-sweep", daemon=True).start()
 
@@ -3666,7 +3751,11 @@ class Handler(BaseHTTPRequestHandler):
                         self.server.board.request_refresh(query.get('host'))
                     return self.send_snapshot()
                 if url.path == "/api/session/recover":
-                    source = self.server.workflow.resolve_source(query, verify=True)
+                    from session_recovery import RecoveryError
+                    try:
+                        source = self.server.workflow.resolve_source(query, verify=True)
+                    except RecoveryError as exc:
+                        return self.send_json(exc.status, exc.payload)
                     return self.send_json(200, {"session": scrub_payload(source)})
                 if url.path == "/api/read":
                     result = self.server.board.read(query.get("host"), query.get("agent"), query.get("id"), query.get("home"))

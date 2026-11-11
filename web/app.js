@@ -1611,7 +1611,9 @@ async function openRecovery(ref) {
     state.recoveryBusy = null;
     select(key);
   } catch (err) {
-    if (current() && !err.unauthorized && !err.staleAuth) state.recoveryError = err.message || "원래 대화를 확인하지 못했습니다. 잠시 뒤 다시 확인해 주세요.";
+    // The host has no such conversation any more: the server forgot it, a fresh list drops the row.
+    if (current() && err.code === "recovery_session_gone") { toast(err.message); poll(); }
+    else if (current() && !err.unauthorized && !err.staleAuth) state.recoveryError = err.message || "원래 대화를 확인하지 못했습니다. 잠시 뒤 다시 확인해 주세요.";
   } finally {
     if (run === state.recoveryRun && authEpoch === state.authEpoch) state.recoveryBusy = null;
     if (authEpoch === state.authEpoch) renderRecoveries();

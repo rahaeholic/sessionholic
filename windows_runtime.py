@@ -35,6 +35,13 @@ CLAUDE_JOB = re.compile(r'[0-9a-z]{8}\Z')
 
 class NotLoaded(ValueError):
     """No PC server has this stored session open: it may be resumed into its project's server."""
+
+
+class SavedSessionMissing(ValueError):
+    """No saved conversation with this id on the PC (launch.SavedSessionMissing)."""
+    transfer_stage = 'recover-missing'
+
+
 CONTROL_REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
 PROOF_TTL = 45
 ARCHIVE_EFFECT = '선택한 세션을 종료하고 대화 기록을 보관합니다. 하위 에이전트도 함께 종료·보관을 요청합니다.'
@@ -464,6 +471,8 @@ class WindowsRuntime:
         identity = _identity(source)
         if identity['agent'] == 'codex':
             rows = self.reader.database_rows(identity['id'])
+            if not rows:
+                raise SavedSessionMissing('PC 원본 세션과 저장된 작업 폴더를 확인하지 못했습니다.')
             cwd = source.get('cwd')
             if (len(rows) != 1 or rows[0].get('id') != identity['id'] or rows[0].get('archived') != 0
                     or not isinstance(cwd, str) or not Path(wc._windows_path(cwd)).is_absolute()
@@ -480,6 +489,13 @@ class WindowsRuntime:
                 raise ValueError('PC Claude 대화 식별자가 올바르지 않습니다.')
             root = self.reader.claude_home / 'projects'
             matches = list(root.glob('*/' + sid + '.jsonl'))
+            if not matches:
+                # Only a full session id names its transcript file (launch._full_session_id).
+                try:
+                    full = str(uuid.UUID(sid)) == sid
+                except ValueError:
+                    full = False
+                raise (SavedSessionMissing if full else ValueError)('정확한 PC Claude 저장 대화를 확인하지 못했습니다.')
             if len(matches) != 1:
                 raise ValueError('정확한 PC Claude 저장 대화를 확인하지 못했습니다.')
             path = wc._safe(matches[0], root)

@@ -50,6 +50,20 @@ REDACTIONS = (
 )
 
 
+class SavedSessionMissing(ValueError):
+    """The host has no saved conversation with this id: no Codex thread row, no Claude
+    transcript. Only this, never a changed folder or account, lets the board forget its
+    recovery locator (`Workflow.prune_recoveries`)."""
+    transfer_stage = "recover-missing"
+
+
+def _full_session_id(value):
+    try:
+        return str(uuid.UUID(value)) == value
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def scrub_text(value):
     """Best-effort redaction before a transcript crosses into another provider.
 
@@ -90,6 +104,8 @@ def saved_codex_thread(source, home=None):
         rows = connection.execute("SELECT id,cwd,archived FROM threads WHERE id=? LIMIT 2", (sid,)).fetchall()
     finally:
         connection.close()
+    if not rows:
+        raise SavedSessionMissing("원본 계정에서 정확한 세션을 확인하지 못했습니다.")
     if (len(rows) != 1 or not isinstance(rows[0][1], str) or not Path(rows[0][1]).is_absolute()
             or rows[0][2] not in (0, 1)):
         raise ValueError("원본 계정에서 정확한 세션을 확인하지 못했습니다.")
@@ -126,6 +142,9 @@ def recover_saved_session(source, home=None):
             raise ValueError("저장된 Claude 대화 식별자가 올바르지 않습니다.")
         root = _home(home) / ".claude/projects"
         matches = list(root.glob("*/" + sid + ".jsonl"))
+        if not matches:
+            # Only a full session id names its transcript file; a short worker id finds nothing either way.
+            raise (SavedSessionMissing if _full_session_id(sid) else ValueError)("정확한 Claude 저장 대화를 확인하지 못했습니다.")
         if len(matches) != 1:
             raise ValueError("정확한 Claude 저장 대화를 확인하지 못했습니다.")
         path = matches[0]

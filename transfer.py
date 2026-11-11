@@ -416,7 +416,8 @@ class Transfers:
         program += ('try:\n result=m.handle(json.loads(' + ascii(json.dumps({'op': op, 'args': args})) + ')'
                     + (',DATA' if data is not None else '') + ')\n'
                     ' print(json.dumps({"ok":True,"result":result},ensure_ascii=True))\n'
-                    'except ValueError as exc:\n print(json.dumps({"ok":False,"error":str(exc)},ensure_ascii=True))\n'
+                    'except ValueError as exc:\n print(json.dumps({"ok":False,"error":str(exc),'
+                    '"stage":getattr(exc,"transfer_stage",None)},ensure_ascii=True))\n'
                     'except Exception:\n print(json.dumps({"ok":False,"unknown":True}))\n')
         try:
             done = subprocess.run(collector_command(host, [], self.base_dir), input=program.encode(),
@@ -434,7 +435,9 @@ class Transfers:
         if not isinstance(data, dict) or data.get('unknown'):
             raise RuntimeError('PC 요청 결과를 확인하지 못했습니다.')
         if data.get('ok') is not True:
-            raise WorkerError(scrub_text(data.get('error') or 'PC 요청을 실행하지 못했습니다.')[:1000])
+            stage = data.get('stage')
+            raise WorkerError(scrub_text(data.get('error') or 'PC 요청을 실행하지 못했습니다.')[:1000],
+                              stage if isinstance(stage, str) else None)
         if not isinstance(data.get('result'), dict):
             raise RuntimeError('PC 응답 형식이 올바르지 않습니다.')
         return data['result']

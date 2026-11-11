@@ -175,6 +175,51 @@ class RecoverNativeTest(unittest.TestCase):
             self.assertEqual(wr.handle({'op': 'recover_session', 'args': {'source': self.source}}), expected)
             recover.assert_called_once_with(self.source)
 
+    def test_only_an_absent_conversation_is_reported_missing(self):
+        # Gone: no thread row / no transcript. The stage is what lets the board forget the locator.
+        gone = [self.claude_source()]
+        with sqlite3.connect(self.database) as db:
+            db.execute('DELETE FROM threads WHERE id=?', (self.sid,))
+        gone.append(self.source)
+        for platform in ('mac', 'windows'):
+            for source in gone:
+                with self.subTest(platform=platform, agent=source['agent']), self.assertRaises(ValueError) as caught:
+                    self.recover(platform, source)
+                self.assertEqual(getattr(caught.exception, 'transfer_stage', None), 'recover-missing')
+        # A short worker id without its session id cannot name a transcript: never "missing".
+        for platform in ('mac', 'windows'):
+            with self.subTest(platform=platform, short=True), self.assertRaises(ValueError) as caught:
+                self.recover(platform, self.claude_source(id='worker-a1'))
+            self.assertIsNone(getattr(caught.exception, 'transfer_stage', None))
+        # Present but changed (folder, duplicate) is a refusal, never "missing".
+        with sqlite3.connect(self.database) as db:
+            db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?)', (self.sid, str(self.cwd), 't', 1, 1, 0, 'cli'))
+        self.transcript()
+        self.transcript(project='duplicate')
+        for platform in ('mac', 'windows'):
+            for source in (dict(self.source, cwd=str(self.home / 'elsewhere')), self.claude_source()):
+                with self.subTest(platform=platform, source=source), self.assertRaises(ValueError) as caught:
+                    self.recover(platform, source)
+                self.assertIsNone(getattr(caught.exception, 'transfer_stage', None))
+
+    def test_pc_reply_carries_the_missing_stage_to_the_board(self):
+        # The program windows_rpc sends, run here against an empty home: the PC's refusal keeps its stage.
+        host = {'name': 'fixture-pc', 'platform': 'windows', 'ssh': 'fixture-pc'}
+        flow = transfer.Transfers([host], self.temp.name)
+        empty = self.home / 'empty-home'
+        empty.mkdir()
+        import subprocess
+        real_run = subprocess.run
+        def run(command, input=None, **kwargs):
+            return real_run([sys.executable, '-I', '-'], input=input, capture_output=True, timeout=30,
+                                  env={'HOME': str(empty), 'USERPROFILE': str(empty), 'PATH': '/usr/bin:/bin'})
+        source = {'host': 'fixture-pc', 'agent': 'claude', 'id': self.sid, 'home': '.claude', 'cwd': str(self.cwd)}
+        with patch('transfer.subprocess.run', side_effect=run), \
+             patch('server.collector_command', return_value=['fixture']):
+            with self.assertRaises(transfer.WorkerError) as caught:
+                flow.rpc(host, 'recover_session', {'source': source})
+        self.assertEqual(caught.exception.stage, 'recover-missing')
+
 
 if __name__ == '__main__':
     unittest.main()

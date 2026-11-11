@@ -1,7 +1,9 @@
 """Exact recovery outside the bounded list never invents a new native session."""
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -110,6 +112,90 @@ class ExactRecoveryTest(unittest.TestCase):
         handler.server = SimpleNamespace(session_tidied=Mock(), board=self.board)
         handler.tidy_after_close(self.native, ended=False)
         handler.server.session_tidied.mark.assert_not_called()
+
+    def missing(self):
+        from transfer import WorkerError
+        return WorkerError('정확한 Claude 저장 대화를 확인하지 못했습니다.', 'recover-missing')
+
+    def test_sweep_forgets_only_a_conversation_gone_on_its_host(self):
+        later = time.time() + 2 * self.flow.RECOVERY_GRACE
+        self.assertIsNotNone(self.flow.recoveries.get(REF))
+        from transfer import WorkerError
+        kept = (WorkerError('저장된 세션과 원본 작업 경로가 다릅니다.'), RuntimeError('PC 응답을 확인하지 못했습니다.'),
+                OSError('fixture'), None)
+        for outcome in kept:
+            self.flow.recovery_asked.clear()
+            with self.subTest(outcome=outcome), \
+                 patch.object(self.flow.transfers, 'rpc', side_effect=outcome,
+                              return_value={'source': self.native}) as rpc:
+                self.assertEqual(self.flow.prune_recoveries(later), 0)
+                rpc.assert_called_once()
+            self.assertIsNotNone(self.flow.recoveries.get(REF))
+        # A closed terminal record that would save the locator again keeps it.
+        self.flow.recovery_asked.clear()
+        with patch.object(self.flow.transfers, 'rpc', side_effect=self.missing()):
+            self.assertEqual(self.flow.prune_recoveries(later), 0)
+        self.assertIsNotNone(self.flow.recoveries.get(REF))
+        self.terms.records = []
+        self.flow.recovery_asked.clear()
+        with patch.object(self.flow.transfers, 'rpc', side_effect=self.missing()) as rpc:
+            self.assertEqual(self.flow.prune_recoveries(later), 1)
+            rpc.assert_called_once()
+            host, op, args = rpc.call_args.args
+            self.assertEqual((host['name'], op, args['source']['id']), ('local', 'recover_session', SOURCE['id']))
+        self.assertIsNone(self.flow.recoveries.get(REF))
+        self.assertFalse(self.terms.calls)
+
+    def test_sweep_never_asks_for_new_listed_offline_closed_or_recently_asked_locators(self):
+        self.terms.records = []
+        later = time.time() + 2 * self.flow.RECOVERY_GRACE
+        with patch.object(self.flow.transfers, 'rpc', side_effect=self.missing()) as rpc:
+            self.assertEqual(self.flow.prune_recoveries(time.time()), 0)       # just opened: may be starting
+            self.board.state['local']['ok'] = False
+            self.assertEqual(self.flow.prune_recoveries(later), 0)             # host offline
+            self.board.state['local']['ok'] = True
+            self.rows[:] = [SOURCE]
+            self.board.poll(HOST)
+            self.assertEqual(self.flow.prune_recoveries(later), 0)             # listed
+            rpc.assert_not_called()
+            self.rows[:] = []
+            self.board.poll(HOST)
+            self.flow.recovery_asked[json.dumps([REF['host'], REF['agent'], REF['home'], REF['id']])] = later
+            self.assertEqual(self.flow.prune_recoveries(later + 60), 0)        # asked a minute ago
+            self.flow.recoveries.remember({**self.native, 'explicitTermination': True})
+            self.flow.recovery_asked.clear()
+            self.assertEqual(self.flow.prune_recoveries(later), 0)             # an explicit end is kept
+            rpc.assert_not_called()
+        self.assertIsNotNone(self.flow.recoveries.get(REF))
+
+    def test_sweep_asks_a_bounded_batch(self):
+        self.terms.records = []
+        for index in range(self.flow.RECOVERY_BATCH + 2):
+            self.flow.recoveries.remember({**self.native, 'id': SOURCE['id'][:-2] + '%02d' % (index + 10)})
+        later = time.time() + 2 * self.flow.RECOVERY_GRACE
+        with patch.object(self.flow.transfers, 'rpc', return_value={'source': self.native}) as rpc:
+            self.flow.prune_recoveries(later)
+        self.assertEqual(rpc.call_count, self.flow.RECOVERY_BATCH)
+
+    def test_opening_a_gone_conversation_forgets_it_and_says_so(self):
+        self.terms.records = []
+        old = int(time.time() - 2 * self.flow.RECOVERY_GRACE)
+        self.flow.recoveries.remember({**self.native, 'openedAt': old})
+        from session_recovery import RecoveryError
+        with patch.object(self.flow.transfers, 'rpc', side_effect=self.missing()), \
+             self.assertRaises(RecoveryError) as caught:
+            self.flow.resolve_source(REF, verify=True)
+        self.assertEqual((caught.exception.status, caught.exception.payload['code']), (410, 'recovery_session_gone'))
+        self.assertIsNone(self.flow.recoveries.get(REF))
+
+    def test_opening_a_new_or_changed_conversation_keeps_it(self):
+        self.terms.records = []
+        from transfer import WorkerError
+        for error in (self.missing(), WorkerError('저장된 세션과 원본 작업 경로가 다릅니다.')):
+            with self.subTest(error=str(error)), patch.object(self.flow.transfers, 'rpc', side_effect=error), \
+                 self.assertRaises(WorkerError):
+                self.flow.resolve_source(REF, verify=True)
+            self.assertIsNotNone(self.flow.recoveries.get(REF))
 
     def test_windows_idle_connections_are_never_auto_released(self):
         self.board.hosts[0] = {**HOST, 'platform': 'windows'}
