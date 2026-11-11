@@ -488,6 +488,85 @@ test('최근 작업 흐름의 진행 중 딱지는 새로고침 없이 질문이
   assert.ok(findRow.children[1].children.some(node => node.className === 'woni-find-running'));
 });
 
+// 라이언 2026-11-11 "최근작업흐름에 옆에 1이 뜨는데 클릭해도 안 없어지는데"
+function readFixture({ marks = true } = {}) {
+  const now = Date.now() / 1000, start = now - 100, posts = [];
+  const server = { read: start, marks: {} };
+  let chats = [{ id: 'old', stream: 'flow-a', text: '옛 질문', answer: '옛 답', status: 'complete', createdAt: start - 20, finishedAt: start - 10 }];
+  const unreadIn = id => chats.filter(chat => chat.stream === id && chat.status === 'complete' && chat.answer &&
+    chat.finishedAt > Math.max(server.read, server.marks[id] || 0)).length;
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni/read') {
+      posts.push(options.body);
+      if (options.body.stream) server.marks[options.body.stream] = Math.max(server.marks[options.body.stream] || 0, options.body.through);
+      else server.read = Math.max(server.read, options.body.through);
+      return { readThrough: server.read, ...(marks ? { streamRead: { ...server.marks } } : {}) };
+    }
+    if (url === '/api/woni/streams') return { items: ['flow-a', 'flow-b'].map((id, n) => ({ id, title: `흐름 ${id.slice(-1).toUpperCase()}`, count: 1, running: 0, unread: unreadIn(id), lastAt: now - n })), total: 2 };
+    if (url.startsWith('/api/woni/chats?')) return { chats: [], hasMore: false };
+    if (url === '/api/woni/tasks') return { actions: [], completedActions: [], archivedActions: [], counts: {} };
+    return { chats, activity: {}, readThrough: server.read, ...(marks ? { streamRead: { ...server.marks } } : {}) };
+  };
+  const f = fixture(call);
+  const plain = value => JSON.parse(JSON.stringify(value));  // vm 안 객체를 비교할 수 있게
+  const item = key => f.nodes['woni-side'].children.find(node => node.dataset?.side === key);
+  const text = node => [node?.textContent || '', ...(node?.children || []).map(text)].join('');
+  const count = key => text(item(key).children[1]).replace('새 답 ', '');
+  const settle = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate); };
+  return { ...f, start, get posts() { return plain(posts); }, server, item, count, settle, setChats: next => { chats = next(chats); } };
+}
+
+test('흐름을 열어 읽으면 다른 흐름에 먼저 끝난 안 읽은 답이 있어도 그 흐름의 새 답 수가 바로 지워진다', async () => {
+  const r = readFixture();
+  await r.app.check(r.call); r.nodes['woni-open'].click(); await r.settle();
+  r.item('stream:flow-a').click(); await r.settle();
+  // 흐름 A를 보는 사이 B 답(먼저 끝남)과 A 답이 끝난다.
+  r.setChats(chats => [...chats,
+    { id: 'b1', stream: 'flow-b', text: 'B 질문', answer: 'B 답', status: 'complete', createdAt: r.start + 1, finishedAt: r.start + 10 },
+    { id: 'a1', stream: 'flow-a', text: 'A 질문', answer: 'A 답', status: 'complete', createdAt: r.start + 2, finishedAt: r.start + 20 }]);
+  await r.tick(); await r.settle();
+  // 전체 기준은 못 본 B 답 앞에서 멈추고, A는 흐름 읽음으로 남긴다.
+  assert.deepEqual(r.posts, [{ through: r.start + 20, stream: 'flow-a' }]);
+  assert.equal(r.count('stream:flow-a'), '');
+  assert.equal(r.count('stream:flow-b'), '1');
+  assert.equal(r.nodes['woni-unread'].textContent, '1');  // 원이 버튼의 새 답도 B 하나
+  // 전체 대화로 돌아와 B까지 보면 전체 기준이 앞으로 가고 메뉴의 수도 바로 다시 읽는다.
+  r.item('view:chat').click(); await r.settle();
+  assert.deepEqual(r.posts.at(-1), { through: r.start + 20 });
+  assert.equal(r.count('stream:flow-b'), '');
+  assert.equal(r.nodes['woni-unread'].hidden, true);
+});
+
+test('메뉴에서 흐름을 누르면 목록을 다시 읽기 전에도 그 흐름의 새 답 수를 지우고, 읽음을 남긴 뒤 목록을 바로 다시 읽는다', async () => {
+  const r = readFixture();
+  await r.app.check(r.call); r.nodes['woni-open'].click(); await r.settle();
+  r.item('stream:flow-b').click(); await r.settle();
+  // 흐름 B를 보는 사이 A에서 질문이 돌다가 끝난다.
+  const a1 = { id: 'a1', stream: 'flow-a', text: 'A 질문', status: 'running', createdAt: r.start + 2 };
+  r.setChats(chats => [...chats, a1]); await r.tick(); await r.settle();
+  r.setChats(chats => [...chats.slice(0, -1), { ...a1, answer: 'A 답', status: 'complete', finishedAt: r.start + 20 }]); await r.tick(); await r.settle();
+  assert.equal(r.posts.some(body => !body.stream), false);  // B 화면에선 A 답을 전체 읽음으로 넘기지 않는다
+  assert.equal(r.count('stream:flow-a'), '1');
+  r.item('stream:flow-a').click();
+  assert.equal(r.count('stream:flow-a'), '');  // 누르는 즉시
+  await r.settle();
+  assert.equal(r.posts.at(-1).through, r.start + 20);  // 다른 흐름에 남은 답이 없으면 전체 기준으로 남는다
+  r.item('stream:flow-b').click(); await r.settle();
+  assert.equal(r.count('stream:flow-a'), '');  // 다시 읽은 목록에서도 0
+});
+
+test('흐름별 읽음을 모르는 이전 원이 서버에는 흐름 읽음을 보내지 않는다', async () => {
+  const r = readFixture({ marks: false });
+  r.setChats(chats => [...chats,
+    { id: 'b1', stream: 'flow-b', text: 'B 질문', answer: 'B 답', status: 'complete', createdAt: r.start + 1, finishedAt: r.start + 10 },
+    { id: 'a1', stream: 'flow-a', text: 'A 질문', answer: 'A 답', status: 'complete', createdAt: r.start + 2, finishedAt: r.start + 20 }]);
+  await r.app.check(r.call); await r.settle();
+  r.nodes['woni-open'].click(); await r.settle(); r.item('stream:flow-a').click(); await r.settle();
+  await r.tick(); await r.settle();
+  assert.equal(r.posts.some(body => body.stream), false);
+});
+
 test('대화가 하나도 없으면 빈 화면 안내와 오늘 정리 버튼을 보여 준다', async () => {
   const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
   const { nodes, app } = fixture(call);

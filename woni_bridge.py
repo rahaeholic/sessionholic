@@ -40,14 +40,25 @@ def validate(data):
 
 
 def validate_read(data):
-    through = data.get("through") if isinstance(data, dict) and set(data) == {"through"} else None
+    # stream: only that stream was open, so only its answers are read (Ryan 2026-11-11 "최근작업흐름 옆에 1이 뜨는데 클릭해도 안 없어지는데").
+    through = data.get("through") if isinstance(data, dict) and set(data) in ({"through"}, {"through", "stream"}) else None
     if isinstance(through, bool) or not isinstance(through, (int, float)) or not math.isfinite(through) or through <= 0:
         raise ValueError("읽은 시각을 확인해 주세요.")
+    if "stream" in data and (not isinstance(data["stream"], str) or not re.fullmatch(r"[a-z0-9-]{1,40}", data["stream"])):
+        raise ValueError("흐름을 확인해 주세요.")
     return data
 
 
 def read_through(value):
     return value if not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else None
+
+
+def stream_marks(value):
+    """Woni's per-stream read marks ({stream: time}), only well-formed entries; None when the server sends none."""
+    if not isinstance(value, dict):
+        return None
+    return {key: mark for key, mark in list(value.items())[:200]
+            if isinstance(key, str) and re.fullmatch(r"[a-z0-9-]{1,40}", key) and read_through(mark) is not None}
 
 
 def validate_task_status(data):
@@ -297,6 +308,8 @@ def local_call(data=None, home=None, operation="state", query=None):
             output["chatTotal"] = result["chatTotal"]
         if read_through(result.get("readThrough")) is not None:
             output["readThrough"] = result["readThrough"]  # 원이앱·하던일이 함께 쓰는 '이 시각까지 끝난 답은 읽음'
+            if stream_marks(result.get("streamRead")) is not None:
+                output["streamRead"] = stream_marks(result["streamRead"])  # 흐름만 열어 읽은 답: 그 흐름은 이 시각까지 읽음
         return output
     if data is None and operation == "activity":
         def clean_row(row):
@@ -316,7 +329,8 @@ def local_call(data=None, home=None, operation="state", query=None):
     if operation == "read":
         if read_through(result.get("readThrough")) is None:
             raise ValueError("읽음 표시를 확인하지 못했어요.")
-        return {"readThrough": result["readThrough"]}
+        marks = stream_marks(result.get("streamRead"))
+        return {"readThrough": result["readThrough"], **({"streamRead": marks} if marks is not None else {})}
     return {key: result[key] for key in ("id", "status") if key in result}
 
 
