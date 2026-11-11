@@ -18,8 +18,11 @@ ATTACHMENT_ID = re.compile(r"\d{8}-[0-9a-f]{12}\Z")
 
 
 def validate(data):
-    if not isinstance(data, dict) or not {"text", "requestId"} <= set(data) or set(data) - {"text", "requestId", "attachments", "replyTo"}:
+    if not isinstance(data, dict) or not {"text", "requestId"} <= set(data) or set(data) - {"text", "requestId", "attachments", "replyTo", "retryOf"}:
         raise ValueError("메시지와 요청 ID를 확인해 주세요.")
+    # 실패·중단된 질문 다시 보내기(원이가 그 질문에 잇고, 재시작 때 멈춘 것은 같은 세션에서 이어서 한다)
+    if "retryOf" in data and (not isinstance(data["retryOf"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", data["retryOf"])):
+        raise ValueError("다시 보낼 질문을 확인해 주세요.")
     if not isinstance(data["text"], str) or not 1 <= len(data["text"].strip()) <= 12000:
         raise ValueError("메시지를 확인해 주세요.")
     if not isinstance(data["requestId"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", data["requestId"]):
@@ -173,7 +176,8 @@ def clean_transcript(result, query):
     return pick(result, ("sourceId", "text", "truncated", "offset", "nextOffset", "revision", "label"))
 
 
-CHAT_KEYS = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo")
+CHAT_KEYS = ("id", "kind", "text", "answer", "status", "progress", "createdAt", "finishedAt", "stream", "streamTitle", "replyTo",
+             "retriedBy", "errorKind", "toolsRan")  # 실패·중단 안내와 다시 보내기
 
 
 def clean_chat(chat):
