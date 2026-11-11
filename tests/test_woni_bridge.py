@@ -133,7 +133,7 @@ class WoniBridgeTest(unittest.TestCase):
                 'guessBasis': '근거', 'ownerGuess': '추정', 'archived': False,
                 'autoBasis': {'quote': 'q', 'source': 's', 'at': 'a', 'reason': 'r', 'extra': 'x'},
                 'candidates': [{'id': 'x'}], 'linkedSession': {'id': 'y'}, 'recordSummary': '요약', 'url': 'https://drive.google.com/x',
-                'requestedBy': '나', 'guessName': 'g', 'source': 'slack', 'status': 'open', 'title2': 'x'}
+                'requestedBy': '라이언', 'flow': '라이언 → 민수', 'guessName': 'g', 'source': 'slack', 'status': 'open', 'title2': 'x'}
         original = {'actions': [task, 'bad'], 'completedActions': [{'id': 'b' * 24, 'taskStatus': 'done', 'quote': None, 'archived': 'yes'}],
                     'actionCount': 6, 'delegatedCount': 10, 'unassignedCount': 91, 'followupCount': 1, 'dueCount': True, 'autoDoneCount': 2,
                     'completedActionCount': 282, 'archivedCount': 273, 'syncedAt': 1794269917.5, 'driveError': '',
@@ -143,8 +143,10 @@ class WoniBridgeTest(unittest.TestCase):
         self.assertEqual((request.full_url, request.get_header('Authorization'), request.get_header('X-woni-task-roles')),
                          ('http://127.0.0.1:18772/v1/state', 'Bearer test-credential', '1'))
         self.assertEqual(set(result), {'actions', 'completedActions', 'archivedActions', 'counts', 'syncedAt', 'error'})
-        for key in ('candidates', 'linkedSession', 'recordSummary', 'url', 'requestedBy', 'guessName', 'source', 'status', 'title2'):
+        for key in ('candidates', 'linkedSession', 'recordSummary', 'url', 'guessName', 'source', 'status', 'title2'):
             self.assertNotIn(key, result['actions'][0])
+        # 누가 누구에게 맡긴 일인지(Ryan One 1.46.0)는 보인다
+        self.assertEqual((result['actions'][0]['requestedBy'], result['actions'][0]['flow']), ('라이언', '라이언 → 민수'))
         self.assertEqual(result['actions'][0]['autoBasis'], {'quote': 'q', 'source': 's', 'at': 'a', 'reason': 'r'})
         self.assertEqual(len(result['actions']), 1)
         self.assertEqual(result['actions'][0]['stateEvent'], 'xxxx:completion-reported')
