@@ -8,6 +8,7 @@
   const filterBox = $("woni-filter"), replyBox = $("woni-reply"), original = $("woni-original");
   const replyPicks = $("woni-reply-suggestions");
   let api, services = {}, timer, reading = false, sending = false, pending = null, epoch = 0;
+  const resending = new Set();  // failed asks being resent (one request each)
   let attachments = [], uploading = false, uploadAbort = null, composing = false, compositionEndedAt = 0, authEpoch = 0;
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
   let pendingState = "uncertain";
@@ -1416,9 +1417,9 @@
   }
   // Woni's answer, an alert or a failure; a detached one quotes the ask above its bubble.
   function answerRow(nodes, chat, item, latestId) {
-    const askOf = item.detached ? chat : null;
-    if (chat.answer) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat, { askOf }));
-    const replies = chat.answer && chat.id === latestId && !pending ? suggestedReplies(chat.answer) : [];
+    const askOf = item.detached ? chat : null, failed = ["failed", "interrupted"].includes(chat.status);
+    if (chat.answer && !failed) nodes.push(row("assistant", visibleAnswer(chat.answer) || chat.answer, [], chat, chat, { askOf }));
+    const replies = chat.answer && !failed && chat.id === latestId && !pending ? suggestedReplies(chat.answer) : [];
     if (replies.length) {
       const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "추천 답장");
       // A suggestion always goes as a reply to this answer (Ryan One app 1.44.0): the answer that finished last can be
@@ -1428,7 +1429,37 @@
     }
     // An alert has no ask row, so one still being made shows its working line here (as before).
     else if (["queued", "running"].includes(chat.status)) nodes.push(stateRow("working", row("assistant", chat.progress || "생각하고 있어요…", [], null, chat.answer ? null : chat)));
-    else if (["failed", "interrupted"].includes(chat.status)) nodes.push(stateRow("failed", row("assistant", "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], null, chat.answer ? null : chat, { askOf: chat.answer ? null : askOf })));
+    // A failure says in Woni's own words what stopped it (Ryan 2026-11-11: after a restart it showed only '완료하지 못했어요'):
+    // e.g. '9시 43분 원이 서버 재시작 때 이 작업도 멈췄어요. 그전까지 도구를 12번 썼어요. 다시 보내면 같은 세션에서 이어서 해요.'
+    // '다시 보내기' resends it once as the app does; Woni continues a stopped one in its own session.
+    else if (failed) {
+      nodes.push(stateRow("failed", row("assistant", chat.answer || "답변을 완료하지 못했어요. 원이 앱에서 상태를 확인해 주세요.", [], chat.answer ? chat : null, chat, { askOf })));
+      if (chat.kind !== "alert" && chat.text) {
+        const box = el("div", "woni-suggestions"); box.setAttribute("aria-label", "다시 보내기");
+        if (chat.retriedBy) box.append(el("span", "woni-retried", "다시 보냈어요. 아래 답을 확인해 주세요."));
+        else box.append(action("다시 보내기", (event) => resend(chat, event?.currentTarget)));
+        nodes.push(box);
+      }
+    }
+  }
+  // Resends a failed or stopped ask once (retryOf): Woni links it to the failed one, so another tap returns that resend.
+  async function resend(chat, button) {
+    if (sending || resending.has(chat.id)) return;
+    if (chat.errorKind !== "interrupted" && Number(chat.toolsRan) > 0 &&
+        !globalThis.confirm?.("이전 시도에서 원이가 작업을 실행했을 수 있어요. 다시 보내면 답변 전송·할 일 변경 같은 작업이 한 번 더 실행될 수 있어요. 다시 보낼까요?")) return;
+    const ids = (chat.attachments || []).map((file) => file?.id).filter((id) => typeof id === "string");
+    const reply = chat.replyTo?.id ? { id: chat.replyTo.id, part: chat.replyTo.part } : null;
+    const body = { text: chat.text, requestId: crypto.randomUUID(), retryOf: chat.id, ...(ids.length ? { attachments: ids } : {}), ...(reply ? { replyTo: reply } : {}) };
+    resending.add(chat.id); if (button) button.disabled = true;
+    try {
+      await api("/api/woni", { method: "POST", body, csrfRetry: false });
+      status.textContent = "다시 보냈어요.";
+    } catch (_) {
+      status.textContent = "다시 보냈는지 확인하지 못했어요. 잠시 뒤 목록을 확인해 주세요.";
+    } finally {
+      resending.delete(chat.id); if (button) button.disabled = false;
+      clearTimeout(timer); refresh();
+    }
   }
   async function refresh() {
     if (!enabled || reading || !api) return;

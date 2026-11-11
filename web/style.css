@@ -300,6 +300,7 @@
 .woni-work button, .woni-original button { min-height: 36px; padding: 4px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--accent); font: inherit; font-size: var(--fs-sub); cursor: pointer; }
 .woni-message-actions button:active, .woni-suggestions button:active, .woni-chips button:active, .woni-note-card:active { transform: scale(var(--press-scale)); }
 .woni-suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin: -2px 0 16px; }
+.woni-retried { color: var(--label-2); font-size: var(--fs-sub); }
 .woni-suggestions button { min-height: 40px; padding: 8px 14px; border: 0; border-radius: 999px; background: var(--accent-tint); color: var(--accent-strong); font: inherit; font-size: var(--fs-sub); font-weight: 500; text-align: left; cursor: pointer; touch-action: manipulation; }
 @media (hover: hover) { .woni-suggestions button:hover { background: var(--accent-tint-press); } }
 .woni-suggestions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

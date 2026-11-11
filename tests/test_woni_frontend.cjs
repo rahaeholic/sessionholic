@@ -1501,3 +1501,30 @@ test('원이 입력창은 다른 입력칸처럼 맞춤법 검사·자동 보정
   for (const [key, val] of [['spellcheck', 'false'], ['autocorrect', 'off'], ['autocomplete', 'off'], ['autocapitalize', 'off']])
     assert.match(tag, new RegExp(`\\s${key}="${val}"`));
 });
+
+test('실패·중단 줄은 원이가 쓴 안내를 그대로 보이고, 다시 보내기는 retryOf로 한 번만 보낸다', async () => {
+  // 라이언 2026-11-11: 재시작 뒤 하던일 원이에는 '완료하지 못했어요'만 떴다. 앱과 같은 안내와 다시 보내기를 둔다.
+  const sent = [];
+  const stopped = '9시 43분 원이 서버 재시작 때 이 작업도 멈췄어요. 그전까지 도구를 12번 썼어요. 다시 보내면 같은 세션에서 이어서 해요.';
+  const chats = [
+    { id: 'done', seq: 1, text: '끝난 질문', status: 'complete', answer: '끝난 답', createdAt: 10, finishedAt: 20 },
+    { id: 'again', seq: 2, text: '이미 다시 보낸 질문', status: 'failed', answer: 'Claude 연결이 잠시 불안정했어요.', retriedBy: 'r1', createdAt: 30, finishedAt: 40 },
+    { id: 'stop', seq: 3, text: '근본원인부터 해결해줘', status: 'interrupted', errorKind: 'interrupted', toolsRan: 12, answer: stopped,
+      replyTo: { id: 'done', part: 'answer', who: '원이', excerpt: '끝난 답' }, attachments: [{ id: '20261111-abcdefabcdef', name: 'a.png' }], createdAt: 50, finishedAt: 60 },
+  ];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni' && options?.method === 'POST') { sent.push(JSON.parse(JSON.stringify(options.body))); return { id: options.body.requestId, status: 'queued' }; }
+    if (options?.method === 'POST') return {};
+    return { chats, activity: {} };
+  };
+  const { nodes, app } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await settle();
+  const failed = nodes['woni-messages'].children.filter(node => node.dataset?.state === 'failed');
+  assert.deepEqual(failed.map(node => textOf(byClass(node, 'woni-message-body')[0])), ['Claude 연결이 잠시 불안정했어요.', stopped]);
+  assert.equal(textOf(nodes['woni-messages']).includes('답변을 완료하지 못했어요'), false);  // 고정 문구 대신 원이 안내
+  const boxes = nodes['woni-messages'].children.filter(node => node['aria-label'] === '다시 보내기' || node.attributes?.['aria-label'] === '다시 보내기' || (node.className === 'woni-suggestions' && textOf(node).includes('다시')));
+  assert.deepEqual(boxes.map(textOf), ['다시 보냈어요. 아래 답을 확인해 주세요.', '다시 보내기']);
+  await boxes[1].children[0].click(); await settle();
+  assert.deepEqual(sent, [{ text: '근본원인부터 해결해줘', requestId: 'request-123456', retryOf: 'stop', attachments: ['20261111-abcdefabcdef'], replyTo: { id: 'done', part: 'answer' } }]);
+});

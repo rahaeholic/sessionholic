@@ -62,6 +62,20 @@ class WoniBridgeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             woni_bridge.validate({**data, 'attachments': ['../unsafe']})
 
+    def test_resend_of_a_failed_or_stopped_ask_passes_retry_of_and_its_notice(self):
+        # 2026-11-11 재시작 뒤 다시 붙기: 하던일에서도 앱처럼 다시 보내기(retryOf)와 원이 안내(errorKind·toolsRan·retriedBy)를 쓴다.
+        data = {'text': '근본원인부터', 'requestId': 'request-123456', 'retryOf': 'chat-stopped'}
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'id': 'request-123456', 'status': 'queued'})) as urlopen:
+            woni_bridge.local_call(data, self.home)
+        self.assertEqual(json.loads(urlopen.call_args.args[0].data), data)
+        for invalid in ('../x', 3, ''):
+            with self.assertRaises(ValueError): woni_bridge.validate({**data, 'retryOf': invalid})
+        chat = {'id': 'chat-stopped', 'status': 'interrupted', 'errorKind': 'interrupted', 'toolsRan': 12, 'retriedBy': 'r1', 'run': {'pid': 1}}
+        with patch.object(woni_bridge, 'urlopen', return_value=Response({'chats': [chat], 'activity': {}})):
+            shown = woni_bridge.local_call(home=self.home)['chats'][0]
+        self.assertEqual({k: shown[k] for k in ('errorKind', 'toolsRan', 'retriedBy')}, {'errorKind': 'interrupted', 'toolsRan': 12, 'retriedBy': 'r1'})
+        self.assertNotIn('run', shown)
+
     def test_reply_and_read_operations_are_narrowly_validated(self):
         data = {'text': '계속', 'requestId': 'request-123456', 'replyTo': {'id': 'chat-1', 'part': 'answer'}}
         with patch.object(woni_bridge, 'urlopen', return_value=Response({'status': 'queued'})) as urlopen:
