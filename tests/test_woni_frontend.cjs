@@ -696,7 +696,7 @@ const settle = () => new Promise(setImmediate);
 function taskData() {
   return {
     actions: [
-      { id: 'a1', kind: 'mine', title: '재입고 일정 공유하기', project: '물류', due: '11/12', taskStatus: 'open', stateEvent: 'e1', quote: '목요일까지 공유할게요', recordTitle: '주간 회의', recordedAt: '2026-11-08 10:00', counterpart: '김팀장', sourceId: 'rec-1' },
+      { id: 'a1', kind: 'mine', title: '재입고 일정 공유하기', project: '물류', due: '11/12', taskStatus: 'open', stateEvent: 'e1', quote: '목요일까지 공유할게요', recordTitle: '주간 회의', recordedAt: '2026-11-08 10:00', counterpart: '김팀장', sourceId: 'rec-1', requestedBy: '김팀장', flow: '김팀장 → 라이언' },
       { id: 'd1', kind: 'delegated', title: '촬영 견적 받기', assignee: '박매니저', attention: '완료 보고 · 확인 필요', taskStatus: 'reported', previousStatus: 'open', stateEvent: 'd1:completion-reported', reportQuote: '견적 받았어요', project: '마케팅' },
       { id: 'd2', kind: 'delegated', title: '상세페이지 수정', attention: '기다리는 중', taskStatus: 'open', stateEvent: '' },
       { id: 'u1', kind: 'unassigned', title: '샘플 발송', attention: '담당 확인 · 박매니저일 가능성', guessBasis: '박매니저가 보내겠다고 말함', taskStatus: 'open', stateEvent: '' },
@@ -730,11 +730,14 @@ test('할 일 탭은 종류·보기·찾기로 나누고 앱과 같은 줄과 �
   assert.deepEqual(byClass(nodes['woni-tasks'], 'woni-kinds')[0].children.map(textOf), ['내가 할 일1', '내가 맡긴 일2', '담당 확인1']);
   assert.deepEqual(titles(), ['재입고 일정 공유하기']);
   assert.equal(textOf(byClass(rows()[0], 'woni-task-meta')[0]), '물류 · 11/12');
+  // 누가 누구에게 맡긴 일인지(Ryan One 1.46.0): 서버가 준 flow
+  assert.equal(textOf(byClass(rows()[0], 'woni-task-line')[0]), '김팀장 → 라이언');
   assert.equal(rows()[0].children[0]['aria-label'], '완료 처리: 재입고 일정 공유하기');
   toggle('내가 맡긴 일').click();
   assert.deepEqual(titles(), ['촬영 견적 받기', '상세페이지 수정']);
   const lines = byClass(nodes['woni-tasks'], 'woni-task-line');
-  assert.deepEqual(lines.map(textOf), ['담당: 박매니저 · 완료 보고 · 확인 필요', '담당: 담당 미정 · 기다리는 중']);
+  // flow가 없는 옛 서버 응답도 맡긴 일은 '라이언 → 받는 사람'으로 보인다
+  assert.deepEqual(lines.map(textOf), ['라이언 → 박매니저 · 완료 보고 · 확인 필요', '라이언 → 받을 사람 확인 필요 · 기다리는 중']);
   assert.equal(lines[0].className.includes('is-attention'), true); assert.equal(lines[1].className.includes('is-attention'), false);
   assert.match(textOf(byClass(nodes['woni-tasks'], 'woni-note-hint')[0]), /^확인 필요 1개 · 완료 보고와 마감이 된 일을 먼저 보여줘요/);
   assert.equal(rows()[0].children[0]['aria-label'], '결과 확인 완료: 촬영 견적 받기');
@@ -837,7 +840,8 @@ test('할 일 상세는 근거·담당·버튼을 보여 주고 노트 읽기 �
   assert.equal(detail().hidden, true); assert.equal(nodes['woni-tasks'].scrollTop, 120);  // 목록 스크롤 유지
   toggle('내가 맡긴 일').click();
   byClass(rows()[0], 'woni-task-open')[0].click();  // 완료 보고된 맡긴 일
-  assert.ok(textOf(detail()).includes('담당: 박매니저'));
+  assert.ok(textOf(detail()).includes('맡긴 사람: 라이언'));
+  assert.ok(textOf(detail()).includes('할 사람: 박매니저'));
   assert.ok(textOf(detail()).includes('완료 보고 근거: 견적 받았어요'));
   assert.equal(buttonOf(detail(), '완료 보고 받음'), undefined);
   buttonOf(detail(), '다시 기다리는 중으로').click(); await settle();

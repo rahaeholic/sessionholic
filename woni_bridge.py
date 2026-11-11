@@ -124,7 +124,7 @@ def pick(row, keys):
 
 
 def clean_tasks(result):
-    text = ("id", "kind", "title", "project", "due", "assignee", "attention", "taskStatus", "previousStatus", "stateEvent", "quote",
+    text = ("id", "kind", "title", "project", "due", "assignee", "requestedBy", "flow", "attention", "taskStatus", "previousStatus", "stateEvent", "quote",
             "requestQuote", "reportQuote", "recordTitle", "recordedAt", "counterpart", "sourceId", "guessBasis", "ownerGuess")
     def clean(row):
         item = {key: row[key] for key in text if isinstance(row.get(key), str)}

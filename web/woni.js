@@ -552,10 +552,18 @@
     return list.filter((task) => taskFilter === "archived" || kindOf(task) === taskKind)
       .filter((task) => !query || ["title", "project", "recordTitle", "assignee"].some((key) => String(task[key] || "").toLowerCase().includes(query)));
   }
+  // Who handed it to whom (Ryan One 1.46.0, Ryan 2026-11-11 "누가 맡겼는지도, 누구에게 맡긴 건지도 잘 분간해야 돼").
+  // The server sends `flow`; an older server only gets the delegated line built here.
+  function assigneeOf(task) { const who = String(task.assignee || ""); return who && who !== "담당 미정" ? who : ""; }
+  function taskFlow(task) {
+    if (task.flow) return String(task.flow);
+    return kindOf(task) === "delegated" ? `라이언 → ${assigneeOf(task) || "받을 사람 확인 필요"}` : "";
+  }
   function taskLines(task) {
-    const kind = kindOf(task), saving = taskSaving.has(task.id), attention = String(task.attention || ""), lines = [];
-    if (kind === "delegated") lines.push([`woni-task-line${attentionClass(attention)}`, `담당: ${task.assignee || "담당 미정"}${attention ? ` · ${attention}` : ""}`]);
-    else if (kind === "unassigned" && task.guessBasis) lines.push(["woni-task-line is-guess", attention.replace(/^담당 확인 · /, "")]);
+    const kind = kindOf(task), saving = taskSaving.has(task.id), attention = String(task.attention || ""), lines = [], flow = taskFlow(task);
+    if (kind === "delegated") lines.push([`woni-task-line${attentionClass(attention)}`, `${flow}${attention ? ` · ${attention}` : ""}`]);
+    else if (flow) lines.push(["woni-task-line", flow]);
+    if (kind === "unassigned" && task.guessBasis) lines.push(["woni-task-line is-guess", attention.replace(/^담당 확인 · /, "")]);
     if (isDone(task) && !saving && task.autoBasis?.quote) lines.push(["woni-task-auto", `원이 확인 · “${task.autoBasis.quote}”`]);
     lines.push(saving ? ["woni-task-meta is-saving", "저장 중…"] : ["woni-task-meta", [task.project, task.due].filter(Boolean).join(" · ")]);
     return lines.filter(([, text]) => text);
@@ -651,9 +659,13 @@
       nodes.push(box);
     }
     const actions = el("div", "woni-detail-actions");
+    const by = String(task.requestedBy || "") || (kind === "delegated" ? "라이언" : "");
+    if (by) {
+      const to = kind === "unassigned" ? "확인 필요" : kind === "mine" ? "라이언" : assigneeOf(task) || "확인 필요";
+      nodes.push(el("p", "woni-group-title", `맡긴 사람: ${by}`), el("p", "woni-group-title", `할 사람: ${to}`));
+    }
     if (kind === "delegated") {
       const group = el("section", "woni-group");
-      group.append(el("p", "woni-group-title", `담당: ${task.assignee || "담당 미정"}`));
       if (attention) group.append(el("p", `woni-note-hint${attentionClass(attention)}`, attention));
       if (task.reportQuote) group.append(el("p", "", `완료 보고 근거: ${task.reportQuote}`));
       nodes.push(group);
