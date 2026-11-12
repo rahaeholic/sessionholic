@@ -6266,6 +6266,37 @@ test('the theme follows the device by default, forced themes set data-theme, onl
   assert.deepEqual(metas.map((item) => item.attributes.content), ['#f2f2f7', '#f2f2f7']);
 });
 
+test('inside the Ryan One app a theme picked on the board tells the app, and the app sets the board without an echo', () => {
+  const c = client(undefined, noChatTimers);
+  const root = c.context.document.documentElement;
+  root.attributes = {};
+  root.setAttribute = (name, value) => { root.attributes[name] = String(value); };
+  root.removeAttribute = (name) => { delete root.attributes[name]; };
+  c.context.document.querySelectorAll = () => [];
+  const writes = [];
+  c.context.localStorage = { getItem: () => null, setItem: (key, value) => writes.push([key, value]) };
+  const told = [];
+  c.context.window.RyanOneHost = { compact: true, setTheme(mode) { told.push(mode); return true; } };
+  c.applyTheme('auto');
+  c.setTheme('dark');
+  assert.deepEqual(told, ['dark'], 'a choice on the board reaches the app');
+  assert.equal(root.attributes['data-theme'], 'dark');
+  c.setTheme('light', { fromHost: true });
+  assert.deepEqual(told, ['dark'], 'the app setting the board is not sent back');
+  assert.equal(root.attributes['data-theme'], 'light');
+  assert.equal(c.get('theme-light').checked, true);
+  c.setTheme('light', { fromHost: true });
+  c.setTheme('auto', { fromHost: true });
+  assert.equal(root.attributes['data-theme'], undefined, 'the app may hand the look back to the device');
+  assert.deepEqual(writes.map(([, value]) => value), ['"dark"', '"light"', '"auto"'], 'the app\'s choice is stored for the next first paint');
+  c.context.window.RyanOneHost = { compact: true };
+  c.setTheme('dark');
+  assert.equal(root.attributes['data-theme'], 'dark', 'an older app without setTheme leaves the board working');
+  c.context.window.RyanOneHost = { compact: true, setTheme() { throw new Error('host gone'); } };
+  c.setTheme('light');
+  assert.equal(root.attributes['data-theme'], 'light', 'a failing host does not undo the board choice');
+});
+
 test('the settings sheet opens from the top bar with the current theme and returns focus when closed', () => {
   const c = client(undefined, noChatTimers);
   c.context.navigator = { onLine: false };

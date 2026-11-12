@@ -366,12 +366,21 @@ function applyTheme(theme = state.theme) {
   }
   updateThemeColor();
 }
-function setTheme(theme) {
+// Inside the Ryan One app one look covers the app and this board (Ryan 2026-11-13): the app
+// sets the board's theme with { fromHost: true }, and a choice made here tells the app. An
+// older app has no RyanOneHost.setTheme, so the board then keeps its own choice as before.
+function setTheme(theme, { fromHost = false } = {}) {
   const next = normalizeTheme(theme);
   if (next === state.theme) return;
   applyTheme(next);
   prefs.set("theme", next);
+  if (fromHost) return;
   haptic("select");
+  try {
+    window.RyanOneHost?.setTheme?.(next);
+  } catch {
+    // The host only mirrors the choice; the board has already applied it.
+  }
 }
 // Board text size: "small"/"large" scale the root font size (style.css section
 // 12); "default" removes the attribute. theme-init.js applies the stored
