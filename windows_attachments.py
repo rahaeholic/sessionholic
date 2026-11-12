@@ -123,13 +123,25 @@ def _cwd(cwd):
     return Path(os.path.realpath(cwd))
 
 
+def _mkdir(path):
+    """A new folder with the work folder's own access, as the PC's Codex and Claude read it.
+    Python 3.13 (and 3.12.4) on Windows makes mode 0o700 a protected ACL of SYSTEM,
+    Administrators and the owner only, and the owner of what an elevated SSH session creates is
+    BUILTIN\\Administrators: the agent, not elevated, was then refused the file (os error 5).
+    So on Windows the folder inherits the work folder's ACL; elsewhere it stays 0o700."""
+    if os.name == 'nt':
+        os.mkdir(path)
+    else:
+        os.mkdir(path, 0o700)
+
+
 def _root(cwd, create=False):
     if not isinstance(DIRECTORY, str) or not _FOLDER.fullmatch(DIRECTORY) or DIRECTORY.endswith('.'):
         _fail('첨부 저장 폴더 이름이 올바르지 않습니다.')
     root = cwd / DIRECTORY
     if create:
         try:
-            os.mkdir(root, 0o700)
+            _mkdir(root)
         except FileExistsError:
             pass
         except OSError:
@@ -308,7 +320,7 @@ def store(cwd, name, data, expected_sha256=None):
     identifier = uuid.uuid4().hex
     folder = root / identifier
     try:
-        os.mkdir(folder, 0o700)
+        _mkdir(folder)
     except OSError:
         _fail('첨부 저장 폴더를 만들지 못했습니다.')
     try:

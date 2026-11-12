@@ -48,6 +48,22 @@ class WindowsAttachmentsTest(unittest.TestCase):
     def ids(self):
         return sorted(os.listdir(self.managed)) if self.managed.exists() else []
 
+    def test_on_windows_folders_inherit_the_work_folder_access_not_an_owner_only_acl(self):
+        # Python 3.13 on Windows turns mkdir mode 0o700 into an owner-only ACL that an elevated
+        # SSH session owns as Administrators: the PC's agent, not elevated, could not read it.
+        calls = []
+        with patch.object(wa.os, 'name', 'nt'), patch.object(wa.os, 'mkdir', side_effect=lambda *a: calls.append(a)):
+            wa._mkdir(self.cwd / 'a')
+        self.assertEqual(calls, [(self.cwd / 'a',)])
+        with patch.object(wa.os, 'name', 'posix'), patch.object(wa.os, 'mkdir', side_effect=lambda *a: calls.append(a)):
+            wa._mkdir(self.cwd / 'b')
+        self.assertEqual(calls[-1], (self.cwd / 'b', 0o700))
+        made = []
+        real = wa._mkdir
+        with patch.object(wa, '_mkdir', side_effect=lambda path: (made.append(path), real(path))):
+            result = wa.store(str(self.cwd), 'a.png', PNG)
+        self.assertEqual(made, [self.managed, self.managed / result['id']])
+
     def test_a_file_is_stored_once_read_only_with_relative_metadata_and_read_back(self):
         data = b'\x00\xfffixture\x80'
         result = wa.store(str(self.cwd), '자료.bin', data, hashlib.sha256(data).hexdigest())
