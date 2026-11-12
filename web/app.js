@@ -9074,8 +9074,10 @@ function markOutbox(entry, requestId, receipt) {
   item.status = receipt?.status || "unknown";
   item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
   if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
-  // The server found the message in the conversation it read.
-  if (item.state !== "failed" && (receipt?.readbackConfirmed === true || receipt?.deliveryVerified === true)) item.recorded = true;
+  // The server found the message in the conversation it read. Found only in Claude's input
+  // queue (status "queued", deliveryVerified) it is delivered but not shown yet: the bubble
+  // stays ("대기 중") until the conversation shows it.
+  if (item.state !== "failed" && receipt?.readbackConfirmed === true) item.recorded = true;
 }
 // Drops bubbles whose message reached the transcript, settled ones the
 // transcript never showed, and anything older than OUTBOX_MAX_MS. Each

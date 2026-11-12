@@ -1343,20 +1343,33 @@ class Chat:
 
     @classmethod
     def _claude_evidence(cls, record, messages, queued):
-        candidates = [message for message in messages if isinstance(message, dict) and message.get('role') == 'user']
-        if isinstance(queued, list):
-            candidates.extend(item for item in queued if isinstance(item, dict))
-        return any(isinstance(item.get('ts'), (int, float)) and item['ts'] >= record.get('sentAt', 0) - 5
-                   and cls._recorded(record, item) for item in candidates)
+        """'message' when the conversation shows the send, 'queue' when it is only in Claude Code's
+        input queue (Claude still works; the conversation records it when Claude takes it, seconds
+        to minutes later), None when neither has it."""
+        since = record.get('sentAt', 0) - 5
+        def found(items):
+            return any(isinstance(item, dict) and isinstance(item.get('ts'), (int, float)) and item['ts'] >= since
+                       and cls._recorded(record, item) for item in items)
+        if found(message for message in messages if isinstance(message, dict) and message.get('role') == 'user'):
+            return 'message'
+        if isinstance(queued, list) and found(queued):
+            return 'queue'
+        return None
 
     def _claude_receipt(self, source, request_id, messages, queued=None):
         record = self._claude_read_record(source, request_id)
         if not record:
             return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         receipt = dict(record.get('receipt') or {})
-        if self._claude_evidence(record, messages, queued):
+        evidence = self._claude_evidence(record, messages, queued)
+        if evidence == 'message':
             receipt.update(delivery='accepted', confirmed=True, readbackConfirmed=True,
                            currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
+        elif evidence == 'queue':
+            # Delivered, but the conversation does not show it yet: the page keeps its bubble
+            # ("대기 중") until the message itself shows (readbackConfirmed only for that).
+            receipt.update(delivery='queued', confirmed=True, readbackConfirmed=False,
+                           deliveryVerified=True, reason=None)
         return receipt
 
     def _claude_readback(self, host, source, record, seconds):
@@ -1370,8 +1383,9 @@ class Chat:
                 if (not isinstance(result, dict) or result.get('error') or result.get('conversationUnavailable')
                         or not isinstance(result.get('messages'), list)):
                     return None
-                if self._claude_evidence(record, result['messages'], result.get('queuedPrompts')):
-                    return True
+                evidence = self._claude_evidence(record, result['messages'], result.get('queuedPrompts'))
+                if evidence:
+                    return evidence
                 if not isinstance(result.get('queuedPrompts'), list):
                     return None
             except (RuntimeError, OSError, ValueError, TimeoutError, KeyError):
@@ -1411,9 +1425,13 @@ class Chat:
                         outcome += '→repaste'
                 else:
                     found = None
-            if found is True:
-                receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
-                outcome = 'ok' if outcome == 'unknown' else outcome + '→ok'
+            if found in ('message', 'queue'):
+                if found == 'message':
+                    receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True)
+                else:
+                    receipt.update(delivery='queued')
+                receipt.update(deliveryVerified=True, reason=None)
+                outcome = ('ok' if outcome == 'unknown' else outcome + '→ok') + ('' if found == 'message' else '(대기열)')
             elif found is False:
                 receipt.update(delivery='not_delivered', confirmed=False, deliveryVerified=False, reason=CLAUDE_NOT_DELIVERED)
                 outcome += '→missing'
