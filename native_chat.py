@@ -709,6 +709,7 @@ def _claude(identity, action, home, deadline, args):
         if transcript is None:
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         entries, result["messages"], result["olderOmitted"] = collector.claude_conversation(transcript)
+        result["queuedPrompts"] = collector.claude_queued_prompts(entries)
         # `claude agents` names neither: each response records its model and effort. The newest
         # main-thread one counts (a subagent's or a <synthetic> one says nothing of the session).
         if not (result['modelSettings']['model'] and result['modelSettings']['effort']):

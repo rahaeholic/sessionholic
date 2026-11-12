@@ -35,6 +35,7 @@ CLAUDE_READY_SECONDS = 12
 CLAUDE_PROBE = 160
 # Claude Code records a pasted image path as "[Image #1]" in the prompt (before, after or
 # instead of the words) and may show a long paste as "[Pasted text #1 +12 lines]".
+PASTED_CONTENT_TAG = re.compile(r'</?pasted_content(?:\s+id="[^"<>]*")?\s*>')
 CLAUDE_INPUT_TOKEN = re.compile(r'\[(?:Image|Pasted text|Pasted image) #\d+(?: \+\d+ lines?)?\]')
 ATTACHMENT_LINE = '첨부 파일:'
 ATTACHMENT_ONLY = ('[이미지 첨부]', '[파일 첨부]')
@@ -43,7 +44,7 @@ ATTACHMENT_ONLY = ('[이미지 첨부]', '[파일 첨부]')
 def claude_words(text):
     """A Claude prompt as the board compares it: collapsed, without Claude Code's input
     tokens and without the trailing "첨부 파일: …" lines the board appends for files."""
-    lines = CLAUDE_INPUT_TOKEN.sub(' ', str(text or '')).split('\n')
+    lines = CLAUDE_INPUT_TOKEN.sub(' ', PASTED_CONTENT_TAG.sub('', str(text or ''))).split('\n')
     while lines and (not lines[-1].strip() or lines[-1].strip().startswith(ATTACHMENT_LINE)):
         lines.pop()
     words = ' '.join(' '.join(lines).split())
@@ -166,6 +167,10 @@ def _screen_lines(screen):
 # Claude Code may take the Enter that follows a paste as a newline in its input (seen now and
 # then): this long after the paste, a message still in the input box gets Enter once more.
 SUBMIT_CHECK_SECONDS = 0.8
+CLAUDE_READ_INTERVAL = 0.7
+CLAUDE_READ_SECONDS = 6.0
+CLAUDE_RESUBMIT_READ_SECONDS = 4.0
+CLAUDE_NOT_DELIVERED = '터미널에 넣었지만 Claude 대화에 들어가지 않았어요. 다시 보내기를 눌러 주세요.'
 PASTED_PLACEHOLDER = re.compile(r'\[Pasted text #\d+')
 
 
@@ -459,6 +464,8 @@ class Chat:
         self.reads = {}
         # Times a send's steps (SendTiming).
         self.clock = time.monotonic
+        self.verify_clock = time.monotonic
+        self.sleep = time.sleep
 
     @staticmethod
     def identity(source):
@@ -510,8 +517,8 @@ class Chat:
             raise RuntimeError('기기 연결을 다시 확인한 뒤 메시지를 보내 주세요.')
         return source, host
 
-    def rpc(self, host, action, source, **kwargs):
-        return self.workflow.transfers.rpc(host, 'chat', {'action': action, 'source': source, **kwargs}, timeout=20)
+    def rpc(self, host, action, source, _timeout=20, **kwargs):
+        return self.workflow.transfers.rpc(host, 'chat', {'action': action, 'source': source, **kwargs}, timeout=_timeout)
 
     def _direct_session(self, source):
         guard = getattr(self.workflow, 'ensure_direct_session', None)
@@ -527,7 +534,7 @@ class Chat:
     @staticmethod
     def receipt(result, request_id):
         status = result.get('delivery') or result.get('status') or 'unknown'
-        if status == 'rejected': status = 'failed'
+        if status in ('rejected', 'not_delivered'): status = 'failed'
         return {'requestId': request_id, 'status': status,
                 'confirmed': result.get('confirmed', False),
                 'readbackConfirmed': result.get('readbackConfirmed', False),
@@ -535,6 +542,7 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
+                **({'deliveryVerified': result['deliveryVerified']} if 'deliveryVerified' in result else {}),
                 **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
                    and result.get('failureCode') == 'server_overloaded' else {}),
                 'attachments': Chat.attachment_history(result.get('attachments', [])),
@@ -674,7 +682,7 @@ class Chat:
         receipts = []
         for request_id in request_ids:
             if claude:
-                receipt = self._claude_receipt(source, request_id, messages)
+                receipt = self._claude_receipt(source, request_id, messages, result.get('queuedPrompts'))
             else:
                 receipt = next((receipt for receipt in result.get('receipts', [])
                                 if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
@@ -1318,7 +1326,7 @@ class Chat:
         probe, length = record.get('probe'), record.get('probeLength')
         if isinstance(probe, str) and isinstance(length, int):
             # Whole for a short message ("확인" is not "확인해 주세요"); the opening for a long one.
-            collapsed = ' '.join(str(text or '').split())
+            collapsed = ' '.join(PASTED_CONTENT_TAG.sub('', str(text or '')).split())
             collapsed = collapsed if length < CLAUDE_PROBE else collapsed[:length]
             if hashlib.sha256(collapsed.encode()).hexdigest() == probe:
                 return True
@@ -1333,28 +1341,94 @@ class Chat:
             return False
         return hashlib.sha256(words.encode()).hexdigest() == probe
 
-    def _claude_receipt(self, source, request_id, messages):
+    @classmethod
+    def _claude_evidence(cls, record, messages, queued):
+        candidates = [message for message in messages if isinstance(message, dict) and message.get('role') == 'user']
+        if isinstance(queued, list):
+            candidates.extend(item for item in queued if isinstance(item, dict))
+        return any(isinstance(item.get('ts'), (int, float)) and item['ts'] >= record.get('sentAt', 0) - 5
+                   and cls._recorded(record, item) for item in candidates)
+
+    def _claude_receipt(self, source, request_id, messages, queued=None):
         record = self._claude_read_record(source, request_id)
         if not record:
             return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         receipt = dict(record.get('receipt') or {})
-        for message in messages:
-            if (isinstance(message, dict) and message.get('role') == 'user'
-                    and (message.get('ts') or 0) >= record.get('sentAt', 0) - 5
-                    and self._recorded(record, message)):
-                receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True, reason=None)
-                if not receipt.get('acknowledged') and receipt.get('delivery') == 'unknown':
-                    # The paste's own result was lost, but the transcript has the message:
-                    # it was delivered (the board still never sends it again).
-                    receipt.update(delivery='accepted', confirmed=True)
-                break
+        if self._claude_evidence(record, messages, queued):
+            receipt.update(delivery='accepted', confirmed=True, readbackConfirmed=True,
+                           currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
         return receipt
+
+    def _claude_readback(self, host, source, record, seconds):
+        deadline = self.verify_clock() + seconds
+        while True:
+            remaining = deadline - self.verify_clock()
+            if remaining <= 0:
+                return False
+            try:
+                result = self.rpc(host, 'read', source, _timeout=remaining)
+                if (not isinstance(result, dict) or result.get('error') or result.get('conversationUnavailable')
+                        or not isinstance(result.get('messages'), list)):
+                    return None
+                if self._claude_evidence(record, result['messages'], result.get('queuedPrompts')):
+                    return True
+                if not isinstance(result.get('queuedPrompts'), list):
+                    return None
+            except (RuntimeError, OSError, ValueError, TimeoutError, KeyError):
+                return None
+            remaining = deadline - self.verify_clock()
+            if remaining <= 0:
+                return False
+            self.sleep(min(CLAUDE_READ_INTERVAL, remaining))
+
+    def _verify_claude_delivery(self, host, source, terminal, body, record, receipt):
+        started = self.verify_clock()
+        outcome = 'unknown'
+        repasted = False
+        resubmitted = bool(receipt.get('resubmitted'))
+        try:
+            found = self._claude_readback(host, source, record, CLAUDE_READ_SECONDS)
+            if found is False:
+                outcome = 'missing'
+                screen = self.workflow.terminals.capture(terminal['id'])
+                if parse_menu(screen):
+                    outcome += '→menu'
+                elif still_typed(screen, body):
+                    self.workflow.terminals.send_keys(terminal['id'], ['Enter'])
+                    resubmitted = True
+                    found = self._claude_readback(host, source, record, CLAUDE_RESUBMIT_READ_SECONDS)
+                    outcome += '→resubmit'
+                elif input_text(screen) == '':
+                    hold = terminal.get('holdName')
+                    if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():
+                        found = None
+                    else:
+                        self.workflow.terminals.paste(terminal['id'], body, submit=True)
+                        repasted = True
+                        if self._confirm_submit(terminal['id'], body):
+                            resubmitted = True
+                        found = self._claude_readback(host, source, record, CLAUDE_READ_SECONDS)
+                        outcome += '→repaste'
+                else:
+                    found = None
+            if found is True:
+                receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
+                outcome = 'ok' if outcome == 'unknown' else outcome + '→ok'
+            elif found is False:
+                receipt.update(delivery='not_delivered', confirmed=False, deliveryVerified=False, reason=CLAUDE_NOT_DELIVERED)
+                outcome += '→missing'
+        except (RuntimeError, ValueError, KeyError, OSError):
+            outcome += '→unknown'
+        elapsed = max(0, self.verify_clock() - started)
+        receipt.update(repasted=repasted)
+        receipt.update(resubmitted=resubmitted, verificationSeconds=round(elapsed, 2))
+        sys.stderr.write('%s: Claude 전달 확인 %s %.1f초\n' % (instance.current()['brand']['logPrefix'], outcome, elapsed))
 
     def _confirm_submit(self, terminal_id, body):
         """The message still in Claude Code's input box a moment after its Enter (taken as a
         newline): Enter once more. An empty input ignores Enter, so a message the first Enter
         sent is not sent twice. Returns whether it pressed again."""
-        time.sleep(SUBMIT_CHECK_SECONDS)
+        self.sleep(SUBMIT_CHECK_SECONDS)
         try:
             screen = self.workflow.terminals.capture(terminal_id)
             if parse_menu(screen) or not still_typed(screen, body):
@@ -1464,11 +1538,12 @@ class Chat:
                 self.workflow.terminals.paste(terminal['id'], body, submit=True)
                 timing.mark('paste')
                 receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
-                           'readbackConfirmed': False,
+                           'readbackConfirmed': False, 'deliveryVerified': None,
                            'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
                 if self._confirm_submit(terminal['id'], body):
                     receipt['resubmitted'] = True
                 timing.mark('submit')
+                self._verify_claude_delivery(host, source, terminal, body, record, receipt)
             except InputNotSent as exc:
                 path.unlink(missing_ok=True)
                 raise SendRejected(str(exc), 409) from None

@@ -501,10 +501,12 @@ class WindowsRuntimeTest(unittest.TestCase):
         folder.mkdir(parents=True)
         (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(entry) + '\n' for entry in [
             {'type': 'user', 'message': {'content': '합성 요청'}},
-            {'type': 'assistant', 'effort': 'xhigh', 'message': {'model': 'claude-opus-5-5', 'content': [{'type': 'text', 'text': '합성 답변'}]}}]))
+            {'type': 'assistant', 'effort': 'xhigh', 'message': {'model': 'claude-opus-5-5', 'content': [{'type': 'text', 'text': '합성 답변'}]}},
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 123, 'content': '<pasted_content>대기</pasted_content>'}]))
         value = wr.WindowsRuntime(reader=reader).chat(
             {'action': 'read', 'source': {'host': 'fixture-pc', 'agent': 'claude', 'id': sid, 'home': '.claude'}})
         self.assertEqual(value['modelSettings'], {'model': 'claude-opus-5-5', 'effort': 'xhigh', 'observed': 'last_response'})
+        self.assertEqual(value['queuedPrompts'], [{'ts': 123, 'text': '대기'}])
         self.assertEqual(([m['text'] for m in value['messages']], value['olderOmitted']), (['합성 요청', '합성 답변'], False))
 
     def test_stored_or_unloaded_session_remains_readable_without_execution(self):

@@ -19,6 +19,41 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import windows_collector as wc
 
 
+class ClaudeQueueDeliveryTest(unittest.TestCase):
+    def test_paste_tags_queue_evidence_and_human_rows(self):
+        import collector as mac
+        import windows_collector as win
+        wrapped = '[Image #1]  <pasted_content id="abcd">\n첫 줄\n둘째 줄\n</pasted_content id="abcd">'
+        entries = [
+            {'type': 'attachment', 'timestamp': 100, 'attachment': {'type': 'queued_command', 'prompt': wrapped, 'origin': {'kind': 'human'}}},
+            {'type': 'attachment', 'attachment': {'type': 'queued_command', 'prompt': '알림', 'origin': {'kind': 'task-notification'}}},
+            {'type': 'attachment', 'attachment': {'type': 'queued_command', 'prompt': '명령', 'origin': {'kind': 'human'}, 'commandMode': 'bash'}},
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 101, 'content': '<pasted_content>대기</pasted_content>'},
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 102, 'isSidechain': True, 'content': '하위'},
+        ]
+        for rows in (mac.claude_rows(entries), win._claude_rows(entries)):
+            self.assertEqual([(row['role'], row['text']) for row in rows], [('user', '[Image #1]  \n첫 줄\n둘째 줄')])
+        for queues in (mac.claude_queued_prompts(entries), win._claude_queued_prompts(entries)):
+            self.assertEqual(queues, [{'ts': 101, 'text': '대기'}])
+        many = [{'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': i, 'content': str(i)} for i in range(25)]
+        self.assertEqual(len(mac.claude_queued_prompts(many)), 20)
+        self.assertEqual(win._claude_queued_prompts(many)[0]['text'], '5')
+        reminder = '<system-reminder>Text inside <pasted_content> tags was hidden</system-reminder>hello'
+        self.assertEqual(mac.user_text(reminder), ('user', 'hello'))
+        self.assertEqual(win._claude_user_text(reminder), ('user', 'hello'))
+
+    def test_queued_prompt_deduplication_after_interrupt(self):
+        import collector as mac
+        import windows_collector as win
+        queued = {'type': 'attachment', 'attachment': {'type': 'queued_command', 'origin': {'kind': 'human'}, 'prompt': '진행'}}
+        interrupt = {'type': 'user', 'message': {'content': '[Request interrupted by user]'}}
+        user = {'type': 'user', 'message': {'content': '<pasted_content>진행</pasted_content>'}}
+        answer = {'type': 'assistant', 'message': {'content': '완료'}}
+        for parser in (mac.claude_rows, win._claude_rows):
+            self.assertEqual([row['text'] for row in parser([queued, interrupt, user])], ['사용자가 중단함', '진행'])
+            self.assertEqual([row['text'] for row in parser([queued, answer, user])].count('진행'), 2)
+
+
 class SessionOriginTest(unittest.TestCase):
     def test_native_subagent_variants_keep_agent_origin_without_spawn_details(self):
         for sub in ({'thread_spawn': {}}, {'other': 'native_worker'}, 'review', 'compact', 'memory_consolidation'):
@@ -256,9 +291,12 @@ class ClaudeProcessOriginTest(unittest.TestCase):
     def test_existing_saved_transcript_takes_precedence(self):
         path = self.reader.claude_home / 'projects/example' / (self.sid + '.jsonl')
         path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({'type': 'assistant', 'uuid': 'message', 'message': {'content': 'saved example'}}))
+        path.write_text('\n'.join(json.dumps(row) for row in [
+            {'type': 'assistant', 'uuid': 'message', 'message': {'content': 'saved example'}},
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 123, 'content': '<pasted_content>queued</pasted_content>'}]))
         result = self.reader.read('claude', self.sid)
         self.assertEqual(result['messages'][0]['text'], 'saved example')
+        self.assertEqual(result['queuedPrompts'], [{'ts': 123, 'text': 'queued'}])
         self.assertNotIn('historyNotice', result)
 
     def test_missing_unknown_history_still_errors(self):

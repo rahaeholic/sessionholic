@@ -1560,6 +1560,8 @@ class Board:
                 raise RuntimeError("기기 연결을 다시 확인한 뒤 대화를 읽어 주세요.")
         args = ["read", agent, session_id] + ([home] if agent == "codex" else [])
         result = scrub_payload(self.runner(host, args, 30))
+        # Queue evidence is for the chat verifier only, never browser reads or the read cache.
+        result.pop("queuedPrompts", None)
         import collector
         # The host already sent its window; this only bounds what any host may send.
         rows = result.get("messages")

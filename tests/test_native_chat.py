@@ -887,7 +887,9 @@ class NativeChatTests(unittest.TestCase):
         sid = 'session-12345'
         folder = self.home / '.claude/projects/p'
         folder.mkdir(parents=True)
-        (folder / (sid + '.jsonl')).write_text(json.dumps({'type': 'user', 'message': {'content': 'fixture'}}) + '\n')
+        (folder / (sid + '.jsonl')).write_text(''.join(json.dumps(entry) + '\n' for entry in [
+            {'type': 'user', 'message': {'content': 'fixture'}},
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 123, 'content': '<pasted_content>queued</pasted_content>'}]))
         row = {'id': source['id'], 'sessionId': sid, 'kind': 'background',
                'state': 'idle', 'status': 'idle', 'cwd': str(self.cwd)}
         with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
@@ -898,6 +900,7 @@ class NativeChatTests(unittest.TestCase):
             send = chat.handle({**self.args, 'source': source}, home=self.home)
         self.assertEqual(read['cwd'], str(self.cwd))
         self.assertEqual(read['messages'][0]['text'], 'fixture')
+        self.assertEqual(read['queuedPrompts'], [{'ts': 123, 'text': 'queued'}])
         # The owning host never types into Claude; the board's own terminal does.
         self.assertFalse(read['capabilities']['canSend'])
         self.assertEqual(read['capabilities']['reason'], 'Claude 입력은 보드가 연결한 터미널로 전달합니다.')

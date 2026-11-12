@@ -9075,7 +9075,7 @@ function markOutbox(entry, requestId, receipt) {
   item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
   if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
   // The server found the message in the conversation it read.
-  if (item.state !== "failed" && receipt?.readbackConfirmed === true) item.recorded = true;
+  if (item.state !== "failed" && (receipt?.readbackConfirmed === true || receipt?.deliveryVerified === true)) item.recorded = true;
 }
 // Drops bubbles whose message reached the transcript, settled ones the
 // transcript never showed, and anything older than OUTBOX_MAX_MS. Each
@@ -9213,7 +9213,7 @@ function outboxRows(list, entry) {
       if (item.state === "failed") {
         const retry = button("다시 보내기", "msg-retry", () => retryOutbox(entry, item));
         retry.setAttribute("aria-label", "보내지 못한 메시지 다시 보내기");
-        row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS.failed), retry);
+        row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS.failed + (item.reason ? ` · ${item.reason}` : "")), retry);
       } else row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS[name] || OUTBOX_LABELS.uncertain));
     }
     rows.push(row);

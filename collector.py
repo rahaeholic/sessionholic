@@ -394,6 +394,21 @@ def claude_conversation(path):
     return entries, window, dropped or not whole
 
 
+# Claude wraps long pasted user input in these tags; the contents are the prompt.
+PASTED_CONTENT_TAG = re.compile(r'</?pasted_content(?:\s+id="[^"<>]*")?\s*>')
+
+
+def clean_pasted_content(text):
+    return PASTED_CONTENT_TAG.sub('', text)
+
+
+def claude_queued_prompts(entries):
+    return [{'ts': to_epoch(entry.get('timestamp')), 'text': clean_pasted_content(entry['content']).strip()}
+            for entry in entries if entry.get('type') == 'queue-operation'
+            and entry.get('operation') == 'enqueue' and not entry.get('isSidechain')
+            and isinstance(entry.get('content'), str)][-20:]
+
+
 def user_text(text):
     """Hide harness wrappers in user lines; returns (role, text) or None to skip.
 
@@ -414,7 +429,7 @@ def user_text(text):
     match = BASH_INPUT.match(stripped)
     if match:
         return "tool", "$ " + one_line(match.group(1), 160)
-    text = REMINDER.sub("", text).strip()
+    text = clean_pasted_content(REMINDER.sub("", text)).strip()
     return ("user", text) if text else None
 
 
