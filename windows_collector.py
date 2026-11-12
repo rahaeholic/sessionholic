@@ -1150,7 +1150,7 @@ class WindowsCollector:
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
             entries, messages, older = _conversation(path, _claude_rows)
             # The work folder, as the list row derives it: an upload is checked against it (chat.Chat.upload).
-            return {'messages': messages, 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
+            return {'messages': messages, 'queuedPrompts': _claude_queued_prompts(entries), 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
                     'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
                     **{key: row[key] for key in ('runtimeReason', 'runtimeReasonCode', 'runtimeEvidence') if key in row},
                     'activeFlags': [], 'updatedAt': int(path.stat().st_mtime), 'readOnly': True,
@@ -1486,6 +1486,31 @@ CLAUDE_COMMAND_NAME = re.compile(r'<command-name>([^<]{1,60})</command-name>')
 CLAUDE_BASH_INPUT = re.compile(r'<bash-input>(.*?)</bash-input>', re.S)
 
 
+PASTED_CONTENT_TAG = re.compile(r'</?pasted_content(?:\s+id="[^"<>]*")?\s*>')
+
+
+def _clean_pasted_content(text):
+    return PASTED_CONTENT_TAG.sub('', text)
+
+
+def _claude_queued_prompts(entries):
+    return [{'ts': _epoch(entry.get('timestamp')), 'text': _clean_pasted_content(entry['content']).strip()}
+            for entry in entries if entry.get('type') == 'queue-operation'
+            and entry.get('operation') == 'enqueue' and not entry.get('isSidechain')
+            and isinstance(entry.get('content'), str)][-20:]
+
+
+def _queued_prompt(entry):
+    attachment = entry.get('attachment')
+    if (not isinstance(attachment, dict) or attachment.get('type') != 'queued_command'
+            or attachment.get('commandMode') not in (None, 'prompt')
+            or not isinstance(attachment.get('origin'), dict)
+            or attachment['origin'].get('kind') != 'human'):
+        return None
+    prompt = attachment.get('prompt')
+    return prompt if isinstance(prompt, (str, list)) else None
+
+
 def _claude_user_text(text):
     """(role, text) for a Claude user line, or None to skip it; harness lines are not the person's words."""
     if '<task-notification>' in text[:300]:
@@ -1501,25 +1526,33 @@ def _claude_user_text(text):
     match = CLAUDE_BASH_INPUT.match(stripped)
     if match:
         return 'tool', '$ ' + _one_line(match.group(1), 160)
-    text = CLAUDE_REMINDER.sub('', text).strip()
+    text = _clean_pasted_content(CLAUDE_REMINDER.sub('', text)).strip()
     return ('user', text) if text else None
 
 
 def _claude_rows(entries):
     """As collector.claude_rows for text: expanded skills, side threads and compaction summaries
     are not the conversation, and each text block is read on its own."""
-    result = []
+    result, queued, dropped = [], [], set()
     for entry in entries:
         message = entry.get('message')
         role = entry.get('type')
-        if (role not in ('user', 'assistant') or not isinstance(message, dict)
-                or entry.get('isMeta') or entry.get('isSidechain')):
+        content = _queued_prompt(entry) if role == 'attachment' else None
+        if content is not None:
+            role = 'user'
+        elif role not in ('user', 'assistant') or not isinstance(message, dict):
             continue
+        if entry.get('isMeta') or entry.get('isSidechain'):
+            continue
+        start = len(result)
         ts, uid = entry.get('timestamp'), entry.get('uuid')
         if entry.get('isCompactSummary'):
             result.append(_message('system', '이전 대화 요약으로 이어짐', ts, messageId=uid))
             continue
-        content = message.get('content')
+        if content is None:
+            content = message.get('content')
+        blocks = [{'type': 'text', 'text': content}] if isinstance(content, str) else content
+        attached = _native_attachments(blocks) if role == 'user' else []
         texts = [content] if isinstance(content, str) else [block['text'] for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)] if isinstance(content, list) else []
         for text in texts:
             shown = text.strip() and (_claude_user_text(text) if role == 'user' else ('assistant', text))
@@ -1530,7 +1563,24 @@ def _claude_rows(entries):
                                                 'reasoningEffort': entry.get('effort') or entry.get('perTurnEffort')})
                     extra.update({key: value for key, value in settings.items() if value})
                 result.append(_message(shown[0], shown[1], ts, messageId=uid, **extra))
-    return result
+        user_row = next((row for row in result[start:] if row['role'] == 'user'), None)
+        if attached:
+            if user_row is None:
+                user_row = _message('user', '[이미지 첨부]' if all(item['kind'] == 'image' for item in attached) else '[파일 첨부]', ts, messageId=uid)
+                result.append(user_row)
+            user_row['attachments'] = attached
+        if role == 'assistant':
+            queued = []
+        elif user_row is not None:
+            words = ' '.join(user_row['text'].split())
+            if entry.get('type') == 'attachment':
+                queued.append((words, result[start:]))
+            else:
+                again = next((item for item in queued if item[0] == words), None)
+                if again is not None:
+                    queued.remove(again)
+                    dropped.update(id(row) for row in again[1])
+    return [row for row in result if id(row) not in dropped]
 
 
 def _rollout_messages(entries):

@@ -1212,6 +1212,82 @@ class ChatClaudeTest(unittest.TestCase):
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
 
+    def test_delivery_readback_and_recovery_scenarios(self):
+        empty = '─' * 20 + '\n❯ \n' + '─' * 20
+        typed = '─' * 20 + '\n❯ 안녕하세요\n' + '─' * 20
+        for mode in ('user', 'queue', 'typed', 'repaste', 'missing', 'error', 'old', 'menu', 'hold'):
+            with self.subTest(mode=mode):
+                self.terms.rows, self.terms.pastes, self.terms.keys = [], [], []
+                terminal = self.terminal()
+                self.terms.screens = ['> ', empty, typed if mode == 'typed' else CLAUDE_PERMISSION if mode == 'menu' else empty, empty]
+                now = [0.0]
+                self.chat.verify_clock = lambda: now[0]
+                self.chat.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+                if mode == 'hold':
+                    terminal['holdName'] = 'held'
+                    hold_dir = self.root / 'holds'; hold_dir.mkdir(exist_ok=True)
+                    hold_file = hold_dir / 'held'
+                    hold_file.unlink(missing_ok=True)
+                    self.flow.transfers.hold_waiting = str(hold_dir)
+                    original_paste = self.terms.paste
+                    def paste(*args, **kwargs):
+                        value = original_paste(*args, **kwargs)
+                        hold_file.touch()
+                        return value
+                else:
+                    paste = self.terms.paste
+                def rpc(host, action, source, **kwargs):
+                    if action == 'capabilities': return {'phase': 'idle'}
+                    if mode == 'error': raise TimeoutError('fixture')
+                    if mode == 'old': return {'messages': []}
+                    evidence = (mode in ('user', 'queue') or mode == 'typed' and bool(self.terms.keys)
+                                or mode == 'repaste' and len(self.terms.pastes) > 1)
+                    row = {'ts': time.time(), 'text': '<pasted_content id="abc">안녕하세요</pasted_content id="abc">'}
+                    return {'messages': [{**row, 'role': 'user'}] if evidence and mode == 'user' else [],
+                            'queuedPrompts': [row] if evidence and mode != 'user' else []}
+                with patch.object(self.chat, 'rpc', side_effect=rpc), patch.object(self.terms, 'paste', side_effect=paste):
+                    result = self.send(rid='delivery-' + mode)
+                    before = len(self.terms.pastes)
+                    again = self.send(rid='delivery-' + mode)
+                receipt = result['receipt']
+                self.assertEqual(len(self.terms.pastes), before)
+                self.assertEqual(again['status'], result['status'])
+                if mode in ('user', 'queue', 'typed', 'repaste'):
+                    self.assertTrue(receipt['deliveryVerified'])
+                    self.assertTrue(receipt['readbackConfirmed'])
+                elif mode in ('missing', 'menu'):
+                    self.assertEqual((result['status'], receipt['confirmed'], receipt['deliveryVerified']), ('failed', False, False))
+                    self.assertTrue(receipt['reason'])
+                else:
+                    self.assertEqual(result['status'], 'accepted')
+                    self.assertIsNone(receipt['deliveryVerified'])
+                self.assertEqual(len(self.terms.pastes), 2 if mode in ('repaste', 'missing') else 1)
+                self.assertEqual(len(self.terms.keys), 1 if mode == 'typed' else 0)
+                saved = self.chat._claude_read_record(self.chat.resolve(CLAUDE_REF), 'delivery-' + mode)
+                self.assertEqual(saved['receipt']['repasted'], mode in ('repaste', 'missing'))
+                self.assertIn('verificationSeconds', saved['receipt'])
+
+    def test_late_queue_reconciles_failed_receipt_and_stays_internal(self):
+        self.terminal()
+        self.chat.verify_clock = lambda: 1
+        self.chat.sleep = lambda _: None
+        with patch.object(self.chat, '_claude_readback', return_value=False), \
+             patch.object(self.terms, 'capture', side_effect=['> ', '> ', CLAUDE_PERMISSION]):
+            self.assertEqual(self.send()['status'], 'failed')
+        queued = [{'ts': time.time(), 'text': '<pasted_content>안녕하세요</pasted_content>'}]
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'idle', 'messages': [], 'queuedPrompts': queued}):
+            state = self.state(requestIds=['request-0001'])
+        self.assertNotIn('queuedPrompts', state)
+        self.assertEqual(state['receipts'][0]['status'], 'accepted')
+        self.assertTrue(state['receipts'][0]['deliveryVerified'])
+
+    def test_tagged_comparison_matches_both_probes(self):
+        text = '가나다 줄\n둘째 줄'
+        probe, digest = self.chat._probe(text)
+        record = {'probe': digest, 'probeLength': len(probe), 'wordsProbe': digest, 'wordsLength': len(probe)}
+        self.assertTrue(self.chat._recorded(record, {'text': '<pasted_content id="a">' + text + '</pasted_content id="a">'}))
+        self.assertEqual(chat.claude_words('[Image #1] <pasted_content>' + text + '</pasted_content>'), '가나다 줄 둘째 줄')
+
     def test_fork_opens_one_terminal_and_replays_receipt_without_sending(self):
         from contextlib import nullcontext
         spec = {'argv': ['/native/claude'], 'cwd': str(self.project), 'env': {}}
@@ -1632,7 +1708,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(receipt['acknowledged'])
         self.assertFalse(receipt['readbackConfirmed'])
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '첫 줄\n둘째 줄', True)])
-        self.assertEqual(self.calls, [('chat', 'capabilities')])
+        self.assertEqual(self.calls, [('chat', 'capabilities'), ('chat', 'read')])
         records = self.records()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
@@ -1647,7 +1723,7 @@ class ChatClaudeTest(unittest.TestCase):
         restarted = chat.Chat(self.board, self.flow, self.root)
         restarted.send({'source': CLAUDE_REF, 'requestId': 'request-0001', 'text': '첫 줄\n둘째 줄'})
         self.assertEqual(len(self.terms.pastes), 1)
-        self.assertEqual(self.calls, [('chat', 'capabilities')])
+        self.assertEqual(self.calls, [('chat', 'capabilities'), ('chat', 'read')])
 
     def test_a_slow_send_leaves_one_line_of_its_step_times_and_nothing_of_the_message(self):
         import contextlib, io, instance

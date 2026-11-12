@@ -939,6 +939,13 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(entry["error"], "SSH 연결 실패")
         self.assertEqual(entry["data"]["claude"][0]["title"], "정산")
 
+    def test_public_read_never_returns_or_caches_queue_evidence(self):
+        board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: {
+            'messages': [], 'queuedPrompts': [{'ts': 123, 'text': 'fixture'}]})
+        result = board.read('remote', 'claude', 'session-1234', None)
+        self.assertNotIn('queuedPrompts', result)
+        self.assertNotIn('queuedPrompts', next(iter(board.reads.values()))[1])
+
     def test_a_failed_read_never_pushes_a_kept_one_out_of_a_full_cache(self):
         board = server.Board(HOSTS, 60, runner=lambda host, args, timeout: {"messages": [{"role": "user", "text": "본문"}]})
         for number in range(128):
