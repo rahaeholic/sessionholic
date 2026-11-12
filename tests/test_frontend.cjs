@@ -7910,11 +7910,29 @@ test('Claude delivery failure shows its reason and retry preserves another draft
   assert.equal(entry.text, '새 초안');
 });
 
-test('Claude deliveryVerified settles its bubble without waiting for an answer', () => {
-  const { c, entry } = inlineDetailClient();
+test('a Claude message only in the input queue keeps its bubble until the conversation shows it', () => {
+  const { c, entry } = inlineDetailClient({ agent: 'claude', home: '.claude' });
   const item = { requestId: 'request-verified-01', text: '대기열 입력', attachments: [], state: 'sending', at: Date.now() };
   entry.outbox = [item];
-  c.markOutbox(entry, item.requestId, { status: 'accepted', deliveryVerified: true });
+  // Delivered to Claude's queue: the conversation has not recorded it yet (Ryan One 2026-11-12).
+  c.markOutbox(entry, item.requestId, { status: 'queued', confirmed: true, deliveryVerified: true, readbackConfirmed: false });
+  assert.notEqual(item.recorded, true);
+  const answer = { role: 'assistant', text: '하던 작업 계속', ts: Date.now() / 1000 + 1 };
+  c.settleOutbox(entry, [answer], { working: true });
+  assert.equal(entry.outbox.length, 1);
+  // Even long after an answer while Claude works, it stays until the message itself shows.
+  item.at = Date.now() - 5 * 60 * 1000;
+  c.settleOutbox(entry, [answer], { working: true });
+  assert.equal(entry.outbox.length, 1);
+  c.settleOutbox(entry, [answer, { role: 'user', text: '대기열 입력', ts: Date.now() / 1000 }], { working: true });
+  assert.equal(entry.outbox.length, 0);
+});
+
+test('Claude readbackConfirmed settles its bubble without waiting for an answer', () => {
+  const { c, entry } = inlineDetailClient({ agent: 'claude', home: '.claude' });
+  const item = { requestId: 'request-verified-02', text: '기록된 입력', attachments: [], state: 'sending', at: Date.now() };
+  entry.outbox = [item];
+  c.markOutbox(entry, item.requestId, { status: 'accepted', deliveryVerified: true, readbackConfirmed: true });
   assert.equal(item.recorded, true);
   c.settleOutbox(entry, []);
   assert.equal(entry.outbox.length, 0);

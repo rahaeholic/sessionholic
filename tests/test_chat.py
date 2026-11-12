@@ -1252,9 +1252,16 @@ class ChatClaudeTest(unittest.TestCase):
                 receipt = result['receipt']
                 self.assertEqual(len(self.terms.pastes), before)
                 self.assertEqual(again['status'], result['status'])
-                if mode in ('user', 'queue', 'typed', 'repaste'):
+                if mode == 'user':
+                    self.assertEqual(result['status'], 'accepted')
                     self.assertTrue(receipt['deliveryVerified'])
                     self.assertTrue(receipt['readbackConfirmed'])
+                elif mode in ('queue', 'typed', 'repaste'):
+                    # Only in Claude's queue: delivered, yet not in the conversation, so the page
+                    # keeps its bubble ("대기 중") rather than dropping it as recorded.
+                    self.assertEqual(result['status'], 'queued')
+                    self.assertTrue(receipt['deliveryVerified'])
+                    self.assertFalse(receipt['readbackConfirmed'])
                 elif mode in ('missing', 'menu'):
                     self.assertEqual((result['status'], receipt['confirmed'], receipt['deliveryVerified']), ('failed', False, False))
                     self.assertTrue(receipt['reason'])
@@ -1278,8 +1285,15 @@ class ChatClaudeTest(unittest.TestCase):
         with patch.object(self.chat, 'rpc', return_value={'phase': 'idle', 'messages': [], 'queuedPrompts': queued}):
             state = self.state(requestIds=['request-0001'])
         self.assertNotIn('queuedPrompts', state)
-        self.assertEqual(state['receipts'][0]['status'], 'accepted')
+        self.assertEqual(state['receipts'][0]['status'], 'queued')
         self.assertTrue(state['receipts'][0]['deliveryVerified'])
+        self.assertFalse(state['receipts'][0]['readbackConfirmed'])
+        # Claude took it from the queue: the conversation shows it now.
+        shown = [{'role': 'user', 'ts': time.time(), 'text': '안녕하세요'}]
+        with patch.object(self.chat, 'rpc', return_value={'phase': 'working', 'messages': shown, 'queuedPrompts': []}):
+            later = self.state(requestIds=['request-0001'])
+        self.assertEqual(later['receipts'][0]['status'], 'accepted')
+        self.assertTrue(later['receipts'][0]['readbackConfirmed'])
 
     def test_tagged_comparison_matches_both_probes(self):
         text = '가나다 줄\n둘째 줄'
