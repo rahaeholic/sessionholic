@@ -215,6 +215,9 @@ const state = {
   authEpoch: 0,
   loginBusy: false,
   offline: false,
+  boardReachable: false, // the board answered while navigator.onLine said offline (checkReachability)
+  reachabilityTimer: null,
+  reachabilityBusy: false,
   terminals: [],
   terminalsRefreshing: false,
   terminalsError: "",
@@ -5143,8 +5146,48 @@ function trimChatMemory(opened = null) {
     entry.questions = null;
   }
 }
+// An Android WebView inside an app can keep navigator.onLine false long after the phone is
+// back online (Ryan One 2026-11-12: 하던일 탭이 '오프라인'에 멈춘 동안에도 같은 웹뷰의 요청은
+// 보드에 닿고 있었다). The browser's word alone no longer keeps the board from asking: while
+// it says offline and the page is shown, a small read asks the board itself, and an answer
+// of any status means the board is reachable (checkReachability).
+const REACHABILITY_FIRST_MS = 1500;
+const REACHABILITY_RETRY_MS = 15000;
+const REACHABILITY_TIMEOUT_MS = 8000;
+const REACHABILITY_PATH = "/api/usage";
 function networkOffline() {
-  return state.offline || globalThis.navigator?.onLine === false;
+  if (state.offline) return true;
+  return globalThis.navigator?.onLine === false && !state.boardReachable;
+}
+function scheduleReachabilityCheck(delay = REACHABILITY_RETRY_MS) {
+  clearTimeout(state.reachabilityTimer);
+  state.reachabilityTimer = setTimeout(checkReachability, delay);
+}
+async function checkReachability() {
+  state.reachabilityTimer = null;
+  if (!networkOffline() || document.hidden || state.reachabilityBusy) return false;
+  state.reachabilityBusy = true;
+  let reachable = false;
+  const { signal, release } = apiSignal(undefined, REACHABILITY_TIMEOUT_MS);
+  try {
+    // Not a cached shell file (the worker answers those offline): an /api read the worker passes on.
+    const response = await fetch(REACHABILITY_PATH, { credentials: "same-origin", cache: "no-store", signal });
+    reachable = Number(response?.status) > 0;
+  } catch {
+    reachable = false;
+  } finally {
+    release();
+    state.reachabilityBusy = false;
+  }
+  // The browser's own online event may have come first.
+  if (!networkOffline()) return true;
+  if (reachable) {
+    state.boardReachable = true;
+    recoverConnection();
+    return true;
+  }
+  if (!document.hidden) scheduleReachabilityCheck();
+  return false;
 }
 const DRAFT_PREFIX = INSTANCE.storagePrefix + "draft:v1:";
 const BATCH_PREFIX = INSTANCE.storagePrefix + "batch:v1:";
@@ -15962,6 +16005,8 @@ function pageShown() {
     const selected = selectedSession();
     if (selected) loadChatState(selected, true);
   } else recoverConnection();
+  // Still offline by the browser's word: ask the board itself (checkReachability).
+  if (networkOffline()) scheduleReachabilityCheck(REACHABILITY_FIRST_MS);
 }
 // Unsent words or files on this page: what leaving or reloading it would lose.
 function unsavedWork() {
@@ -16584,6 +16629,9 @@ window.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("focus", settleViewport);
   window.addEventListener("offline", () => {
     state.offline = true;
+    // A new word from the browser: the board is asked afresh before it is believed.
+    state.boardReachable = false;
+    scheduleReachabilityCheck(REACHABILITY_FIRST_MS);
     closeEvents();
     showOfflineStart();
     stopChatPolling();
@@ -16636,6 +16684,7 @@ window.addEventListener("DOMContentLoaded", () => {
     window.launchQueue?.setConsumer((params) => handleAppLaunch(params).catch(() => {}));
   if (networkOffline()) {
     showOfflineStart();
+    scheduleReachabilityCheck(REACHABILITY_FIRST_MS);
   } else {
     const authEpoch = state.authEpoch;
     poll(true).then(() => {
