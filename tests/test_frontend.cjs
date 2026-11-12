@@ -17669,3 +17669,109 @@ test('답변 끝의 👉 줄이 있으면 그 답장을 쓰고, 보드 기능이
   // Each chip shows its whole reply (what a tap sends): it wraps inside the row instead of spilling onto the next chip.
   assert.match(styleSheet(), /:root\[data-compact-mobile="true"\] \.chat-suggestion \{[^}]*max-width: 85%;[^}]*white-space: normal/);
 });
+
+// 라이언 2026-11-12 "하던일이 안켜지네 라이언원 앱에서": 앱 웹뷰가 navigator.onLine=false에 굳어
+// '오프라인' 로그인 화면에 멈췄는데, 같은 웹뷰의 요청은 보드에 닿고 있었다. 브라우저 말만 믿지 않고
+// 보드에 직접 물어 답이 오면 연다.
+function reachabilityClient(fetchImpl) {
+  const callbacks = new Map(); let timerId = 0;
+  const timers = { setTimeout: (fn, ms) => { const id = ++timerId; callbacks.set(id, { fn, ms }); return id; },
+    clearTimeout: (id) => callbacks.delete(id) };
+  const c = client(fetchImpl, timers);
+  const run = async (ms) => {
+    const due = [...callbacks].filter(([, t]) => t.ms === ms);
+    for (const [id, t] of due) { callbacks.delete(id); t.fn(); }
+    for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+    return due.length;
+  };
+  return { ...c, callbacks, run };
+}
+const reachableBoard = (requests, { usage = 'ok' } = {}) => async (url) => {
+  requests.push(url);
+  if (url === '/api/usage' && usage === 'down') throw new TypeError('Failed to fetch');
+  return { ok: true, status: 200, json: async () => url.startsWith('/api/snapshot') ? { hosts: [] }
+    : url === '/api/capabilities' ? { hosts: [], csrfToken: 'csrf-test' } : {} };
+};
+
+test('앱 웹뷰가 오프라인이라고 해도 보드가 답하면 하던일을 연다', async () => {
+  const requests = [];
+  const c = reachabilityClient(reachableBoard(requests));
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  assert.equal(c.get('login').hidden, false);
+  assert.match(c.get('login-error').textContent, /오프라인/);
+  assert.deepEqual(requests, []);
+  assert.equal(await c.run(1500), 1);
+  assert.equal(requests[0], '/api/usage');
+  assert.equal(c.networkOffline(), false);
+  assert.ok(requests.includes('/api/snapshot'));
+  assert.equal(c.state.authenticated, true);
+  assert.equal(c.get('login').hidden, true);
+  assert.equal(c.get('app').hidden, false);
+});
+
+test('보드에도 닿지 않으면 오프라인을 유지하고 15초 뒤 다시 묻는다', async () => {
+  const requests = [];
+  let usage = 'down';
+  const c = reachabilityClient(async (url) => reachableBoard(requests, { usage })(url));
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  await c.run(1500);
+  assert.deepEqual(requests, ['/api/usage']);
+  assert.equal(c.networkOffline(), true);
+  assert.equal(c.get('login').hidden, false);
+  assert.equal([...c.callbacks.values()].filter((t) => t.ms === 15000).length, 1);
+  usage = 'ok';
+  assert.equal(await c.run(15000), 1);
+  assert.equal(c.networkOffline(), false);
+  assert.ok(requests.includes('/api/snapshot'));
+  assert.equal(c.get('app').hidden, false);
+});
+
+test('숨은 화면은 보드에 묻지 않고, 다시 보일 때 묻는다', async () => {
+  const requests = [];
+  const c = reachabilityClient(reachableBoard(requests));
+  c.context.navigator = { onLine: false };
+  c.context.document.hidden = true;
+  c.windowEvents.DOMContentLoaded();
+  await c.run(1500);
+  assert.deepEqual(requests, []);
+  assert.equal([...c.callbacks.values()].filter((t) => t.ms === 15000).length, 0);
+  c.context.document.hidden = false; c.documentEvents.visibilitychange();
+  assert.equal(await c.run(1500), 1);
+  assert.equal(requests[0], '/api/usage');
+  assert.equal(c.networkOffline(), false);
+  assert.equal(c.get('app').hidden, false);
+});
+
+test('보드가 닿은 뒤 브라우저가 다시 오프라인을 알리면 새로 묻는다', async () => {
+  const requests = [];
+  let usage = 'ok';
+  const c = reachabilityClient(async (url) => reachableBoard(requests, { usage })(url));
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  await c.run(1500);
+  assert.equal(c.state.boardReachable, true);
+  usage = 'down';
+  c.windowEvents.offline();
+  assert.equal(c.state.boardReachable, false);
+  assert.equal(c.networkOffline(), true);
+  requests.length = 0;
+  await c.run(1500);
+  assert.deepEqual(requests, ['/api/usage']);
+  assert.equal(c.networkOffline(), true);
+  usage = 'ok';
+  await c.run(15000);
+  assert.equal(c.networkOffline(), false);
+  assert.equal(c.state.offline, false);
+});
+
+test('브라우저가 온라인이면 보드에 따로 묻지 않는다', async () => {
+  const requests = [];
+  const c = reachabilityClient(reachableBoard(requests));
+  c.context.navigator = { onLine: true };
+  c.windowEvents.DOMContentLoaded();
+  for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal([...c.callbacks.values()].filter((t) => t.ms === 1500).length, 0);
+  assert.equal(requests.includes('/api/usage') && requests.indexOf('/api/usage') < requests.indexOf('/api/snapshot'), false);
+});
