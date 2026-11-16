@@ -35,11 +35,15 @@ def _save(path, value):
 
 
 def _resume(spec, identity, socket, receipt_path):
+    argv = [spec['argv'][0], 'resume', identity['id'], '--remote',
+            'unix://' + str(socket), '--cd', spec['cwd']]
+    for key, flag in (('sandbox', '-s'), ('approvalPolicy', '-a')):
+        if key in spec:
+            argv.extend([flag, spec[key]])
     return {**spec, 'nativeSource': identity, 'connectionMode': 'attach',
             'nativeReceiptPath': str(receipt_path),
             'initialDelivery': json.loads(Path(receipt_path).read_text()).get('delivery', 'unknown'),
-            'argv': [spec['argv'][0], 'resume', identity['id'], '--remote',
-                     'unix://' + str(socket), '--cd', spec['cwd']]}
+            'argv': argv}
 
 
 def app_server_running(profile, home=None):
@@ -142,9 +146,21 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
             if not model or spec['effort'] not in model['efforts']:
                 raise ValueError('이 계정에서 사용할 수 있는 모델과 에포트를 선택해 주세요.')
             params.update(model=spec['model'], config={'model_reasoning_effort': spec['effort']})
+            for key in ('sandbox', 'approvalPolicy'):
+                if key in spec:
+                    params[key] = spec[key]
         started_thread = client.call('thread/start', params)
         if spec.get('mode') == 'profile' and (started_thread.get('model') != spec['model'] or started_thread.get('reasoningEffort') != spec['effort']):
             raise ValueError('새 세션의 모델과 에포트를 확인하지 못했습니다.')
+        if spec.get('mode') == 'profile':
+            # Refuse the first prompt unless the server confirms the requested permissions.
+            sandbox_types = {'danger-full-access': 'dangerFullAccess',
+                             'workspace-write': 'workspaceWrite', 'read-only': 'readOnly'}
+            if ('sandbox' in spec and (not isinstance(started_thread.get('sandbox'), dict) or
+                    started_thread['sandbox'].get('type') != sandbox_types.get(spec['sandbox']))):
+                raise ValueError('새 세션의 샌드박스 권한을 확인하지 못했습니다.')
+            if 'approvalPolicy' in spec and started_thread.get('approvalPolicy') != spec['approvalPolicy']:
+                raise ValueError('새 세션의 승인 정책을 확인하지 못했습니다.')
         thread = started_thread.get('thread', {})
         identity['id'] = str(uuid.UUID(thread.get('id', '')))
         if thread.get('cwd') != spec['cwd']:

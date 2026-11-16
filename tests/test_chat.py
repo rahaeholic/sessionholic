@@ -2529,6 +2529,49 @@ class MenuDemoTmuxTest(unittest.TestCase):
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def test_profile_permissions_are_confirmed_before_first_prompt_and_resume(self):
+        class Client:
+            def __init__(self, response): self.response, self.calls = response, []
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def call(self, method, args):
+                self.calls.append((method, args))
+                if method == 'model/list': return {'data': [{'model': 'fixture-model', 'supportedReasoningEfforts': [{'reasoningEffort': 'high'}]}]}
+                if method == 'thread/start': return {'thread': {'id': SID, 'cwd': '/tmp/fixture'}, 'model': 'fixture-model', 'reasoningEffort': 'high', **self.response}
+                if method == 'thread/read': return {'thread': {'id': SID, 'turns': [{'id': 't1'}]}}
+                return {'turn': {'id': 't1'}}
+        base = {'mode': 'profile', 'argv': ['codex', 'prompt'], 'cwd': '/tmp/fixture',
+                'model': 'fixture-model', 'effort': 'high'}
+        for sandbox, kind in [('danger-full-access', 'dangerFullAccess'), ('workspace-write', 'workspaceWrite'), ('read-only', 'readOnly')]:
+            spec = {**base, 'sandbox': sandbox, 'approvalPolicy': 'never'}
+            for response, valid in [({'sandbox': {'type': kind}, 'approvalPolicy': 'never'}, True),
+                                    ({'sandbox': {'type': 'externalSandbox'}, 'approvalPolicy': 'never'}, False),
+                                    ({'sandbox': {'type': kind}, 'approvalPolicy': 'on-request'}, False)]:
+                with self.subTest(sandbox=sandbox, response=response), tempfile.TemporaryDirectory() as folder:
+                    client = Client(response)
+                    with patch('transfer_native._socket_path', return_value=Path('/tmp/control.sock')), \
+                         patch('native_chat._client', return_value=client), patch('managed_launch.ensure_app_server'):
+                        receipt = Path(folder) / 'receipt.json'
+                        if valid:
+                            out = managed_launch.bind(spec, {'agent': 'codex', 'home': '.codex'}, 'fixture', receipt_path=receipt)
+                            reopened = managed_launch.bind(spec, {'agent': 'codex', 'home': '.codex'}, 'fixture', receipt_path=receipt)
+                            self.assertEqual(out['argv'], ['codex', 'resume', SID, '--remote', 'unix:///tmp/control.sock', '--cd', '/tmp/fixture', '-s', sandbox, '-a', 'never'])
+                            self.assertEqual(out['argv'], reopened['argv'])
+                        else:
+                            with self.assertRaisesRegex(ValueError, '확인하지 못했습니다'):
+                                managed_launch.bind(spec, {'agent': 'codex', 'home': '.codex'}, 'fixture', receipt_path=receipt)
+                            self.assertNotIn('turn/start', [method for method, _ in client.calls])
+                        params = dict(client.calls)['thread/start']
+                        self.assertEqual((params['sandbox'], params['approvalPolicy']), (sandbox, 'never'))
+
+        client = Client({})
+        with tempfile.TemporaryDirectory() as folder, patch('transfer_native._socket_path', return_value=Path('/tmp/control.sock')), \
+             patch('native_chat._client', return_value=client), patch('managed_launch.ensure_app_server'):
+            out = managed_launch.bind(base, {'agent': 'codex', 'home': '.codex'}, 'fixture', receipt_path=Path(folder) / 'receipt.json')
+        self.assertEqual(dict(client.calls)['thread/start'], {'cwd': '/tmp/fixture', 'historyMode': 'legacy',
+                         'model': 'fixture-model', 'config': {'model_reasoning_effort': 'high'}})
+        self.assertEqual(out['argv'], ['codex', 'resume', SID, '--remote', 'unix:///tmp/control.sock', '--cd', '/tmp/fixture'])
+
     def test_profile_applies_model_and_effort_to_new_native_session_and_first_turn(self):
         class Client:
             def __init__(self): self.calls = []
