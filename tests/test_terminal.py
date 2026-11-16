@@ -19,6 +19,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import terminal  # noqa: E402
 
 
+class IdleRunContractTest(unittest.TestCase):
+    def test_default_and_minimum_are_rechecked_before_release(self):
+        manager = terminal.TerminalManager.__new__(terminal.TerminalManager)
+        manager.lock = threading.RLock()
+        manager.reservations = set()
+        item = terminal._Terminal({'id': 'a' * 32, 'key': 'run', 'metadata': {'mode': 'handoff'}}, 1024)
+        item.touched = time.monotonic() - 610
+        item.last_used_at = int(time.time()) - 610
+        item.reconnect_until = 0
+        manager.terminals = {item.record['id']: item}
+        manager._unrecorded = lambda _: False
+        manager._foreign = lambda _: False
+        manager._exists = lambda _: True
+        manager._end = lambda *_: self.fail('recent run must not be released by default')
+        self.assertEqual(manager.idle_runs(), [])
+        self.assertEqual(len(manager.idle_runs(min_idle=600)), 1)
+        self.assertIsNone(manager.release_run(item.record['id']))
+        for invalid in (None, True, '600', 59, float('nan')):
+            with self.assertRaises(ValueError):
+                manager.idle_runs(min_idle=invalid)
+            with self.assertRaises(ValueError):
+                manager.release_run(item.record['id'], min_idle=invalid)
+
+
 class BufferTest(unittest.TestCase):
     def test_bounded_output_and_reconnect_cursor(self):
         stream = terminal._Terminal({"id": "a" * 32}, 8)

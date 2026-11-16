@@ -1245,11 +1245,13 @@ class TerminalManager:
         self._changed()
         return row
 
-    def idle_runs(self):
+    def idle_runs(self, min_idle=RUN_IDLE):
         """Rows of terminals that run their own CLI (RUN_MODES) unused for RUN_IDLE; the caller
         ends one only when its screen rests at an empty prompt and the session it names is not
         at work (release_run). A 새 세션 terminal counts once its program was read as Claude,
         Codex or an SSH connection: its menu and Claude's agent view are idle_launchers'."""
+        if type(min_idle) not in (int, float) or not math.isfinite(min_idle) or min_idle < 60:
+            raise ValueError('min_idle must be at least 60 seconds')
         now = time.monotonic()
         with self.lock:
             rows = []
@@ -1257,7 +1259,7 @@ class TerminalManager:
                 metadata = terminal.record["metadata"]
                 if (metadata.get("mode") not in RUN_MODES or terminal.record.get("closed", False)
                         or terminal.record["key"] in self.reservations or self._unrecorded(terminal)
-                        or self._foreign(terminal) or self._idle_seconds(terminal, now) < RUN_IDLE
+                        or self._foreign(terminal) or self._idle_seconds(terminal, now) < min_idle
                         or (metadata.get("mode") == "new-session"
                             and metadata.get("program") not in ("claude", "codex", "ssh"))):
                     continue
@@ -1265,11 +1267,11 @@ class TerminalManager:
                     rows.append(self._public(terminal))
             return rows
 
-    def release_run(self, terminal_id):
+    def release_run(self, terminal_id, min_idle=RUN_IDLE):
         """End one terminal idle_runs named, if it still is one (nobody used it meanwhile); its
         row (the caller ends its held run on a remote host), else None."""
         with self.lock:
-            if terminal_id not in {row["id"] for row in self.idle_runs()}:
+            if terminal_id not in {row["id"] for row in self.idle_runs(min_idle=min_idle)}:
                 return None
             terminal = self._get(terminal_id)
             self._end(terminal, "released")
