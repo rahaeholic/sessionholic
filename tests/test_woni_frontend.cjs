@@ -23,13 +23,13 @@ function fixture(call, storage = new Map(), host = undefined, extra = {}) {
   for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-quick', 'woni-quick-options', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
   nodes['woni-quick-options'].hidden = true;
   nodes['woni-form'].submit = element();
-  const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
+  const context = { document: { ...element(), getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     setTimeout: (fn, ms) => { timers.set(++timerId, fn); delays.set(timerId, ms); return timerId; }, clearTimeout: id => { timers.delete(id); }, AbortController, URLSearchParams, CSS: { escape: value => value }, ...extra };
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
   const tick = async () => { const waiting = [...timers.values()]; timers.clear(); for (const fn of waiting) await fn(); };
-  return { nodes, storage, app: context.window.SessionholicWoni, call, tick, delays };
+  return { nodes, storage, app: context.window.SessionholicWoni, call, tick, delays, document: context.document, waiting: () => [...timers.keys()].map(id => delays.get(id)) };
 }
 
 test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포커스한다', async () => {
@@ -136,6 +136,50 @@ test('닷츠처럼 원이 말에는 이름·시각을 달지 않고 날짜와 �
   // 말풍선 속 링크·버튼을 누른 것은 메뉴를 열지 않는다.
   answer.listeners.click({ target: { closest: () => ({}) } });
   assert.equal(list().some(node => node.className?.includes('is-open')), false);
+});
+
+test('닫힌 보드는 대기 중 30초, 진행 중 6초, 열린 창은 4초짜리 타이머 하나만 둔다', async () => {
+  let reads = 0, chats = [];
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni') reads++;
+    return { chats, activity: {}, items: [] };
+  };
+  const { app, nodes, waiting, tick } = fixture(call);
+  await app.check(call); await new Promise(setImmediate);
+  assert.equal(reads, 1);
+  assert.deepEqual(waiting(), [30000]);
+  chats = [{ id: 'active', status: 'queued' }];
+  await tick();
+  assert.deepEqual(waiting(), [6000]);
+  nodes['woni-open'].click(); await new Promise(setImmediate);
+  assert.deepEqual(waiting(), [4000]);
+  nodes['woni-close'].click();
+  assert.equal(reads, 3);
+  assert.deepEqual(waiting(), [6000]);
+  chats = []; await tick();
+  assert.deepEqual(waiting(), [30000]);
+});
+
+test('숨긴 탭은 진행 중 조회가 끝나도 멈추고 복귀 시 한 번 갱신하며 잠금 뒤에는 쉬어 간다', async () => {
+  let reads = 0, finish;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    reads++;
+    return new Promise(resolve => { finish = () => resolve({ chats: [], activity: {} }); });
+  };
+  const { app, document, waiting, tick } = fixture(call);
+  const visibility = hidden => { document.hidden = hidden; document.listeners.visibilitychange(); };
+  document.hidden = true;
+  await app.check(call); assert.equal(reads, 0);
+  visibility(false); assert.equal(reads, 1);
+  visibility(true); finish(); await new Promise(setImmediate);
+  assert.deepEqual(waiting(), []);
+  await tick(); assert.equal(reads, 1);
+  visibility(false); assert.equal(reads, 2);
+  finish(); await new Promise(setImmediate); assert.deepEqual(waiting(), [30000]);
+  visibility(true); assert.deepEqual(waiting(), []);
+  app.lock(); visibility(false); await tick(); assert.equal(reads, 2);
 });
 
 test('팝업을 닫아도 새 답변 배지를 표시하고 확인하면 지운다', async () => {

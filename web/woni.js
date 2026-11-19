@@ -294,7 +294,7 @@
     for (const [tab, name] of [[chatTab, "chat"], [tasksTab, "tasks"], [notesTab, "notes"], [workTab, "work"], [findOpen, "find"]]) tab.setAttribute("aria-pressed", String(value === name));
     original.hidden = true;
     if (isChat && dialog.open) markVisibleRead();
-    if (value === "work") { renderWork(); clearTimeout(timer); refresh(); }
+    if (value === "work") { renderWork(); refresh(); }
     if (value === "tasks") { renderTasks(); loadTasks(); }
     if (value === "notes") { renderNotes(); if (!notes && !notesLoading) loadNotes(); }
     if (value === "find") { renderFind(); loadStreams(); }
@@ -1375,7 +1375,7 @@
   }
   function reloadAll() {
     closeDrawer();
-    clearTimeout(timer); refresh(); loadStreams();
+    refresh(); loadStreams();
     if (view === "tasks") loadTasks();
     if (view === "notes" && !note) loadNotes();
     notify("새로 불러오고 있어요.");
@@ -1516,11 +1516,18 @@
       status.textContent = "다시 보냈는지 확인하지 못했어요. 잠시 뒤 목록을 확인해 주세요.";
     } finally {
       resending.delete(chat.id); if (button) button.disabled = false;
-      clearTimeout(timer); refresh();
+      refresh();
     }
   }
+  function scheduleRefresh(immediate = false) {
+    clearTimeout(timer);
+    if (!enabled || document.hidden || reading) return;
+    const delay = dialog.open ? 4000 : runKey ? 6000 : 30000;
+    timer = setTimeout(refresh, immediate ? 0 : delay);
+  }
   async function refresh() {
-    if (!enabled || reading || !api) return;
+    clearTimeout(timer);
+    if (!enabled || document.hidden || reading || !api) return;
     reading = true; const current = authEpoch;
     try {
       const data = await api("/api/woni");
@@ -1530,7 +1537,7 @@
       if (left.length) olderChats = mergeChats(olderChats, left);
       latestData = data; observeReplies(data);
       const key = runningKey(data?.chats), started = key !== runKey; runKey = key;
-      if (dialog.open) {
+      if (dialog.open && !document.hidden) {
         show(data);
         // The to-do list is read when its tab opens and every 30 seconds while it stays open.
         if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
@@ -1543,7 +1550,7 @@
           else showOriginal(id);
         }
       }
-      if (current === authEpoch && dialog.open && view === "work") {
+      if (current === authEpoch && dialog.open && !document.hidden && view === "work") {
         try {
           const result = await api("/api/woni/activity");
           if (current === authEpoch && dialog.open) { workData = result; workError = ""; }
@@ -1557,9 +1564,10 @@
       }
     } finally {
       reading = false;
-      if (enabled) timer = setTimeout(refresh, current === authEpoch ? (dialog.open ? 4000 : 6000) : 0);
+      scheduleRefresh(current !== authEpoch);
     }
   }
+  document.addEventListener("visibilitychange", refresh);
   open.addEventListener("click", () => {
     if (dialog.open) { setView("chat"); markVisibleRead(); return; }
     pending = savedPending();
@@ -1587,7 +1595,7 @@
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { closeQuick(); closeDrawer(false); clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
+  dialog.addEventListener("close", () => { closeQuick(); closeDrawer(false); services.voice?.stop(input); epoch++; scheduleRefresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
   tasksTab.addEventListener("click", () => setView("tasks"));
@@ -1671,7 +1679,7 @@
       if (current === authEpoch) {
         sending = false; renderAttachments();
         if (dialog.open) show(latestData || { chats: [], activity: {} });
-        clearTimeout(timer); refresh();
+        refresh();
       }
     }
   }
@@ -1704,7 +1712,7 @@
     openFromNotification(id) {
       if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) return false;
       focusId = id; leaveStream();
-      if (enabled) { open.click(); clearTimeout(timer); refresh(); }
+      if (enabled) { open.click(); refresh(); }
       return true;
     },
     lock() {
