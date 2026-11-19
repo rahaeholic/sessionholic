@@ -47,13 +47,14 @@ class WoniBridgeTest(unittest.TestCase):
             result = woni_bridge.local_call(home=self.home)
         self.assertEqual(result, {'enabled': True, 'chats': [{'id': 'a', 'attachments': []}], 'activity': {'running': 1}})
         request = urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, 'http://127.0.0.1:18772/v1/state')
+        self.assertEqual(request.full_url, 'http://127.0.0.1:18772/v1/state?view=chat')
         self.assertNotIn('test-credential', json.dumps(result))
 
     def test_send_preserves_request_id_and_never_accepts_other_fields(self):
         data = {'text': '안녕', 'requestId': 'request-123456'}
         with patch.object(woni_bridge, 'urlopen', return_value=Response({'status': 'queued'})) as urlopen:
             woni_bridge.local_call(data, self.home)
+        self.assertEqual(urlopen.call_args.args[0].full_url, 'http://127.0.0.1:18772/v1/chat')
         self.assertEqual(json.loads(urlopen.call_args.args[0].data), data)
         self.assertEqual(urlopen.call_args.args[0].get_header('X-woni'), '1')
         with self.assertRaises(ValueError):
