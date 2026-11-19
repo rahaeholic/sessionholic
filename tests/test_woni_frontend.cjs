@@ -20,7 +20,8 @@ function fixture(call, storage = new Map(), host = undefined, extra = {}) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-quick', 'woni-quick-options', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
+  nodes['woni-quick-options'].hidden = true;
   nodes['woni-form'].submit = element();
   const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
@@ -1657,4 +1658,27 @@ test('실패·중단 줄은 원이가 쓴 안내를 그대로 보이고, 다시 
   assert.deepEqual(boxes.map(textOf), ['다시 보냈어요. 아래 답을 확인해 주세요.', '다시 보내기']);
   await boxes[1].children[0].click(); await settle();
   assert.deepEqual(sent, [{ text: '근본원인부터 해결해줘', requestId: 'request-123456', retryOf: 'stop', attachments: ['20261111-abcdefabcdef'], replyTo: { id: 'done', part: 'answer' } }]);
+});
+
+test('빠른 답장은 공유 문구를 한 번만 보내고 작성 중인 글을 유지한다', async () => {
+  const sent = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST' && url === '/api/woni') sent.push(options.body.text);
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call, new Map(), undefined, { quickReplies: () => ['내가 저장한 문구'] });
+  await app.check(call);
+  nodes['woni-open'].click();
+  nodes['woni-input'].value = '내가 저장한 문구';
+  nodes['woni-quick'].click();
+  const options = nodes['woni-quick-options'];
+  assert.equal(options.hidden, false);
+  const choice = options.children[0];
+  assert.equal(choice.textContent, '내가 저장한 문구');
+  await choice.click();
+  await choice.click();
+  assert.deepEqual(sent, ['내가 저장한 문구']);
+  assert.equal(nodes['woni-input'].value, '내가 저장한 문구');
+  assert.equal(options.hidden, true);
 });

@@ -150,10 +150,10 @@
   // target: the Woni answer being replied to. A suggestion tapped while replying to that answer goes as a reply to it.
   async function sendSuggestion(text, target = null) {
     if (pending || sending || uploading) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
-    const reply = target?.part === "answer" ? { id: target.id, part: "answer" } : null;
+    const reply = target ? { id: target.id, part: target.part } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(reply ? { replyTo: reply } : {}) });
     // The reply bar closes only when it was on this answer; a bar on another message stays for the composer.
-    if (reply && replyTarget?.id === reply.id && replyTarget.part === "answer") replyBox.hidden = true;
+    if (reply && replyTarget?.id === reply.id && replyTarget.part === reply.part) replyBox.hidden = true;
     leaveStream();
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -427,6 +427,7 @@
     });
     filesBox.replaceChildren(...nodes);
     filesBox.hidden = !!pending || !nodes.length;
+    quick.disabled = !!pending || sending || uploading;
     attach.disabled = !!pending || attachments.length >= maxFiles;
     send.disabled = sending || uploading || !!pending;
     send.textContent = sending ? "전송 중…" : pending ? (pendingState === "uncertain" ? "전송 확인 필요" : "확인 중…") : "보내기";
@@ -1586,7 +1587,7 @@
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { closeDrawer(false); clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
+  dialog.addEventListener("close", () => { closeQuick(); closeDrawer(false); clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
   tasksTab.addEventListener("click", () => setView("tasks"));
@@ -1612,6 +1613,25 @@
   $("woni-reply-clear").addEventListener("click", () => {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
     replyTarget = null; replyBox.hidden = true; renderReplyPicks();
+  });
+  const quick = $("woni-quick"), quickOptions = $("woni-quick-options");
+  function closeQuick() {
+    quickOptions.hidden = true;
+    quickOptions.replaceChildren();
+    quick.setAttribute("aria-expanded", "false");
+  }
+  quick.addEventListener("click", () => {
+    if (!quickOptions.hidden) { closeQuick(); return; }
+    const replies = quickReplies();
+    quickOptions.replaceChildren(...replies.map((text) => action(text, () => {
+      closeQuick();
+      quick.focus();
+      return sendSuggestion(text, replyTarget);
+    })));
+    if (!replies.length) quickOptions.append(el("span", "", "하던일 설정에서 문구를 추가해 주세요."));
+    quickOptions.hidden = false;
+    quick.setAttribute("aria-expanded", "true");
+    quickOptions.querySelector("button")?.focus();
   });
   attach.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
