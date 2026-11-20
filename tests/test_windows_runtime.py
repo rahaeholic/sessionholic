@@ -134,12 +134,16 @@ class FakeReader:
                         raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
                     if owner.oversized_turn_cursor is not None and owner.oversized_turn_cursor == params.get('cursor'):
                         raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
-                    turns = []
-                    for turn in reversed(copy.deepcopy(owner.thread.get('turns', []))):
+                    turns = copy.deepcopy(owner.thread.get('turns', []))
+                    if params.get('sortDirection', 'desc') == 'desc':
+                        turns.reverse()
+                    summaries = []
+                    for turn in turns:
                         items = turn.get('items', [])
                         summary = [item for item in items if item.get('type') == 'userMessage']
                         answers = [item for item in items if item.get('type') == 'agentMessage']
-                        turns.append({**turn, 'items': summary + answers[-1:]})
+                        summaries.append({**turn, 'items': summary + answers[-1:]})
+                    turns = summaries
                     start = int(params.get('cursor') or 0)
                     end = start + min(params['limit'], owner.turn_page_size or params['limit'])
                     return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
@@ -316,6 +320,22 @@ class WindowsRuntimeTest(unittest.TestCase):
         sent = self.send(request='fresh-request-0001')
         self.assertEqual((sent['delivery'], sent['confirmed'], self.reader.send_calls),
                          ('accepted', True, 1))
+
+    def test_old_request_before_oversized_turn_is_found_before_retransmit(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '합성 입력' if index == 0 else '질문 %d' % index +
+                             ('x' * (9 * 1024 * 1024) if index == 20 else '')}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(81)]
+        self.reader.turn_page_size = 20
+        self.reader.oversized_turn_cursor = '60'
+        for index in (0, 80):
+            result = self.send(request='request-%04d' % index,
+                               text='합성 입력' if index == 0 else '질문 %d' % index)
+            self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                             ('completed', True, 'turn-%d' % index, 0))
 
     def test_status_inconsistency_outside_display_window_rejects_send(self):
         self.reader.thread['turns'] = [

@@ -785,14 +785,24 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
     """Find exact old request or turn identities without loading their full items."""
     request_ids = set(request_ids)
     found, found_turn, cursor, seen = {}, None, None, set()
+    direction, limit, retried = 'desc', HISTORY_PAGE, False
     while True:
-        params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
-                  'sortDirection': 'desc', 'itemsView': 'summary'}
+        params = {'threadId': thread_id, 'limit': limit,
+                  'sortDirection': direction, 'itemsView': 'summary'}
         if cursor:
             params['cursor'] = cursor
         try:
             page = server.call('thread/turns/list', params)
         except OversizedReply:
+            if direction == 'desc' and not retried:
+                # A large old item can hide earlier IDs from a newest-first scan.
+                # Retry from the oldest side so earlier IDs are still checked first.
+                direction, cursor, seen, retried = 'asc', None, set(), True
+                continue
+            if direction == 'asc' and limit > 1:
+                # Shrink only the page containing the oversized turn.
+                limit = max(1, limit // 2)
+                continue
             found_by_id = {turn['id']: turn for turn in found.values()}
             if found_turn is not None:
                 found_by_id[found_turn['id']] = found_turn
