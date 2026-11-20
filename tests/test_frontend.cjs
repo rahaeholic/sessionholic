@@ -4108,7 +4108,10 @@ test('terminal keys sit in two rows with held modifiers, an inverted-T arrow clu
   assert.match(css, /"left down right enter cmd2 k4\s+word pick/);
   assert.match(html, /data-key="model" class="command-key"[^>]*>\/model</);
   assert.match(html, /data-key="effort" class="command-key"[^>]*>\/effort</);
-  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*"up\s+down left right enter cmd1 cmd2"\s+"k4\s+word pick/);
+  // A phone keeps the two rows and the arrow cluster: the narrow rule only reweights columns.
+  const narrow = css.split('@container terminal-tools (max-width: 395.98px) {')[1].split('\n}\n')[0];
+  assert.doesNotMatch(narrow, /grid-template-(?:areas|rows)/);
+  assert.match(narrow, /grid-template-columns: repeat\(3, minmax\(0, 0\.9fr\)\) minmax\(0, 1\.3fr\)/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])

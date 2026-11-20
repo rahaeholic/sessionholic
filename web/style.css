@@ -3256,17 +3256,14 @@ li[data-task] {
   font-family: var(--font);
   font-size: 12px;
 }
-/* Keep the navigation and command buttons together at narrow terminal widths. */
+/* A phone (384px) keeps the same two rows and inverted-T arrows: glyph-only keys give width
+   to the word keys (Ctrl, ⇧Tab, Enter, /effort) so every label stays on one line. */
 @container terminal-tools (max-width: 395.98px) {
   .terminal-keys {
-    grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1.2fr) repeat(2, minmax(0, 1.5fr));
-    grid-template-rows: repeat(3, var(--key-row));
-    grid-template-areas:
-      "up   down left right enter cmd1 cmd2"
-      "k4   word pick ctrl  ctrl  alt  alt"
-      "meta k1   k2   k3    k3    cup  cup";
+    grid-template-columns: repeat(3, minmax(0, 0.9fr)) minmax(0, 1.3fr) minmax(0, 1.5fr) minmax(0, 1.1fr) repeat(2, minmax(0, 1fr)) minmax(0, 1.1fr) minmax(0, 0.9fr);
   }
-  .terminal-keys .command-key {
+  .terminal-keys .command-key,
+  .terminal-keys [data-mod="meta"] {
     margin-left: 0;
   }
 }
