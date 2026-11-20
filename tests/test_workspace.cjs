@@ -782,3 +782,42 @@ test('the root window capture and visible Option number buttons select the same 
   assert.equal(f.workspace.readingActive(), true); assert.equal(second.frame.appendCount, 1);
   assert.equal(f.calls.some(([name]) => name === 'api'), false);
 });
+
+test('selecting a replacement in the primary pane cancels its pending cold restore', () => {
+  const f = fixture();
+  f.workspace.locked();
+  f.preferences.set('workspace', {version: 1, tree: W.tiled(['p1','p2','p3','p4']), active: 'p1',
+    panes: {p1: {key:'missing', mode:'chat'}, p2:{key:'session-b'}}});
+  const restore = f.primary.restore;
+  f.primary.restore = () => false;
+  f.workspace.changed();
+  assert.equal(f.preferences.get('workspace').panes.p1.key, 'missing');
+  assert.equal(f.workspace.awaitingSession(), true);
+  assert.equal(f.workspace.routeSession('session-c'), false);
+  assert.equal(f.workspace.awaitingSession(), false);
+  f.primary.select('session-c');
+  f.primary.restore = restore;
+  f.workspace.changed();
+  assert.equal(f.preferences.get('workspace').panes.p1.key, 'session-c');
+  assert.equal(f.preferences.get('workspace').panes.p2.key, 'session-b');
+});
+
+test('refresh from a mounted pane reaches the board and protects input in every pane', () => {
+  const f = fixture();
+  f.workspace.add({ key: 'session-b' });
+  const second = f.attach('p2');
+  f.workspace.add({ key: 'session-c' });
+  const third = f.attach('p3');
+  let reloads = 0;
+  f.primary.reloadBoard = () => reloads++;
+  f.workspace.requestBoardReload('p2', {});
+  assert.equal(reloads, 0);
+  f.workspace.requestBoardReload('p2', second.frame.contentWindow);
+  assert.equal(reloads, 1);
+  assert.equal(f.workspace.reloadBlocker(), null);
+  third.info.unsaved = true;
+  assert.equal(f.workspace.reloadBlocker(), '3');
+  third.info.unsaved = false;
+  f.infos.get('p1').composing = true;
+  assert.equal(f.workspace.reloadBlocker(), '1');
+});

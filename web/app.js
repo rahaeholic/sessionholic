@@ -480,6 +480,8 @@ function shortLayout() {
 // (scale) is not a keyboard. A hardware keyboard's shortcut bar stays below
 // KEYBOARD_MIN_PX.
 const KEYBOARD_MIN_PX = 150;
+// External-keyboard traces show a 68–69px accessory bar before WebKit pans.
+const IPAD_ACCESSORY_ROOM = 72;
 function editingText() {
   const node = document.activeElement;
   return !!node && (node.isContentEditable === true || /^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName || ""));
@@ -1023,7 +1025,15 @@ function answerOnOpen(s) {
 // notifications is unregistered (one that does keeps its subscription and only updates).
 // Other applications' caches and every stored preference stay.
 async function hardReload({ discard = false, preserveDrafts = false } = {}) {
+  const workspace = window.SessionholicWorkspace;
+  if (workspace?.embedded) return workspace.requestBoardReload();
   if (state.hardReloadBusy) return;
+  const blocked = () => {
+    const pane = workspace?.reloadBlocker?.();
+    if (pane) toast(`${pane}번 창에 입력 중인 내용이 있어 화면을 유지했습니다.`);
+    return !!pane;
+  };
+  if (blocked()) return;
   if ($("board-status")) $("board-status").open = false;
   if (networkOffline()) {
     // A cleared shell could not load again until the board is reachable.
@@ -1056,6 +1066,11 @@ async function hardReload({ discard = false, preserveDrafts = false } = {}) {
     }
   } catch {
     // Reload anyway: the fresh page reads everything from the board again.
+  }
+  if (blocked() || (!discard && unsavedWork())) {
+    state.hardReloadBusy = false;
+    for (const button of buttons) button.disabled = false;
+    return;
   }
   state.discardOnReload = discard;
   if (discard && !preserveDrafts) clearSavedDrafts();
@@ -1708,8 +1723,8 @@ function renderEmptyPane() {
   let empty = detail.children[0];
   if (empty?.id !== "empty-pane") {
     empty = el("section", "welcome empty-pane"); empty.id = "empty-pane";
-    empty.append(appMark(), el("h2", null, "빈 창"),
-      el("p", null, "새 세션을 시작하거나 기존 세션을 이 창에서 여세요."));
+    empty.heading = el("h2"); empty.description = el("p");
+    empty.append(appMark(), empty.heading, empty.description);
     const actions = el("div", "empty-pane-actions");
     const current = () => state.authenticated && !state.selected && !state.selectedBotRequest &&
       !state.terminalVisible && !state.launcherWorkspace && detail.children[0] === empty;
@@ -1729,6 +1744,12 @@ function renderEmptyPane() {
     empty.startButton = start; empty.statusNote = note;
     detail.replaceChildren(empty);
   }
+  const waiting = window.SessionholicWorkspace?.awaitingSession?.();
+  const heading = waiting ? "저장한 세션 확인 중" : "빈 창";
+  if (empty.heading.textContent !== heading) {
+    empty.heading.textContent = heading;
+    empty.description.textContent = waiting ? "목록에 세션이 나타나면 이 창에 다시 표시합니다." : "새 세션을 시작하거나 기존 세션을 이 창에서 여세요.";
+  }
   const ready = !networkOffline() && newSessionHosts().some((host) => host.newSession.available && host.online !== false);
   empty.startButton.disabled = !ready || !!state.newSessionBusy;
   empty.statusNote.textContent = !state.capabilities ? "기기 정보를 확인하고 있습니다…" :
@@ -1742,7 +1763,7 @@ function render() {
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
-  if (reading && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
+  if (reading && !sharedSessionSidebar() && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   const embedded = window.SessionholicWorkspace?.embedded;
   if (!embedded) { renderHosts(now); renderFreshness(now); renderAttention(sessions); }
   // The conversation on screen is read, also when it answers or finishes while shown
@@ -1751,8 +1772,8 @@ function render() {
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   if (!embedded) { renderSessionList(sessions, now); renderHistorySearch(); }
   if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
+  const wasEmpty = !state.selected;
   const selected = sessions.find((s) => s.key === state.selected);
-  if (!state.selected) renderEmptyPane();
   window.SessionholicGoals?.update?.(sessions);
   // Its conversation listed now: it takes its place beside the docked terminal.
   if (!selected && state.docked && state.terminal && !state.dockBeside && dockedSessionFor(state.terminal)) {
@@ -1765,7 +1786,10 @@ function render() {
     if (list?.conversationSource === chatKey(sourceOf(selected))) renderWorkContext(selected, entry, (list.conversationRows || []).map((row) => row.message));
   }
   else if (state.selected) {
-    state.selected = null;
+    // The recent-session list can omit one session even when its host is online.
+    // Only choosing another session or closing the pane replaces this reference.
+    const reconnecting = !!window.SessionholicWorkspace?.managed?.();
+    if (!reconnecting) state.selected = null;
     state.detailFor = null;
     // Nothing follows the conversation any more (polling, its live stream).
     stopChatPolling();
@@ -1773,17 +1797,18 @@ function render() {
       el(
         "div",
         "welcome",
-        "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
+        reconnecting ? "저장한 세션을 기다리는 중입니다. 목록에서 확인되면 이 창에 다시 표시합니다." : "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
       ),
     );
     // A phone showed nothing but that conversation, and its back button went
     // with it: back to the list, saying why.
-    if (mobileStartOnList() && state.detailShown && !state.terminalVisible) {
+    if (!reconnecting && mobileStartOnList() && state.detailShown && !state.terminalVisible) {
       toast("열어 둔 작업을 목록에서 더 이상 찾을 수 없어 목록으로 돌아왔습니다.");
       backToList();
     } else syncEvents();
   }
   window.SessionholicWorkspace?.changed();
+  if (wasEmpty && !state.selected) renderEmptyPane();
 }
 // A lost connection comes first: on a phone the chips scroll sideways and only the
 // first fit, so a device that is down is never the one pushed out of sight. A tap
@@ -2564,13 +2589,19 @@ function sessionForBotRequest(request) {
   const ref = request?.nativeRef;
   return ref ? allSessions().find((s) => s.host === request.host && s.agent === ref.agent && s.id === ref.id && s.home === ref.home) || null : null;
 }
+// The split board's sidebar belongs to all panes. Its filter can differ
+// from the conversation in the primary pane, which lives in this document.
+function sharedSessionSidebar() {
+  const workspace = window.SessionholicWorkspace;
+  return !workspace?.embedded && !!workspace?.managed?.();
+}
 function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
   const selected = selectedSession();
   // With a bot picked, every tab but 봇 요청 lists its sessions: the open one stays open.
   const kept = botFilter() && category !== "bot";
-  if (clearSelection && ((selected && !kept && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
+  if (clearSelection && !sharedSessionSidebar() && ((selected && !kept && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
     rememberConversationView(); stopChatPolling();
     state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
     $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);
@@ -6824,6 +6855,31 @@ function buildChatComposer(s) {
   });
   return box;
 }
+function splitInputContentHeight(input, fallback) {
+  if (!ipadWorkspace() || !input.clientWidth) return fallback();
+  const style = window.getComputedStyle(input);
+  // A detached node has no layout. This inert measurement field sits outside
+  // the pane flow and never receives focus, a selection, or keyboard events.
+  let measure = state.ipadInputMeasure;
+  if (!measure) {
+    measure = document.createElement("textarea");
+    measure.tabIndex = -1;
+    measure.inert = true;
+    measure.setAttribute("aria-hidden", "true");
+    measure.style.cssText = "position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;height:0;min-height:0;max-height:none;overflow:hidden;box-sizing:content-box;border:0;margin:0;";
+    document.body.append(measure);
+    state.ipadInputMeasure = measure;
+  }
+  for (const key of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "lineHeight", "letterSpacing", "whiteSpace", "overflowWrap", "wordBreak", "paddingTop", "paddingBottom", "direction", "tabSize"])
+    measure.style[key] = style[key];
+  measure.style.width = `${Math.max(1,input.clientWidth - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0))}px`;
+  measure.style.paddingLeft = measure.style.paddingRight = "0px";
+  measure.wrap = input.wrap;
+  measure.value = input.value;
+  const height = measure.scrollHeight;
+  measure.value = "";
+  return height;
+}
 function resizeChatInput(entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   const input = $("chat-input");
@@ -6839,7 +6895,8 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
     Math.min(line * (entry.expanded ? 11 : compactSessionLayout() ? 3 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded && !compactSessionLayout() ? 3 * line + padding + border : base);
   const list = $("messages");
-  const atBottom = list && list.scrollHeight - list.scrollTop - list.clientHeight < 50;
+  const listHeight = list?.clientHeight;
+  const atBottom = list && list.scrollHeight - list.scrollTop - listHeight < 50;
   const inputScroll = input.scrollTop || 0;
   // Followed to its end only when it was there (typing at the end): a status read resizes it
   // too, and must not pull a draft scrolled back for reading down to its last line.
@@ -6847,22 +6904,25 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const wasAtEnd = inputScroll + (input.clientHeight || 0) >= (input.scrollHeight || 0) - line - 2;
   input.style.minHeight = `${minimum}px`;
   input.style.maxHeight = `${cap}px`;
-  input.style.height = "0px";
-  const content = input.value ? input.scrollHeight + border || minimum : minimum;
+  const content = input.value ? splitInputContentHeight(input, () => {
+    input.style.height = "0px";
+    return input.scrollHeight;
+  }) + border || minimum : minimum;
   const height = Math.max(minimum, Math.min(cap, content));
   input.style.height = `${Math.ceil(height)}px`;
   // A sent draft is kept but drawn empty (.is-sent-draft): its lines past the one-line cap
   // give no scrollbar to an editor that shows nothing.
   const hidden = sentDraftHidden(entry);
   input.style.overflowY = content > cap && !hidden ? "auto" : "hidden";
-  input.scrollTop = input.value && !hidden ? inputScroll : 0;
+  const scroll = input.value && !hidden ? inputScroll : 0;
+  if (input.scrollTop !== scroll) input.scrollTop = scroll;
   if (document.activeElement === input && input.selectionEnd === input.value.length && content > cap && wasAtEnd && !hidden)
     input.scrollTop = input.scrollHeight;
   input.dataset.grown = String(height > base + 1);
   const toggle = $("chat-expand");
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
-  if (atBottom) setMessagesScroll(list, list.scrollHeight);
+  if (atBottom && (!ipadWorkspace() || list.clientHeight !== listHeight)) setMessagesScroll(list, list.scrollHeight);
   // A taller composer moves the bottom of the list: the 맨 아래 button sits above it again.
   renderJump();
 }
@@ -6922,7 +6982,7 @@ function noteHardwareKey(event) {
   const key = String(event.key || "");
   // Letters typed with no on-screen keyboard up: a tablet's narrow window counts, a phone does not.
   const physical = event.metaKey || event.ctrlKey || event.altKey || HARDWARE_KEYS.has(key) ||
-    (key.length === 1 && chatTyping() && (tabletScreen() || (!phoneLayout() && !shortLayout())) && !keyboardOpen());
+    (key.length === 1 && (chatTyping() || document.activeElement?.id === "terminal-draft") && (tabletScreen() || (!phoneLayout() && !shortLayout())) && !keyboardOpen());
   if (!physical) return;
   state.hardwareKeyboard = true;
   renderKeyboardHint();
@@ -12635,6 +12695,13 @@ function fitTerminal() {
   }
   if (!dimensions) return;
   const { cols, rows } = dimensions;
+  // A tile can transiently have only one row during a keyboard resize.
+  // Keep the last valid PTY grid until the server can accept the new size.
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || cols > 500 || rows < 2 || rows > 300) {
+    clearTimeout(state.resizeTimer);
+    state.resizePending = null;
+    return;
+  }
   const terminal = state.terminal, openRun = state.terminalOpenRun;
   const size = `${cols}x${rows}`;
   const previous = state.resizePending;
@@ -14001,9 +14068,12 @@ function resizeDraft() {
   const input = $("terminal-draft");
   if (!input?.style || state.composing) return;
   const before = input.style.height;
-  input.style.height = "auto";
+  const content = splitInputContentHeight(input, () => {
+    input.style.height = "auto";
+    return input.scrollHeight;
+  });
   const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
-  input.style.height = `${Math.min(input.scrollHeight, line * (compactSessionLayout() ? 3 : 4) + 20)}px`;
+  input.style.height = `${Math.min(content, line * (compactSessionLayout() ? 3 : 4) + 20)}px`;
   // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
   if (input.style.height !== before) requestAnimationFrame(fitTerminal);
 }
@@ -15748,7 +15818,7 @@ function showLogin() {
   }
   renderConnectivity();
   updateThemeColor();
-  $("login-token").focus();
+  if (!document.documentElement.hasAttribute?.("data-ipad")) $("login-token").focus();
 }
 async function lock() {
   if (state.launchBusy) {
@@ -15767,34 +15837,121 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
-// Keep room for iPad's hardware-keyboard accessory bar even before an editor takes focus.
-// A larger measured accessory bar is remembered for this page, never a software keyboard.
-const IPAD_INPUT_ROOM = 55;
+// A split workspace can have several editors. Only the focused pane needs room.
+function ipadWorkspace() {
+  const workspace = window.SessionholicWorkspace;
+  return document.documentElement.hasAttribute?.("data-ipad") && (workspace?.embedded || workspace?.managed?.());
+}
+function ipadInputPane() {
+  if (!document.documentElement.hasAttribute?.("data-ipad") || window.SessionholicWorkspace?.embedded ||
+      (window.visualViewport?.scale || 1) > 1.01) return null;
+  const field = document.activeElement;
+  if (field?.classList?.contains?.("workspace-frame")) {
+    const editor = field.contentDocument?.activeElement;
+    if (editor && !editor.isContentEditable && !editor.matches?.("input,textarea,select")) return null;
+    return field.parentElement;
+  }
+  if (!editingText() || field.closest?.("dialog")) return null;
+  return (ipadWorkspace() && field.closest?.(".workspace-pane")) || field.closest?.("#terminal-screen, #detail") || null;
+}
+
+function renderIpadInputRoom(pane) {
+  if (state.ipadInputPane && state.ipadInputPane !== pane) {
+    state.ipadInputPane.classList.remove("ipad-input-pane");
+    state.ipadInputPane.style.removeProperty("--ipad-input-room");
+    state.ipadInputPane.style.removeProperty("--ipad-pane-lift");
+    state.ipadInputPane.classList.remove("ipad-pane-lifted");
+    state.ipadAccessoryRoom = 0;
+  }
+  state.ipadInputPane = pane;
+  if (!pane) return;
+  const viewport = window.visualViewport;
+  const split = ipadWorkspace();
+  const visible = viewport?.height || window.innerHeight;
+  // In a split the parent lays out the frames. Accessory-bar pans must not move
+  // their anchor or alternately remove/add the focused frame's bottom padding.
+  const bottom = visible + (split ? 0 : viewport?.offsetTop || 0);
+  const bounds = pane.getBoundingClientRect();
+  const splitTile = split && pane.classList.contains("workspace-pane");
+  // offsetTop/Height are layout coordinates. The active tile's own translation
+  // must never feed back into the next keyboard or scroll measurement.
+  const parent = splitTile && pane.offsetParent;
+  const tileBottom = parent ? parent.getBoundingClientRect().top + pane.offsetTop + pane.offsetHeight : bounds.bottom;
+  let covered = Math.max(0, Math.ceil(tileBottom - bottom));
+  const keyboard = split && state.ipadLayoutHeight - visible > KEYBOARD_MIN_PX;
+  if (split && !keyboard) {
+    const size = `${window.innerWidth}/${state.ipadLayoutHeight}/${Math.round(bounds.height)}/${Math.round(tileBottom)}`;
+    if (state.ipadRoomSize !== size) state.ipadAccessoryRoom = 0;
+    state.ipadRoomSize = size;
+    covered = state.ipadAccessoryRoom = Math.max(covered, state.ipadAccessoryRoom || 0);
+  } else state.ipadAccessoryRoom = 0;
+  // A shallow row's header and composer already occupy most of its height.
+  // Slide the tile intact if it fits above the keyboard. Padding alone would
+  // shrink its iframe below the minimum usable editor height.
+  const shallow = bounds.height <= 340;
+  const readable = Math.min(shallow ? bounds.height : 200, visible);
+  const lift = splitTile && (shallow || keyboard) ? Math.max(0, covered - (bounds.height - readable)) : 0;
+  const inset = Math.min(bounds.height, covered - lift);
+  if (splitTile) {
+    pane.classList[lift ? "add" : "remove"]("ipad-pane-lifted");
+    const value = `${lift}px`;
+    if (pane.style.getPropertyValue?.("--ipad-pane-lift") !== value) pane.style.setProperty("--ipad-pane-lift", value);
+  }
+  pane.classList.add("ipad-input-pane");
+  const value = `${inset}px`;
+  if (pane.style.getPropertyValue?.("--ipad-input-room") !== value) pane.style.setProperty("--ipad-input-room", value);
+}
 // The height the app has: the visual viewport (an on-screen keyboard takes its space), except
 // that without a focused text field no keyboard takes space, so a visual viewport shorter than
 // the window is stale: iPadOS reports one for a moment when the app comes back from the
 // background or a minimized window, with no resize after it. Not when pinch-zoomed (the
 // visual viewport is then meant to be smaller).
-function viewportHeight() {
+function viewportHeight(pane = ipadInputPane()) {
   const viewport = window.visualViewport;
   let height = viewport?.height || window.innerHeight || 800;
   const unzoomed = (viewport?.scale || 1) <= 1.01;
   if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
-  // The parent already reserved room before sizing its split-pane iframes.
-  if (unzoomed && document.documentElement.hasAttribute?.("data-ipad") && !window.SessionholicWorkspace?.embedded) {
-    const inset = keyboardInset();
-    if (editingText() && inset > 0 && inset <= KEYBOARD_MIN_PX)
-      state.ipadInputRoom = Math.max(state.ipadInputRoom || IPAD_INPUT_ROOM, Math.round(inset));
-    height = Math.min(height, Math.max(0, (state.viewportTall || window.innerHeight || height) - (state.ipadInputRoom || IPAD_INPUT_ROOM)));
+  if (unzoomed && ipadWorkspace()) {
+    if (window.SessionholicWorkspace.embedded) return window.innerHeight || height;
+    const accessory = window.innerWidth > 1600 || window.matchMedia?.("(any-pointer: fine)")?.matches
+      ? IPAD_ACCESSORY_ROOM : 0;
+    const layout = window.innerHeight || height;
+    // During an iframe focus handoff activeElement can temporarily be BODY
+    // while WebKit still reports the smaller window and its 68px pan.
+    const offset = viewport?.offsetTop || 0;
+    const sameWidth = state.ipadLayoutWidth === window.innerWidth;
+    const panned = accessory && offset > 0 && offset <= accessory;
+    const full = panned ? Math.max(layout, Math.round(viewport.height + offset)) : layout;
+    // WebKit can clear offsetTop on blur before restoring innerHeight. The
+    // same reduced height still includes the bar until the window changes.
+    if (!sameWidth || !accessory || layout !== state.ipadAccessoryWindowHeight)
+      state.ipadAccessoryWindowHeight = 0;
+    const reduction = Math.max(full, sameWidth ? state.ipadLayoutHeight || 0 : 0) - layout;
+    if (reduction > 0 && reduction <= accessory && (panned || pane || state.ipadInputPane))
+      state.ipadAccessoryWindowHeight = layout;
+    if (!sameWidth || !state.ipadLayoutHeight ||
+        (!pane && !state.ipadInputPane && !state.ipadAccessoryWindowHeight) || full > state.ipadLayoutHeight) {
+      // The pan can round to 69px one frame before settling to 68px.
+      if (!sameWidth || !panned || Math.abs(full - state.ipadLayoutHeight) > 1)
+        state.ipadLayoutHeight = full;
+      state.ipadLayoutWidth = window.innerWidth;
+    }
+    return Math.max(1, state.ipadLayoutHeight - accessory);
+  }
+  if (pane) {
+    keyboardInset();
+    return Math.max(window.innerHeight || height, state.viewportTall || 0);
   }
   return height;
 }
 function updateViewport() {
-  const height = Math.round(viewportHeight());
+  const pane = ipadInputPane();
+  const height = Math.round(viewportHeight(pane));
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   redock();
   renderKeyboardRoom();
   renderAppShift();
+  renderIpadInputRoom(pane);
   traceKeyboardRoom();
   syncChromeMode();
   syncCompactSessionLayout();
@@ -15825,7 +15982,7 @@ function renderKeyboardRoom() {
   // A phone held upright folds its own way (is-typing); one held sideways is as short as a tablet
   // with its keyboard up, so its top bar folds too.
   const open = touchDevice() && editingText() && keyboardOpen();
-  const typing = open && (!phoneLayout() || shortLayout());
+  const typing = open && (!phoneLayout() || shortLayout()) && !(ipadInputPane() && !phoneLayout());
   // Typing on the board (its sheets included) leaves a docked terminal its height.
   const beside = typing && state.docked && !!document.activeElement?.closest?.("#app, dialog");
   // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
@@ -15851,9 +16008,29 @@ function renderKeyboardRoom() {
 // that hid a narrow window's header, its ‹ 세션 included.
 function renderAppShift() {
   const viewport = window.visualViewport;
-  const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
-  const top = viewport && touchDevice() && (viewport.scale || 1) <= 1.01 && following
-    ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
+  let top = 0;
+  if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
+    // WebKit may pan the fixed board when an iframe editor gains focus. The
+    // unshifted shell starts at zero; offsetTop alone can change without a pan.
+    if (!window.SessionholicWorkspace.embedded) {
+      const rect = $("app")?.getBoundingClientRect?.();
+      if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) - rect.top));
+    }
+  } else {
+    const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
+    const pane = ipadInputPane();
+    const follows = following || !!pane;
+    top = viewport && (touchDevice() || pane) && (viewport.scale || 1) <= 1.01 && follows
+      ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
+    // A fixed surface can already be at the visible top. Correct only the measured
+    // displacement, so a shortcut bar reporting pageTop alone cannot move the board.
+    if (pane && viewport) {
+      const shell = pane.id === "terminal-screen" && !document.body.classList.contains("terminal-inline")
+        ? pane : $("app");
+      const rect = shell?.getBoundingClientRect?.();
+      if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) + (viewport.offsetTop || 0) - rect.top));
+    }
+  }
   if (top === (state.appShift || 0)) return;
   state.appShift = top;
   document.documentElement.style?.setProperty?.("--app-shift", `${top}px`);
@@ -15872,7 +16049,8 @@ function keyboardTraceSeen(shape, values) {
       value != null && values[index] != null && Math.abs(value - values[index]) <= KEYBOARD_TRACE_SLACK));
 }
 function traceKeyboardRoom() {
-  const open = touchDevice() && editingText() && keyboardOpen();
+  const split = !!ipadWorkspace() && !window.SessionholicWorkspace.embedded;
+  const open = split ? !!ipadInputPane() : touchDevice() && editingText() && keyboardOpen();
   if (open === !!state.keyboardTraced) return;
   state.keyboardTraced = open;
   if (!open || (state.keyboardTraces || 0) >= KEYBOARD_TRACES) return;
@@ -15880,16 +16058,21 @@ function traceKeyboardRoom() {
   const events = [];
   const env = { kind: "viewport", field: String(document.activeElement?.id || ""), touch: true,
     standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, phone: phoneLayout(),
-    width: Math.round(window.innerWidth || 0), docked: !!state.docked };
+    width: Math.round(window.innerWidth || 0), docked: !!state.docked, ...(split ? { split: true, version: APP_VERSION } : {}) };
   const box = (node) => node?.getBoundingClientRect?.() || null;
   const round = (value) => (Number.isFinite(value) ? Math.round(value) : null);
   const snap = (e) => {
     const viewport = window.visualViewport;
     const app = box($("app"));
-    const field = box(document.activeElement);
+    const active = document.activeElement;
+    const frame = split && active?.classList?.contains?.("workspace-frame") ? active : null;
+    const field = box(frame ? frame.contentDocument?.activeElement : active);
+    const fieldOffset = frame ? (box(frame)?.top || 0) + (frame.clientTop || 0) : 0;
+    const other = split ? box(document.querySelector?.(".workspace-pane:not(.workspace-pane-active):not([hidden])")) : null;
     events.push({ t: Date.now() - t0, e, ih: round(window.innerHeight), vh: round(viewport?.height),
-      vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), sy: round(window.scrollY), at: round(app?.top),
-      ah: round(app?.height), it: round(field?.top), ib: round(field?.bottom), shift: state.appShift || 0 });
+      vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), at: round(app?.top), ah: round(app?.height),
+      it: round(field?.top + fieldOffset), ib: round(field?.bottom + fieldOffset), ...(split ? { otherBottom: round(other?.bottom),
+        otherHeight: round(other?.height) } : { sy: round(window.scrollY), shift: state.appShift || 0 }) });
   };
   snap("open");
   setTimeout(() => snap("settled"), 400);
@@ -15936,13 +16119,14 @@ function checkWebVersion() {
 // guards), interrupt a terminal or close an open sheet; the banner offers it then.
 // A plain reload is enough: the page is read from the network and assets carry ?v=.
 function reloadForUpdate() {
-  if (!state.updateAvailable || networkOffline() || state.terminalVisible || unsavedWork() ||
+  if (!state.updateAvailable || networkOffline() || window.SessionholicWorkspace?.managed?.() || state.terminalVisible || unsavedWork() ||
       document.querySelector?.("dialog[open]")) return false;
   window.location.reload();
   return true;
 }
 // The banner's tap: never at the cost of unsent words (a home-screen app shows no leave prompt).
 function updateBannerPressed() {
+  if (window.SessionholicWorkspace?.managed?.()) return hardReload();
   if (unsavedWork()) {
     toast("보내지 않은 글이나 첨부가 있어 새로고침하지 않았습니다. 보내거나 지운 뒤 다시 눌러 주세요.");
     return;
@@ -16128,6 +16312,12 @@ function showHistoryEntry(event, swiped = false) {
 
 // Pane layout never starts or resumes a native execution. Each pane owns the
 // original editor, IME, terminal and recognition state in its own document.
+function releaseHiddenIpadEditor() {
+  if (!document.documentElement.hasAttribute?.("data-ipad")) return;
+  const field = document.activeElement;
+  if (field && (field.id === "chat-input" || field.id === "terminal-draft" || field === state.term?.textarea) &&
+      !workspaceComposing()) field.blur();
+}
 function workspaceComposing() {
   // compositionOwner identifies late terminal events; it is not an active IME
   // flag. Samsung can also omit compositionend after a blur.
@@ -16147,7 +16337,7 @@ async function commitChatComposition(entry) {
     $("chat-input") === field && !entry.composing;
 }
 function workspaceHooks() {
-  let lastField = null;
+  let lastField = null, lastRef = null;
   document.addEventListener("focusin", (event) => {
     if (event.target?.matches?.("textarea, input:not([type='password'])") && !event.target.closest?.("dialog")) lastField = event.target;
   });
@@ -16157,8 +16347,9 @@ function workspaceHooks() {
       ...(state.terminalVisible && state.terminal ? { terminalId: state.terminal.id } : {}) }
       : state.launcherWorkspace?.terminalId ? { terminalId: state.launcherWorkspace.terminalId, mode: state.terminalVisible ? "terminal" : "chat" }
       : state.terminalVisible && state.terminal ? { terminalId: state.terminal.id, mode: "terminal" } : null;
-    return { authenticated: state.authenticated, snapshot: state.snapshot, ref,
-      title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : ""),
+    lastRef = ref || (state.selected && lastRef?.key === state.selected ? lastRef : null);
+    return { authenticated: state.authenticated, snapshot: state.snapshot, ref: lastRef,
+      title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : lastRef ? "저장한 세션 확인 중" : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,
       canToggleView: canToggleConversationView(),
@@ -16168,6 +16359,7 @@ function workspaceHooks() {
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    reloadBoard: hardReload,
     startOnList: mobileStartOnList,
     paneOpened: () => {
       if (mobileStartOnList() && !state.detailShown) { navigateView("detail"); setDetailShown(true); }
@@ -16584,6 +16776,8 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
+  // xterm and the draft can consume navigation keys before document keydown bubbles.
+  $("terminal-screen").addEventListener("keydown", noteHardwareKey, true);
   bindDraftInput($("terminal-draft"));
   // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
   $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
@@ -16617,6 +16811,7 @@ window.addEventListener("DOMContentLoaded", () => {
       dropParkedDictation("hidden");
     }
     if (document.hidden) {
+      releaseHiddenIpadEditor();
       state.pageHidden = true;
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();
@@ -16632,7 +16827,7 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   // A page restored from the back-forward cache may fire no visibilitychange.
-  window.addEventListener("pagehide", () => { persistAllDrafts(); state.pageHidden = true; });
+  window.addEventListener("pagehide", () => { releaseHiddenIpadEditor(); persistAllDrafts(); state.pageHidden = true; });
   window.addEventListener("pageshow", (event) => {
     settleViewport();
     if (event.persisted && !document.hidden) pageShown();
@@ -16662,6 +16857,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("online", recoverConnection);
   $("terminal-direct-input").checked = directTerminalInput();
+  $("terminal-show-keys")?.addEventListener("change", (event) => {
+    document.body.classList.toggle("hide-terminal-keys", !event.target.checked);
+    fitTerminal();
+  });
   $("terminal-direct-input").addEventListener("change", (event) => {
     state.directTerminalInput = event.target.checked;
     prefs.set("directTerminalInput", state.directTerminalInput);
@@ -16680,7 +16879,14 @@ window.addEventListener("DOMContentLoaded", () => {
   for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
   // iOS moves the visible area with no resize (its keyboard's own scroll, or a drag).
-  window.visualViewport?.addEventListener("scroll", renderAppShift);
+  window.visualViewport?.addEventListener("scroll", () => {
+    renderAppShift();
+    renderIpadInputRoom(ipadInputPane());
+  });
+  if (document.documentElement.hasAttribute?.("data-ipad")) {
+    for (const event of ["focusin", "focusout"])
+      document.addEventListener(event, () => window.requestAnimationFrame(updateViewport));
+  }
   updateViewport();
   if ("serviceWorker" in navigator && !window.SessionholicWorkspace?.embedded) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});

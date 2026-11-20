@@ -224,6 +224,7 @@
   function layout({ save = true } = {}) {
     if (embedded || !hooks) return;
     const list = ids(tree), rootNode = $("session-workspace");
+    const wasSplit = enabled;
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
@@ -302,6 +303,8 @@
     });
     hooks.listChanged?.();
     if (save) persist();
+    // Set the outer iPad height before the first restored tiles are painted.
+    if (wasSplit !== enabled && doc.documentElement?.hasAttribute?.("data-ipad")) hooks.resize();
     root.requestAnimationFrame?.(() => { for (const id of list) fit(panes.get(id)); });
   }
   // keyboard: moved from a hardware keyboard, whose editor focus a phone or an iPad keeps too.
@@ -450,6 +453,26 @@
     applyRef(row); changed();
     return true;
   }
+  let editorFrame = 0;
+  function editorChanged(id, win) {
+    if (!enabled || editorFrame || panes.get(id)?.frame?.contentWindow !== win) return;
+    editorFrame = root.requestAnimationFrame(() => { editorFrame = 0; hooks?.resize(); });
+  }
+  function requestBoardReload(id, win) {
+    if (embedded) {
+      if (frameReady && parent.requestBoardReload) return parent.requestBoardReload(ownId, root);
+      notify("화면 맨 위의 새로고침을 누르면 분할 창이 함께 갱신됩니다.");
+      return;
+    }
+    if (panes.get(id)?.frame?.contentWindow === win && win) return hooks?.reloadBoard();
+  }
+  function reloadBlocker() {
+    for (const [id, row] of panes) {
+      const info = row.hooks?.describe();
+      if (info?.composing || info?.dictation || (id !== "p1" && row.hooks?.unsaved())) return id.slice(1);
+    }
+    return null;
+  }
   function report(id, win) {
     if (panes.get(id)?.frame?.contentWindow !== win) return;
     changed();
@@ -467,8 +490,12 @@
       }
       return true;
     }
-    if (active === "p1") return false;
     const row = panes.get(active);
+    if (active === "p1") {
+      // An explicit choice supersedes the saved session still waiting for its host.
+      row.ref = null; row.pendingAnswer = null;
+      return false;
+    }
     if (!row?.hooks) { row.ref = { key, mode: "chat" }; if (answer) row.pendingAnswer = key; changed(); return true; }
     row.ref = null;
     const selected = row.hooks.select(key);
@@ -534,6 +561,11 @@
     if (row.hooks) row.hooks.openSessionTerminal(session);
     else row.ref = { key: session.key, mode: "terminal" };
     return true;
+  }
+  function awaitingSession(id = ownId, win = root) {
+    if (embedded) return !!parent?.awaitingSession(ownId, root);
+    const row = panes.get(id);
+    return !!row?.ref && (id === "p1" || row.frame?.contentWindow === win);
   }
   function activeSessionKey() {
     const row = panes.get(active);
@@ -685,6 +717,10 @@
       root.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
       doc.addEventListener("pointerdown", () => parent.focus(ownId, false), true);
       doc.addEventListener("focusin", () => parent.focus(ownId, false));
+      if (doc.documentElement?.hasAttribute?.("data-ipad")) {
+        for (const type of ["focusin", "focusout"])
+          doc.addEventListener(type, () => parent.editorChanged?.(ownId, root));
+      }
       return;
     }
     record("p1");
@@ -726,14 +762,23 @@
       drop(event.clientX, event.clientY, data); clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready");
     }, true);
     doc.addEventListener("dragend", () => { clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready"); });
-    root.addEventListener("resize", () => layout({ save: false }));
+    let layoutWidth = root.innerWidth;
+    root.addEventListener("resize", () => {
+      const sameWidth = layoutWidth === root.innerWidth;
+      layoutWidth = root.innerWidth;
+      // The board holds its pre-focus height while an iPad keyboard is up.
+      // A height-only keyboard event need not rebuild the other three panes.
+      if (enabled && sameWidth && doc.documentElement?.hasAttribute?.("data-ipad") &&
+          doc.activeElement?.matches?.("input,textarea,[contenteditable=true],.workspace-frame")) return;
+      layout({ save: false });
+    });
     root.addEventListener("beforeunload", (event) => {
       if ([...panes].some(([id, row]) => id !== "p1" && row.hooks?.unsaved())) {
         event.preventDefault(); event.returnValue = "";
       }
     });
   }
-  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
+  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, editorChanged, requestBoardReload, reloadBlocker, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
+    add, addFromPane, closePane, layout, arrange, awaitingSession, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
 })(typeof window !== "undefined" ? window : null);

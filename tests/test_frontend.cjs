@@ -1542,8 +1542,8 @@ test('assistant labels show recorded model settings, and current settings only o
   assert.equal(rows[2].row.modelLabel.textContent, '');
 });
 
-test('iPad editor reserves bottom gesture space only while the screen keyboard is closed', () => {
-  assert.match(styleSheet(), /:root\[data-ipad\] body:not\(\.keyboard-open\) \.chat-composer \{\s*padding-bottom: max\(48px, env\(safe-area-inset-bottom\)\);/);
+test('iPad composer respects the bottom safe area without a fixed accessory bar', () => {
+  assert.match(styleSheet(), /:root\[data-ipad\] \.chat-composer \{\s*padding-bottom: max\(8px, env\(safe-area-inset-bottom\)\);/);
 });
 
 test('즐겨찾기는 오래된 대화도 상단에 한 번만 표시하며 지우기와 검색 조건을 지킨다', () => {
@@ -4099,17 +4099,19 @@ test('changing list filters removes hidden cards without changing the selected s
 test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'model', 'effort', 'ctrl-up', 'shift-left', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
-    assert.match(html, new RegExp(`data-key="${key}"`));
+  const toolbar = html.split('id="terminal-keys"')[1].split('</div>')[0];
+  assert.deepEqual(Array.from(toolbar.matchAll(/data-(?:key|mod)="([^"]+)"/g), match => match[1]),
+    ['up','down','left','right','enter','model','effort','interrupt','alt-left','shift-left','ctrl','alt','meta','escape','tab','backtab','ctrl-up']);
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
-  assert.match(css, /"ctrl k1 k2 k3 k4 cmd1 meta cup up\s+word\s+enter"/);
-  assert.match(css, /"alt\s+k5 k6 k7 k8 cmd2 pick left down right enter"/);
+  assert.match(css, /"\.\s+up\s+\.\s+enter cmd1 ctrl/);
+  assert.match(css, /"left down right enter cmd2 k4\s+word pick/);
   assert.match(html, /data-key="model" class="command-key"[^>]*>\/model</);
   assert.match(html, /data-key="effort" class="command-key"[^>]*>\/effort</);
-  // A narrower terminal keeps the other keys' width: the commands move to a short third row.
-  assert.match(css, /\.terminal-tools \{\s*container: terminal-tools \/ inline-size;/);
-  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*grid-template-rows: repeat\(2, var\(--key-row\)\) 30px;[^@]*"cmd1 cmd1 cmd1 cmd1 cmd1 cmd2 cmd2 cmd2 cmd2 cmd2"/);
+  // A phone keeps the two rows and the arrow cluster: the narrow rule only reweights columns.
+  const narrow = css.split('@container terminal-tools (max-width: 395.98px) {')[1].split('\n}\n')[0];
+  assert.doesNotMatch(narrow, /grid-template-(?:areas|rows)/);
+  assert.match(narrow, /grid-template-columns: repeat\(3, minmax\(0, 0\.9fr\)\) minmax\(0, 1\.3fr\)/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
@@ -17020,6 +17022,18 @@ test('continuous terminal output cannot postpone the same pending resize forever
   assert.equal(c.state.lastSize, '90x25');
 });
 
+test('a transient one-row tile waits for a valid PTY size', () => {
+  const timers = [];
+  const c = client(undefined, {setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {}});
+  Object.assign(c.state, {terminal: {id:'tiny'}, terminalVisible:true, term: {}, terminalSizingId:'tiny',
+    terminalScreenSize:{cols:80,rows:24}, fit:{proposeDimensions: () => ({cols:60,rows:1})}});
+  vm.runInContext('fitTerminal()', c.context);
+  assert.equal(timers.length, 0);
+  c.state.fit.proposeDimensions = () => ({cols:60,rows:2});
+  vm.runInContext('fitTerminal()', c.context);
+  assert.equal(timers.length, 1);
+});
+
 test('a brief host-state gap never opens a recovery card, while a sustained gap does and a later gap gets its own grace period', () => {
   let now = 1000;
   const timers = [];
@@ -17575,35 +17589,29 @@ test('mobile session menu keeps model controls and opens only board settings wit
   assert.equal(settings, 0); assert.equal(entry.text, '보존할 초안');
 });
 
-test('iPad reserves its input accessory room before focus and keeps the same height through blur', () => {
-  const c = client(undefined, noChatTimers), vars = {};
+test('iPad session panes absorb only actual bottom coverage and release it on blur', () => {
+  const c = client(undefined, noChatTimers), vars = {}, room = {};
   c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
-  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
-  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.context.document.documentElement.style = { setProperty: (n,v) => { vars[n] = v; } };
+  Object.assign(c.context.window, { innerWidth: 1600, innerHeight: 900, visualViewport: { height: 900, scale: 1, offsetTop: 0 } });
   c.updateViewport();
-  assert.equal(vars['--app-height'], '779px');
-  for (const id of ['chat-input','terminal-draft']) {
-    c.context.document.activeElement = { tagName: 'TEXTAREA', id };
-    c.context.window.visualViewport.height = 779;
-    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
-    c.context.document.activeElement = null;
-    c.context.window.visualViewport.height = 834;
-    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+  assert.equal(vars['--app-height'], '900px');
+  const pane = c.get('detail');
+  pane.style = { setProperty(n,v) { room[n] = v; }, removeProperty(n) { delete room[n]; } };
+  pane.getBoundingClientRect = () => ({ height: 800, bottom: 900 });
+  c.context.document.activeElement = { tagName: 'TEXTAREA', id: 'chat-input', closest: s => s.includes('#detail') ? pane : null };
+  for (const [height, expected] of [[900,0],[845,55],[510,390],[900,0]]) {
+    c.context.window.visualViewport.height = height;
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px');
+    assert.equal(room['--ipad-input-room'], expected + 'px');
   }
-  c.context.document.activeElement = { tagName: 'TEXTAREA' };
-  c.context.window.visualViewport.height = 764;
-  c.updateViewport(); assert.equal(vars['--app-height'], '764px');
-  c.context.document.activeElement = null; c.context.window.visualViewport.height = 834;
-  c.updateViewport(); assert.equal(vars['--app-height'], '764px', 'keep the larger measured bar after blur');
-  c.context.document.activeElement = { tagName: 'TEXTAREA' }; c.context.window.visualViewport.height = 434;
-  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'software keyboard is not charged twice');
-  c.context.window.innerHeight = 434;
-  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'resizes-content keyboard is not charged twice');
+  pane.getBoundingClientRect = () => ({ height: 400, bottom: 500 });
+  c.context.window.visualViewport.height = 510;
+  c.updateViewport(); assert.equal(room['--ipad-input-room'], '0px', 'a top split pane is already visible');
   c.context.document.activeElement = null;
-  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
-  c.updateViewport(); assert.equal(vars['--app-height'], '1124px', 'rotation recomputes full height');
-  c.context.window.visualViewport = { height: 597, scale: 2 };
-  c.updateViewport(); assert.equal(vars['--app-height'], '597px', 'pinch zoom keeps the actual visual viewport');
+  c.updateViewport(); assert.equal(room['--ipad-input-room'], undefined);
+  assert.equal(vars['--app-height'], '900px', 'no remembered accessory bar');
 });
 
 test('iPad room belongs to the top-level screen; desktop, Android and child panes keep their own height', () => {
@@ -17852,4 +17860,174 @@ test('브라우저가 온라인이면 보드에 따로 묻지 않는다', async 
   for (let i = 0; i < 8; i++) await new Promise((resolve) => setImmediate(resolve));
   assert.equal([...c.callbacks.values()].filter((t) => t.ms === 1500).length, 0);
   assert.equal(requests.includes('/api/usage') && requests.indexOf('/api/usage') < requests.indexOf('/api/snapshot'), false);
+});
+
+test('iPad split typing keeps four-pane layout stable through accessory viewport oscillation', () => {
+  const c = client(undefined, noChatTimers), vars = {}, room = {};
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  c.context.document.documentElement.style = { setProperty(n,v) { vars[n] = v; } };
+  const win = c.context.window;
+  win.SessionholicWorkspace = { managed: () => true, embedded: false, visible: () => true };
+  Object.assign(win, {innerWidth: 1600, innerHeight: 900, visualViewport: {height: 900, offsetTop: 0, scale: 1}});
+  const pane = c.get('detail');
+  const classes = new Set(['workspace-pane']);
+  pane.classList = {add: k => classes.add(k), remove: k => classes.delete(k), contains: k => classes.has(k)};
+  pane.offsetTop = 690; pane.offsetHeight = 210; pane.offsetParent = {getBoundingClientRect: () => ({top:0})};
+  pane.style = {setProperty(n,v) { room[n] = v; }, removeProperty(n) { delete room[n]; }};
+  pane.getBoundingClientRect = () => ({height: 210, bottom: 900});
+  c.context.document.activeElement = {classList: {contains: key => key === 'workspace-frame'}, parentElement: pane};
+  c.updateViewport();
+  for (const y of [0, 36, 0, 35, 0]) {
+    Object.assign(win.visualViewport, {height:845, offsetTop:y, pageTop:y});
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px');
+    assert.equal(c.state.appShift || 0, 0);
+    assert.equal(room['--ipad-input-room'], '0px');
+    assert.equal(room['--ipad-pane-lift'], '55px', 'leave the shallow editor its full height');
+  }
+  Object.assign(win.visualViewport, {height: 460, offsetTop: 0, pageTop: 0});
+  pane.getBoundingClientRect = () => ({height: 210, bottom: 900 - Number.parseFloat(room['--ipad-pane-lift'] || 0)});
+  for (const layoutHeight of [900, 460, 845, 900]) {
+    win.innerHeight = layoutHeight;
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px', 'an iframe editor never resizes its siblings');
+    assert.ok(parseFloat(room['--ipad-pane-lift']) > 0, 'only the covered lower tile moves above the keyboard');
+    assert.equal(parseFloat(room['--ipad-pane-lift']) + parseFloat(room['--ipad-input-room']), 440);
+  }
+  win.SessionholicWorkspace.embedded = true;
+  win.innerHeight = 210;
+  Object.assign(win.visualViewport, {height:210, offsetTop:35, pageTop:35});
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '210px');
+  assert.equal(c.state.appShift || 0, 0);
+});
+
+test('external iPad keyboard pans the fixed split board up 68px while the fourth pane has focus', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  c.context.document.documentElement.style = {setProperty(key, value) { vars[key] = value; }};
+  const win = c.context.window;
+  Object.assign(win, {innerWidth: 3008, innerHeight: 1592, visualViewport: {height: 1592, scale: 1},
+    SessionholicWorkspace: {managed: () => true, embedded: false}});
+  let nativeTop = 0;
+  c.get('app').getBoundingClientRect = () => ({height: 1660, top: nativeTop + (parseFloat(vars['--app-shift']) || 0)});
+  for (const [pan, offset] of [[0, 0], [69, 69], [68, 68], [68, 68], [0, 68], [0, 0]]) {
+    nativeTop = -pan;
+    Object.assign(win.visualViewport, {offsetTop: offset, pageTop: offset});
+    vm.runInContext('renderAppShift()', c.context);
+    assert.equal(c.get('app').getBoundingClientRect().top, 0);
+  }
+});
+
+test('bringing back an iPad pane does not reopen the keyboard for an idle draft', () => {
+  const c = client(undefined, noChatTimers);
+  const field = c.get('terminal-draft');
+  field.id = 'terminal-draft';
+  field.value = '이어서 쓸 초안';
+  let blurred = 0;
+  field.blur = () => blurred++;
+  c.context.document.activeElement = field;
+  let ipad = false;
+  c.context.document.documentElement.hasAttribute = key => ipad && key === 'data-ipad';
+  const hide = () => vm.runInContext('releaseHiddenIpadEditor()', c.context);
+  hide();
+  ipad = true;
+  c.state.composing = true;
+  hide();
+  assert.equal(blurred, 0);
+  c.state.composing = false;
+  hide();
+  assert.equal(blurred, 1);
+  assert.equal(field.value, '이어서 쓸 초안');
+});
+
+test('changing the shared sidebar category leaves the primary split session available to restore', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = {onLine: false};
+  const first = recentSession('primary-human', {initiator: 'human'});
+  setRecentSnapshot(c, [first, recentSession('other', {initiator: 'agent'})]);
+  c.context.window.SessionholicWorkspace = {managed: () => true, readingActive: () => true,
+    activeSessionKey: () => c.state.selected, routeSession: () => false, changed() {}, visible: () => true, embedded: false};
+  c.select(first.key);
+  c.setSessionCategory('agent');
+  assert.equal(c.state.selected, first.key);
+  c.render();
+  assert.equal(c.state.sessionCategory, 'agent');
+  const ref = vm.runInContext('workspaceHooks().describe().ref', c.context);
+  assert.equal(ref.key, first.key);
+});
+
+test('a split pane retains its saved session through a temporarily missing host', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = {onLine: false};
+  const first = recentSession('reconnect');
+  setRecentSnapshot(c, [first]);
+  c.context.window.SessionholicWorkspace = {managed: () => true, readingActive: () => true,
+    activeSessionKey: () => c.state.selected, routeSession: () => false, changed() {}, visible: () => true};
+  const hooks = vm.runInContext('workspaceHooks()', c.context);
+  c.select(first.key);
+  const saved = hooks.describe().ref;
+  c.state.snapshot.hosts = [];
+  c.render();
+  assert.deepEqual(hooks.describe().ref, saved);
+  setRecentSnapshot(c, [first]);
+  c.render();
+  assert.equal(c.state.selected, first.key);
+  assert.equal(hooks.describe().ref.key, first.key);
+  setRecentSnapshot(c, []);
+  c.render();
+  assert.deepEqual(hooks.describe().ref, saved, 'a healthy host can also temporarily omit one session');
+  const replacement = recentSession('replacement');
+  setRecentSnapshot(c, [replacement]);
+  c.select(replacement.key);
+  assert.equal(hooks.describe().ref.key, replacement.key);
+  setRecentSnapshot(c, [replacement, first]);
+  c.render();
+  assert.equal(c.state.selected, replacement.key, 'a late return never replaces the user selection');
+});
+
+test('external iPad display makes room before focus and keeps it through a gap between frame editors', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window;
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  win.SessionholicWorkspace = {managed: () => true, embedded: false};
+  Object.assign(win, {innerWidth: 3008, innerHeight: 1660, visualViewport: {height: 1660, offsetTop: 0, scale: 1}});
+  const height = pane => vm.runInContext('viewportHeight(' + (pane ? '{}' : 'null') + ')', c.context);
+  const resting = height(false);
+  assert.ok(resting <= 1592 && resting >= 1580, 'all four panes end above the 68px input bar before the first tap');
+  Object.assign(win.visualViewport, {height: 1592});
+  assert.equal(height(true), resting);
+  win.innerHeight = 1592;
+  for (const [pane, offset] of [[true,69],[false,68],[true,68],[false,69]]) {
+    win.visualViewport.offsetTop = offset;
+    assert.equal(height(pane), resting);
+  }
+  win.visualViewport.offsetTop = 0;
+  assert.equal(height(false), resting, 'offsetTop resets before either viewport grows back');
+  assert.equal(height(false), resting);
+  win.innerHeight = 1660;
+  Object.assign(win.visualViewport,{height:1660,offsetTop:0});
+  assert.equal(height(false), resting);
+  Object.assign(win, {innerHeight:1200});
+  win.visualViewport.height = 1200;
+  assert.equal(height(false), resting - 460, 'resizing the external window still works');
+  win.SessionholicWorkspace.embedded = true;
+  assert.equal(height(false), 1200, 'a child frame does not reserve space twice');
+});
+
+test('a split reload uses the board and a sibling draft stops navigation', async () => {
+  const c = client(undefined, noChatTimers);
+  let requests = 0, reloads = 0;
+  const workspace = { embedded: true, requestBoardReload() { requests++; }, reloadBlocker: () => '3' };
+  c.context.window.SessionholicWorkspace = workspace;
+  c.context.window.location = { reload() { reloads++; } };
+  await c.hardReload();
+  assert.equal(requests, 1);
+  workspace.embedded = false;
+  await c.hardReload();
+  assert.equal(reloads, 0);
+  workspace.reloadBlocker = () => null;
+  c.context.caches = { keys: async () => { workspace.reloadBlocker = () => '2'; return []; } };
+  await c.hardReload();
+  assert.equal(reloads, 0, 'input that started during refresh is protected');
+  assert.equal(c.state.hardReloadBusy, false);
 });

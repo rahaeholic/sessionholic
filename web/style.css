@@ -3217,11 +3217,11 @@ li[data-task] {
 .terminal-keys {
   display: grid;
   --key-row: 42px;
-  grid-template-columns: repeat(5, minmax(0, 1fr)) minmax(0, 1.6fr) repeat(4, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr) minmax(0, 1.6fr) repeat(5, minmax(0, 1fr));
   grid-template-rows: repeat(2, var(--key-row));
   grid-template-areas:
-    "ctrl k1 k2 k3 k4 cmd1 meta cup up   word  enter"
-    "alt  k5 k6 k7 k8 cmd2 pick left down right enter";
+    ".    up   .     enter cmd1 ctrl k1   k2   k3  cup"
+    "left down right enter cmd2 k4   word pick alt meta";
   gap: 5px;
   max-width: 680px;
 }
@@ -3248,10 +3248,6 @@ li[data-task] {
 .terminal-keys [data-key="tab"] { grid-area: k2; }
 .terminal-keys [data-key="backtab"] { grid-area: k3; }
 .terminal-keys [data-key="interrupt"] { grid-area: k4; }
-.terminal-keys [data-key="ctrl-j"] { grid-area: k5; }
-.terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
-.terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
-.terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
 /* Slash commands the CLI runs at once: words, not glyphs, so the body font fits them. */
 .terminal-keys [data-key="model"] { grid-area: cmd1; }
 .terminal-keys [data-key="effort"] { grid-area: cmd2; }
@@ -3260,18 +3256,14 @@ li[data-task] {
   font-family: var(--font);
   font-size: 12px;
 }
-/* Narrower than a 412px phone (a docked or split terminal too): a column would wrap the other
-   keys' labels, so the commands take a short third row and those keys keep their width. */
+/* A phone (384px) keeps the same two rows and inverted-T arrows: glyph-only keys give width
+   to the word keys (Ctrl, ⇧Tab, Enter, /effort) so every label stays on one line. */
 @container terminal-tools (max-width: 395.98px) {
   .terminal-keys {
-    grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.3fr);
-    grid-template-rows: repeat(2, var(--key-row)) 30px;
-    grid-template-areas:
-      "ctrl k1 k2 k3 k4 meta cup up   word  enter"
-      "alt  k5 k6 k7 k8 pick left down right enter"
-      "cmd1 cmd1 cmd1 cmd1 cmd1 cmd2 cmd2 cmd2 cmd2 cmd2";
+    grid-template-columns: repeat(3, minmax(0, 0.9fr)) minmax(0, 1.3fr) minmax(0, 1.5fr) minmax(0, 1.1fr) repeat(2, minmax(0, 1fr)) minmax(0, 1.1fr) minmax(0, 0.9fr);
   }
-  .terminal-keys .command-key {
+  .terminal-keys .command-key,
+  .terminal-keys [data-mod="meta"] {
     margin-left: 0;
   }
 }
@@ -3283,14 +3275,6 @@ li[data-task] {
 .terminal-keys [data-key="down"] { grid-area: down; }
 .terminal-keys [data-key="right"] { grid-area: right; }
 .terminal-keys [data-key="enter"] { grid-area: enter; }
-.terminal-keys [data-key="up"],
-.terminal-keys [data-key="left"] {
-  /* A small gap separates the arrow cluster from the control keys. */
-  margin-left: 4px;
-}
-.terminal-keys [data-key="up"] {
-  margin-left: 0;
-}
 .terminal-keys [data-key="interrupt"] {
   color: var(--t-red-key);
 }
@@ -4359,9 +4343,51 @@ li[data-task] {
   padding-top: 10px;
   padding-bottom: 8px;
 }
-/* Keep the editor away from the iPad's bottom-edge home gesture. */
-:root[data-ipad] body:not(.keyboard-open) .chat-composer {
-  padding-bottom: max(48px, env(safe-area-inset-bottom));
+/* Account for the keyboard once, at the bottom of the active pane. */
+:root[data-ipad] :is(#detail, #terminal-screen, .workspace-pane).ipad-input-pane {
+  padding-bottom: var(--ipad-input-room, 0px);
+}
+:root[data-ipad] .chat-composer {
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+.terminal-accessibility-label.terminal-physical-keys { display: none; }
+:root[data-ipad] .terminal-physical-keys.terminal-accessibility-label { display: flex; }
+:root[data-ipad] body.hide-terminal-keys #terminal-keys { display: none; }
+
+/* In a split, shortcuts use one scrollable row even in a shallow tile. */
+:root[data-ipad] :is(body.workspace-split, body.workspace-embedded) {
+  position: fixed;
+  inset: 0;
+  overflow: clip;
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-tools {
+  display: block;
+  padding: 4px 6px max(4px, env(safe-area-inset-bottom));
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: none;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys button {
+  flex: none;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 6px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+/* A four-column iPad board can leave only 265px for the shortcut strip. */
+@container terminal-tools (max-width: 320px) {
+  :root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys { gap: 2px; }
+  :root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys button {
+    min-width: 30px;
+    padding-inline: 3px;
+  }
 }
 
 /* Status: no space when empty (existing :empty rule); long errors stay
