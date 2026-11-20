@@ -4384,6 +4384,15 @@ li[data-task] {
   white-space: nowrap;
 }
 
+/* A four-column iPad board can leave only 265px for the shortcut strip. */
+@container terminal-tools (max-width: 320px) {
+  :root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys { gap: 2px; }
+  :root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys button {
+    min-width: 30px;
+    padding-inline: 3px;
+  }
+}
+
 /* Status: no space when empty (existing :empty rule); long errors stay
    readable by scrolling instead of stretching the compact bar. */
 .chat-composer .chat-status {
