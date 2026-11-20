@@ -47,6 +47,7 @@ class FakeReader:
         self.fail_after = False
         self.large_read = False
         self.large_page_response = False
+        self.unsupported_pages = False
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -110,6 +111,8 @@ class FakeReader:
                         thread.pop('turns', None)
                     return {'thread': thread}
                 if method == 'thread/items/list':
+                    if owner.unsupported_pages:
+                        raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
                     data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
                             for item in turn.get('items', [])]
                     data.reverse()
@@ -117,9 +120,13 @@ class FakeReader:
                     end = start + params['limit']
                     page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
                     if owner.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
-                        raise ValueError('synthetic app-server page exceeds 8 MiB')
+                        if params['limit'] <= 1:
+                            raise wc.OversizedReply('synthetic app-server page exceeds 8 MiB')
+                        return self.call(method, {**params, 'limit': max(1, params['limit'] // 2)})
                     return page
                 if method == 'thread/turns/list':
+                    if owner.unsupported_pages:
+                        raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
                     turns = []
                     for turn in reversed(copy.deepcopy(owner.thread.get('turns', []))):
                         items = turn.get('items', [])
@@ -218,6 +225,21 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertFalse(any(method == 'thread/read' and params.get('includeTurns') is True
                              for method, params in self.reader.calls))
 
+    def test_oversized_first_history_page_is_retried_before_send_preflight(self):
+        self.reader.large_page_response = True
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'old-%d' % index,
+                 'content': [{'type': 'text', 'text': '과거 요청'}]},
+                {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 600000},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '과거 답변'}]}
+            for index in range(20)]
+        result = self.send()
+        self.assertTrue(result['confirmed'])
+        self.assertEqual(self.reader.send_calls, 1)
+        limits = [params['limit'] for method, params in self.reader.calls if method == 'thread/items/list']
+        self.assertTrue(any(limit < wc.HISTORY_PAGE for limit in limits))
+
     def test_old_receipt_and_fork_point_are_found_outside_the_display_window(self):
         self.reader.thread['turns'] = [
             {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
@@ -233,6 +255,39 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual((receipt['delivery'], receipt['turnId'], receipt['readbackConfirmed']),
                          ('completed', 'turn-1', True))
         self.assertEqual(self.reader.send_calls, 0)
+
+    def test_page_unsupported_full_read_allows_first_send_without_history_lookup(self):
+        self.reader.unsupported_pages = True
+        result = self.send()
+        self.assertTrue(result['confirmed'])
+        self.assertEqual(self.reader.send_calls, 1)
+        self.assertFalse(any(method == 'thread/turns/list' for method, _ in self.reader.calls))
+
+    def test_history_lookup_scans_past_one_hundred_pages(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '과거 요청'}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '과거 답변'}]}
+            for index in range(1601)]
+        result = self.runtime.chat({'action': 'read', 'source': self.source, 'requestId': 'request-0000'})
+        self.assertEqual((result['receipts'][0]['delivery'], result['receipts'][0]['turnId']),
+                         ('completed', 'turn-0'))
+
+    def test_small_item_pages_preserve_middle_answers_when_reasoning_is_hidden(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items':
+             [{'id': 'input-%d' % index, 'type': 'userMessage',
+               'content': [{'type': 'text', 'text': '질문'}]},
+              {'id': 'middle-%d' % index, 'type': 'agentMessage', 'text': '중간 답변'}]
+             + [{'id': 'reason-%d-%d' % (index, item), 'type': 'reasoning', 'text': '숨김'} for item in range(17)]
+             + [{'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '최종 답변'}]}
+            for index in range(25)]
+        result = self.runtime.chat({'action': 'read', 'source': self.source})
+        visible = [row['text'] for row in result['messages']]
+        self.assertEqual(len(visible), 75)
+        self.assertEqual(visible.count('중간 답변'), 25)
+        self.assertFalse(result['olderOmitted'])
         self.reader.fork_id = str(uuid.uuid4())
         fork = self.model_command('fork', 'turn-1', request='old-turn-fork-0001')
         self.assertEqual(fork['status'], 'created')

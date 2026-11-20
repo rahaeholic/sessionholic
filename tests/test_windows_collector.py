@@ -94,6 +94,7 @@ class FakeProxy:
         pass
 
     def call(self, method, params):
+        params = dict(params)
         self.calls.append((method, params))
         if method == 'thread/loaded/list':
             return {'data': [row['id'] for row in self.rows]}
@@ -113,9 +114,13 @@ class FakeProxy:
             end = start + params['limit']
             page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
             if self.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
-                raise ValueError('synthetic app-server page exceeds 8 MiB')
+                if params['limit'] <= 1:
+                    raise wc.OversizedReply('synthetic app-server page exceeds 8 MiB')
+                return self.call(method, {**params, 'limit': max(1, params['limit'] // 2)})
             return page
         if method == 'thread/turns/list':
+            if self.unsupported_pages:
+                raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
             turns = list(reversed((self.read or self.rows[0]).get('turns', [])))
             start = int(params.get('cursor') or 0)
             end = start + params['limit']
@@ -865,6 +870,20 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertTrue(item_pages)
         self.assertLessEqual(max(item_pages), wc.HISTORY_PAGE)
 
+    def test_twenty_large_tool_outputs_retry_the_first_page_before_failing(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+            {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 600000},
+            {'id': 'input-%d' % index, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '요청'}]},
+            {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변'}]}
+            for index in range(20)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((result['phase'], result['runtimeKnown']), ('working', True))
+        self.assertEqual(result['messages'][-1]['text'], '답변')
+        limits = [params['limit'] for method, params in self.calls if method == 'thread/items/list']
+        self.assertTrue(any(limit < wc.HISTORY_PAGE for limit in limits))
+
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')
         self.assertEqual([row['text'] for row in result['messages']], ['합성 요청', '합성 결과'])
@@ -1275,10 +1294,30 @@ class WindowsCollectorTest(unittest.TestCase):
         with patch.object(proxy, '_send') as send:
             self.assertEqual(proxy._message(), {'id': 1, 'result': {'data': []}})
             send.assert_called_once_with(b'p', 10)
-        oversized = io.BytesIO(bytes([0x81, 127]) + struct.pack('!Q', 9 * 1024 * 1024))
+        oversized_bytes = bytes([0x81, 127]) + struct.pack('!Q', 9 * 1024 * 1024) + b'x' * (9 * 1024 * 1024)
+        oversized = io.BytesIO(oversized_bytes + bytes([0x81, len(payload)]) + payload)
         proxy._read = lambda size: oversized.read(size)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(wc.OversizedReply):
             proxy._message()
+        self.assertEqual(proxy._message(), {'id': 1, 'result': {'data': []}})
+
+    def test_proxy_retries_oversized_read_pages_with_a_smaller_limit(self):
+        proxy = wc.Proxy.__new__(wc.Proxy)
+        proxy.sequence = 0
+        sent = []
+        replies = [wc.OversizedReply('too large'), {'id': 2, 'result': {'data': []}}]
+        proxy._send = lambda message: sent.append(json.loads(json.dumps(message)))
+        def message():
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        proxy._message = message
+        self.assertEqual(proxy.call('thread/items/list', {'threadId': 'thread', 'limit': 100, 'cursor': 'same'}),
+                         {'data': []})
+        self.assertEqual([message['params'] for message in sent], [
+            {'threadId': 'thread', 'limit': 100, 'cursor': 'same'},
+            {'threadId': 'thread', 'limit': 50, 'cursor': 'same'}])
 
     def test_blocked_proxy_write_has_a_deadline_and_only_closes_fixture(self):
         proxy = wc.Proxy.__new__(wc.Proxy)

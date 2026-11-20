@@ -554,12 +554,13 @@ class WindowsRuntime:
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
         result = wc.codex_recent_thread(client, identity['id'])
+        full_read = result is None
         if result is None:
             result = client.call('thread/read', {'threadId': identity['id'], 'includeTurns': True})
         thread = result.get('thread') if isinstance(result, dict) else None
         if not isinstance(thread, dict) or thread.get('id') != identity['id'] or wc._norm(thread.get('cwd')) != wc._norm(cwd):
             raise ValueError('PC 원본 세션의 작업 폴더가 변경되었습니다.')
-        if result is not None and (request_ids or turn_id is not None):
+        if not full_read and (request_ids or turn_id is not None):
             turns = thread.get('turns') or []
             found_requests = {item.get('clientId') for turn in turns if isinstance(turn, dict)
                               for item in turn.get('items') or [] if isinstance(item, dict)

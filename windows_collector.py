@@ -49,10 +49,9 @@ CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 # after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
-HISTORY_PAGE = 16
-HISTORY_PAGES = 25
+HISTORY_PAGE = 100
+HISTORY_PAGES = 50
 HISTORY_ITEMS_BUDGET = 0.3
-HISTORY_LOOKUP_PAGES = 100
 CODEX_TOOL_KINDS = {'commandExecution', 'fileChange', 'webSearch', 'mcpToolCall', 'dynamicToolCall'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
@@ -547,6 +546,7 @@ class Proxy:
     def _message(self):
         fragments = bytearray()
         started = False
+        oversized = False
         while True:
             head = self._read(2)
             final, opcode, length = bool(head[0] & 0x80), head[0] & 15, head[1] & 127
@@ -556,13 +556,29 @@ class Proxy:
                 length = struct.unpack('!H', self._read(2))[0]
             elif length == 127:
                 length = struct.unpack('!Q', self._read(8))[0]
-            if length > 8 * 1024 * 1024 or len(fragments) + length > 8 * 1024 * 1024:
-                raise ValueError('PC 서버 응답 크기가 제한을 초과했습니다.')
-            raw = self._read(length)
+            if opcode in (0, 1) and (length > 8 * 1024 * 1024 or len(fragments) + length > 8 * 1024 * 1024):
+                oversized = True
+            if oversized and opcode in (0, 1):
+                remaining = length
+                while remaining:
+                    size = min(remaining, 65536)
+                    self._read(size)
+                    remaining -= size
+                raw = b''
+            else:
+                raw = self._read(length)
             if opcode == 9 and final and length <= 125:
                 self._send(raw, 10)
                 continue
             if opcode == 10 and final and length <= 125:
+                continue
+            if oversized:
+                if opcode == 1 and not started:
+                    started = True
+                elif opcode != 0 or not started:
+                    raise ValueError('PC 서버 메시지 형식이 올바르지 않습니다.')
+                if final:
+                    raise OversizedReply('PC 서버 응답 크기가 제한을 초과했습니다.')
                 continue
             if opcode == 1 and not started:
                 started = True
@@ -578,18 +594,26 @@ class Proxy:
     def call(self, method, params):
         if method not in self.ALLOWED:
             raise ValueError('PC 수집기는 읽기 요청만 허용합니다.')
-        self.sequence += 1
-        request = self.sequence
-        self._send({'id': request, 'method': method, 'params': params})
-        for unused in range(1000):
-            message = self._message()
-            if message.get('id') == request:
-                if 'error' in message or 'result' not in message:
-                    error = message.get('error') or {}
-                    raise RpcReplyError('PC 서버가 읽기 요청을 거부했습니다: ' + str(error.get('message', '')),
-                                        error.get('code'))
-                return message['result']
-        raise ValueError('PC 서버 알림이 제한을 초과했습니다.')
+        page_params = dict(params)
+        while True:
+            self.sequence += 1
+            request = self.sequence
+            self._send({'id': request, 'method': method, 'params': page_params})
+            try:
+                for unused in range(1000):
+                    message = self._message()
+                    if message.get('id') == request:
+                        if 'error' in message or 'result' not in message:
+                            error = message.get('error') or {}
+                            raise RpcReplyError('PC 서버가 읽기 요청을 거부했습니다: ' + str(error.get('message', '')),
+                                                error.get('code'))
+                        return message['result']
+                raise ValueError('PC 서버 알림이 제한을 초과했습니다.')
+            except OversizedReply:
+                limit = page_params.get('limit')
+                if method not in ('thread/items/list', 'thread/turns/list') or type(limit) is not int or limit <= 1:
+                    raise
+                page_params['limit'] = max(1, limit // 2)
 
     def close(self):
         self.closed.set()
@@ -614,6 +638,10 @@ class RpcReplyError(ValueError):
     def __init__(self, message, code=None):
         super().__init__(message)
         self.code = code
+
+
+class OversizedReply(ValueError):
+    """A complete WebSocket response exceeded the bounded JSON size."""
 
 
 def _summary_items(turn):
@@ -737,7 +765,7 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
     """Find exact old request or turn identities without loading their full items."""
     request_ids = set(request_ids)
     found, found_turn, cursor, seen = {}, None, None, set()
-    for unused in range(HISTORY_LOOKUP_PAGES):
+    while True:
         params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
                   'sortDirection': 'desc', 'itemsView': 'summary'}
         if cursor:
@@ -767,10 +795,6 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         if not isinstance(cursor, str) or not cursor or cursor in seen:
             raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
         seen.add(cursor)
-    found_by_id = {turn['id']: turn for turn in found.values()}
-    if found_turn is not None:
-        found_by_id[found_turn['id']] = found_turn
-    return list(found_by_id.values()), False
 
 
 def _wal_without_index(database):
