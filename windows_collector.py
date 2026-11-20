@@ -729,7 +729,14 @@ def codex_recent_thread(server, thread_id):
                       'sortDirection': 'desc', 'itemsView': 'summary'}
             if cursor:
                 params['cursor'] = cursor
-            page = server.call(method, params)
+            try:
+                page = server.call(method, params)
+            except OversizedReply:
+                # The visible window is complete; a later status-only page must
+                # not make that already usable conversation unreadable.
+                if wanted <= {turn['id'] for turn in turns} and not short(turns):
+                    break
+                raise
             data = page.get('data') if isinstance(page, dict) else None
             if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
                 raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
@@ -768,7 +775,7 @@ def codex_recent_thread(server, thread_id):
             shown += _summary_talk(turn)
     thread['turns'] = list(reversed(kept + summarized))
     thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
-                              for turn in reversed(turns[:STATUS_TURN_LIMIT])]
+                              for turn in reversed(turns)]
     thread['olderUnread'] = oversized_item or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}

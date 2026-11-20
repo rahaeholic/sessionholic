@@ -48,6 +48,8 @@ class FakeReader:
         self.large_read = False
         self.large_page_response = False
         self.unsupported_pages = False
+        self.oversized_turn_cursor = None
+        self.turn_page_size = None
         self.item_page_delay = 0
         self.send_calls = 0
         self.mutate_hook = None
@@ -130,6 +132,8 @@ class FakeReader:
                 if method == 'thread/turns/list':
                     if owner.unsupported_pages:
                         raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
+                    if owner.oversized_turn_cursor is not None and owner.oversized_turn_cursor == params.get('cursor'):
+                        raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
                     turns = []
                     for turn in reversed(copy.deepcopy(owner.thread.get('turns', []))):
                         items = turn.get('items', [])
@@ -137,7 +141,7 @@ class FakeReader:
                         answers = [item for item in items if item.get('type') == 'agentMessage']
                         turns.append({**turn, 'items': summary + answers[-1:]})
                     start = int(params.get('cursor') or 0)
-                    end = start + params['limit']
+                    end = start + min(params['limit'], owner.turn_page_size or params['limit'])
                     return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
@@ -294,6 +298,33 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(len(result['messages']), 80)
         self.assertEqual((result['messages'][0]['text'], result['messages'][-1]['text']), ('질문 0', '답변 39'))
         self.assertFalse(result['olderOmitted'])
+
+    def test_oversized_status_page_after_visible_window_does_not_block_read_or_send(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%d' % index,
+                 'content': [{'type': 'text', 'text': '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(81)]
+        self.reader.turn_page_size = 20
+        self.reader.oversized_turn_cursor = '60'
+        result = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((result['phase'], result['runtimeKnown'], result['capabilities']['canSend']),
+                         ('idle', True, True))
+        self.assertEqual(len(result['messages']), 80)
+
+    def test_status_inconsistency_outside_display_window_rejects_send(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'inProgress' if index == 0 else 'interrupted', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage',
+                 'content': [{'type': 'text', 'text': '질문 %d' % index}]}]}
+            for index in range(81)]
+        state = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((state['runtimeReasonCode'], state['capabilities']['canSend']),
+                         ('status_inconsistent', False))
+        send = self.send()
+        self.assertEqual(send['delivery'], 'rejected')
+        self.assertEqual(self.reader.send_calls, 0)
 
     def test_old_receipt_and_fork_point_are_found_outside_the_display_window(self):
         self.reader.thread['turns'] = [
