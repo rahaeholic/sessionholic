@@ -4359,10 +4359,16 @@ li[data-task] {
   padding-top: 10px;
   padding-bottom: 8px;
 }
-/* Keep the editor away from the iPad's bottom-edge home gesture. */
-:root[data-ipad] body:not(.keyboard-open) .chat-composer {
-  padding-bottom: max(48px, env(safe-area-inset-bottom));
+/* Account for the keyboard once, at the bottom of the active pane. */
+:root[data-ipad] :is(#detail, #terminal-screen, .workspace-pane).ipad-input-pane {
+  padding-bottom: var(--ipad-input-room, 0px);
 }
+:root[data-ipad] .chat-composer {
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+.terminal-accessibility-label.terminal-physical-keys { display: none; }
+:root[data-ipad] body.physical-keyboard:not(.keyboard-open) .terminal-physical-keys { display: flex; }
+:root[data-ipad] body.physical-keyboard:not(.keyboard-open):not(.show-terminal-keys) #terminal-keys { display: none; }
 
 /* Status: no space when empty (existing :empty rule); long errors stay
    readable by scrolling instead of stretching the compact bar. */

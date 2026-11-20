@@ -1542,8 +1542,8 @@ test('assistant labels show recorded model settings, and current settings only o
   assert.equal(rows[2].row.modelLabel.textContent, '');
 });
 
-test('iPad editor reserves bottom gesture space only while the screen keyboard is closed', () => {
-  assert.match(styleSheet(), /:root\[data-ipad\] body:not\(\.keyboard-open\) \.chat-composer \{\s*padding-bottom: max\(48px, env\(safe-area-inset-bottom\)\);/);
+test('iPad composer respects the bottom safe area without a fixed accessory bar', () => {
+  assert.match(styleSheet(), /:root\[data-ipad\] \.chat-composer \{\s*padding-bottom: max\(8px, env\(safe-area-inset-bottom\)\);/);
 });
 
 test('즐겨찾기는 오래된 대화도 상단에 한 번만 표시하며 지우기와 검색 조건을 지킨다', () => {
@@ -17575,35 +17575,29 @@ test('mobile session menu keeps model controls and opens only board settings wit
   assert.equal(settings, 0); assert.equal(entry.text, '보존할 초안');
 });
 
-test('iPad reserves its input accessory room before focus and keeps the same height through blur', () => {
-  const c = client(undefined, noChatTimers), vars = {};
+test('iPad session panes absorb only actual bottom coverage and release it on blur', () => {
+  const c = client(undefined, noChatTimers), vars = {}, room = {};
   c.context.document.documentElement.hasAttribute = name => name === 'data-ipad';
-  c.context.document.documentElement.style = { setProperty: (name,value) => { vars[name] = value; } };
-  Object.assign(c.context.window, { innerWidth: 1194, innerHeight: 834, visualViewport: { height: 834, scale: 1 } });
+  c.context.document.documentElement.style = { setProperty: (n,v) => { vars[n] = v; } };
+  Object.assign(c.context.window, { innerWidth: 1600, innerHeight: 900, visualViewport: { height: 900, scale: 1, offsetTop: 0 } });
   c.updateViewport();
-  assert.equal(vars['--app-height'], '779px');
-  for (const id of ['chat-input','terminal-draft']) {
-    c.context.document.activeElement = { tagName: 'TEXTAREA', id };
-    c.context.window.visualViewport.height = 779;
-    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
-    c.context.document.activeElement = null;
-    c.context.window.visualViewport.height = 834;
-    c.updateViewport(); assert.equal(vars['--app-height'], '779px');
+  assert.equal(vars['--app-height'], '900px');
+  const pane = c.get('detail');
+  pane.style = { setProperty(n,v) { room[n] = v; }, removeProperty(n) { delete room[n]; } };
+  pane.getBoundingClientRect = () => ({ height: 800, bottom: 900 });
+  c.context.document.activeElement = { tagName: 'TEXTAREA', id: 'chat-input', closest: s => s.includes('#detail') ? pane : null };
+  for (const [height, expected] of [[900,0],[845,55],[510,390],[900,0]]) {
+    c.context.window.visualViewport.height = height;
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px');
+    assert.equal(room['--ipad-input-room'], expected + 'px');
   }
-  c.context.document.activeElement = { tagName: 'TEXTAREA' };
-  c.context.window.visualViewport.height = 764;
-  c.updateViewport(); assert.equal(vars['--app-height'], '764px');
-  c.context.document.activeElement = null; c.context.window.visualViewport.height = 834;
-  c.updateViewport(); assert.equal(vars['--app-height'], '764px', 'keep the larger measured bar after blur');
-  c.context.document.activeElement = { tagName: 'TEXTAREA' }; c.context.window.visualViewport.height = 434;
-  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'software keyboard is not charged twice');
-  c.context.window.innerHeight = 434;
-  c.updateViewport(); assert.equal(vars['--app-height'], '434px', 'resizes-content keyboard is not charged twice');
+  pane.getBoundingClientRect = () => ({ height: 400, bottom: 500 });
+  c.context.window.visualViewport.height = 510;
+  c.updateViewport(); assert.equal(room['--ipad-input-room'], '0px', 'a top split pane is already visible');
   c.context.document.activeElement = null;
-  Object.assign(c.context.window, { innerWidth: 834, innerHeight: 1194, visualViewport: { height: 1194, scale: 1 } });
-  c.updateViewport(); assert.equal(vars['--app-height'], '1124px', 'rotation recomputes full height');
-  c.context.window.visualViewport = { height: 597, scale: 2 };
-  c.updateViewport(); assert.equal(vars['--app-height'], '597px', 'pinch zoom keeps the actual visual viewport');
+  c.updateViewport(); assert.equal(room['--ipad-input-room'], undefined);
+  assert.equal(vars['--app-height'], '900px', 'no remembered accessory bar');
 });
 
 test('iPad room belongs to the top-level screen; desktop, Android and child panes keep their own height', () => {

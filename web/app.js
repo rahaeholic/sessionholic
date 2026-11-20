@@ -6922,9 +6922,10 @@ function noteHardwareKey(event) {
   const key = String(event.key || "");
   // Letters typed with no on-screen keyboard up: a tablet's narrow window counts, a phone does not.
   const physical = event.metaKey || event.ctrlKey || event.altKey || HARDWARE_KEYS.has(key) ||
-    (key.length === 1 && chatTyping() && (tabletScreen() || (!phoneLayout() && !shortLayout())) && !keyboardOpen());
+    (key.length === 1 && (chatTyping() || document.activeElement?.id === "terminal-draft") && (tabletScreen() || (!phoneLayout() && !shortLayout())) && !keyboardOpen());
   if (!physical) return;
   state.hardwareKeyboard = true;
+  document.body?.classList?.add?.("physical-keyboard");
   renderKeyboardHint();
   const s = selectedSession();
   if (s) updateChatComposer(chatEntry(s));
@@ -15767,34 +15768,54 @@ async function lock() {
       toast("잠금 요청을 완료하지 못했습니다. 연결을 확인해 주세요.");
   }
 }
-// Keep room for iPad's hardware-keyboard accessory bar even before an editor takes focus.
-// A larger measured accessory bar is remembered for this page, never a software keyboard.
-const IPAD_INPUT_ROOM = 55;
+// A split workspace can have several editors. Only the focused pane needs room.
+function ipadInputPane() {
+  if (!document.documentElement.hasAttribute?.("data-ipad") || window.SessionholicWorkspace?.embedded ||
+      (window.visualViewport?.scale || 1) > 1.01) return null;
+  const field = document.activeElement;
+  if (field?.classList?.contains?.("workspace-frame")) return field.parentElement;
+  if (!editingText() || field.closest?.("dialog")) return null;
+  return field.closest?.("#terminal-screen, #detail") || null;
+}
+
+function renderIpadInputRoom(pane) {
+  if (state.ipadInputPane && state.ipadInputPane !== pane) {
+    state.ipadInputPane.classList.remove("ipad-input-pane");
+    state.ipadInputPane.style.removeProperty("--ipad-input-room");
+  }
+  state.ipadInputPane = pane;
+  if (!pane) return;
+  const viewport = window.visualViewport;
+  const bottom = (viewport?.offsetTop || 0) + (viewport?.height || window.innerHeight);
+  const bounds = pane.getBoundingClientRect();
+  const inset = Math.max(0, Math.min(bounds.height, Math.ceil(bounds.bottom - bottom)));
+  pane.classList.add("ipad-input-pane");
+  pane.style.setProperty("--ipad-input-room", `${inset}px`);
+}
 // The height the app has: the visual viewport (an on-screen keyboard takes its space), except
 // that without a focused text field no keyboard takes space, so a visual viewport shorter than
 // the window is stale: iPadOS reports one for a moment when the app comes back from the
 // background or a minimized window, with no resize after it. Not when pinch-zoomed (the
 // visual viewport is then meant to be smaller).
-function viewportHeight() {
+function viewportHeight(pane = ipadInputPane()) {
   const viewport = window.visualViewport;
   let height = viewport?.height || window.innerHeight || 800;
   const unzoomed = (viewport?.scale || 1) <= 1.01;
   if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
-  // The parent already reserved room before sizing its split-pane iframes.
-  if (unzoomed && document.documentElement.hasAttribute?.("data-ipad") && !window.SessionholicWorkspace?.embedded) {
-    const inset = keyboardInset();
-    if (editingText() && inset > 0 && inset <= KEYBOARD_MIN_PX)
-      state.ipadInputRoom = Math.max(state.ipadInputRoom || IPAD_INPUT_ROOM, Math.round(inset));
-    height = Math.min(height, Math.max(0, (state.viewportTall || window.innerHeight || height) - (state.ipadInputRoom || IPAD_INPUT_ROOM)));
+  if (pane) {
+    keyboardInset();
+    return Math.max(window.innerHeight || height, state.viewportTall || 0);
   }
   return height;
 }
 function updateViewport() {
-  const height = Math.round(viewportHeight());
+  const pane = ipadInputPane();
+  const height = Math.round(viewportHeight(pane));
   document.documentElement.style.setProperty("--app-height", `${height}px`);
   redock();
   renderKeyboardRoom();
   renderAppShift();
+  renderIpadInputRoom(pane);
   traceKeyboardRoom();
   syncChromeMode();
   syncCompactSessionLayout();
@@ -15825,7 +15846,7 @@ function renderKeyboardRoom() {
   // A phone held upright folds its own way (is-typing); one held sideways is as short as a tablet
   // with its keyboard up, so its top bar folds too.
   const open = touchDevice() && editingText() && keyboardOpen();
-  const typing = open && (!phoneLayout() || shortLayout());
+  const typing = open && (!phoneLayout() || shortLayout()) && !(ipadInputPane() && !phoneLayout());
   // Typing on the board (its sheets included) leaves a docked terminal its height.
   const beside = typing && state.docked && !!document.activeElement?.closest?.("#app, dialog");
   // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
@@ -15852,8 +15873,18 @@ function renderKeyboardRoom() {
 function renderAppShift() {
   const viewport = window.visualViewport;
   const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
-  const top = viewport && touchDevice() && (viewport.scale || 1) <= 1.01 && following
+  const pane = ipadInputPane();
+  const follows = following || !!pane;
+  let top = viewport && (touchDevice() || pane) && (viewport.scale || 1) <= 1.01 && follows
     ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
+  // A fixed surface can already be at the visible top. Correct only the measured
+  // displacement, so a shortcut bar reporting pageTop alone cannot move the board.
+  if (pane && viewport) {
+    const shell = pane.id === "terminal-screen" && !document.body.classList.contains("terminal-inline")
+      ? pane : $("app");
+    const rect = shell?.getBoundingClientRect?.();
+    if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) + (viewport.offsetTop || 0) - rect.top));
+  }
   if (top === (state.appShift || 0)) return;
   state.appShift = top;
   document.documentElement.style?.setProperty?.("--app-shift", `${top}px`);
@@ -16584,6 +16615,8 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   $("draft-mic").addEventListener("click", toggleDraftDictation);
   renderDictation();
+  // xterm and the draft can consume navigation keys before document keydown bubbles.
+  $("terminal-screen").addEventListener("keydown", noteHardwareKey, true);
   bindDraftInput($("terminal-draft"));
   // Capture before xterm can turn a mixed file/text paste into immediate PTY input.
   $("terminal-viewport").addEventListener("paste", pasteTerminalFiles, { capture: true });
@@ -16662,6 +16695,10 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   window.addEventListener("online", recoverConnection);
   $("terminal-direct-input").checked = directTerminalInput();
+  $("terminal-show-keys")?.addEventListener("change", (event) => {
+    document.body.classList.toggle("show-terminal-keys", event.target.checked);
+    fitTerminal();
+  });
   $("terminal-direct-input").addEventListener("change", (event) => {
     state.directTerminalInput = event.target.checked;
     prefs.set("directTerminalInput", state.directTerminalInput);
@@ -16680,7 +16717,14 @@ window.addEventListener("DOMContentLoaded", () => {
   for (const id of Object.keys(SHEETS)) sheet(id);
   window.visualViewport?.addEventListener("resize", updateViewport);
   // iOS moves the visible area with no resize (its keyboard's own scroll, or a drag).
-  window.visualViewport?.addEventListener("scroll", renderAppShift);
+  window.visualViewport?.addEventListener("scroll", () => {
+    renderAppShift();
+    renderIpadInputRoom(ipadInputPane());
+  });
+  if (document.documentElement.hasAttribute?.("data-ipad")) {
+    for (const event of ["focusin", "focusout"])
+      document.addEventListener(event, () => window.requestAnimationFrame(updateViewport));
+  }
   updateViewport();
   if ("serviceWorker" in navigator && !window.SessionholicWorkspace?.embedded) {
     navigator.serviceWorker.register("/sw.js").catch(() => {});
