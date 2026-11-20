@@ -132,3 +132,12 @@ body.workspace-embedded .detail-head { padding-top: 4px; }
   #terminal-screen.has-session-composer > .terminal-viewport { grid-area: 4 / 1 / 5 / -1; min-height: 0; padding-top: 0; }
   #terminal-screen.has-session-composer > .terminal-tools { grid-area: 5 / 1 / 6 / -1; max-height: none; padding-block: 0; }
 }
+
+:root[data-ipad] body.workspace-split {
+  height: var(--app-height, 100%);
+  bottom: auto;
+}
+:root[data-ipad] body.workspace-split .workspace-pane.ipad-pane-lifted {
+  z-index: 9;
+  transform: translateY(calc(0px - var(--ipad-pane-lift)));
+}

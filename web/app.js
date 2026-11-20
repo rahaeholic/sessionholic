@@ -15814,13 +15814,15 @@ function ipadInputPane() {
     return field.parentElement;
   }
   if (!editingText() || field.closest?.("dialog")) return null;
-  return field.closest?.("#terminal-screen, #detail") || null;
+  return (ipadWorkspace() && field.closest?.(".workspace-pane")) || field.closest?.("#terminal-screen, #detail") || null;
 }
 
 function renderIpadInputRoom(pane) {
   if (state.ipadInputPane && state.ipadInputPane !== pane) {
     state.ipadInputPane.classList.remove("ipad-input-pane");
     state.ipadInputPane.style.removeProperty("--ipad-input-room");
+    state.ipadInputPane.style.removeProperty("--ipad-pane-lift");
+    state.ipadInputPane.classList.remove("ipad-pane-lifted");
     state.ipadAccessoryRoom = 0;
   }
   state.ipadInputPane = pane;
@@ -15832,13 +15834,31 @@ function renderIpadInputRoom(pane) {
   // their anchor or alternately remove/add the focused frame's bottom padding.
   const bottom = visible + (split ? 0 : viewport?.offsetTop || 0);
   const bounds = pane.getBoundingClientRect();
-  let inset = Math.max(0, Math.min(bounds.height, Math.ceil(bounds.bottom - bottom)));
-  if (split && window.innerHeight - visible <= KEYBOARD_MIN_PX) {
-    const size = `${window.innerWidth}/${window.innerHeight}/${Math.round(bounds.height)}`;
+  const splitTile = split && pane.classList.contains("workspace-pane");
+  // offsetTop/Height are layout coordinates. The active tile's own translation
+  // must never feed back into the next keyboard or scroll measurement.
+  const parent = splitTile && pane.offsetParent;
+  const tileBottom = parent ? parent.getBoundingClientRect().top + pane.offsetTop + pane.offsetHeight : bounds.bottom;
+  let covered = Math.max(0, Math.ceil(tileBottom - bottom));
+  const keyboard = split && state.ipadLayoutHeight - visible > KEYBOARD_MIN_PX;
+  if (split && !keyboard) {
+    const size = `${window.innerWidth}/${state.ipadLayoutHeight}/${Math.round(bounds.height)}/${Math.round(tileBottom)}`;
     if (state.ipadRoomSize !== size) state.ipadAccessoryRoom = 0;
     state.ipadRoomSize = size;
-    inset = state.ipadAccessoryRoom = Math.max(inset, state.ipadAccessoryRoom || 0);
+    covered = state.ipadAccessoryRoom = Math.max(covered, state.ipadAccessoryRoom || 0);
   } else state.ipadAccessoryRoom = 0;
+  // A shallow row's header and composer already occupy most of its height.
+  // Slide the tile intact if it fits above the keyboard. Padding alone would
+  // shrink its iframe below the minimum usable editor height.
+  const shallow = bounds.height <= 340;
+  const readable = Math.min(shallow ? bounds.height : 200, visible);
+  const lift = splitTile && (shallow || keyboard) ? Math.max(0, covered - (bounds.height - readable)) : 0;
+  const inset = Math.min(bounds.height, covered - lift);
+  if (splitTile) {
+    pane.classList[lift ? "add" : "remove"]("ipad-pane-lifted");
+    const value = `${lift}px`;
+    if (pane.style.getPropertyValue?.("--ipad-pane-lift") !== value) pane.style.setProperty("--ipad-pane-lift", value);
+  }
   pane.classList.add("ipad-input-pane");
   const value = `${inset}px`;
   if (pane.style.getPropertyValue?.("--ipad-input-room") !== value) pane.style.setProperty("--ipad-input-room", value);
@@ -15855,10 +15875,15 @@ function viewportHeight(pane = ipadInputPane()) {
   if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
   if (unzoomed && ipadWorkspace()) {
     if (window.SessionholicWorkspace.embedded) return window.innerHeight || height;
-    // A full on-screen keyboard can cover entire rows of tiles. Fit the split
-    // to the visible height; each iframe then already has its usable height.
-    if (pane && (window.innerHeight || height) - (viewport?.height || height) > KEYBOARD_MIN_PX)
-      return viewport.height;
+    const layout = window.innerHeight || height;
+    // Safari can shrink BOTH viewports while focus lives in an iframe. Keep
+    // the pre-focus board height even if innerHeight and visualViewport agree.
+    if (state.ipadLayoutWidth !== window.innerWidth || !state.ipadLayoutHeight ||
+        (!pane && !state.ipadInputPane) || layout > state.ipadLayoutHeight) {
+      state.ipadLayoutWidth = window.innerWidth;
+      state.ipadLayoutHeight = layout;
+    }
+    return state.ipadLayoutHeight;
   }
   if (pane) {
     keyboardInset();
@@ -15930,8 +15955,7 @@ function renderKeyboardRoom() {
 // that hid a narrow window's header, its ‹ 세션 included.
 function renderAppShift() {
   const viewport = window.visualViewport;
-  if (ipadWorkspace() && (window.SessionholicWorkspace.embedded ||
-      (viewport?.scale || 1) <= 1.01 && window.innerHeight - (viewport?.height || window.innerHeight) <= KEYBOARD_MIN_PX)) {
+  if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
     if (state.appShift) {
       state.appShift = 0;
       document.documentElement.style.setProperty("--app-shift", "0px");
@@ -15970,7 +15994,8 @@ function keyboardTraceSeen(shape, values) {
       value != null && values[index] != null && Math.abs(value - values[index]) <= KEYBOARD_TRACE_SLACK));
 }
 function traceKeyboardRoom() {
-  const open = touchDevice() && editingText() && keyboardOpen();
+  const split = !!ipadWorkspace() && !window.SessionholicWorkspace.embedded;
+  const open = split ? !!ipadInputPane() : touchDevice() && editingText() && keyboardOpen();
   if (open === !!state.keyboardTraced) return;
   state.keyboardTraced = open;
   if (!open || (state.keyboardTraces || 0) >= KEYBOARD_TRACES) return;
@@ -15978,16 +16003,18 @@ function traceKeyboardRoom() {
   const events = [];
   const env = { kind: "viewport", field: String(document.activeElement?.id || ""), touch: true,
     standalone: !!window.matchMedia?.("(display-mode: standalone)")?.matches, phone: phoneLayout(),
-    width: Math.round(window.innerWidth || 0), docked: !!state.docked };
+    width: Math.round(window.innerWidth || 0), docked: !!state.docked, ...(split ? { split: true, version: APP_VERSION } : {}) };
   const box = (node) => node?.getBoundingClientRect?.() || null;
   const round = (value) => (Number.isFinite(value) ? Math.round(value) : null);
   const snap = (e) => {
     const viewport = window.visualViewport;
     const app = box($("app"));
     const field = box(document.activeElement);
+    const other = split ? box(document.querySelector?.(".workspace-pane:not(.workspace-pane-active):not([hidden])")) : null;
     events.push({ t: Date.now() - t0, e, ih: round(window.innerHeight), vh: round(viewport?.height),
-      vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), sy: round(window.scrollY), at: round(app?.top),
-      ah: round(app?.height), it: round(field?.top), ib: round(field?.bottom), shift: state.appShift || 0 });
+      vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), at: round(app?.top), ah: round(app?.height),
+      it: round(field?.top), ib: round(field?.bottom), ...(split ? { otherBottom: round(other?.bottom),
+        otherHeight: round(other?.height) } : { sy: round(window.scrollY), shift: state.appShift || 0 }) });
   };
   snap("open");
   setTimeout(() => snap("settled"), 400);

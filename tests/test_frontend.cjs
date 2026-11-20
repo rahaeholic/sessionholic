@@ -17856,6 +17856,9 @@ test('iPad split typing keeps four-pane layout stable through accessory viewport
   win.SessionholicWorkspace = { managed: () => true, embedded: false, visible: () => true };
   Object.assign(win, {innerWidth: 1600, innerHeight: 900, visualViewport: {height: 900, offsetTop: 0, scale: 1}});
   const pane = c.get('detail');
+  const classes = new Set(['workspace-pane']);
+  pane.classList = {add: k => classes.add(k), remove: k => classes.delete(k), contains: k => classes.has(k)};
+  pane.offsetTop = 690; pane.offsetHeight = 210; pane.offsetParent = {getBoundingClientRect: () => ({top:0})};
   pane.style = {setProperty(n,v) { room[n] = v; }, removeProperty(n) { delete room[n]; }};
   pane.getBoundingClientRect = () => ({height: 210, bottom: 900});
   c.context.document.activeElement = {classList: {contains: key => key === 'workspace-frame'}, parentElement: pane};
@@ -17865,13 +17868,18 @@ test('iPad split typing keeps four-pane layout stable through accessory viewport
     c.updateViewport();
     assert.equal(vars['--app-height'], '900px');
     assert.equal(c.state.appShift || 0, 0);
-    assert.equal(room['--ipad-input-room'], '55px');
+    assert.equal(room['--ipad-input-room'], '0px');
+    assert.equal(room['--ipad-pane-lift'], '55px', 'leave the shallow editor its full height');
   }
   Object.assign(win.visualViewport, {height: 460, offsetTop: 0, pageTop: 0});
-  pane.getBoundingClientRect = () => ({height: 105, bottom: 460});
-  c.updateViewport();
-  assert.equal(vars['--app-height'], '460px', 'all rows fit above a full screen keyboard');
-  assert.equal(room['--ipad-input-room'], '0px', 'no second inset in the resized frame');
+  pane.getBoundingClientRect = () => ({height: 210, bottom: 900 - Number.parseFloat(room['--ipad-pane-lift'] || 0)});
+  for (const layoutHeight of [900, 460, 845, 900]) {
+    win.innerHeight = layoutHeight;
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px', 'an iframe editor never resizes its siblings');
+    assert.ok(parseFloat(room['--ipad-pane-lift']) > 0, 'only the covered lower tile moves above the keyboard');
+    assert.equal(parseFloat(room['--ipad-pane-lift']) + parseFloat(room['--ipad-input-room']), 440);
+  }
   win.SessionholicWorkspace.embedded = true;
   win.innerHeight = 210;
   Object.assign(win.visualViewport, {height:210, offsetTop:35, pageTop:35});

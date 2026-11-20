@@ -735,7 +735,16 @@
       drop(event.clientX, event.clientY, data); clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready");
     }, true);
     doc.addEventListener("dragend", () => { clearDrag(); $("session-workspace").classList.remove("workspace-drop-ready"); });
-    root.addEventListener("resize", () => layout({ save: false }));
+    let layoutWidth = root.innerWidth;
+    root.addEventListener("resize", () => {
+      const sameWidth = layoutWidth === root.innerWidth;
+      layoutWidth = root.innerWidth;
+      // The board holds its pre-focus height while an iPad keyboard is up.
+      // A height-only keyboard event need not rebuild the other three panes.
+      if (enabled && sameWidth && doc.documentElement?.hasAttribute?.("data-ipad") &&
+          doc.activeElement?.matches?.("input,textarea,[contenteditable=true],.workspace-frame")) return;
+      layout({ save: false });
+    });
     root.addEventListener("beforeunload", (event) => {
       if ([...panes].some(([id, row]) => id !== "p1" && row.hooks?.unsaved())) {
         event.preventDefault(); event.returnValue = "";
