@@ -18010,3 +18010,21 @@ test('external iPad display makes room before focus and keeps it through a gap b
   win.SessionholicWorkspace.embedded = true;
   assert.equal(height(false), 1200, 'a child frame does not reserve space twice');
 });
+
+test('a split reload uses the board and a sibling draft stops navigation', async () => {
+  const c = client(undefined, noChatTimers);
+  let requests = 0, reloads = 0;
+  const workspace = { embedded: true, requestBoardReload() { requests++; }, reloadBlocker: () => '3' };
+  c.context.window.SessionholicWorkspace = workspace;
+  c.context.window.location = { reload() { reloads++; } };
+  await c.hardReload();
+  assert.equal(requests, 1);
+  workspace.embedded = false;
+  await c.hardReload();
+  assert.equal(reloads, 0);
+  workspace.reloadBlocker = () => null;
+  c.context.caches = { keys: async () => { workspace.reloadBlocker = () => '2'; return []; } };
+  await c.hardReload();
+  assert.equal(reloads, 0, 'input that started during refresh is protected');
+  assert.equal(c.state.hardReloadBusy, false);
+});

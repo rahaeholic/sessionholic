@@ -1025,7 +1025,15 @@ function answerOnOpen(s) {
 // notifications is unregistered (one that does keeps its subscription and only updates).
 // Other applications' caches and every stored preference stay.
 async function hardReload({ discard = false, preserveDrafts = false } = {}) {
+  const workspace = window.SessionholicWorkspace;
+  if (workspace?.embedded) return workspace.requestBoardReload();
   if (state.hardReloadBusy) return;
+  const blocked = () => {
+    const pane = workspace?.reloadBlocker?.();
+    if (pane) toast(`${pane}번 창에 입력 중인 내용이 있어 화면을 유지했습니다.`);
+    return !!pane;
+  };
+  if (blocked()) return;
   if ($("board-status")) $("board-status").open = false;
   if (networkOffline()) {
     // A cleared shell could not load again until the board is reachable.
@@ -1058,6 +1066,11 @@ async function hardReload({ discard = false, preserveDrafts = false } = {}) {
     }
   } catch {
     // Reload anyway: the fresh page reads everything from the board again.
+  }
+  if (blocked() || (!discard && unsavedWork())) {
+    state.hardReloadBusy = false;
+    for (const button of buttons) button.disabled = false;
+    return;
   }
   state.discardOnReload = discard;
   if (discard && !preserveDrafts) clearSavedDrafts();
@@ -16051,11 +16064,14 @@ function traceKeyboardRoom() {
   const snap = (e) => {
     const viewport = window.visualViewport;
     const app = box($("app"));
-    const field = box(document.activeElement);
+    const active = document.activeElement;
+    const frame = split && active?.classList?.contains?.("workspace-frame") ? active : null;
+    const field = box(frame ? frame.contentDocument?.activeElement : active);
+    const fieldOffset = frame ? (box(frame)?.top || 0) + (frame.clientTop || 0) : 0;
     const other = split ? box(document.querySelector?.(".workspace-pane:not(.workspace-pane-active):not([hidden])")) : null;
     events.push({ t: Date.now() - t0, e, ih: round(window.innerHeight), vh: round(viewport?.height),
       vt: round(viewport?.offsetTop), pt: round(viewport?.pageTop), at: round(app?.top), ah: round(app?.height),
-      it: round(field?.top), ib: round(field?.bottom), ...(split ? { otherBottom: round(other?.bottom),
+      it: round(field?.top + fieldOffset), ib: round(field?.bottom + fieldOffset), ...(split ? { otherBottom: round(other?.bottom),
         otherHeight: round(other?.height) } : { sy: round(window.scrollY), shift: state.appShift || 0 }) });
   };
   snap("open");
@@ -16103,13 +16119,14 @@ function checkWebVersion() {
 // guards), interrupt a terminal or close an open sheet; the banner offers it then.
 // A plain reload is enough: the page is read from the network and assets carry ?v=.
 function reloadForUpdate() {
-  if (!state.updateAvailable || networkOffline() || state.terminalVisible || unsavedWork() ||
+  if (!state.updateAvailable || networkOffline() || window.SessionholicWorkspace?.managed?.() || state.terminalVisible || unsavedWork() ||
       document.querySelector?.("dialog[open]")) return false;
   window.location.reload();
   return true;
 }
 // The banner's tap: never at the cost of unsent words (a home-screen app shows no leave prompt).
 function updateBannerPressed() {
+  if (window.SessionholicWorkspace?.managed?.()) return hardReload();
   if (unsavedWork()) {
     toast("보내지 않은 글이나 첨부가 있어 새로고침하지 않았습니다. 보내거나 지운 뒤 다시 눌러 주세요.");
     return;
@@ -16342,6 +16359,7 @@ function workspaceHooks() {
   };
   return {
     prefs, api, toast, describe, select, newSession: openNewSession, openTerminal, openSessionTerminal,
+    reloadBoard: hardReload,
     startOnList: mobileStartOnList,
     paneOpened: () => {
       if (mobileStartOnList() && !state.detailShown) { navigateView("detail"); setDetailShown(true); }

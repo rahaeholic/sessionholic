@@ -801,3 +801,23 @@ test('selecting a replacement in the primary pane cancels its pending cold resto
   assert.equal(f.preferences.get('workspace').panes.p1.key, 'session-c');
   assert.equal(f.preferences.get('workspace').panes.p2.key, 'session-b');
 });
+
+test('refresh from a mounted pane reaches the board and protects input in every pane', () => {
+  const f = fixture();
+  f.workspace.add({ key: 'session-b' });
+  const second = f.attach('p2');
+  f.workspace.add({ key: 'session-c' });
+  const third = f.attach('p3');
+  let reloads = 0;
+  f.primary.reloadBoard = () => reloads++;
+  f.workspace.requestBoardReload('p2', {});
+  assert.equal(reloads, 0);
+  f.workspace.requestBoardReload('p2', second.frame.contentWindow);
+  assert.equal(reloads, 1);
+  assert.equal(f.workspace.reloadBlocker(), null);
+  third.info.unsaved = true;
+  assert.equal(f.workspace.reloadBlocker(), '3');
+  third.info.unsaved = false;
+  f.infos.get('p1').composing = true;
+  assert.equal(f.workspace.reloadBlocker(), '1');
+});

@@ -458,6 +458,21 @@
     if (!enabled || editorFrame || panes.get(id)?.frame?.contentWindow !== win) return;
     editorFrame = root.requestAnimationFrame(() => { editorFrame = 0; hooks?.resize(); });
   }
+  function requestBoardReload(id, win) {
+    if (embedded) {
+      if (frameReady && parent.requestBoardReload) return parent.requestBoardReload(ownId, root);
+      notify("화면 맨 위의 새로고침을 누르면 분할 창이 함께 갱신됩니다.");
+      return;
+    }
+    if (panes.get(id)?.frame?.contentWindow === win && win) return hooks?.reloadBoard();
+  }
+  function reloadBlocker() {
+    for (const [id, row] of panes) {
+      const info = row.hooks?.describe();
+      if (info?.composing || info?.dictation || (id !== "p1" && row.hooks?.unsaved())) return id.slice(1);
+    }
+    return null;
+  }
   function report(id, win) {
     if (panes.get(id)?.frame?.contentWindow !== win) return;
     changed();
@@ -763,7 +778,7 @@
       }
     });
   }
-  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, editorChanged, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
+  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, editorChanged, requestBoardReload, reloadBlocker, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
     add, addFromPane, closePane, layout, arrange, awaitingSession, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
 })(typeof window !== "undefined" ? window : null);
