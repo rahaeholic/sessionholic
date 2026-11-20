@@ -795,18 +795,21 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         return list(by_id.values())
 
     def reverse_once():
-        nonlocal direction, cursor, seen, limit, retried
+        nonlocal direction, cursor, seen, limit, retried, pages
         if direction != 'desc' or retried:
             return False
-        direction, cursor, seen, limit, retried = 'asc', None, set(), HISTORY_PAGE, True
+        direction, cursor, seen, limit, retried, pages = 'asc', None, set(), HISTORY_PAGE, True, 0
         return True
 
-    for unused in range(HISTORY_PAGES):
+    while True:
+        if pages >= HISTORY_PAGES:
+            if reverse_once():
+                continue
+            return matches(), False
         params = {'threadId': thread_id, 'limit': limit,
                   'sortDirection': direction, 'itemsView': 'summary'}
         if cursor:
             params['cursor'] = cursor
-        pages += 1
         try:
             page = server.call('thread/turns/list', params)
         except OversizedReply:
@@ -817,24 +820,24 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
             # The summary for this single turn is too large. Its notLoaded view
             # keeps the cursor metadata small, so skip only this turn and resume
             # searching the ordinary turns on both sides of it.
-            if pages >= HISTORY_PAGES:
-                break
             not_loaded = {**params, 'itemsView': 'notLoaded'}
-            pages += 1
             try:
                 page = server.call('thread/turns/list', not_loaded)
             except (OversizedReply, RpcReplyError):
                 if reverse_once():
                     continue
-                break
+                return matches(), False
             data = page.get('data') if isinstance(page, dict) else None
             if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict) or
                     not isinstance(data[0].get('id'), str)):
-                break
+                return matches(), False
             turn = data[0]
             if turn.get('id') == turn_id:
                 found_turn = turn
             skipped_oversized = True
+            pages += 1
+            if request_ids <= set(found) and (turn_id is None or found_turn is not None):
+                return matches(), True
             cursor = page.get('nextCursor')
             limit = HISTORY_PAGE
             if cursor is None:
@@ -846,6 +849,7 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         data = page.get('data') if isinstance(page, dict) else None
         if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
             raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
+        pages += 1
         for turn in data:
             if turn.get('id') == turn_id:
                 found_turn = turn
@@ -861,7 +865,6 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         if not isinstance(cursor, str) or not cursor or cursor in seen:
             raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
         seen.add(cursor)
-    return matches(), False
 
 
 def _wal_without_index(database):

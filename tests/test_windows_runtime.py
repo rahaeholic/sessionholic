@@ -226,6 +226,12 @@ class WindowsRuntimeTest(unittest.TestCase):
         return self.runtime.chat({'action': 'send', 'source': self.source, 'requestId': request,
                                   'input': [{'type': 'text', 'text': text}]})
 
+    def send_against_history_only(self, request, text):
+        thread = {'thread': {'id': self.reader.sid, 'cwd': str(self.reader.cwd),
+                             'status': {'type': 'idle', 'activeFlags': []}, 'turns': []}}
+        with patch.object(wc, 'codex_recent_thread', return_value=thread):
+            return self.send(request=request, text=text)
+
     def test_large_thread_read_does_not_block_chat_or_send_preflight(self):
         self.reader.large_read = True
         self.reader.large_page_response = True
@@ -400,6 +406,47 @@ class WindowsRuntimeTest(unittest.TestCase):
         result = self.send(request='new-request-between-large-turns', text='새 요청')
 
         self.assertEqual((result['delivery'], result['confirmed'], self.reader.send_calls), ('accepted', True, 1))
+
+    def test_many_oversized_turns_do_not_use_up_history_page_budget_on_retries(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '기존 요청' if index == 6 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(151)]
+        self.reader.oversized_turn_ids = {'turn-%d' % index for index in (1, 12, 24, 36, 48, 60)}
+
+        result = self.send_against_history_only(request='request-0006', text='기존 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-6', 0))
+
+    def test_history_search_uses_opposite_direction_after_page_limit(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '기존 요청' if index == 0 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(5001)]
+
+        result = self.send_against_history_only(request='request-0000', text='기존 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-0', 0))
+
+    def test_far_request_is_found_with_large_history_and_two_oversized_turns(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '기존 요청' if index == 20 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(4501)]
+        self.reader.oversized_turn_ids = {'turn-5', 'turn-4300'}
+
+        result = self.send_against_history_only(request='request-0020', text='기존 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-20', 0))
 
     def test_status_inconsistency_outside_display_window_rejects_send(self):
         self.reader.thread['turns'] = [
