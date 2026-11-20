@@ -552,7 +552,9 @@ class WindowsRuntime:
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
-        result = client.call('thread/read', {'threadId': identity['id'], 'includeTurns': True})
+        result = wc.codex_recent_thread(client, identity['id'])
+        if result is None:
+            result = client.call('thread/read', {'threadId': identity['id'], 'includeTurns': True})
         thread = result.get('thread') if isinstance(result, dict) else None
         if not isinstance(thread, dict) or thread.get('id') != identity['id'] or wc._norm(thread.get('cwd')) != wc._norm(cwd):
             raise ValueError('PC 원본 세션의 작업 폴더가 변경되었습니다.')
@@ -1018,7 +1020,8 @@ class WindowsRuntime:
         except (OSError, ValueError) as exc:
             capabilities.update(canSend=False, canLaunch=False, reason=str(exc))
         messages, older = wc._recent_window(wc._codex_rows(thread['turns']))
-        result = {**_state(thread), 'messages': messages, 'olderOmitted': older, 'cwd': observed['cwd'],
+        result = {**_state(thread), 'messages': messages,
+                  'olderOmitted': older or thread.get('olderUnread') is True, 'cwd': observed['cwd'],
                   'modelSettings': {**wc._model_settings(thread), 'next': self._model_preferences(observed)},
                   'capabilities': capabilities, 'readOnly': not capabilities['canSend'], 'receipts': receipts}
         if action == 'receipt':

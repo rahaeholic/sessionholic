@@ -45,6 +45,7 @@ class FakeReader:
                        'status': {'type': 'idle', 'activeFlags': []}, 'turns': []}
         self.fail_send = False
         self.fail_after = False
+        self.large_read = False
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -101,7 +102,19 @@ class FakeReader:
                         raise TimeoutError('synthetic lost response')
                     return {'data': list(owner.loaded)}
                 if method == 'thread/read':
-                    return {'thread': copy.deepcopy(owner.thread)}
+                    if params.get('includeTurns') and owner.large_read:
+                        raise ValueError('synthetic thread/read response exceeds 8 MiB')
+                    thread = copy.deepcopy(owner.thread)
+                    if params.get('includeTurns') is False:
+                        thread.pop('turns', None)
+                    return {'thread': thread}
+                if method == 'thread/items/list':
+                    data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
+                            for item in turn.get('items', [])]
+                    data.reverse()
+                    return {'data': data, 'nextCursor': None}
+                if method == 'thread/turns/list':
+                    return {'data': list(reversed(copy.deepcopy(owner.thread.get('turns', [])))), 'nextCursor': None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
                     if isinstance(result, Exception):
@@ -173,6 +186,21 @@ class WindowsRuntimeTest(unittest.TestCase):
     def send(self, request='request-1234', text='합성 입력'):
         return self.runtime.chat({'action': 'send', 'source': self.source, 'requestId': request,
                                   'input': [{'type': 'text', 'text': text}]})
+
+    def test_large_thread_read_does_not_block_chat_or_send_preflight(self):
+        self.reader.large_read = True
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'old-%d' % index,
+                 'content': [{'type': 'text', 'text': '오래된 합성 요청'}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '오래된 합성 답변'}]}
+            for index in range(60)]
+        state = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual((state['phase'], state['runtimeKnown']), ('idle', True))
+        self.assertEqual(state['messages'][-1]['text'], '오래된 합성 답변')
+        self.assertTrue(self.send()['confirmed'])
+        self.assertFalse(any(method == 'thread/read' and params.get('includeTurns') is True
+                             for method, params in self.reader.calls))
 
     def test_claude_fork_checks_exact_transcript_and_project(self):
         sid, fork = str(uuid.uuid4()), str(uuid.uuid4())
@@ -1536,7 +1564,17 @@ class SettleServer:
                 if method == 'thread/loaded/list':
                     return {'data': [server.reader.sid] if server.loaded else []}
                 if method == 'thread/read':
-                    return {'thread': copy.deepcopy(server.reader.thread)}
+                    thread = copy.deepcopy(server.reader.thread)
+                    if params.get('includeTurns') is False:
+                        thread.pop('turns', None)
+                    return {'thread': thread}
+                if method == 'thread/items/list':
+                    data = [{'turnId': turn['id'], 'item': item} for turn in server.reader.thread.get('turns', [])
+                            for item in turn.get('items', [])]
+                    data.reverse()
+                    return {'data': data, 'nextCursor': None}
+                if method == 'thread/turns/list':
+                    return {'data': list(reversed(copy.deepcopy(server.reader.thread.get('turns', [])))), 'nextCursor': None}
                 if method == 'thread/resume':
                     if server.reject_exclude and 'excludeTurns' in params:
                         raise ValueError('PC 서버가 읽기 요청을 거부했습니다.')

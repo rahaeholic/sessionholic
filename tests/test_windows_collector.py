@@ -82,8 +82,9 @@ class SessionOriginTest(unittest.TestCase):
 
 
 class FakeProxy:
-    def __init__(self, rows, calls, read=None):
+    def __init__(self, rows, calls, read=None, large_read=False, unsupported_pages=False):
         self.rows, self.calls, self.read = rows, calls, read
+        self.large_read, self.unsupported_pages = large_read, unsupported_pages
 
     def __enter__(self):
         return self
@@ -98,7 +99,19 @@ class FakeProxy:
         if method == 'thread/list':
             return {'data': self.rows}
         if method == 'thread/read':
+            if params.get('includeTurns') and self.large_read:
+                raise ValueError('synthetic thread/read response exceeds 8 MiB: ' + 'x' * (8 * 1024 * 1024 + 1))
             return {'thread': self.read or self.rows[0]}
+        if method == 'thread/items/list':
+            if self.unsupported_pages:
+                raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
+            turns = (self.read or self.rows[0]).get('turns', [])
+            data = [{'turnId': turn.get('id'), 'item': item} for turn in turns for item in turn.get('items', [])]
+            data.reverse()
+            return {'data': data, 'nextCursor': None}
+        if method == 'thread/turns/list':
+            turns = list(reversed((self.read or self.rows[0]).get('turns', [])))
+            return {'data': turns, 'nextCursor': None}
         raise AssertionError('unexpected native mutation: ' + method)
 
 
@@ -496,7 +509,10 @@ class WindowsCollectorTest(unittest.TestCase):
         self.calls = []
         self.live = {'id': self.sid, 'cwd': self.cwd, 'status': {'type': 'active', 'activeFlags': []},
                      'name': '합성 진행 작업', 'updatedAt': 200, 'turns': []}
-        self.reader = wc.WindowsCollector(self.home, hostname='fixture-pc', proxy_factory=lambda *args: FakeProxy([self.live], self.calls),
+        self.large_read = False
+        self.unsupported_pages = False
+        self.reader = wc.WindowsCollector(self.home, hostname='fixture-pc', proxy_factory=lambda *args: FakeProxy([self.live], self.calls,
+            large_read=self.large_read, unsupported_pages=self.unsupported_pages),
             process_reader=lambda pid: {'pid': pid, 'start': '123456', 'exe': str(self.reader.binary)})
         self.reader.codex_home.mkdir()
         self.db = self.reader.codex_home / 'state_5.sqlite'
@@ -800,6 +816,7 @@ class WindowsCollectorTest(unittest.TestCase):
 
     def test_live_read_is_exact_and_never_resumes_or_sends(self):
         self.endpoint()
+        self.large_read = True
         self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'startedAt': 100, 'completedAt': 200,
                               'items': [{'id': 'input-1', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 입력'}]},
                                         {'id': 'answer-1', 'type': 'agentMessage', 'text': '합성 답변', 'phase': 'final_answer'}]}]
@@ -807,10 +824,20 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual([m['text'] for m in result['messages']], ['합성 입력', '합성 답변'])
         self.assertEqual(result['phase'], 'working')
         self.assertTrue(result['runtimeKnown'])
-        self.assertEqual(self.calls, [('thread/loaded/list', {'limit': wc.LIMIT}),
-                                      ('thread/read', {'threadId': self.sid, 'includeTurns': True})])
+        self.assertEqual(self.calls[:2], [('thread/loaded/list', {'limit': wc.LIMIT}),
+                                      ('thread/read', {'threadId': self.sid, 'includeTurns': False})])
+        self.assertEqual([method for method, _ in self.calls[2:]], ['thread/items/list', 'thread/turns/list'])
         self.assertEqual(result['messages'][-1]['turnId'], 'turn-1')
         self.assertEqual(result['messages'][-1]['messageId'], 'answer-1')
+
+    def test_live_read_falls_back_when_the_server_does_not_support_history_pages(self):
+        self.endpoint()
+        self.unsupported_pages = True
+        self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 요청'}]}]}]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual([row['text'] for row in result['messages']], ['합성 요청'])
+        self.assertIn(('thread/read', {'threadId': self.sid, 'includeTurns': True}), self.calls)
 
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')
