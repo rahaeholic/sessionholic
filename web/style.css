@@ -4367,8 +4367,35 @@ li[data-task] {
   padding-bottom: max(8px, env(safe-area-inset-bottom));
 }
 .terminal-accessibility-label.terminal-physical-keys { display: none; }
-:root[data-ipad] body.physical-keyboard:not(.keyboard-open) .terminal-physical-keys { display: flex; }
-:root[data-ipad] body.physical-keyboard:not(.keyboard-open):not(.show-terminal-keys) #terminal-keys { display: none; }
+:root[data-ipad] .terminal-physical-keys.terminal-accessibility-label { display: flex; }
+:root[data-ipad] body.hide-terminal-keys #terminal-keys { display: none; }
+
+/* In a split, shortcuts use one scrollable row even in a shallow tile. */
+:root[data-ipad] :is(body.workspace-split, body.workspace-embedded) {
+  position: fixed;
+  inset: 0;
+  overflow: clip;
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-tools {
+  display: block;
+  padding: 4px 6px max(4px, env(safe-area-inset-bottom));
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: none;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+:root[data-ipad] :is(.workspace-split, .workspace-embedded) .terminal-keys button {
+  flex: none;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 6px;
+  margin: 0;
+  white-space: nowrap;
+}
 
 /* Status: no space when empty (existing :empty rule); long errors stay
    readable by scrolling instead of stretching the compact bar. */

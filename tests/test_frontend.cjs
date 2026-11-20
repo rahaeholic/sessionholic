@@ -17847,3 +17847,35 @@ test('브라우저가 온라인이면 보드에 따로 묻지 않는다', async 
   assert.equal([...c.callbacks.values()].filter((t) => t.ms === 1500).length, 0);
   assert.equal(requests.includes('/api/usage') && requests.indexOf('/api/usage') < requests.indexOf('/api/snapshot'), false);
 });
+
+test('iPad split typing keeps four-pane layout stable through accessory viewport oscillation', () => {
+  const c = client(undefined, noChatTimers), vars = {}, room = {};
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  c.context.document.documentElement.style = { setProperty(n,v) { vars[n] = v; } };
+  const win = c.context.window;
+  win.SessionholicWorkspace = { managed: () => true, embedded: false, visible: () => true };
+  Object.assign(win, {innerWidth: 1600, innerHeight: 900, visualViewport: {height: 900, offsetTop: 0, scale: 1}});
+  const pane = c.get('detail');
+  pane.style = {setProperty(n,v) { room[n] = v; }, removeProperty(n) { delete room[n]; }};
+  pane.getBoundingClientRect = () => ({height: 210, bottom: 900});
+  c.context.document.activeElement = {classList: {contains: key => key === 'workspace-frame'}, parentElement: pane};
+  c.updateViewport();
+  for (const y of [0, 36, 0, 35, 0]) {
+    Object.assign(win.visualViewport, {height:845, offsetTop:y, pageTop:y});
+    c.updateViewport();
+    assert.equal(vars['--app-height'], '900px');
+    assert.equal(c.state.appShift || 0, 0);
+    assert.equal(room['--ipad-input-room'], '55px');
+  }
+  Object.assign(win.visualViewport, {height: 460, offsetTop: 0, pageTop: 0});
+  pane.getBoundingClientRect = () => ({height: 105, bottom: 460});
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '460px', 'all rows fit above a full screen keyboard');
+  assert.equal(room['--ipad-input-room'], '0px', 'no second inset in the resized frame');
+  win.SessionholicWorkspace.embedded = true;
+  win.innerHeight = 210;
+  Object.assign(win.visualViewport, {height:210, offsetTop:35, pageTop:35});
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '210px');
+  assert.equal(c.state.appShift || 0, 0);
+});

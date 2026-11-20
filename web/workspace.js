@@ -450,6 +450,11 @@
     applyRef(row); changed();
     return true;
   }
+  let editorFrame = 0;
+  function editorChanged(id, win) {
+    if (!enabled || editorFrame || panes.get(id)?.frame?.contentWindow !== win) return;
+    editorFrame = root.requestAnimationFrame(() => { editorFrame = 0; hooks?.resize(); });
+  }
   function report(id, win) {
     if (panes.get(id)?.frame?.contentWindow !== win) return;
     changed();
@@ -685,6 +690,10 @@
       root.addEventListener("keydown", (event) => parent.handleKey(event, ownId), true);
       doc.addEventListener("pointerdown", () => parent.focus(ownId, false), true);
       doc.addEventListener("focusin", () => parent.focus(ownId, false));
+      if (doc.documentElement?.hasAttribute?.("data-ipad")) {
+        for (const type of ["focusin", "focusout"])
+          doc.addEventListener(type, () => parent.editorChanged?.(ownId, root));
+      }
       return;
     }
     record("p1");
@@ -733,7 +742,7 @@
       }
     });
   }
-  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
+  root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, editorChanged, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
     add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
 })(typeof window !== "undefined" ? window : null);
