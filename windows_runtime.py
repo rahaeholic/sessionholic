@@ -553,7 +553,7 @@ class WindowsRuntime:
         if self._resume_pending(observed):
             raise ValueError(RESUME_PENDING_REASON)
 
-    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None):
+    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None, allow_incomplete_requests=False):
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
@@ -578,7 +578,8 @@ class WindowsRuntime:
                                     for item in turn.get('items') or [] if isinstance(item, dict)
                                     and item.get('type') == 'userMessage'}
                 matched_turn = turn_id is None or found_turn or any(turn.get('id') == turn_id for turn in matches)
-                if not history_complete and (missing_requests - matched_requests or not matched_turn):
+                if not history_complete and (not matched_turn or
+                                             missing_requests - matched_requests and not allow_incomplete_requests):
                     raise ValueError('PC 대화 기록의 이전 요청 또는 분기 지점을 모두 확인하지 못했습니다.')
                 thread['_lookupTurns'] = matches
         _state(thread)
@@ -1234,7 +1235,10 @@ class WindowsRuntime:
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
                 self._verify_endpoint(observed)
                 self._require_resume_verified(observed)
-                thread = self._thread(client, identity, observed['cwd'], (request_id,))
+                # The local receipt was checked under this lock above. An oversized remote
+                # history page may hide an old client ID; it must not block this new request.
+                thread = self._thread(client, identity, observed['cwd'], (request_id,),
+                                      allow_incomplete_requests=True)
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
                     return before

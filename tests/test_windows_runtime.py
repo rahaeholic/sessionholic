@@ -303,7 +303,8 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.reader.thread['turns'] = [
             {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
                 {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%d' % index,
-                 'content': [{'type': 'text', 'text': '질문 %d' % index}]},
+                 'content': [{'type': 'text', 'text': '질문 %d' % index +
+                             ('x' * (9 * 1024 * 1024) if index == 20 else '')}]},
                 {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
             for index in range(81)]
         self.reader.turn_page_size = 20
@@ -312,6 +313,9 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual((result['phase'], result['runtimeKnown'], result['capabilities']['canSend']),
                          ('idle', True, True))
         self.assertEqual(len(result['messages']), 80)
+        sent = self.send(request='fresh-request-0001')
+        self.assertEqual((sent['delivery'], sent['confirmed'], self.reader.send_calls),
+                         ('accepted', True, 1))
 
     def test_status_inconsistency_outside_display_window_rejects_send(self):
         self.reader.thread['turns'] = [

@@ -790,7 +790,13 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
                   'sortDirection': 'desc', 'itemsView': 'summary'}
         if cursor:
             params['cursor'] = cursor
-        page = server.call('thread/turns/list', params)
+        try:
+            page = server.call('thread/turns/list', params)
+        except OversizedReply:
+            found_by_id = {turn['id']: turn for turn in found.values()}
+            if found_turn is not None:
+                found_by_id[found_turn['id']] = found_turn
+            return list(found_by_id.values()), False
         data = page.get('data') if isinstance(page, dict) else None
         if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
             raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
