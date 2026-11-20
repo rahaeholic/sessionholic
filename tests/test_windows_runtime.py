@@ -49,6 +49,7 @@ class FakeReader:
         self.large_page_response = False
         self.unsupported_pages = False
         self.oversized_turn_cursor = None
+        self.oversized_turn_ids = set()
         self.turn_page_size = None
         self.item_page_delay = 0
         self.send_calls = 0
@@ -132,8 +133,6 @@ class FakeReader:
                 if method == 'thread/turns/list':
                     if owner.unsupported_pages:
                         raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
-                    if owner.oversized_turn_cursor is not None and owner.oversized_turn_cursor == params.get('cursor'):
-                        raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
                     turns = copy.deepcopy(owner.thread.get('turns', []))
                     if params.get('sortDirection', 'desc') == 'desc':
                         turns.reverse()
@@ -146,7 +145,15 @@ class FakeReader:
                     turns = summaries
                     start = int(params.get('cursor') or 0)
                     end = start + min(params['limit'], owner.turn_page_size or params['limit'])
-                    return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
+                    page_turns = turns[start:end]
+                    if params.get('itemsView', 'summary') == 'summary' and (
+                            owner.oversized_turn_cursor is not None and
+                            owner.oversized_turn_cursor == params.get('cursor') or
+                            any(turn['id'] in owner.oversized_turn_ids for turn in page_turns)):
+                        raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
+                    if params.get('itemsView') == 'notLoaded':
+                        page_turns = [{**turn, 'items': [], 'itemsView': 'notLoaded'} for turn in page_turns]
+                    return {'data': page_turns, 'nextCursor': str(end) if end < len(turns) else None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
                     if isinstance(result, Exception):
@@ -336,6 +343,63 @@ class WindowsRuntimeTest(unittest.TestCase):
                                text='합성 입력' if index == 0 else '질문 %d' % index)
             self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
                              ('completed', True, 'turn-%d' % index, 0))
+
+    def test_request_between_two_oversized_turns_is_found_before_retransmit(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '기존 요청' if index == 30 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(121)]
+        self.reader.turn_page_size = 20
+        self.reader.oversized_turn_ids = {'turn-20', 'turn-40'}
+
+        result = self.send(request='request-0030', text='기존 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-30', 0))
+        self.assertTrue(any(params.get('itemsView') == 'notLoaded'
+                            for method, params in self.reader.calls if method == 'thread/turns/list'))
+
+    def test_request_between_oversized_turns_with_lost_receipt_is_not_replayed(self):
+        request_id = 'request-between-large-turns'
+        request_text = '이미 접수된 요청'
+        first = self.send(request=request_id, text=request_text)
+        self.assertEqual((first['delivery'], self.reader.send_calls), ('accepted', 1))
+
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage',
+                 'clientId': request_id if index == 70 else 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': request_text if index == 70 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(151)]
+        self.reader.turn_page_size = 20
+        self.reader.oversized_turn_ids = {'turn-5', 'turn-90'}
+        identity = wr._identity(self.source)
+        receipt_path = self.runtime.store.root / ('chat-' + wr._digest([identity, request_id]) + '.json')
+        receipt_path.unlink()
+
+        replay = self.send(request=request_id, text=request_text)
+
+        self.assertEqual((replay['delivery'], replay['confirmed'], replay['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-70', 1))
+        self.assertEqual(sum(1 for turn in self.reader.thread['turns'] for item in turn.get('items', [])
+                             if item.get('type') == 'userMessage' and item.get('clientId') == request_id), 1)
+
+    def test_new_request_between_oversized_turns_is_still_accepted(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'old-%04d' % index,
+                 'content': [{'type': 'text', 'text': '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(121)]
+        self.reader.turn_page_size = 20
+        self.reader.oversized_turn_ids = {'turn-20', 'turn-40'}
+
+        result = self.send(request='new-request-between-large-turns', text='새 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], self.reader.send_calls), ('accepted', True, 1))
 
     def test_status_inconsistency_outside_display_window_rejects_send(self):
         self.reader.thread['turns'] = [

@@ -786,27 +786,63 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
     request_ids = set(request_ids)
     found, found_turn, cursor, seen = {}, None, None, set()
     direction, limit, retried = 'desc', HISTORY_PAGE, False
-    while True:
+    skipped_oversized, pages = False, 0
+
+    def matches():
+        by_id = {turn['id']: turn for turn in found.values()}
+        if found_turn is not None:
+            by_id[found_turn['id']] = found_turn
+        return list(by_id.values())
+
+    def reverse_once():
+        nonlocal direction, cursor, seen, limit, retried
+        if direction != 'desc' or retried:
+            return False
+        direction, cursor, seen, limit, retried = 'asc', None, set(), HISTORY_PAGE, True
+        return True
+
+    for unused in range(HISTORY_PAGES):
         params = {'threadId': thread_id, 'limit': limit,
                   'sortDirection': direction, 'itemsView': 'summary'}
         if cursor:
             params['cursor'] = cursor
+        pages += 1
         try:
             page = server.call('thread/turns/list', params)
         except OversizedReply:
-            if direction == 'desc' and not retried:
-                # A large old item can hide earlier IDs from a newest-first scan.
-                # Retry from the oldest side so earlier IDs are still checked first.
-                direction, cursor, seen, retried = 'asc', None, set(), True
-                continue
-            if direction == 'asc' and limit > 1:
-                # Shrink only the page containing the oversized turn.
+            if limit > 1:
+                # Reduce the page until the oversized response identifies one turn.
                 limit = max(1, limit // 2)
                 continue
-            found_by_id = {turn['id']: turn for turn in found.values()}
-            if found_turn is not None:
-                found_by_id[found_turn['id']] = found_turn
-            return list(found_by_id.values()), False
+            # The summary for this single turn is too large. Its notLoaded view
+            # keeps the cursor metadata small, so skip only this turn and resume
+            # searching the ordinary turns on both sides of it.
+            if pages >= HISTORY_PAGES:
+                break
+            not_loaded = {**params, 'itemsView': 'notLoaded'}
+            pages += 1
+            try:
+                page = server.call('thread/turns/list', not_loaded)
+            except (OversizedReply, RpcReplyError):
+                if reverse_once():
+                    continue
+                break
+            data = page.get('data') if isinstance(page, dict) else None
+            if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict) or
+                    not isinstance(data[0].get('id'), str)):
+                break
+            turn = data[0]
+            if turn.get('id') == turn_id:
+                found_turn = turn
+            skipped_oversized = True
+            cursor = page.get('nextCursor')
+            limit = HISTORY_PAGE
+            if cursor is None:
+                return matches(), not (request_ids - set(found)) and (turn_id is None or found_turn is not None)
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+            seen.add(cursor)
+            continue
         data = page.get('data') if isinstance(page, dict) else None
         if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
             raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
@@ -818,19 +854,14 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
                 if request_id in request_ids:
                     found[request_id] = turn
         if request_ids <= set(found) and (turn_id is None or found_turn is not None):
-            found_by_id = {turn['id']: turn for turn in found.values()}
-            if found_turn is not None:
-                found_by_id[found_turn['id']] = found_turn
-            return list(found_by_id.values()), True
+            return matches(), True
         cursor = page.get('nextCursor')
         if cursor is None:
-            found_by_id = {turn['id']: turn for turn in found.values()}
-            if found_turn is not None:
-                found_by_id[found_turn['id']] = found_turn
-            return list(found_by_id.values()), True
+            return matches(), not skipped_oversized
         if not isinstance(cursor, str) or not cursor or cursor in seen:
             raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
         seen.add(cursor)
+    return matches(), False
 
 
 def _wal_without_index(database):
