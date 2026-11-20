@@ -899,6 +899,20 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual([row['text'] for row in result['messages']], ['질문', '답변'])
         self.assertTrue(result['olderOmitted'])
 
+    def test_file_change_items_do_not_consume_visible_message_row_limit(self):
+        self.endpoint()
+        self.live['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items':
+             [{'id': 'input-%d' % index, 'type': 'userMessage',
+               'content': [{'type': 'text', 'text': '질문 %d' % index}]}]
+             + [{'id': 'edit-%d-%d' % (index, item), 'type': 'fileChange', 'changes': []} for item in range(18)]
+             + [{'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(40)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual(len(result['messages']), 80)
+        self.assertEqual((result['messages'][0]['text'], result['messages'][-1]['text']), ('질문 0', '답변 39'))
+        self.assertFalse(result['olderOmitted'])
+
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')
         self.assertEqual([row['text'] for row in result['messages']], ['합성 요청', '합성 결과'])

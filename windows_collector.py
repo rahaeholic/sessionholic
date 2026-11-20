@@ -49,9 +49,10 @@ CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 # after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
+STATUS_TURN_LIMIT = 80
 HISTORY_PAGE = 100
 HISTORY_PAGES = 50
-CODEX_TOOL_KINDS = {'commandExecution', 'fileChange', 'webSearch', 'mcpToolCall', 'dynamicToolCall'}
+CODEX_VISIBLE_TOOL_KINDS = {'commandExecution'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
@@ -673,7 +674,7 @@ def _codex_window_edge(entries):
         item = entry['item']
         if _codex_conversation_item(item):
             seen += 1
-        elif item.get('type') not in CODEX_TOOL_KINDS:
+        elif item.get('type') not in CODEX_VISIBLE_TOOL_KINDS:
             continue
         shown += 1
         if seen >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
@@ -734,7 +735,8 @@ def codex_recent_thread(server, thread_id):
                 raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
             turns.extend(data)
             cursor = page.get('nextCursor')
-            if not cursor or ({turn['id'] for turn in turns} >= wanted and not short(turns)):
+            if not cursor or (len(turns) >= STATUS_TURN_LIMIT
+                              and {turn['id'] for turn in turns} >= wanted and not short(turns)):
                 break
     except RpcReplyError as error:
         if error.code == -32601 or (error.code == -32600 and ('unknown variant `%s`' % method) in str(error)):
@@ -755,7 +757,8 @@ def codex_recent_thread(server, thread_id):
     summarized = []
     if items_cursor and (wanted or oversized_item):
         count = sum(1 for turn in kept for item in turn['items'] if _codex_conversation_item(item))
-        shown = count + sum(1 for turn in kept for item in turn['items'] if item.get('type') in CODEX_TOOL_KINDS)
+        shown = count + sum(1 for turn in kept for item in turn['items']
+                            if item.get('type') in CODEX_VISIBLE_TOOL_KINDS)
         summary_turns = turns[last + 1:] if wanted else turns
         for turn in summary_turns:
             if count >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
@@ -764,6 +767,8 @@ def codex_recent_thread(server, thread_id):
             count += _summary_talk(turn)
             shown += _summary_talk(turn)
     thread['turns'] = list(reversed(kept + summarized))
+    thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
+                              for turn in reversed(turns[:STATUS_TURN_LIMIT])]
     thread['olderUnread'] = oversized_item or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}

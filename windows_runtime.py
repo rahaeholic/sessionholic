@@ -348,15 +348,19 @@ def _state(thread):
     turns = thread.get('turns')
     if not isinstance(turns, list):
         raise ValueError('PC 세션 응답 형식이 올바르지 않습니다.')
-    known = all(isinstance(t, dict) and t.get('status') in ('inProgress', 'completed', 'interrupted', 'failed') for t in turns)
-    active = [t for t in turns if isinstance(t, dict) and t.get('status') == 'inProgress']
+    status_turns = thread.get('_statusTurns', turns)
+    if not isinstance(status_turns, list):
+        raise ValueError('PC 세션 상태 응답 형식이 올바르지 않습니다.')
+    known = all(isinstance(t, dict) and t.get('status') in ('inProgress', 'completed', 'interrupted', 'failed') for t in status_turns)
+    active = [t for t in status_turns if isinstance(t, dict) and t.get('status') == 'inProgress']
     runtime = wc._codex_runtime(thread.get('status')) if known else wc._unknown_runtime('turn_status_unsupported', 'unsupported')
     phase = runtime['phase']
     if phase == 'idle' and active:
         runtime = wc._unknown_runtime('status_inconsistent', 'unsupported')
     return {**runtime, 'activeTurnId': active[0].get('id') if len(active) == 1 else None,
             'activeFlags': wc._flags(thread.get('status')),
-            'turns': [{'id': t.get('id'), 'status': t.get('status')} for t in turns[-80:] if isinstance(t, dict)],
+            'turns': [{'id': t.get('id'), 'status': t.get('status')}
+                      for t in status_turns[-wc.STATUS_TURN_LIMIT:] if isinstance(t, dict)],
             'updatedAt': wc._epoch(thread.get('updatedAt'))}
 
 

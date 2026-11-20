@@ -270,6 +270,31 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(visible.count('중간 답변'), 25)
         self.assertFalse(result['olderOmitted'])
 
+    def test_recent_state_retains_failed_turns_outside_the_message_window(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'failed' if index == 0 else 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(60)]
+        result = self.runtime.chat({'action': 'read', 'source': self.source, 'requestId': 'request-0000'})
+        self.assertEqual(result['receipts'][0]['delivery'], 'failed')
+        self.assertEqual((len(result['turns']), result['turns'][0]['id'], result['turns'][-1]['id']),
+                         (60, 'turn-0', 'turn-59'))
+
+    def test_file_change_events_do_not_cut_off_visible_pc_messages(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items':
+             [{'id': 'input-%d' % index, 'type': 'userMessage',
+               'content': [{'type': 'text', 'text': '질문 %d' % index}]}]
+             + [{'id': 'edit-%d-%d' % (index, item), 'type': 'fileChange', 'changes': []} for item in range(18)]
+             + [{'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(40)]
+        result = self.runtime.chat({'action': 'read', 'source': self.source})
+        self.assertEqual(len(result['messages']), 80)
+        self.assertEqual((result['messages'][0]['text'], result['messages'][-1]['text']), ('질문 0', '답변 39'))
+        self.assertFalse(result['olderOmitted'])
+
     def test_old_receipt_and_fork_point_are_found_outside_the_display_window(self):
         self.reader.thread['turns'] = [
             {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
