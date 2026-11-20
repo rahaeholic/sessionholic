@@ -86,6 +86,7 @@ class FakeProxy:
         self.rows, self.calls, self.read = rows, calls, read
         self.large_read, self.unsupported_pages = large_read, unsupported_pages
         self.large_page_response = large_page_response
+        self.item_page_delay = 0
 
     def __enter__(self):
         return self
@@ -107,6 +108,8 @@ class FakeProxy:
         if method == 'thread/items/list':
             if self.unsupported_pages:
                 raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
+            if self.item_page_delay:
+                time.sleep(self.item_page_delay)
             turns = (self.read or self.rows[0]).get('turns', [])
             data = [{'turnId': turn.get('id'), 'item': item} for turn in turns for item in turn.get('items', [])]
             data.reverse()
@@ -884,6 +887,18 @@ class WindowsCollectorTest(unittest.TestCase):
         limits = [params['limit'] for method, params in self.calls if method == 'thread/items/list']
         self.assertTrue(any(limit < wc.HISTORY_PAGE for limit in limits))
 
+    def test_single_oversized_tool_item_falls_back_to_turn_summaries(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'id': 'tool', 'type': 'commandExecution', 'aggregatedOutput': 'x' * (9 * 1024 * 1024)},
+            {'id': 'input', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '질문'}]},
+            {'id': 'answer', 'type': 'agentMessage', 'text': '답변'}]}]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertTrue(result['runtimeKnown'])
+        self.assertEqual([row['text'] for row in result['messages']], ['질문', '답변'])
+        self.assertTrue(result['olderOmitted'])
+
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')
         self.assertEqual([row['text'] for row in result['messages']], ['합성 요청', '합성 결과'])
@@ -1300,6 +1315,11 @@ class WindowsCollectorTest(unittest.TestCase):
         with self.assertRaises(wc.OversizedReply):
             proxy._message()
         self.assertEqual(proxy._message(), {'id': 1, 'result': {'data': []}})
+        unsupported = io.BytesIO(bytes([0x82, 127]) + struct.pack('!Q', 9 * 1024 * 1024))
+        proxy._read = lambda size: unsupported.read(size)
+        with self.assertRaises(ValueError):
+            proxy._message()
+        self.assertEqual(unsupported.tell(), 10)
 
     def test_proxy_retries_oversized_read_pages_with_a_smaller_limit(self):
         proxy = wc.Proxy.__new__(wc.Proxy)

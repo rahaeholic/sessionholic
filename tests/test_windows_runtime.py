@@ -48,6 +48,7 @@ class FakeReader:
         self.large_read = False
         self.large_page_response = False
         self.unsupported_pages = False
+        self.item_page_delay = 0
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -113,6 +114,8 @@ class FakeReader:
                 if method == 'thread/items/list':
                     if owner.unsupported_pages:
                         raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
+                    if owner.item_page_delay:
+                        time.sleep(owner.item_page_delay)
                     data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
                             for item in turn.get('items', [])]
                     data.reverse()
@@ -239,6 +242,33 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(self.reader.send_calls, 1)
         limits = [params['limit'] for method, params in self.reader.calls if method == 'thread/items/list']
         self.assertTrue(any(limit < wc.HISTORY_PAGE for limit in limits))
+
+    def test_single_oversized_tool_item_uses_summary_for_send_preflight(self):
+        self.reader.large_page_response = True
+        self.reader.thread['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'id': 'input', 'type': 'userMessage', 'clientId': 'old-request',
+             'content': [{'type': 'text', 'text': '과거 질문'}]},
+            {'id': 'tool', 'type': 'commandExecution', 'aggregatedOutput': 'x' * (9 * 1024 * 1024)},
+            {'id': 'answer', 'type': 'agentMessage', 'text': '과거 답변'}]}]
+        result = self.send()
+        self.assertTrue(result['confirmed'])
+        self.assertEqual(self.reader.send_calls, 1)
+
+    def test_slow_pages_continue_until_small_visible_history_is_complete(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items':
+             [{'id': 'input-%d' % index, 'type': 'userMessage',
+               'content': [{'type': 'text', 'text': '질문'}]},
+              {'id': 'middle-%d' % index, 'type': 'agentMessage', 'text': '중간 답변'}]
+             + [{'id': 'reason-%d-%d' % (index, item), 'type': 'reasoning', 'text': '숨김'} for item in range(17)]
+             + [{'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '최종 답변'}]}
+            for index in range(25)]
+        self.reader.item_page_delay = .08
+        result = self.runtime.chat({'action': 'read', 'source': self.source})
+        visible = [row['text'] for row in result['messages']]
+        self.assertEqual(len(visible), 75)
+        self.assertEqual(visible.count('중간 답변'), 25)
+        self.assertFalse(result['olderOmitted'])
 
     def test_old_receipt_and_fork_point_are_found_outside_the_display_window(self):
         self.reader.thread['turns'] = [

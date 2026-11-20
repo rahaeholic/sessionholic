@@ -51,7 +51,6 @@ MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
 HISTORY_PAGE = 100
 HISTORY_PAGES = 50
-HISTORY_ITEMS_BUDGET = 0.3
 CODEX_TOOL_KINDS = {'commandExecution', 'fileChange', 'webSearch', 'mcpToolCall', 'dynamicToolCall'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
@@ -556,6 +555,10 @@ class Proxy:
                 length = struct.unpack('!H', self._read(2))[0]
             elif length == 127:
                 length = struct.unpack('!Q', self._read(8))[0]
+            if opcode not in (0, 1, 9, 10) or (opcode == 1 and started) or (opcode == 0 and not started):
+                raise ValueError('PC 서버 메시지 형식이 올바르지 않습니다.')
+            if opcode in (9, 10) and (not final or length > 125):
+                raise ValueError('PC 서버 제어 프레임 형식이 올바르지 않습니다.')
             if opcode in (0, 1) and (length > 8 * 1024 * 1024 or len(fragments) + length > 8 * 1024 * 1024):
                 oversized = True
             if oversized and opcode in (0, 1):
@@ -685,13 +688,18 @@ def codex_recent_thread(server, thread_id):
     if not isinstance(thread, dict) or thread.get('id') != thread_id:
         return result
     entries, cursor, method = [], None, 'thread/items/list'
-    started = time.monotonic()
+    oversized_item = False
     try:
         for unused in range(HISTORY_PAGES):
             params = {'threadId': thread_id, 'limit': HISTORY_PAGE, 'sortDirection': 'desc'}
             if cursor:
                 params['cursor'] = cursor
-            page = server.call(method, params)
+            try:
+                page = server.call(method, params)
+            except OversizedReply:
+                oversized_item = True
+                cursor = cursor or 'oversized-item'
+                break
             data = page.get('data') if isinstance(page, dict) else None
             if not isinstance(data, list) or any(not isinstance(entry, dict) or not isinstance(entry.get('item'), dict)
                                                  or not isinstance(entry.get('turnId'), str) for entry in data):
@@ -702,8 +710,6 @@ def codex_recent_thread(server, thread_id):
                 break
             edge = _codex_window_edge(entries)
             if edge and any(entry['turnId'] == edge and entry['item'].get('type') == 'userMessage' for entry in entries):
-                break
-            if time.monotonic() - started > HISTORY_ITEMS_BUDGET:
                 break
         items_cursor = cursor
         wanted = {entry['turnId'] for entry in entries}
@@ -740,23 +746,25 @@ def codex_recent_thread(server, thread_id):
     ids = [turn['id'] for turn in turns]
     last = max((ids.index(turn_id) for turn_id in wanted if turn_id in ids), default=-1)
     kept = []
-    for index, turn in enumerate(turns[:last + 1] if wanted else turns[:1]):
+    full_turns = turns[:last + 1] if wanted else ([] if oversized_item else turns[:1])
+    for index, turn in enumerate(full_turns):
         items = by_turn.get(turn['id'], [])
         if index == last and items_cursor and not any(item.get('type') == 'userMessage' for item in items):
             items = [item for item in _summary_items(turn) if item.get('type') == 'userMessage'] + items
         kept.append({**turn, 'items': items, 'itemsView': 'full'})
     summarized = []
-    if items_cursor and wanted:
+    if items_cursor and (wanted or oversized_item):
         count = sum(1 for turn in kept for item in turn['items'] if _codex_conversation_item(item))
         shown = count + sum(1 for turn in kept for item in turn['items'] if item.get('type') in CODEX_TOOL_KINDS)
-        for turn in turns[last + 1:]:
+        summary_turns = turns[last + 1:] if wanted else turns
+        for turn in summary_turns:
             if count >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
                 break
             summarized.append({**turn, 'items': _summary_items(turn), 'itemsView': 'summary'})
             count += _summary_talk(turn)
             shown += _summary_talk(turn)
     thread['turns'] = list(reversed(kept + summarized))
-    thread['olderUnread'] = bool(items_cursor) and (
+    thread['olderUnread'] = oversized_item or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}
 
