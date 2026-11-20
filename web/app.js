@@ -15787,7 +15787,7 @@ function showLogin() {
   }
   renderConnectivity();
   updateThemeColor();
-  $("login-token").focus();
+  if (!document.documentElement.hasAttribute?.("data-ipad")) $("login-token").focus();
 }
 async function lock() {
   if (state.launchBusy) {
@@ -15962,26 +15962,28 @@ function renderKeyboardRoom() {
 // that hid a narrow window's header, its ‹ 세션 included.
 function renderAppShift() {
   const viewport = window.visualViewport;
+  let top = 0;
   if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
-    if (state.appShift) {
-      state.appShift = 0;
-      document.documentElement.style.setProperty("--app-shift", "0px");
-      document.body.classList.remove("app-shifted");
+    // WebKit may pan the fixed board when an iframe editor gains focus. The
+    // unshifted shell starts at zero; offsetTop alone can change without a pan.
+    if (!window.SessionholicWorkspace.embedded) {
+      const rect = $("app")?.getBoundingClientRect?.();
+      if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) - rect.top));
     }
-    return;
-  }
-  const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
-  const pane = ipadInputPane();
-  const follows = following || !!pane;
-  let top = viewport && (touchDevice() || pane) && (viewport.scale || 1) <= 1.01 && follows
-    ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
-  // A fixed surface can already be at the visible top. Correct only the measured
-  // displacement, so a shortcut bar reporting pageTop alone cannot move the board.
-  if (pane && viewport && !ipadWorkspace()) {
-    const shell = pane.id === "terminal-screen" && !document.body.classList.contains("terminal-inline")
-      ? pane : $("app");
-    const rect = shell?.getBoundingClientRect?.();
-    if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) + (viewport.offsetTop || 0) - rect.top));
+  } else {
+    const following = (editingText() && (keyboardOpen() || tabletScreen())) || (state.appShift || 0) > 0;
+    const pane = ipadInputPane();
+    const follows = following || !!pane;
+    top = viewport && (touchDevice() || pane) && (viewport.scale || 1) <= 1.01 && follows
+      ? Math.max(0, Math.round(viewport.pageTop ?? ((window.scrollY || 0) + (viewport.offsetTop || 0)))) : 0;
+    // A fixed surface can already be at the visible top. Correct only the measured
+    // displacement, so a shortcut bar reporting pageTop alone cannot move the board.
+    if (pane && viewport) {
+      const shell = pane.id === "terminal-screen" && !document.body.classList.contains("terminal-inline")
+        ? pane : $("app");
+      const rect = shell?.getBoundingClientRect?.();
+      if (rect?.height) top = Math.max(0, Math.round((state.appShift || 0) + (viewport.offsetTop || 0) - rect.top));
+    }
   }
   if (top === (state.appShift || 0)) return;
   state.appShift = top;
@@ -16260,6 +16262,12 @@ function showHistoryEntry(event, swiped = false) {
 
 // Pane layout never starts or resumes a native execution. Each pane owns the
 // original editor, IME, terminal and recognition state in its own document.
+function releaseHiddenIpadEditor() {
+  if (!document.documentElement.hasAttribute?.("data-ipad")) return;
+  const field = document.activeElement;
+  if (field && (field.id === "chat-input" || field.id === "terminal-draft" || field === state.term?.textarea) &&
+      !workspaceComposing()) field.blur();
+}
 function workspaceComposing() {
   // compositionOwner identifies late terminal events; it is not an active IME
   // flag. Samsung can also omit compositionend after a blur.
@@ -16751,6 +16759,7 @@ window.addEventListener("DOMContentLoaded", () => {
       dropParkedDictation("hidden");
     }
     if (document.hidden) {
+      releaseHiddenIpadEditor();
       state.pageHidden = true;
       // Live updates stop with the page; a visible page reconnects after its read.
       closeEvents();
@@ -16766,7 +16775,7 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   // A page restored from the back-forward cache may fire no visibilitychange.
-  window.addEventListener("pagehide", () => { persistAllDrafts(); state.pageHidden = true; });
+  window.addEventListener("pagehide", () => { releaseHiddenIpadEditor(); persistAllDrafts(); state.pageHidden = true; });
   window.addEventListener("pageshow", (event) => {
     settleViewport();
     if (event.persisted && !document.hidden) pageShown();

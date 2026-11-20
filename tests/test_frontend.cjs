@@ -17899,3 +17899,42 @@ test('iPad split typing keeps four-pane layout stable through accessory viewport
   assert.equal(vars['--app-height'], '210px');
   assert.equal(c.state.appShift || 0, 0);
 });
+
+test('external iPad keyboard pans the fixed split board up 68px while the fourth pane has focus', () => {
+  const c = client(undefined, noChatTimers), vars = {};
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  c.context.document.documentElement.style = {setProperty(key, value) { vars[key] = value; }};
+  const win = c.context.window;
+  Object.assign(win, {innerWidth: 3008, innerHeight: 1592, visualViewport: {height: 1592, scale: 1},
+    SessionholicWorkspace: {managed: () => true, embedded: false}});
+  let nativeTop = 0;
+  c.get('app').getBoundingClientRect = () => ({height: 1660, top: nativeTop + (parseFloat(vars['--app-shift']) || 0)});
+  for (const [pan, offset] of [[0, 0], [69, 69], [68, 68], [68, 68], [0, 68], [0, 0]]) {
+    nativeTop = -pan;
+    Object.assign(win.visualViewport, {offsetTop: offset, pageTop: offset});
+    vm.runInContext('renderAppShift()', c.context);
+    assert.equal(c.get('app').getBoundingClientRect().top, 0);
+  }
+});
+
+test('bringing back an iPad pane does not reopen the keyboard for an idle draft', () => {
+  const c = client(undefined, noChatTimers);
+  const field = c.get('terminal-draft');
+  field.id = 'terminal-draft';
+  field.value = '이어서 쓸 초안';
+  let blurred = 0;
+  field.blur = () => blurred++;
+  c.context.document.activeElement = field;
+  let ipad = false;
+  c.context.document.documentElement.hasAttribute = key => ipad && key === 'data-ipad';
+  const hide = () => vm.runInContext('releaseHiddenIpadEditor()', c.context);
+  hide();
+  ipad = true;
+  c.state.composing = true;
+  hide();
+  assert.equal(blurred, 0);
+  c.state.composing = false;
+  hide();
+  assert.equal(blurred, 1);
+  assert.equal(field.value, '이어서 쓸 초안');
+});
