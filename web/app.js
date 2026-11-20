@@ -1742,7 +1742,7 @@ function render() {
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
   const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
-  if (reading && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
+  if (reading && !sharedSessionSidebar() && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   const embedded = window.SessionholicWorkspace?.embedded;
   if (!embedded) { renderHosts(now); renderFreshness(now); renderAttention(sessions); }
   // The conversation on screen is read, also when it answers or finishes while shown
@@ -2564,13 +2564,19 @@ function sessionForBotRequest(request) {
   const ref = request?.nativeRef;
   return ref ? allSessions().find((s) => s.host === request.host && s.agent === ref.agent && s.id === ref.id && s.home === ref.home) || null : null;
 }
+// The split board's sidebar belongs to all panes. Its filter can differ
+// from the conversation in the primary pane, which lives in this document.
+function sharedSessionSidebar() {
+  const workspace = window.SessionholicWorkspace;
+  return !workspace?.embedded && !!workspace?.managed?.();
+}
 function setSessionCategory(category, { renderView = true, clearSelection = true } = {}) {
   if (!Object.hasOwn(SESSION_CATEGORIES, category) || state.launchBusy) return false;
   const changed = state.sessionCategory !== category;
   const selected = selectedSession();
   // With a bot picked, every tab but 봇 요청 lists its sessions: the open one stays open.
   const kept = botFilter() && category !== "bot";
-  if (clearSelection && ((selected && !kept && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
+  if (clearSelection && !sharedSessionSidebar() && ((selected && !kept && sessionCategoryOf(selected) !== category) || (state.selectedBotRequest && category !== "bot"))) {
     rememberConversationView(); stopChatPolling();
     state.selected = null; state.selectedBotRequest = null; state.detailFor = null; state.detailRevision = null; state.detailRun += 1;
     $("detail").replaceChildren(); $("detail").dataset.key = ""; setDetailShown(false); navigateView("list", true);

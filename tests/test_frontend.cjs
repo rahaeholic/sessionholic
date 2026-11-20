@@ -17938,3 +17938,19 @@ test('bringing back an iPad pane does not reopen the keyboard for an idle draft'
   assert.equal(blurred, 1);
   assert.equal(field.value, '이어서 쓸 초안');
 });
+
+test('changing the shared sidebar category leaves the primary split session available to restore', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = {onLine: false};
+  const first = recentSession('primary-human', {initiator: 'human'});
+  setRecentSnapshot(c, [first, recentSession('other', {initiator: 'agent'})]);
+  c.context.window.SessionholicWorkspace = {managed: () => true, readingActive: () => true,
+    activeSessionKey: () => c.state.selected, routeSession: () => false, changed() {}, visible: () => true, embedded: false};
+  c.select(first.key);
+  c.setSessionCategory('agent');
+  assert.equal(c.state.selected, first.key);
+  c.render();
+  assert.equal(c.state.sessionCategory, 'agent');
+  const ref = vm.runInContext('workspaceHooks().describe().ref', c.context);
+  assert.equal(ref.key, first.key);
+});
