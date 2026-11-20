@@ -1765,7 +1765,10 @@ function render() {
     if (list?.conversationSource === chatKey(sourceOf(selected))) renderWorkContext(selected, entry, (list.conversationRows || []).map((row) => row.message));
   }
   else if (state.selected) {
-    state.selected = null;
+    // A split pane still belongs to this session while its host reconnects.
+    const host = state.snapshot.hosts?.find(item => item.name === state.selected.split("|", 1)[0]);
+    const reconnecting = window.SessionholicWorkspace?.managed?.() && (!host?.ok || !host.data);
+    if (!reconnecting) state.selected = null;
     state.detailFor = null;
     // Nothing follows the conversation any more (polling, its live stream).
     stopChatPolling();
@@ -1773,12 +1776,12 @@ function render() {
       el(
         "div",
         "welcome",
-        "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
+        reconnecting ? "기기가 다시 연결되면 이 창에 대화를 표시합니다." : "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
       ),
     );
     // A phone showed nothing but that conversation, and its back button went
     // with it: back to the list, saying why.
-    if (mobileStartOnList() && state.detailShown && !state.terminalVisible) {
+    if (!reconnecting && mobileStartOnList() && state.detailShown && !state.terminalVisible) {
       toast("열어 둔 작업을 목록에서 더 이상 찾을 수 없어 목록으로 돌아왔습니다.");
       backToList();
     } else syncEvents();
@@ -16293,7 +16296,7 @@ async function commitChatComposition(entry) {
     $("chat-input") === field && !entry.composing;
 }
 function workspaceHooks() {
-  let lastField = null;
+  let lastField = null, lastRef = null;
   document.addEventListener("focusin", (event) => {
     if (event.target?.matches?.("textarea, input:not([type='password'])") && !event.target.closest?.("dialog")) lastField = event.target;
   });
@@ -16303,7 +16306,8 @@ function workspaceHooks() {
       ...(state.terminalVisible && state.terminal ? { terminalId: state.terminal.id } : {}) }
       : state.launcherWorkspace?.terminalId ? { terminalId: state.launcherWorkspace.terminalId, mode: state.terminalVisible ? "terminal" : "chat" }
       : state.terminalVisible && state.terminal ? { terminalId: state.terminal.id, mode: "terminal" } : null;
-    return { authenticated: state.authenticated, snapshot: state.snapshot, ref,
+    lastRef = ref || (state.selected && lastRef?.key === state.selected ? lastRef : null);
+    return { authenticated: state.authenticated, snapshot: state.snapshot, ref: lastRef,
       title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,

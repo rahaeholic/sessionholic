@@ -17954,3 +17954,25 @@ test('changing the shared sidebar category leaves the primary split session avai
   const ref = vm.runInContext('workspaceHooks().describe().ref', c.context);
   assert.equal(ref.key, first.key);
 });
+
+test('a split pane retains its saved session through a temporarily missing host', () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = {onLine: false};
+  const first = recentSession('reconnect');
+  setRecentSnapshot(c, [first]);
+  c.context.window.SessionholicWorkspace = {managed: () => true, readingActive: () => true,
+    activeSessionKey: () => c.state.selected, routeSession: () => false, changed() {}, visible: () => true};
+  const hooks = vm.runInContext('workspaceHooks()', c.context);
+  c.select(first.key);
+  const saved = hooks.describe().ref;
+  c.state.snapshot.hosts = [];
+  c.render();
+  assert.deepEqual(hooks.describe().ref, saved);
+  setRecentSnapshot(c, [first]);
+  c.render();
+  assert.equal(c.state.selected, first.key);
+  assert.equal(hooks.describe().ref.key, first.key);
+  setRecentSnapshot(c, []);
+  c.render();
+  assert.equal(hooks.describe().ref, null, 'an authoritative removal still takes effect');
+});
