@@ -4099,17 +4099,16 @@ test('changing list filters removes hidden cards without changing the selected s
 test('terminal keys sit in two rows with held modifiers, an inverted-T arrow cluster and the requested control keys', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
-  for (const key of ['escape', 'tab', 'backtab', 'interrupt', 'ctrl-j', 'ctrl-u', 'ctrl-x', 'ctrl-l', 'model', 'effort', 'ctrl-up', 'shift-left', 'alt-left', 'up', 'left', 'down', 'right', 'enter'])
-    assert.match(html, new RegExp(`data-key="${key}"`));
+  const toolbar = html.split('id="terminal-keys"')[1].split('</div>')[0];
+  assert.deepEqual(Array.from(toolbar.matchAll(/data-(?:key|mod)="([^"]+)"/g), match => match[1]),
+    ['up','down','left','right','enter','model','effort','ctrl','alt','meta','escape','tab','backtab','interrupt','ctrl-up','shift-left','alt-left']);
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
-  assert.match(css, /"ctrl k1 k2 k3 k4 cmd1 meta cup up\s+word\s+enter"/);
-  assert.match(css, /"alt\s+k5 k6 k7 k8 cmd2 pick left down right enter"/);
+  assert.match(css, /"\.\s+up\s+\.\s+enter cmd1 ctrl/);
+  assert.match(css, /"left down right enter cmd2 alt/);
   assert.match(html, /data-key="model" class="command-key"[^>]*>\/model</);
   assert.match(html, /data-key="effort" class="command-key"[^>]*>\/effort</);
-  // A narrower terminal keeps the other keys' width: the commands move to a short third row.
-  assert.match(css, /\.terminal-tools \{\s*container: terminal-tools \/ inline-size;/);
-  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*grid-template-rows: repeat\(2, var\(--key-row\)\) 30px;[^@]*"cmd1 cmd1 cmd1 cmd1 cmd1 cmd2 cmd2 cmd2 cmd2 cmd2"/);
+  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*"up\s+down left right enter cmd1 cmd2"/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])

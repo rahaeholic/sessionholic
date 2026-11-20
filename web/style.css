@@ -3217,11 +3217,11 @@ li[data-task] {
 .terminal-keys {
   display: grid;
   --key-row: 42px;
-  grid-template-columns: repeat(5, minmax(0, 1fr)) minmax(0, 1.6fr) repeat(4, minmax(0, 1fr)) minmax(0, 1.3fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr) minmax(0, 1.6fr) repeat(5, minmax(0, 1fr));
   grid-template-rows: repeat(2, var(--key-row));
   grid-template-areas:
-    "ctrl k1 k2 k3 k4 cmd1 meta cup up   word  enter"
-    "alt  k5 k6 k7 k8 cmd2 pick left down right enter";
+    ".    up   .     enter cmd1 ctrl k1   k2 cup word"
+    "left down right enter cmd2 alt  meta k3 k4  pick";
   gap: 5px;
   max-width: 680px;
 }
@@ -3248,10 +3248,6 @@ li[data-task] {
 .terminal-keys [data-key="tab"] { grid-area: k2; }
 .terminal-keys [data-key="backtab"] { grid-area: k3; }
 .terminal-keys [data-key="interrupt"] { grid-area: k4; }
-.terminal-keys [data-key="ctrl-j"] { grid-area: k5; }
-.terminal-keys [data-key="ctrl-u"] { grid-area: k6; }
-.terminal-keys [data-key="ctrl-x"] { grid-area: k7; }
-.terminal-keys [data-key="ctrl-l"] { grid-area: k8; }
 /* Slash commands the CLI runs at once: words, not glyphs, so the body font fits them. */
 .terminal-keys [data-key="model"] { grid-area: cmd1; }
 .terminal-keys [data-key="effort"] { grid-area: cmd2; }
@@ -3260,16 +3256,15 @@ li[data-task] {
   font-family: var(--font);
   font-size: 12px;
 }
-/* Narrower than a 412px phone (a docked or split terminal too): a column would wrap the other
-   keys' labels, so the commands take a short third row and those keys keep their width. */
+/* Keep the navigation and command buttons together at narrow terminal widths. */
 @container terminal-tools (max-width: 395.98px) {
   .terminal-keys {
-    grid-template-columns: repeat(9, minmax(0, 1fr)) minmax(0, 1.3fr);
-    grid-template-rows: repeat(2, var(--key-row)) 30px;
+    grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 1.2fr) repeat(2, minmax(0, 1.5fr));
+    grid-template-rows: repeat(3, var(--key-row));
     grid-template-areas:
-      "ctrl k1 k2 k3 k4 meta cup up   word  enter"
-      "alt  k5 k6 k7 k8 pick left down right enter"
-      "cmd1 cmd1 cmd1 cmd1 cmd1 cmd2 cmd2 cmd2 cmd2 cmd2";
+      "up   down left right enter cmd1 cmd2"
+      "ctrl alt  meta k1    k1    k2   k2"
+      "cup  pick word k3    k3    k4   k4";
   }
   .terminal-keys .command-key {
     margin-left: 0;
@@ -3283,14 +3278,6 @@ li[data-task] {
 .terminal-keys [data-key="down"] { grid-area: down; }
 .terminal-keys [data-key="right"] { grid-area: right; }
 .terminal-keys [data-key="enter"] { grid-area: enter; }
-.terminal-keys [data-key="up"],
-.terminal-keys [data-key="left"] {
-  /* A small gap separates the arrow cluster from the control keys. */
-  margin-left: 4px;
-}
-.terminal-keys [data-key="up"] {
-  margin-left: 0;
-}
 .terminal-keys [data-key="interrupt"] {
   color: var(--t-red-key);
 }
