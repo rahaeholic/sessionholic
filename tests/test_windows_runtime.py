@@ -46,6 +46,7 @@ class FakeReader:
         self.fail_send = False
         self.fail_after = False
         self.large_read = False
+        self.large_page_response = False
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -112,9 +113,22 @@ class FakeReader:
                     data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
                             for item in turn.get('items', [])]
                     data.reverse()
-                    return {'data': data, 'nextCursor': None}
+                    start = int(params.get('cursor') or 0)
+                    end = start + params['limit']
+                    page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
+                    if owner.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
+                        raise ValueError('synthetic app-server page exceeds 8 MiB')
+                    return page
                 if method == 'thread/turns/list':
-                    return {'data': list(reversed(copy.deepcopy(owner.thread.get('turns', [])))), 'nextCursor': None}
+                    turns = []
+                    for turn in reversed(copy.deepcopy(owner.thread.get('turns', []))):
+                        items = turn.get('items', [])
+                        summary = [item for item in items if item.get('type') == 'userMessage']
+                        answers = [item for item in items if item.get('type') == 'agentMessage']
+                        turns.append({**turn, 'items': summary + answers[-1:]})
+                    start = int(params.get('cursor') or 0)
+                    end = start + params['limit']
+                    return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
                     if isinstance(result, Exception):
@@ -189,18 +203,40 @@ class WindowsRuntimeTest(unittest.TestCase):
 
     def test_large_thread_read_does_not_block_chat_or_send_preflight(self):
         self.reader.large_read = True
+        self.reader.large_page_response = True
         self.reader.thread['turns'] = [
             {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
                 {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'old-%d' % index,
                  'content': [{'type': 'text', 'text': '오래된 합성 요청'}]},
+                {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 280000},
                 {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '오래된 합성 답변'}]}
-            for index in range(60)]
+            for index in range(40)]
         state = self.runtime.chat({'action': 'read', 'source': self.source})
         self.assertEqual((state['phase'], state['runtimeKnown']), ('idle', True))
         self.assertEqual(state['messages'][-1]['text'], '오래된 합성 답변')
         self.assertTrue(self.send()['confirmed'])
         self.assertFalse(any(method == 'thread/read' and params.get('includeTurns') is True
                              for method, params in self.reader.calls))
+
+    def test_old_receipt_and_fork_point_are_found_outside_the_display_window(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '과거 요청'}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '과거 답변'}]}
+            for index in range(120)]
+        read = self.runtime.chat({'action': 'read', 'source': self.source, 'requestId': 'request-0001'})
+        self.assertEqual((read['receipts'][0]['delivery'], read['receipts'][0]['turnId']),
+                         ('completed', 'turn-1'))
+        receipt = self.runtime.chat({'action': 'send', 'source': self.source, 'requestId': 'request-0001',
+                                     'input': [{'type': 'text', 'text': '과거 요청'}]})
+        self.assertEqual((receipt['delivery'], receipt['turnId'], receipt['readbackConfirmed']),
+                         ('completed', 'turn-1', True))
+        self.assertEqual(self.reader.send_calls, 0)
+        self.reader.fork_id = str(uuid.uuid4())
+        fork = self.model_command('fork', 'turn-1', request='old-turn-fork-0001')
+        self.assertEqual(fork['status'], 'created')
+        self.assertEqual(self.reader.send_calls, 0)
 
     def test_claude_fork_checks_exact_transcript_and_project(self):
         sid, fork = str(uuid.uuid4()), str(uuid.uuid4())

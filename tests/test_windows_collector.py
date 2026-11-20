@@ -82,9 +82,10 @@ class SessionOriginTest(unittest.TestCase):
 
 
 class FakeProxy:
-    def __init__(self, rows, calls, read=None, large_read=False, unsupported_pages=False):
+    def __init__(self, rows, calls, read=None, large_read=False, unsupported_pages=False, large_page_response=False):
         self.rows, self.calls, self.read = rows, calls, read
         self.large_read, self.unsupported_pages = large_read, unsupported_pages
+        self.large_page_response = large_page_response
 
     def __enter__(self):
         return self
@@ -108,10 +109,17 @@ class FakeProxy:
             turns = (self.read or self.rows[0]).get('turns', [])
             data = [{'turnId': turn.get('id'), 'item': item} for turn in turns for item in turn.get('items', [])]
             data.reverse()
-            return {'data': data, 'nextCursor': None}
+            start = int(params.get('cursor') or 0)
+            end = start + params['limit']
+            page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
+            if self.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
+                raise ValueError('synthetic app-server page exceeds 8 MiB')
+            return page
         if method == 'thread/turns/list':
             turns = list(reversed((self.read or self.rows[0]).get('turns', [])))
-            return {'data': turns, 'nextCursor': None}
+            start = int(params.get('cursor') or 0)
+            end = start + params['limit']
+            return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
         raise AssertionError('unexpected native mutation: ' + method)
 
 
@@ -511,8 +519,10 @@ class WindowsCollectorTest(unittest.TestCase):
                      'name': '합성 진행 작업', 'updatedAt': 200, 'turns': []}
         self.large_read = False
         self.unsupported_pages = False
+        self.large_page_response = False
         self.reader = wc.WindowsCollector(self.home, hostname='fixture-pc', proxy_factory=lambda *args: FakeProxy([self.live], self.calls,
-            large_read=self.large_read, unsupported_pages=self.unsupported_pages),
+            large_read=self.large_read, unsupported_pages=self.unsupported_pages,
+            large_page_response=self.large_page_response),
             process_reader=lambda pid: {'pid': pid, 'start': '123456', 'exe': str(self.reader.binary)})
         self.reader.codex_home.mkdir()
         self.db = self.reader.codex_home / 'state_5.sqlite'
@@ -838,6 +848,22 @@ class WindowsCollectorTest(unittest.TestCase):
         result = self.reader.read('codex', self.sid, '.codex')
         self.assertEqual([row['text'] for row in result['messages']], ['합성 요청'])
         self.assertIn(('thread/read', {'threadId': self.sid, 'includeTurns': True}), self.calls)
+
+    def test_large_tool_outputs_are_split_into_pages_under_the_proxy_limit(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+            {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 280000},
+            {'id': 'input-%d' % index, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '요청'}]},
+            {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변'}]}
+            for index in range(40)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((result['phase'], result['runtimeKnown']), ('working', True))
+        self.assertEqual(result['messages'][-1]['text'], '답변')
+        self.assertTrue(result['olderOmitted'])
+        item_pages = [params['limit'] for method, params in self.calls if method == 'thread/items/list']
+        self.assertTrue(item_pages)
+        self.assertLessEqual(max(item_pages), wc.HISTORY_PAGE)
 
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')

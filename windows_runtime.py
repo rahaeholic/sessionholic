@@ -406,7 +406,8 @@ def _models(client):
 
 
 def _receipt(identity, request_id, thread):
-    for turn in reversed(thread.get('turns') or []):
+    turns = list(thread.get('turns') or []) + list(thread.get('_lookupTurns') or [])
+    for turn in reversed(turns):
         for item in turn.get('items') or []:
             if isinstance(item, dict) and item.get('type') == 'userMessage' and item.get('clientId') == request_id:
                 delivery = turn.get('status')
@@ -548,7 +549,7 @@ class WindowsRuntime:
         if self._resume_pending(observed):
             raise ValueError(RESUME_PENDING_REASON)
 
-    def _thread(self, client, identity, cwd):
+    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None):
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
@@ -558,10 +559,27 @@ class WindowsRuntime:
         thread = result.get('thread') if isinstance(result, dict) else None
         if not isinstance(thread, dict) or thread.get('id') != identity['id'] or wc._norm(thread.get('cwd')) != wc._norm(cwd):
             raise ValueError('PC 원본 세션의 작업 폴더가 변경되었습니다.')
+        if result is not None and (request_ids or turn_id is not None):
+            turns = thread.get('turns') or []
+            found_requests = {item.get('clientId') for turn in turns if isinstance(turn, dict)
+                              for item in turn.get('items') or [] if isinstance(item, dict)
+                              and item.get('type') == 'userMessage'}
+            missing_requests = set(request_ids) - found_requests
+            found_turn = any(turn.get('id') == turn_id for turn in turns if isinstance(turn, dict))
+            if missing_requests or (turn_id is not None and not found_turn):
+                matches, history_complete = wc.codex_find_history(client, identity['id'], missing_requests,
+                                                                  turn_id if not found_turn else None)
+                matched_requests = {item.get('clientId') for turn in matches
+                                    for item in turn.get('items') or [] if isinstance(item, dict)
+                                    and item.get('type') == 'userMessage'}
+                matched_turn = turn_id is None or found_turn or any(turn.get('id') == turn_id for turn in matches)
+                if not history_complete and (missing_requests - matched_requests or not matched_turn):
+                    raise ValueError('PC 대화 기록의 이전 요청 또는 분기 지점을 모두 확인하지 못했습니다.')
+                thread['_lookupTurns'] = matches
         _state(thread)
         return thread
 
-    def _codex(self, source, deadline):
+    def _codex(self, source, deadline, request_ids=(), turn_id=None):
         identity = _identity(source)
         rows = self.reader.database_rows(identity['id'])
         if len(rows) != 1 or rows[0].get('archived') or source.get('cwd') and wc._norm(source['cwd']) != wc._norm(rows[0]['cwd']):
@@ -577,7 +595,7 @@ class WindowsRuntime:
                         raise ValueError('PC 서버 전체 실행 목록을 확인하지 못했습니다.')
                     if identity['id'] not in loaded:
                         continue
-                    thread = self._thread(client, identity, rows[0]['cwd'])
+                    thread = self._thread(client, identity, rows[0]['cwd'], request_ids, turn_id)
                 state = wc._json(path.parent / 'server-state.json', self.reader.codex_home)
                 process = self.reader.process_reader(state.get('server_pid'))
                 if not process:
@@ -971,8 +989,21 @@ class WindowsRuntime:
             return {**result, 'capabilities': {'canSend': False, 'canRead': True}}
         if action in ('send', 'receipt') and not REQUEST.fullmatch(args.get('requestId', '')):
             raise ValueError('PC 메시지 요청 식별자가 올바르지 않습니다.')
+        request_ids = []
+        if action == 'read':
+            supplied_ids = args.get('requestIds') or []
+            if not isinstance(supplied_ids, list) or len(supplied_ids) > 32:
+                raise ValueError('PC 메시지 확인 목록이 올바르지 않습니다.')
+            request_ids = list(supplied_ids)
+            if args.get('requestId') is not None:
+                request_ids.insert(0, args['requestId'])
+            if any(not isinstance(value, str) or not REQUEST.fullmatch(value) for value in request_ids):
+                raise ValueError('PC 메시지 요청 식별자가 올바르지 않습니다.')
+            request_ids = list(dict.fromkeys(request_ids))
+        elif action == 'receipt':
+            request_ids = [args['requestId']]
         try:
-            observed = self._codex(source, time.monotonic() + 12)
+            observed = self._codex(source, time.monotonic() + 12, request_ids)
         except (OSError, ValueError, TimeoutError):
             if action not in ('read', 'capabilities'):
                 raise
@@ -983,15 +1014,6 @@ class WindowsRuntime:
             return self._command(args, observed)
         if action == 'send':
             return self._send(args, observed)
-        supplied_ids = args.get('requestIds') or []
-        if not isinstance(supplied_ids, list) or len(supplied_ids) > 32:
-            raise ValueError('PC 메시지 확인 목록이 올바르지 않습니다.')
-        request_ids = list(supplied_ids)
-        if args.get('requestId') is not None:
-            request_ids.insert(0, args['requestId'])
-        if any(not isinstance(value, str) or not REQUEST.fullmatch(value) for value in request_ids):
-            raise ValueError('PC 메시지 요청 식별자가 올바르지 않습니다.')
-        request_ids = list(dict.fromkeys(request_ids))
         if action == 'receipt':
             request_ids = [args['requestId']]
         receipts = []
@@ -1080,7 +1102,8 @@ class WindowsRuntime:
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
                 self._verify_endpoint(observed)
                 self._require_resume_verified(observed)
-                thread = self._thread(client, identity, observed['cwd'])
+                thread = self._thread(client, identity, observed['cwd'],
+                                      turn_id=value if command == 'fork' else None)
                 current = wc._model_settings(thread)
                 if command == 'models':
                     return {'models': _models(client), 'current': current, 'next': self._model_preferences(observed)}
@@ -1093,7 +1116,8 @@ class WindowsRuntime:
                 if command == 'fork':
                     if _state(thread)['phase'] != 'idle':
                         return {'status': 'rejected', 'reason': '원본 작업이 끝난 뒤 분기해 주세요.'}
-                    if value is not None and not any(t.get('id') == value and t.get('status') == 'completed' for t in thread['turns']):
+                    if value is not None and not any(t.get('id') == value and t.get('status') == 'completed'
+                                                     for t in list(thread['turns']) + list(thread.get('_lookupTurns') or [])):
                         return {'status': 'rejected', 'reason': '완료된 원본 대화 지점을 확인하지 못했습니다.'}
                     unknown = {'status': 'unknown', 'reason': '분기 생성 여부를 확인하지 못했습니다. 자동으로 다시 만들지 않습니다.'}
                     self.store.save(name, {'digest': digest, 'binding': binding, 'result': unknown})
@@ -1205,7 +1229,7 @@ class WindowsRuntime:
             with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
                 self._verify_endpoint(observed)
                 self._require_resume_verified(observed)
-                thread = self._thread(client, identity, observed['cwd'])
+                thread = self._thread(client, identity, observed['cwd'], (request_id,))
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
                     return before
@@ -1225,7 +1249,7 @@ class WindowsRuntime:
                     turn = response.get('turn') if isinstance(response, dict) else None
                     if isinstance(turn, dict) and isinstance(turn.get('id'), str):
                         result = {**before, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True, 'turnId': turn['id'], 'reason': None}
-                    after = self._thread(client, identity, observed['cwd'])
+                    after = self._thread(client, identity, observed['cwd'], (request_id,))
                     confirmed = _receipt(identity, request_id, after)
                     if confirmed['confirmed']:
                         result = {**confirmed, **named}

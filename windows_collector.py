@@ -49,10 +49,10 @@ CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 # after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
-HISTORY_PAGE = 100
-HISTORY_PAGES = 10
-HISTORY_SUMMARY_TURNS = 50
+HISTORY_PAGE = 16
+HISTORY_PAGES = 25
 HISTORY_ITEMS_BUDGET = 0.3
+HISTORY_LOOKUP_PAGES = 100
 CODEX_TOOL_KINDS = {'commandExecution', 'fileChange', 'webSearch', 'mcpToolCall', 'dynamicToolCall'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
@@ -690,7 +690,7 @@ def codex_recent_thread(server, thread_id):
 
         turns, cursor, method = [], None, 'thread/turns/list'
         for unused in range(HISTORY_PAGES):
-            params = {'threadId': thread_id, 'limit': max(len(wanted) + 2, HISTORY_SUMMARY_TURNS),
+            params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
                       'sortDirection': 'desc', 'itemsView': 'summary'}
             if cursor:
                 params['cursor'] = cursor
@@ -728,8 +728,49 @@ def codex_recent_thread(server, thread_id):
             count += _summary_talk(turn)
             shown += _summary_talk(turn)
     thread['turns'] = list(reversed(kept + summarized))
-    thread['olderUnread'] = bool(items_cursor) and not (cursor is None and len(summarized) == len(turns) - (last + 1))
+    thread['olderUnread'] = bool(items_cursor) and (
+        len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}
+
+
+def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
+    """Find exact old request or turn identities without loading their full items."""
+    request_ids = set(request_ids)
+    found, found_turn, cursor, seen = {}, None, None, set()
+    for unused in range(HISTORY_LOOKUP_PAGES):
+        params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
+                  'sortDirection': 'desc', 'itemsView': 'summary'}
+        if cursor:
+            params['cursor'] = cursor
+        page = server.call('thread/turns/list', params)
+        data = page.get('data') if isinstance(page, dict) else None
+        if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
+            raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
+        for turn in data:
+            if turn.get('id') == turn_id:
+                found_turn = turn
+            for item in _summary_items(turn):
+                request_id = item.get('clientId') if item.get('type') == 'userMessage' else None
+                if request_id in request_ids:
+                    found[request_id] = turn
+        if request_ids <= set(found) and (turn_id is None or found_turn is not None):
+            found_by_id = {turn['id']: turn for turn in found.values()}
+            if found_turn is not None:
+                found_by_id[found_turn['id']] = found_turn
+            return list(found_by_id.values()), True
+        cursor = page.get('nextCursor')
+        if cursor is None:
+            found_by_id = {turn['id']: turn for turn in found.values()}
+            if found_turn is not None:
+                found_by_id[found_turn['id']] = found_turn
+            return list(found_by_id.values()), True
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        seen.add(cursor)
+    found_by_id = {turn['id']: turn for turn in found.values()}
+    if found_turn is not None:
+        found_by_id[found_turn['id']] = found_turn
+    return list(found_by_id.values()), False
 
 
 def _wal_without_index(database):
