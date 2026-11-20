@@ -15909,8 +15909,15 @@ function viewportHeight(pane = ipadInputPane()) {
     const sameWidth = state.ipadLayoutWidth === window.innerWidth;
     const panned = accessory && offset > 0 && offset <= accessory;
     const full = panned ? Math.max(layout, Math.round(viewport.height + offset)) : layout;
+    // WebKit can clear offsetTop on blur before restoring innerHeight. The
+    // same reduced height still includes the bar until the window changes.
+    if (!sameWidth || !accessory || layout !== state.ipadAccessoryWindowHeight)
+      state.ipadAccessoryWindowHeight = 0;
+    const reduction = Math.max(full, sameWidth ? state.ipadLayoutHeight || 0 : 0) - layout;
+    if (reduction > 0 && reduction <= accessory && (panned || pane || state.ipadInputPane))
+      state.ipadAccessoryWindowHeight = layout;
     if (!sameWidth || !state.ipadLayoutHeight ||
-        (!pane && !state.ipadInputPane) || full > state.ipadLayoutHeight) {
+        (!pane && !state.ipadInputPane && !state.ipadAccessoryWindowHeight) || full > state.ipadLayoutHeight) {
       // The pan can round to 69px one frame before settling to 68px.
       if (!sameWidth || !panned || Math.abs(full - state.ipadLayoutHeight) > 1)
         state.ipadLayoutHeight = full;

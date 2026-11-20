@@ -224,6 +224,7 @@
   function layout({ save = true } = {}) {
     if (embedded || !hooks) return;
     const list = ids(tree), rootNode = $("session-workspace");
+    const wasSplit = enabled;
     enabled = list.length > 1 || list[0] !== "p1";
     doc.body.classList.toggle("workspace-split", enabled);
     doc.body.classList.toggle("workspace-has-layout", enabled);
@@ -302,6 +303,8 @@
     });
     hooks.listChanged?.();
     if (save) persist();
+    // Set the outer iPad height before the first restored tiles are painted.
+    if (wasSplit !== enabled && doc.documentElement?.hasAttribute?.("data-ipad")) hooks.resize();
     root.requestAnimationFrame?.(() => { for (const id of list) fit(panes.get(id)); });
   }
   // keyboard: moved from a hardware keyboard, whose editor focus a phone or an iPad keeps too.

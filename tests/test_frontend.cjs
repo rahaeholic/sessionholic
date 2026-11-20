@@ -17998,6 +17998,9 @@ test('external iPad display makes room before focus and keeps it through a gap b
     win.visualViewport.offsetTop = offset;
     assert.equal(height(pane), resting);
   }
+  win.visualViewport.offsetTop = 0;
+  assert.equal(height(false), resting, 'offsetTop resets before either viewport grows back');
+  assert.equal(height(false), resting);
   win.innerHeight = 1660;
   Object.assign(win.visualViewport,{height:1660,offsetTop:0});
   assert.equal(height(false), resting);
