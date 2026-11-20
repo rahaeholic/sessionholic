@@ -472,8 +472,12 @@
       }
       return true;
     }
-    if (active === "p1") return false;
     const row = panes.get(active);
+    if (active === "p1") {
+      // An explicit choice supersedes the saved session still waiting for its host.
+      row.ref = null; row.pendingAnswer = null;
+      return false;
+    }
     if (!row?.hooks) { row.ref = { key, mode: "chat" }; if (answer) row.pendingAnswer = key; changed(); return true; }
     row.ref = null;
     const selected = row.hooks.select(key);
