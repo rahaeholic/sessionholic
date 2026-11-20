@@ -17974,5 +17974,12 @@ test('a split pane retains its saved session through a temporarily missing host'
   assert.equal(hooks.describe().ref.key, first.key);
   setRecentSnapshot(c, []);
   c.render();
-  assert.equal(hooks.describe().ref, null, 'an authoritative removal still takes effect');
+  assert.deepEqual(hooks.describe().ref, saved, 'a healthy host can also temporarily omit one session');
+  const replacement = recentSession('replacement');
+  setRecentSnapshot(c, [replacement]);
+  c.select(replacement.key);
+  assert.equal(hooks.describe().ref.key, replacement.key);
+  setRecentSnapshot(c, [replacement, first]);
+  c.render();
+  assert.equal(c.state.selected, replacement.key, 'a late return never replaces the user selection');
 });

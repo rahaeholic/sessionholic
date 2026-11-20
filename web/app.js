@@ -1765,9 +1765,9 @@ function render() {
     if (list?.conversationSource === chatKey(sourceOf(selected))) renderWorkContext(selected, entry, (list.conversationRows || []).map((row) => row.message));
   }
   else if (state.selected) {
-    // A split pane still belongs to this session while its host reconnects.
-    const host = state.snapshot.hosts?.find(item => item.name === state.selected.split("|", 1)[0]);
-    const reconnecting = window.SessionholicWorkspace?.managed?.() && (!host?.ok || !host.data);
+    // The recent-session list can omit one session even when its host is online.
+    // Only choosing another session or closing the pane replaces this reference.
+    const reconnecting = !!window.SessionholicWorkspace?.managed?.();
     if (!reconnecting) state.selected = null;
     state.detailFor = null;
     // Nothing follows the conversation any more (polling, its live stream).
@@ -1776,7 +1776,7 @@ function render() {
       el(
         "div",
         "welcome",
-        reconnecting ? "기기가 다시 연결되면 이 창에 대화를 표시합니다." : "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
+        reconnecting ? "저장한 세션을 기다리는 중입니다. 목록에서 확인되면 이 창에 다시 표시합니다." : "이 작업을 목록에서 더 이상 찾을 수 없습니다. 새로고침 후 확인해 주세요.",
       ),
     );
     // A phone showed nothing but that conversation, and its back button went
@@ -16308,7 +16308,7 @@ function workspaceHooks() {
       : state.terminalVisible && state.terminal ? { terminalId: state.terminal.id, mode: "terminal" } : null;
     lastRef = ref || (state.selected && lastRef?.key === state.selected ? lastRef : null);
     return { authenticated: state.authenticated, snapshot: state.snapshot, ref: lastRef,
-      title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : ""),
+      title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : lastRef ? "저장한 세션 확인 중" : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,
       canToggleView: canToggleConversationView(),
