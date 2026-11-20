@@ -434,6 +434,20 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
                          ('completed', True, 'turn-0', 0))
 
+    def test_middle_request_is_found_when_server_returns_one_turn_per_page(self):
+        self.reader.thread['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+                {'id': 'input-%d' % index, 'type': 'userMessage', 'clientId': 'request-%04d' % index,
+                 'content': [{'type': 'text', 'text': '기존 요청' if index == 75 else '질문 %d' % index}]},
+                {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(151)]
+        self.reader.turn_page_size = 1
+
+        result = self.send_against_history_only(request='request-0075', text='기존 요청')
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['turnId'], self.reader.send_calls),
+                         ('completed', True, 'turn-75', 0))
+
     def test_far_request_is_found_with_large_history_and_two_oversized_turns(self):
         self.reader.thread['turns'] = [
             {'id': 'turn-%d' % index, 'status': 'completed', 'items': [

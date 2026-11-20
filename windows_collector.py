@@ -51,7 +51,7 @@ MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
 STATUS_TURN_LIMIT = 80
 HISTORY_PAGE = 100
-HISTORY_PAGES = 50
+HISTORY_PAGES = 200
 CODEX_VISIBLE_TOOL_KINDS = {'commandExecution'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
