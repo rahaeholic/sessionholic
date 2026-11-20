@@ -792,7 +792,9 @@ test('selecting a replacement in the primary pane cancels its pending cold resto
   f.primary.restore = () => false;
   f.workspace.changed();
   assert.equal(f.preferences.get('workspace').panes.p1.key, 'missing');
+  assert.equal(f.workspace.awaitingSession(), true);
   assert.equal(f.workspace.routeSession('session-c'), false);
+  assert.equal(f.workspace.awaitingSession(), false);
   f.primary.select('session-c');
   f.primary.restore = restore;
   f.workspace.changed();

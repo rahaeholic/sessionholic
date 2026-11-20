@@ -1708,8 +1708,8 @@ function renderEmptyPane() {
   let empty = detail.children[0];
   if (empty?.id !== "empty-pane") {
     empty = el("section", "welcome empty-pane"); empty.id = "empty-pane";
-    empty.append(appMark(), el("h2", null, "빈 창"),
-      el("p", null, "새 세션을 시작하거나 기존 세션을 이 창에서 여세요."));
+    empty.heading = el("h2"); empty.description = el("p");
+    empty.append(appMark(), empty.heading, empty.description);
     const actions = el("div", "empty-pane-actions");
     const current = () => state.authenticated && !state.selected && !state.selectedBotRequest &&
       !state.terminalVisible && !state.launcherWorkspace && detail.children[0] === empty;
@@ -1728,6 +1728,12 @@ function renderEmptyPane() {
     empty.append(actions, note);
     empty.startButton = start; empty.statusNote = note;
     detail.replaceChildren(empty);
+  }
+  const waiting = window.SessionholicWorkspace?.awaitingSession?.();
+  const heading = waiting ? "저장한 세션 확인 중" : "빈 창";
+  if (empty.heading.textContent !== heading) {
+    empty.heading.textContent = heading;
+    empty.description.textContent = waiting ? "목록에 세션이 나타나면 이 창에 다시 표시합니다." : "새 세션을 시작하거나 기존 세션을 이 창에서 여세요.";
   }
   const ready = !networkOffline() && newSessionHosts().some((host) => host.newSession.available && host.online !== false);
   empty.startButton.disabled = !ready || !!state.newSessionBusy;
@@ -1751,8 +1757,8 @@ function render() {
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   if (!embedded) { renderSessionList(sessions, now); renderHistorySearch(); }
   if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
+  const wasEmpty = !state.selected;
   const selected = sessions.find((s) => s.key === state.selected);
-  if (!state.selected) renderEmptyPane();
   window.SessionholicGoals?.update?.(sessions);
   // Its conversation listed now: it takes its place beside the docked terminal.
   if (!selected && state.docked && state.terminal && !state.dockBeside && dockedSessionFor(state.terminal)) {
@@ -1787,6 +1793,7 @@ function render() {
     } else syncEvents();
   }
   window.SessionholicWorkspace?.changed();
+  if (wasEmpty && !state.selected) renderEmptyPane();
 }
 // A lost connection comes first: on a phone the chips scroll sideways and only the
 // first fit, so a device that is down is never the one pushed out of sight. A tap

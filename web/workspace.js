@@ -544,6 +544,11 @@
     else row.ref = { key: session.key, mode: "terminal" };
     return true;
   }
+  function awaitingSession(id = ownId, win = root) {
+    if (embedded) return !!parent?.awaitingSession(ownId, root);
+    const row = panes.get(id);
+    return !!row?.ref && (id === "p1" || row.frame?.contentWindow === win);
+  }
   function activeSessionKey() {
     const row = panes.get(active);
     return (row?.ref || row?.hooks?.describe().ref)?.key || null;
@@ -757,5 +762,5 @@
   }
   root.SessionholicWorkspace = { ...model, embedded, detached, init, changed, editorChanged, managed, visible, routeSession, routeNew, routeTerminal, routeSessionTerminal, claimTerminal, claimDictation, claimMic,
     sharedRead, dataChanged, mutated, locked, attach, report, readShared, mutation, childLocked, claim, focus, handleKey,
-    add, addFromPane, closePane, layout, arrange, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
+    add, addFromPane, closePane, layout, arrange, awaitingSession, activeSessionKey, readingActive, isActive, browseSessions, showList, dismissActiveDialog };
 })(typeof window !== "undefined" ? window : null);
