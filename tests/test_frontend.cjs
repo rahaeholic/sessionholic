@@ -17982,3 +17982,28 @@ test('a split pane retains its saved session through a temporarily missing host'
   c.render();
   assert.equal(c.state.selected, replacement.key, 'a late return never replaces the user selection');
 });
+
+test('external iPad display makes room before focus and keeps it through a gap between frame editors', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window;
+  c.context.document.documentElement.hasAttribute = key => key === 'data-ipad';
+  win.SessionholicWorkspace = {managed: () => true, embedded: false};
+  Object.assign(win, {innerWidth: 3008, innerHeight: 1660, visualViewport: {height: 1660, offsetTop: 0, scale: 1}});
+  const height = pane => vm.runInContext('viewportHeight(' + (pane ? '{}' : 'null') + ')', c.context);
+  const resting = height(false);
+  assert.ok(resting <= 1592 && resting >= 1580, 'all four panes end above the 68px input bar before the first tap');
+  Object.assign(win.visualViewport, {height: 1592});
+  assert.equal(height(true), resting);
+  win.innerHeight = 1592;
+  for (const [pane, offset] of [[true,69],[false,68],[true,68],[false,69]]) {
+    win.visualViewport.offsetTop = offset;
+    assert.equal(height(pane), resting);
+  }
+  win.innerHeight = 1660;
+  Object.assign(win.visualViewport,{height:1660,offsetTop:0});
+  assert.equal(height(false), resting);
+  Object.assign(win, {innerHeight:1200});
+  win.visualViewport.height = 1200;
+  assert.equal(height(false), resting - 460, 'resizing the external window still works');
+  win.SessionholicWorkspace.embedded = true;
+  assert.equal(height(false), 1200, 'a child frame does not reserve space twice');
+});

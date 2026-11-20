@@ -480,6 +480,8 @@ function shortLayout() {
 // (scale) is not a keyboard. A hardware keyboard's shortcut bar stays below
 // KEYBOARD_MIN_PX.
 const KEYBOARD_MIN_PX = 150;
+// External-keyboard traces show a 68–69px accessory bar before WebKit pans.
+const IPAD_ACCESSORY_ROOM = 72;
 function editingText() {
   const node = document.activeElement;
   return !!node && (node.isContentEditable === true || /^(INPUT|TEXTAREA|SELECT)$/.test(node.tagName || ""));
@@ -15898,15 +15900,23 @@ function viewportHeight(pane = ipadInputPane()) {
   if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
   if (unzoomed && ipadWorkspace()) {
     if (window.SessionholicWorkspace.embedded) return window.innerHeight || height;
+    const accessory = window.innerWidth > 1600 || window.matchMedia?.("(any-pointer: fine)")?.matches
+      ? IPAD_ACCESSORY_ROOM : 0;
     const layout = window.innerHeight || height;
-    // Safari can shrink BOTH viewports while focus lives in an iframe. Keep
-    // the pre-focus board height even if innerHeight and visualViewport agree.
-    if (state.ipadLayoutWidth !== window.innerWidth || !state.ipadLayoutHeight ||
-        (!pane && !state.ipadInputPane) || layout > state.ipadLayoutHeight) {
+    // During an iframe focus handoff activeElement can temporarily be BODY
+    // while WebKit still reports the smaller window and its 68px pan.
+    const offset = viewport?.offsetTop || 0;
+    const sameWidth = state.ipadLayoutWidth === window.innerWidth;
+    const panned = accessory && offset > 0 && offset <= accessory;
+    const full = panned ? Math.max(layout, Math.round(viewport.height + offset)) : layout;
+    if (!sameWidth || !state.ipadLayoutHeight ||
+        (!pane && !state.ipadInputPane) || full > state.ipadLayoutHeight) {
+      // The pan can round to 69px one frame before settling to 68px.
+      if (!sameWidth || !panned || Math.abs(full - state.ipadLayoutHeight) > 1)
+        state.ipadLayoutHeight = full;
       state.ipadLayoutWidth = window.innerWidth;
-      state.ipadLayoutHeight = layout;
     }
-    return state.ipadLayoutHeight;
+    return Math.max(1, state.ipadLayoutHeight - accessory);
   }
   if (pane) {
     keyboardInset();
