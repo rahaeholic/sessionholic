@@ -3220,8 +3220,8 @@ li[data-task] {
   grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 1.3fr) minmax(0, 1.6fr) repeat(5, minmax(0, 1fr));
   grid-template-rows: repeat(2, var(--key-row));
   grid-template-areas:
-    ".    up   .     enter cmd1 ctrl k1   k2 cup word"
-    "left down right enter cmd2 alt  meta k3 k4  pick";
+    ".    up   .     enter cmd1 ctrl k1   k2   k3  cup"
+    "left down right enter cmd2 k4   word pick alt meta";
   gap: 5px;
   max-width: 680px;
 }
@@ -3263,8 +3263,8 @@ li[data-task] {
     grid-template-rows: repeat(3, var(--key-row));
     grid-template-areas:
       "up   down left right enter cmd1 cmd2"
-      "ctrl alt  meta k1    k1    k2   k2"
-      "cup  pick word k3    k3    k4   k4";
+      "k4   word pick ctrl  ctrl  alt  alt"
+      "meta k1   k2   k3    k3    cup  cup";
   }
   .terminal-keys .command-key {
     margin-left: 0;

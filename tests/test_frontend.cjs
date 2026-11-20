@@ -4101,14 +4101,14 @@ test('terminal keys sit in two rows with held modifiers, an inverted-T arrow clu
   const css = fs.readFileSync(path.join(__dirname, '../web/style.css'), 'utf8');
   const toolbar = html.split('id="terminal-keys"')[1].split('</div>')[0];
   assert.deepEqual(Array.from(toolbar.matchAll(/data-(?:key|mod)="([^"]+)"/g), match => match[1]),
-    ['up','down','left','right','enter','model','effort','ctrl','alt','meta','escape','tab','backtab','interrupt','ctrl-up','shift-left','alt-left']);
+    ['up','down','left','right','enter','model','effort','interrupt','alt-left','shift-left','ctrl','alt','meta','escape','tab','backtab','ctrl-up']);
   for (const mod of ['ctrl', 'alt', 'meta'])
     assert.match(html, new RegExp(`data-mod="${mod}" aria-pressed="false"`));
   assert.match(css, /"\.\s+up\s+\.\s+enter cmd1 ctrl/);
-  assert.match(css, /"left down right enter cmd2 alt/);
+  assert.match(css, /"left down right enter cmd2 k4\s+word pick/);
   assert.match(html, /data-key="model" class="command-key"[^>]*>\/model</);
   assert.match(html, /data-key="effort" class="command-key"[^>]*>\/effort</);
-  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*"up\s+down left right enter cmd1 cmd2"/);
+  assert.match(css, /@container terminal-tools \(max-width: 395\.98px\) \{[^@]*"up\s+down left right enter cmd1 cmd2"\s+"k4\s+word pick/);
   // Modifier buttons are not keys: a key loop over every button would send undefined.
   assert.ok(source.includes('querySelectorAll("button[data-key]")'));
   for (const [key, bytes] of [['backtab', '\\x1b[Z'], ['"ctrl-j"', '\\n'], ['"ctrl-u"', '\\x15'], ['"ctrl-x"', '\\x18'], ['"ctrl-l"', '\\x0c']])
