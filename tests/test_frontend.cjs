@@ -17020,6 +17020,18 @@ test('continuous terminal output cannot postpone the same pending resize forever
   assert.equal(c.state.lastSize, '90x25');
 });
 
+test('a transient one-row tile waits for a valid PTY size', () => {
+  const timers = [];
+  const c = client(undefined, {setTimeout(fn) { timers.push(fn); return timers.length; }, clearTimeout() {}});
+  Object.assign(c.state, {terminal: {id:'tiny'}, terminalVisible:true, term: {}, terminalSizingId:'tiny',
+    terminalScreenSize:{cols:80,rows:24}, fit:{proposeDimensions: () => ({cols:60,rows:1})}});
+  vm.runInContext('fitTerminal()', c.context);
+  assert.equal(timers.length, 0);
+  c.state.fit.proposeDimensions = () => ({cols:60,rows:2});
+  vm.runInContext('fitTerminal()', c.context);
+  assert.equal(timers.length, 1);
+});
+
 test('a brief host-state gap never opens a recovery card, while a sustained gap does and a later gap gets its own grace period', () => {
   let now = 1000;
   const timers = [];

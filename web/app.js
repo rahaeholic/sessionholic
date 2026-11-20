@@ -12664,6 +12664,13 @@ function fitTerminal() {
   }
   if (!dimensions) return;
   const { cols, rows } = dimensions;
+  // A tile can transiently have only one row during a keyboard resize.
+  // Keep the last valid PTY grid until the server can accept the new size.
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 2 || cols > 500 || rows < 2 || rows > 300) {
+    clearTimeout(state.resizeTimer);
+    state.resizePending = null;
+    return;
+  }
   const terminal = state.terminal, openRun = state.terminalOpenRun;
   const size = `${cols}x${rows}`;
   const previous = state.resizePending;
