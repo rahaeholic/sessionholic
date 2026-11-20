@@ -82,8 +82,11 @@ class SessionOriginTest(unittest.TestCase):
 
 
 class FakeProxy:
-    def __init__(self, rows, calls, read=None):
+    def __init__(self, rows, calls, read=None, large_read=False, unsupported_pages=False, large_page_response=False):
         self.rows, self.calls, self.read = rows, calls, read
+        self.large_read, self.unsupported_pages = large_read, unsupported_pages
+        self.large_page_response = large_page_response
+        self.item_page_delay = 0
 
     def __enter__(self):
         return self
@@ -92,13 +95,39 @@ class FakeProxy:
         pass
 
     def call(self, method, params):
+        params = dict(params)
         self.calls.append((method, params))
         if method == 'thread/loaded/list':
             return {'data': [row['id'] for row in self.rows]}
         if method == 'thread/list':
             return {'data': self.rows}
         if method == 'thread/read':
+            if params.get('includeTurns') and self.large_read:
+                raise ValueError('synthetic thread/read response exceeds 8 MiB: ' + 'x' * (8 * 1024 * 1024 + 1))
             return {'thread': self.read or self.rows[0]}
+        if method == 'thread/items/list':
+            if self.unsupported_pages:
+                raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
+            if self.item_page_delay:
+                time.sleep(self.item_page_delay)
+            turns = (self.read or self.rows[0]).get('turns', [])
+            data = [{'turnId': turn.get('id'), 'item': item} for turn in turns for item in turn.get('items', [])]
+            data.reverse()
+            start = int(params.get('cursor') or 0)
+            end = start + params['limit']
+            page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
+            if self.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
+                if params['limit'] <= 1:
+                    raise wc.OversizedReply('synthetic app-server page exceeds 8 MiB')
+                return self.call(method, {**params, 'limit': max(1, params['limit'] // 2)})
+            return page
+        if method == 'thread/turns/list':
+            if self.unsupported_pages:
+                raise wc.RpcReplyError('unknown variant `thread/turns/list`', -32600)
+            turns = list(reversed((self.read or self.rows[0]).get('turns', [])))
+            start = int(params.get('cursor') or 0)
+            end = start + params['limit']
+            return {'data': turns[start:end], 'nextCursor': str(end) if end < len(turns) else None}
         raise AssertionError('unexpected native mutation: ' + method)
 
 
@@ -496,7 +525,12 @@ class WindowsCollectorTest(unittest.TestCase):
         self.calls = []
         self.live = {'id': self.sid, 'cwd': self.cwd, 'status': {'type': 'active', 'activeFlags': []},
                      'name': '합성 진행 작업', 'updatedAt': 200, 'turns': []}
-        self.reader = wc.WindowsCollector(self.home, hostname='fixture-pc', proxy_factory=lambda *args: FakeProxy([self.live], self.calls),
+        self.large_read = False
+        self.unsupported_pages = False
+        self.large_page_response = False
+        self.reader = wc.WindowsCollector(self.home, hostname='fixture-pc', proxy_factory=lambda *args: FakeProxy([self.live], self.calls,
+            large_read=self.large_read, unsupported_pages=self.unsupported_pages,
+            large_page_response=self.large_page_response),
             process_reader=lambda pid: {'pid': pid, 'start': '123456', 'exe': str(self.reader.binary)})
         self.reader.codex_home.mkdir()
         self.db = self.reader.codex_home / 'state_5.sqlite'
@@ -800,6 +834,7 @@ class WindowsCollectorTest(unittest.TestCase):
 
     def test_live_read_is_exact_and_never_resumes_or_sends(self):
         self.endpoint()
+        self.large_read = True
         self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'startedAt': 100, 'completedAt': 200,
                               'items': [{'id': 'input-1', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 입력'}]},
                                         {'id': 'answer-1', 'type': 'agentMessage', 'text': '합성 답변', 'phase': 'final_answer'}]}]
@@ -807,10 +842,76 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual([m['text'] for m in result['messages']], ['합성 입력', '합성 답변'])
         self.assertEqual(result['phase'], 'working')
         self.assertTrue(result['runtimeKnown'])
-        self.assertEqual(self.calls, [('thread/loaded/list', {'limit': wc.LIMIT}),
-                                      ('thread/read', {'threadId': self.sid, 'includeTurns': True})])
+        self.assertEqual(self.calls[:2], [('thread/loaded/list', {'limit': wc.LIMIT}),
+                                      ('thread/read', {'threadId': self.sid, 'includeTurns': False})])
+        self.assertEqual([method for method, _ in self.calls[2:]], ['thread/items/list', 'thread/turns/list'])
         self.assertEqual(result['messages'][-1]['turnId'], 'turn-1')
         self.assertEqual(result['messages'][-1]['messageId'], 'answer-1')
+
+    def test_live_read_falls_back_when_the_server_does_not_support_history_pages(self):
+        self.endpoint()
+        self.unsupported_pages = True
+        self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'content': [{'type': 'text', 'text': '합성 요청'}]}]}]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual([row['text'] for row in result['messages']], ['합성 요청'])
+        self.assertIn(('thread/read', {'threadId': self.sid, 'includeTurns': True}), self.calls)
+
+    def test_large_tool_outputs_are_split_into_pages_under_the_proxy_limit(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+            {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 280000},
+            {'id': 'input-%d' % index, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '요청'}]},
+            {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변'}]}
+            for index in range(40)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((result['phase'], result['runtimeKnown']), ('working', True))
+        self.assertEqual(result['messages'][-1]['text'], '답변')
+        self.assertTrue(result['olderOmitted'])
+        item_pages = [params['limit'] for method, params in self.calls if method == 'thread/items/list']
+        self.assertTrue(item_pages)
+        self.assertLessEqual(max(item_pages), wc.HISTORY_PAGE)
+
+    def test_twenty_large_tool_outputs_retry_the_first_page_before_failing(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-%d' % index, 'status': 'completed', 'items': [
+            {'id': 'tool-%d' % index, 'type': 'commandExecution', 'aggregatedOutput': 'x' * 600000},
+            {'id': 'input-%d' % index, 'type': 'userMessage', 'content': [{'type': 'text', 'text': '요청'}]},
+            {'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변'}]}
+            for index in range(20)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual((result['phase'], result['runtimeKnown']), ('working', True))
+        self.assertEqual(result['messages'][-1]['text'], '답변')
+        limits = [params['limit'] for method, params in self.calls if method == 'thread/items/list']
+        self.assertTrue(any(limit < wc.HISTORY_PAGE for limit in limits))
+
+    def test_single_oversized_tool_item_falls_back_to_turn_summaries(self):
+        self.endpoint()
+        self.large_page_response = True
+        self.live['turns'] = [{'id': 'turn-1', 'status': 'completed', 'items': [
+            {'id': 'tool', 'type': 'commandExecution', 'aggregatedOutput': 'x' * (9 * 1024 * 1024)},
+            {'id': 'input', 'type': 'userMessage', 'content': [{'type': 'text', 'text': '질문'}]},
+            {'id': 'answer', 'type': 'agentMessage', 'text': '답변'}]}]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertTrue(result['runtimeKnown'])
+        self.assertEqual([row['text'] for row in result['messages']], ['질문', '답변'])
+        self.assertTrue(result['olderOmitted'])
+
+    def test_file_change_items_do_not_consume_visible_message_row_limit(self):
+        self.endpoint()
+        self.live['turns'] = [
+            {'id': 'turn-%d' % index, 'status': 'completed', 'items':
+             [{'id': 'input-%d' % index, 'type': 'userMessage',
+               'content': [{'type': 'text', 'text': '질문 %d' % index}]}]
+             + [{'id': 'edit-%d-%d' % (index, item), 'type': 'fileChange', 'changes': []} for item in range(18)]
+             + [{'id': 'answer-%d' % index, 'type': 'agentMessage', 'text': '답변 %d' % index}]}
+            for index in range(40)]
+        result = self.reader.read('codex', self.sid, '.codex')
+        self.assertEqual(len(result['messages']), 80)
+        self.assertEqual((result['messages'][0]['text'], result['messages'][-1]['text']), ('질문 0', '답변 39'))
+        self.assertFalse(result['olderOmitted'])
 
     def test_saved_rollout_read_is_bound_to_native_id_and_cwd(self):
         result = self.reader.read('codex', self.sid, '.codex')
@@ -1222,10 +1323,35 @@ class WindowsCollectorTest(unittest.TestCase):
         with patch.object(proxy, '_send') as send:
             self.assertEqual(proxy._message(), {'id': 1, 'result': {'data': []}})
             send.assert_called_once_with(b'p', 10)
-        oversized = io.BytesIO(bytes([0x81, 127]) + struct.pack('!Q', 9 * 1024 * 1024))
+        oversized_bytes = bytes([0x81, 127]) + struct.pack('!Q', 9 * 1024 * 1024) + b'x' * (9 * 1024 * 1024)
+        oversized = io.BytesIO(oversized_bytes + bytes([0x81, len(payload)]) + payload)
         proxy._read = lambda size: oversized.read(size)
+        with self.assertRaises(wc.OversizedReply):
+            proxy._message()
+        self.assertEqual(proxy._message(), {'id': 1, 'result': {'data': []}})
+        unsupported = io.BytesIO(bytes([0x82, 127]) + struct.pack('!Q', 9 * 1024 * 1024))
+        proxy._read = lambda size: unsupported.read(size)
         with self.assertRaises(ValueError):
             proxy._message()
+        self.assertEqual(unsupported.tell(), 10)
+
+    def test_proxy_retries_oversized_read_pages_with_a_smaller_limit(self):
+        proxy = wc.Proxy.__new__(wc.Proxy)
+        proxy.sequence = 0
+        sent = []
+        replies = [wc.OversizedReply('too large'), {'id': 2, 'result': {'data': []}}]
+        proxy._send = lambda message: sent.append(json.loads(json.dumps(message)))
+        def message():
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        proxy._message = message
+        self.assertEqual(proxy.call('thread/items/list', {'threadId': 'thread', 'limit': 100, 'cursor': 'same'}),
+                         {'data': []})
+        self.assertEqual([message['params'] for message in sent], [
+            {'threadId': 'thread', 'limit': 100, 'cursor': 'same'},
+            {'threadId': 'thread', 'limit': 50, 'cursor': 'same'}])
 
     def test_blocked_proxy_write_has_a_deadline_and_only_closes_fixture(self):
         proxy = wc.Proxy.__new__(wc.Proxy)

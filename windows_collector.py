@@ -49,6 +49,10 @@ CLAUDE_USER_RECORD = re.compile(rb'"type"\s*:\s*"user"')
 # after the oldest of them, at most ROW_LIMIT rows.
 MESSAGE_LIMIT = 80
 ROW_LIMIT = 400
+STATUS_TURN_LIMIT = 80
+HISTORY_PAGE = 100
+HISTORY_PAGES = 200
+CODEX_VISIBLE_TOOL_KINDS = {'commandExecution'}
 FULL_MESSAGE_TEXT = ContextVar('full_message_text', default=False)
 SID = re.compile(r'[0-9A-Za-z-]{8,64}\Z')
 CAPABILITIES = {'readOnly': True, 'canRead': True, 'canSend': False, 'canLaunch': False, 'canControl': False}
@@ -438,7 +442,8 @@ def _pinned_query(expected, deadline, query, empty):
 
 class Proxy:
     """Read-only JSON-RPC over the native Windows socket proxy's WebSocket bytes."""
-    ALLOWED = {'initialize', 'thread/list', 'thread/read', 'thread/loaded/list'}
+    ALLOWED = {'initialize', 'thread/list', 'thread/read', 'thread/loaded/list',
+               'thread/items/list', 'thread/turns/list'}
 
     def __init__(self, binary, socket_path, deadline):
         self.deadline, self.pending, self.frames, self.sequence = deadline, bytearray(), queue.Queue(maxsize=256), 0
@@ -541,6 +546,7 @@ class Proxy:
     def _message(self):
         fragments = bytearray()
         started = False
+        oversized = False
         while True:
             head = self._read(2)
             final, opcode, length = bool(head[0] & 0x80), head[0] & 15, head[1] & 127
@@ -550,13 +556,33 @@ class Proxy:
                 length = struct.unpack('!H', self._read(2))[0]
             elif length == 127:
                 length = struct.unpack('!Q', self._read(8))[0]
-            if length > 8 * 1024 * 1024 or len(fragments) + length > 8 * 1024 * 1024:
-                raise ValueError('PC 서버 응답 크기가 제한을 초과했습니다.')
-            raw = self._read(length)
+            if opcode not in (0, 1, 9, 10) or (opcode == 1 and started) or (opcode == 0 and not started):
+                raise ValueError('PC 서버 메시지 형식이 올바르지 않습니다.')
+            if opcode in (9, 10) and (not final or length > 125):
+                raise ValueError('PC 서버 제어 프레임 형식이 올바르지 않습니다.')
+            if opcode in (0, 1) and (length > 8 * 1024 * 1024 or len(fragments) + length > 8 * 1024 * 1024):
+                oversized = True
+            if oversized and opcode in (0, 1):
+                remaining = length
+                while remaining:
+                    size = min(remaining, 65536)
+                    self._read(size)
+                    remaining -= size
+                raw = b''
+            else:
+                raw = self._read(length)
             if opcode == 9 and final and length <= 125:
                 self._send(raw, 10)
                 continue
             if opcode == 10 and final and length <= 125:
+                continue
+            if oversized:
+                if opcode == 1 and not started:
+                    started = True
+                elif opcode != 0 or not started:
+                    raise ValueError('PC 서버 메시지 형식이 올바르지 않습니다.')
+                if final:
+                    raise OversizedReply('PC 서버 응답 크기가 제한을 초과했습니다.')
                 continue
             if opcode == 1 and not started:
                 started = True
@@ -572,16 +598,26 @@ class Proxy:
     def call(self, method, params):
         if method not in self.ALLOWED:
             raise ValueError('PC 수집기는 읽기 요청만 허용합니다.')
-        self.sequence += 1
-        request = self.sequence
-        self._send({'id': request, 'method': method, 'params': params})
-        for unused in range(1000):
-            message = self._message()
-            if message.get('id') == request:
-                if 'error' in message or 'result' not in message:
-                    raise ValueError('PC 서버가 읽기 요청을 거부했습니다.')
-                return message['result']
-        raise ValueError('PC 서버 알림이 제한을 초과했습니다.')
+        page_params = dict(params)
+        while True:
+            self.sequence += 1
+            request = self.sequence
+            self._send({'id': request, 'method': method, 'params': page_params})
+            try:
+                for unused in range(1000):
+                    message = self._message()
+                    if message.get('id') == request:
+                        if 'error' in message or 'result' not in message:
+                            error = message.get('error') or {}
+                            raise RpcReplyError('PC 서버가 읽기 요청을 거부했습니다: ' + str(error.get('message', '')),
+                                                error.get('code'))
+                        return message['result']
+                raise ValueError('PC 서버 알림이 제한을 초과했습니다.')
+            except OversizedReply:
+                limit = page_params.get('limit')
+                if method not in ('thread/items/list', 'thread/turns/list') or type(limit) is not int or limit <= 1:
+                    raise
+                page_params['limit'] = max(1, limit // 2)
 
     def close(self):
         self.closed.set()
@@ -600,6 +636,235 @@ class Proxy:
 
     def __exit__(self, *args):
         self.close()
+
+
+class RpcReplyError(ValueError):
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+class OversizedReply(ValueError):
+    """A complete WebSocket response exceeded the bounded JSON size."""
+
+
+def _summary_items(turn):
+    return [item for item in turn.get('items') or [] if isinstance(item, dict)]
+
+
+def _summary_talk(turn):
+    return sum(1 for item in _summary_items(turn) if _codex_conversation_item(item))
+
+
+def _codex_conversation_item(item):
+    kind = item.get('type')
+    if kind == 'agentMessage':
+        return bool(str(item.get('text') or '').strip())
+    if kind != 'userMessage':
+        return False
+    content = item.get('content') if isinstance(item.get('content'), list) else []
+    return bool(_native_attachments(content)) or any(
+        (_codex_user_text(str(block.get('text') or '')) or '').strip()
+        for block in content if isinstance(block, dict) and block.get('type') == 'text')
+
+
+def _codex_window_edge(entries):
+    seen = shown = 0
+    for entry in entries:
+        item = entry['item']
+        if _codex_conversation_item(item):
+            seen += 1
+        elif item.get('type') not in CODEX_VISIBLE_TOOL_KINDS:
+            continue
+        shown += 1
+        if seen >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
+            return entry['turnId']
+    return None
+
+
+def codex_recent_thread(server, thread_id):
+    """As collector.codex_recent_thread: fetch a bounded recent Codex window."""
+    result = server.call('thread/read', {'threadId': thread_id, 'includeTurns': False})
+    thread = result.get('thread') if isinstance(result, dict) else None
+    if not isinstance(thread, dict) or thread.get('id') != thread_id:
+        return result
+    entries, cursor, method = [], None, 'thread/items/list'
+    oversized_item = False
+    try:
+        for unused in range(HISTORY_PAGES):
+            params = {'threadId': thread_id, 'limit': HISTORY_PAGE, 'sortDirection': 'desc'}
+            if cursor:
+                params['cursor'] = cursor
+            try:
+                page = server.call(method, params)
+            except OversizedReply:
+                oversized_item = True
+                cursor = cursor or 'oversized-item'
+                break
+            data = page.get('data') if isinstance(page, dict) else None
+            if not isinstance(data, list) or any(not isinstance(entry, dict) or not isinstance(entry.get('item'), dict)
+                                                 or not isinstance(entry.get('turnId'), str) for entry in data):
+                raise ValueError('Codex 대화 기록 형식이 올바르지 않습니다.')
+            entries.extend(data)
+            cursor = page.get('nextCursor')
+            if not cursor:
+                break
+            edge = _codex_window_edge(entries)
+            if edge and any(entry['turnId'] == edge and entry['item'].get('type') == 'userMessage' for entry in entries):
+                break
+        items_cursor = cursor
+        wanted = {entry['turnId'] for entry in entries}
+        talk = sum(1 for entry in entries if _codex_conversation_item(entry['item']))
+
+        def short(turns):
+            if items_cursor is None or len(entries) >= ROW_LIMIT:
+                return False
+            ids = [turn['id'] for turn in turns]
+            last = max((ids.index(turn_id) for turn_id in wanted if turn_id in ids), default=-1)
+            return talk + sum(_summary_talk(turn) for turn in turns[last + 1:]) < MESSAGE_LIMIT
+
+        turns, cursor, method = [], None, 'thread/turns/list'
+        for unused in range(HISTORY_PAGES):
+            params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
+                      'sortDirection': 'desc', 'itemsView': 'summary'}
+            if cursor:
+                params['cursor'] = cursor
+            try:
+                page = server.call(method, params)
+            except OversizedReply:
+                # The visible window is complete; a later status-only page must
+                # not make that already usable conversation unreadable.
+                if wanted <= {turn['id'] for turn in turns} and not short(turns):
+                    break
+                raise
+            data = page.get('data') if isinstance(page, dict) else None
+            if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
+                raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
+            turns.extend(data)
+            cursor = page.get('nextCursor')
+            if not cursor or (len(turns) >= STATUS_TURN_LIMIT
+                              and {turn['id'] for turn in turns} >= wanted and not short(turns)):
+                break
+    except RpcReplyError as error:
+        if error.code == -32601 or (error.code == -32600 and ('unknown variant `%s`' % method) in str(error)):
+            return None
+        raise
+    by_turn = {}
+    for entry in reversed(entries):
+        by_turn.setdefault(entry['turnId'], []).append(entry['item'])
+    ids = [turn['id'] for turn in turns]
+    last = max((ids.index(turn_id) for turn_id in wanted if turn_id in ids), default=-1)
+    kept = []
+    full_turns = turns[:last + 1] if wanted else ([] if oversized_item else turns[:1])
+    for index, turn in enumerate(full_turns):
+        items = by_turn.get(turn['id'], [])
+        if index == last and items_cursor and not any(item.get('type') == 'userMessage' for item in items):
+            items = [item for item in _summary_items(turn) if item.get('type') == 'userMessage'] + items
+        kept.append({**turn, 'items': items, 'itemsView': 'full'})
+    summarized = []
+    if items_cursor and (wanted or oversized_item):
+        count = sum(1 for turn in kept for item in turn['items'] if _codex_conversation_item(item))
+        shown = count + sum(1 for turn in kept for item in turn['items']
+                            if item.get('type') in CODEX_VISIBLE_TOOL_KINDS)
+        summary_turns = turns[last + 1:] if wanted else turns
+        for turn in summary_turns:
+            if count >= MESSAGE_LIMIT or shown >= ROW_LIMIT:
+                break
+            summarized.append({**turn, 'items': _summary_items(turn), 'itemsView': 'summary'})
+            count += _summary_talk(turn)
+            shown += _summary_talk(turn)
+    thread['turns'] = list(reversed(kept + summarized))
+    thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
+                              for turn in reversed(turns)]
+    thread['olderUnread'] = oversized_item or bool(items_cursor) and (
+        len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
+    return {**result, 'thread': thread}
+
+
+def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
+    """Find exact old request or turn identities without loading their full items."""
+    request_ids = set(request_ids)
+    found, found_turn, cursor, seen = {}, None, None, set()
+    direction, limit, retried = 'desc', HISTORY_PAGE, False
+    skipped_oversized, pages = False, 0
+
+    def matches():
+        by_id = {turn['id']: turn for turn in found.values()}
+        if found_turn is not None:
+            by_id[found_turn['id']] = found_turn
+        return list(by_id.values())
+
+    def reverse_once():
+        nonlocal direction, cursor, seen, limit, retried, pages
+        if direction != 'desc' or retried:
+            return False
+        direction, cursor, seen, limit, retried, pages = 'asc', None, set(), HISTORY_PAGE, True, 0
+        return True
+
+    while True:
+        if pages >= HISTORY_PAGES:
+            if reverse_once():
+                continue
+            return matches(), False
+        params = {'threadId': thread_id, 'limit': limit,
+                  'sortDirection': direction, 'itemsView': 'summary'}
+        if cursor:
+            params['cursor'] = cursor
+        try:
+            page = server.call('thread/turns/list', params)
+        except OversizedReply:
+            if limit > 1:
+                # Reduce the page until the oversized response identifies one turn.
+                limit = max(1, limit // 2)
+                continue
+            # The summary for this single turn is too large. Its notLoaded view
+            # keeps the cursor metadata small, so skip only this turn and resume
+            # searching the ordinary turns on both sides of it.
+            not_loaded = {**params, 'itemsView': 'notLoaded'}
+            try:
+                page = server.call('thread/turns/list', not_loaded)
+            except (OversizedReply, RpcReplyError):
+                if reverse_once():
+                    continue
+                return matches(), False
+            data = page.get('data') if isinstance(page, dict) else None
+            if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict) or
+                    not isinstance(data[0].get('id'), str)):
+                return matches(), False
+            turn = data[0]
+            if turn.get('id') == turn_id:
+                found_turn = turn
+            skipped_oversized = True
+            pages += 1
+            if request_ids <= set(found) and (turn_id is None or found_turn is not None):
+                return matches(), True
+            cursor = page.get('nextCursor')
+            limit = HISTORY_PAGE
+            if cursor is None:
+                return matches(), not (request_ids - set(found)) and (turn_id is None or found_turn is not None)
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+            seen.add(cursor)
+            continue
+        data = page.get('data') if isinstance(page, dict) else None
+        if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
+            raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
+        pages += 1
+        for turn in data:
+            if turn.get('id') == turn_id:
+                found_turn = turn
+            for item in _summary_items(turn):
+                request_id = item.get('clientId') if item.get('type') == 'userMessage' else None
+                if request_id in request_ids:
+                    found[request_id] = turn
+        if request_ids <= set(found) and (turn_id is None or found_turn is not None):
+            return matches(), True
+        cursor = page.get('nextCursor')
+        if cursor is None:
+            return matches(), not skipped_oversized
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        seen.add(cursor)
 
 
 def _wal_without_index(database):
@@ -1176,12 +1441,14 @@ class WindowsCollector:
                     loaded = client.call('thread/loaded/list', {'limit': LIMIT})
                     if not isinstance(loaded, dict) or not isinstance(loaded.get('data'), list) or sid not in loaded['data']:
                         continue
-                    result = client.call('thread/read', {'threadId': sid, 'includeTurns': True})
+                    result = codex_recent_thread(client, sid)
+                    if result is None:
+                        result = client.call('thread/read', {'threadId': sid, 'includeTurns': True})
                 thread = result.get('thread') if isinstance(result, dict) else None
                 if not isinstance(thread, dict) or thread.get('id') != sid or _norm(thread.get('cwd')) != _norm(row['cwd']):
                     raise ValueError('PC 서버 대화의 소유 경계가 다릅니다.')
                 messages, dropped = _recent_window(_codex_rows(thread.get('turns') or []))
-                observed.append({'messages': messages, 'olderOmitted': dropped, 'modelSettings': _model_settings(thread),
+                observed.append({'messages': messages, 'olderOmitted': dropped or thread.get('olderUnread') is True, 'modelSettings': _model_settings(thread),
                         **_codex_runtime(thread.get('status')),
                         'activeFlags': _flags(thread.get('status')),
                         'updatedAt': _epoch(thread.get('updatedAt')), 'readOnly': True})
