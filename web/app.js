@@ -1181,6 +1181,7 @@ function assertAuthEpoch(epoch) {
   throw err;
 }
 function beginAuthEpoch() {
+  state.usageSamples?.clear();
   state.authEpoch++;
   clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
   state.runtimeObservations.clear(); state.runtimeClock = null;
@@ -1894,11 +1895,35 @@ function kstShort(iso) {
   const pad = (value) => String(value).padStart(2, "0");
   return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
+// Compare fresh readings of the same Codex subscription window in this login.
+function usageForecast(provider, row, window, at) {
+  if (provider.id !== "codex") return "";
+  const usageSamples = state.usageSamples ||= new Map();
+  const key = JSON.stringify([provider.id, row.name, window.label]);
+  const reset = Date.parse(window.resetsAt) / 1000;
+  const left = window.remaining, now = Date.now() / 1000;
+  if (provider.status !== "ready" || row.status !== "ready" || !Number.isFinite(at) ||
+      !Number.isFinite(left) || left <= 0 || left > 100 || !(reset > Math.max(at, now)) || now - at > 1800) {
+    usageSamples.delete(key);
+    return "";
+  }
+  let sample = usageSamples.get(key);
+  if (!sample || reset !== sample.reset || at < sample.at || left > sample.lastLeft || at - sample.at > 7200) {
+    usageSamples.set(key, { at, reset, left, lastLeft: left });
+    return "";
+  }
+  sample.lastLeft = left;
+  const elapsed = at - sample.at, spent = sample.left - left;
+  if (elapsed < 300 || spent <= 0) return "";
+  const exhausted = at + elapsed * left / spent;
+  return exhausted < reset ? `현재 속도라면 ${kstShort(new Date(exhausted * 1000).toISOString())} 소진 예상` : "";
+}
 function renderUsage(data) {
   const box = $("usage");
   if (!box) return;
   const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
   if (!providers.length) {
+    state.usageSamples?.clear();
     box.hidden = true;
     box.dataset.revision = "";
     if ($("usage-dialog")?.open) closeSheet("usage-dialog");
@@ -1943,6 +1968,8 @@ function renderUsage(data) {
           el("span", "usage-window-value", remaining === null ? "—" : `${remaining}%`),
           el("span", "usage-window-reset", reset ? `${reset} 초기화` : ""));
         item.append(line);
+        const forecast = usageForecast(provider, row, window, data.error ? null : data.fetchedAt);
+        if (forecast) item.append(el("p", "usage-note", forecast));
       }
       section.append(item);
     }
@@ -3411,6 +3438,10 @@ function runSwipeAction(row) {
   else if (action.kind === "manage") manageSession(action.s);
   else openSessionTerminal(action.s);
 }
+function resumeDetails(s) {
+  return [s.hostLabel || s.host, s.account, s.cwd,
+    s.sessionCommit ? `세션 기록 커밋 ${s.sessionCommit}` : ""].filter(Boolean).join("\n");
+}
 function cardActions(s) {
   const terminal = terminalForSession(s);
   const actions = [
@@ -3420,6 +3451,7 @@ function cardActions(s) {
     { label: sessionPinned(s) ? "★ 상단 고정 해제" : "☆ 상단 고정 (즐겨찾기)", run: () => pinSession(s) },
     { label: "세션 관리", run: () => manageSession(s) },
   ];
+  if (s.cwd) actions.push({ label: "재개 정보 복사", run: () => copyText(resumeDetails(s), "재개 정보를 복사했습니다.") });
   if (state.selected === s.key && $("messages")?.conversationSource === chatKey(sourceOf(s)))
     actions.splice(1, 0, { label: "결과물·검증 보기", run: () => openResults(s, chatEntry(s)) });
   if (window.SessionholicWorkspace)
@@ -12057,6 +12089,10 @@ function renderPlan(s, plan, target) {
       el("strong", null, targetLabel(target)),
     );
     body.append(route);
+  }
+  if (!transfer && s.cwd) {
+    const commit = s.sessionCommit ? ` · 세션 기록 커밋 ${s.sessionCommit.slice(0, 12)}` : "";
+    body.append(el("p", "plan-preserve", `작업 폴더 ${s.cwd}${commit}`));
   }
   if (plan.summary && !transfer) body.append(el("p", "plan-summary", plan.summary));
   if (!plan.allowed && plan.reason) body.append(el("p", "error", plan.reason));

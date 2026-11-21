@@ -156,6 +156,13 @@ class SessionOriginTest(unittest.TestCase):
     def codex(self, **fields):
         return collector.codex_row({'id': 'child-session', **fields}, '.codex', None, 'Fixture', set(), [])
 
+    def test_resume_commit_uses_only_the_sessions_recorded_hash(self):
+        sha = '12' * 20
+        self.assertEqual(self.codex(gitInfo={'sha':sha})['sessionCommit'], sha)
+        self.assertEqual(self.codex(git_sha=sha)['sessionCommit'], sha)
+        self.assertNotIn('sessionCommit', self.codex(gitInfo={'sha':'main'}))
+        self.assertNotIn('sessionCommit', self.codex())
+
     def test_slack_exec_keeps_bot_origin_without_a_ledger_or_special_workspace(self):
         import windows_collector
         envelope = '[슬랙 요청]\n- 요청자: 예제\n- 작업 번호: 12\n[처리 원칙] 봇 정책\n[요청]\n합성 요청'

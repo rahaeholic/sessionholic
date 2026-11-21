@@ -938,7 +938,7 @@ class WindowsCollector:
             if not required <= columns:
                 raise ValueError('PC 세션 DB 형식이 예상과 다릅니다.')
             optional = [key for key in ('name', 'preview', 'first_user_message', 'originator', 'agent_nickname',
-                'agent_role', 'thread_source', 'parent_thread_id', 'parent_session_id', 'initiator', 'initiator_name', 'rollout_path') if key in columns]
+                'agent_role', 'git_sha', 'thread_source', 'parent_thread_id', 'parent_session_id', 'initiator', 'initiator_name', 'rollout_path') if key in columns]
             # Exact terminal attaches need the saved policy, never browser-supplied settings.
             if sid:
                 optional += [key for key in ('sandbox_policy', 'approval_mode') if key in columns]
@@ -1072,8 +1072,11 @@ class WindowsCollector:
                         if isinstance(raw.get(k), str) and raw[k].strip()), '')
         initial = _bot_request_text(_codex_user_text(initial) or '')
         name = _text((live or {}).get('name') or raw.get('name'), 160)
+        git = (live or {}).get('gitInfo')
+        sha = (git.get('sha') if isinstance(git, dict) else None) or raw.get('git_sha')
         return {'agent': 'codex', 'id': sid, 'home': '.codex', 'cwd': str(raw.get('cwd') or ''),
                 'title': name or preview[:60] or '(제목 없음)', 'named': bool(name),
+                **({'sessionCommit': sha} if isinstance(sha, str) and re.fullmatch(r'(?:[a-f0-9]{40}|[a-f0-9]{64})', sha) else {}),
                 'initialTitle': _one_line(initial, 60) or '(제목 없음)',
                 'project': project, 'account': '기기 Codex',
                 'state': status.get('type') if isinstance(status, dict) else 'unknown',
