@@ -647,6 +647,9 @@ class RpcReplyError(ValueError):
 class OversizedReply(ValueError):
     """A complete WebSocket response exceeded the bounded JSON size."""
 
+    item_request_ids = ()
+    thread_cwd = None
+
 
 class HistoryCursorRepeat(ValueError):
     def __init__(self, matches):
@@ -727,6 +730,8 @@ def codex_recent_thread(server, thread_id):
                 break
         items_cursor = cursor
         wanted = {entry['turnId'] for entry in entries}
+        item_request_ids = sorted({item['clientId'] for item in (entry['item'] for entry in entries)
+                                   if item.get('type') == 'userMessage' and isinstance(item.get('clientId'), str)})
         talk = sum(1 for entry in entries if _codex_conversation_item(entry['item']))
 
         def short(turns):
@@ -745,11 +750,13 @@ def codex_recent_thread(server, thread_id):
                 params['cursor'] = cursor
             try:
                 page = server.call(method, params)
-            except OversizedReply:
+            except OversizedReply as error:
                 # The visible window is complete; a later status-only page must
                 # not make that already usable conversation unreadable.
                 if wanted <= {turn['id'] for turn in turns} and not short(turns):
                     break
+                error.item_request_ids = item_request_ids
+                error.thread_cwd = thread.get('cwd')
                 raise
             data = page.get('data') if isinstance(page, dict) else None
             if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
@@ -796,8 +803,7 @@ def codex_recent_thread(server, thread_id):
     thread['turns'] = list(reversed(kept + summarized))
     thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
                               for turn in reversed(turns)]
-    thread['_itemRequestIds'] = sorted({item['clientId'] for item in (entry['item'] for entry in entries)
-                                        if item.get('type') == 'userMessage' and isinstance(item.get('clientId'), str)})
+    thread['_itemRequestIds'] = item_request_ids
     thread['olderUnread'] = oversized_item or repeated_cursor or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}

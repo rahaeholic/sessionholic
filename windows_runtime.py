@@ -1245,14 +1245,16 @@ class WindowsRuntime:
                 self._require_resume_verified(observed)
                 # The local receipt was checked under this lock above. An oversized remote
                 # history page may hide an old client ID; it must not block this new request.
-                seen_request_ids = observed['thread'].get('_itemRequestIds', ())
+                seen_request_ids = set(observed['thread'].get('_itemRequestIds', ()))
                 try:
                     thread = self._thread(client, identity, observed['cwd'], (request_id,),
                                           allow_incomplete_requests=True, seen_request_ids=seen_request_ids)
-                except wc.OversizedReply:
+                except wc.OversizedReply as error:
+                    if wc._norm(error.thread_cwd) == wc._norm(observed['cwd']):
+                        seen_request_ids.update(error.item_request_ids)
                     if request_id not in seen_request_ids:
                         raise
-                    thread = {}  # The first read identified the request, but readback cannot confirm its status.
+                    thread = {}  # Item history identifies the request even when turn summaries fail.
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
                     return before

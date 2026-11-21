@@ -98,6 +98,7 @@ class FakeReader:
 
     def proxy(self, binary, path, deadline):
         owner = self
+        repeat_item_cursor = self.repeat_item_cursor
         turn_cursor_repeats = self.turn_cursor_repeats
         class Client:
             def __enter__(self):
@@ -129,9 +130,9 @@ class FakeReader:
                             for item in turn.get('items', [])]
                     data.reverse()
                     start = int(params.get('cursor') or 0)
-                    end = start + (1 if owner.repeat_item_cursor else params['limit'])
+                    end = start + (1 if repeat_item_cursor else params['limit'])
                     page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
-                    if owner.repeat_item_cursor and start == 1:
+                    if repeat_item_cursor and start == 1:
                         page['nextCursor'] = '1'
                     if owner.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
                         if params['limit'] <= 1:
@@ -559,17 +560,22 @@ class WindowsRuntimeTest(unittest.TestCase):
             client = self.reader.proxy(*args)
             if first_connection_only:
                 self.reader.turn_cursor_repeats = 0
+                self.reader.repeat_item_cursor = False
             return client
 
         self.runtime.proxy_factory = proxy
-        for first_connection_only in (False, True):
-            with self.subTest(first_connection_only=first_connection_only):
-                request_id = f'request-old-{int(first_connection_only)}'
+        for first_connection_only, first_items_repeat in ((False, False), (True, False), (True, True)):
+            with self.subTest(first_connection_only=first_connection_only, first_items_repeat=first_items_repeat):
+                request_id = f'request-old-{int(first_connection_only)}-{int(first_items_repeat)}'
                 old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
                     {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
                     {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
                 self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
                                                {'id': 'latest', 'status': 'interrupted', 'items': []}]
+                if first_items_repeat:
+                    for turn in self.reader.thread['turns'][1:]:
+                        turn['items'] = [{'type': 'userMessage', 'content': [{'type': 'text', 'text': '최근 질문'}]}]
+                self.reader.repeat_item_cursor = first_items_repeat
                 self.reader.turn_cursor_repeats = 1
                 self.reader.calls.clear()
                 self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
