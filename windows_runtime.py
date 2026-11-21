@@ -553,7 +553,8 @@ class WindowsRuntime:
         if self._resume_pending(observed):
             raise ValueError(RESUME_PENDING_REASON)
 
-    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None, allow_incomplete_requests=False):
+    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None, allow_incomplete_requests=False,
+                seen_request_ids=()):
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
@@ -572,14 +573,21 @@ class WindowsRuntime:
             missing_requests = set(request_ids) - found_requests
             found_turn = any(turn.get('id') == turn_id for turn in turns if isinstance(turn, dict))
             if missing_requests or (turn_id is not None and not found_turn):
-                matches, history_complete = wc.codex_find_history(client, identity['id'], missing_requests,
-                                                                  turn_id if not found_turn else None)
+                item_request_ids = set(seen_request_ids).union(thread.get('_itemRequestIds', ()))
+                try:
+                    matches, history_complete = wc.codex_find_history(client, identity['id'], missing_requests,
+                                                                      turn_id if not found_turn else None)
+                except wc.HistoryCursorRepeat as error:
+                    if turn_id is not None or not missing_requests <= item_request_ids:
+                        raise
+                    matches, history_complete = error.matches, False
                 matched_requests = {item.get('clientId') for turn in matches
                                     for item in turn.get('items') or [] if isinstance(item, dict)
                                     and item.get('type') == 'userMessage'}
                 matched_turn = turn_id is None or found_turn or any(turn.get('id') == turn_id for turn in matches)
                 if not history_complete and (not matched_turn or
-                                             missing_requests - matched_requests and not allow_incomplete_requests):
+                                             missing_requests - matched_requests - item_request_ids
+                                             and not allow_incomplete_requests):
                     raise ValueError('PC 대화 기록의 이전 요청 또는 분기 지점을 모두 확인하지 못했습니다.')
                 thread['_lookupTurns'] = matches
         _state(thread)
@@ -1237,10 +1245,16 @@ class WindowsRuntime:
                 self._require_resume_verified(observed)
                 # The local receipt was checked under this lock above. An oversized remote
                 # history page may hide an old client ID; it must not block this new request.
+                seen_request_ids = observed['thread'].get('_itemRequestIds', ())
                 thread = self._thread(client, identity, observed['cwd'], (request_id,),
-                                      allow_incomplete_requests=True)
+                                      allow_incomplete_requests=True, seen_request_ids=seen_request_ids)
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
+                    return before
+                # The item proves the request exists even when its delivery status is unavailable.
+                if request_id in seen_request_ids or request_id in thread.get('_itemRequestIds', ()):
+                    before = {**before, **named}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': before, **named})
                     return before
                 if args.get('requireIdle') is True and _state(thread)['phase'] != 'idle':
                     return {**before, 'delivery': 'rejected', 'reason': '해당 대화가 작업 중이어서 보내지 않았습니다.'}

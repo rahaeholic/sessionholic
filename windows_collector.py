@@ -648,6 +648,12 @@ class OversizedReply(ValueError):
     """A complete WebSocket response exceeded the bounded JSON size."""
 
 
+class HistoryCursorRepeat(ValueError):
+    def __init__(self, matches):
+        super().__init__('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        self.matches = matches
+
+
 def _summary_items(turn):
     return [item for item in turn.get('items') or [] if isinstance(item, dict)]
 
@@ -790,6 +796,8 @@ def codex_recent_thread(server, thread_id):
     thread['turns'] = list(reversed(kept + summarized))
     thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
                               for turn in reversed(turns)]
+    thread['_itemRequestIds'] = sorted({item['clientId'] for item in (entry['item'] for entry in entries)
+                                        if item.get('type') == 'userMessage' and isinstance(item.get('clientId'), str)})
     thread['olderUnread'] = oversized_item or repeated_cursor or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}
@@ -856,8 +864,10 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
             limit = HISTORY_PAGE
             if cursor is None:
                 return matches(), not (request_ids - set(found)) and (turn_id is None or found_turn is not None)
-            if not isinstance(cursor, str) or not cursor or cursor in seen:
+            if not isinstance(cursor, str) or not cursor:
                 raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+            if cursor in seen:
+                raise HistoryCursorRepeat(matches())
             seen.add(cursor)
             continue
         data = page.get('data') if isinstance(page, dict) else None
@@ -876,8 +886,10 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         cursor = page.get('nextCursor')
         if cursor is None:
             return matches(), not skipped_oversized
-        if not isinstance(cursor, str) or not cursor or cursor in seen:
+        if not isinstance(cursor, str) or not cursor:
             raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        if cursor in seen:
+            raise HistoryCursorRepeat(matches())
         seen.add(cursor)
 
 
