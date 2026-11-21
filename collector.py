@@ -1103,7 +1103,7 @@ def codex_db_threads(path):
             if not {"id", "cwd", "title", "created_at", "updated_at", "archived", "source"} <= columns:
                 return None, None, "read"
             optional = [name for name in ("name", "preview", "first_user_message", "originator",
-                                          "agent_nickname", "agent_role", "parent_thread_id",
+                                          "agent_nickname", "agent_role", "git_sha", "parent_thread_id",
                                           "initiator", "initiator_name", "parent_session_id") if name in columns]
             rows = connection.execute(
                 "SELECT id, cwd, title, created_at, updated_at, source%s FROM threads WHERE archived = 0"
@@ -1350,6 +1350,10 @@ def codex_row(thread, key, project_id, account, loaded, projects):
         **session_origin(thread),
         "initialTitle": one_line(initial, 60) or "(제목 없음)",
     }
+    git = thread.get("gitInfo")
+    sha = (git.get("sha") if isinstance(git, dict) else None) or thread.get("git_sha")
+    if isinstance(sha, str) and re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", sha):
+        row["sessionCommit"] = sha
     if row['phase'] == 'unknown':
         row.update(runtimeKnown=False, runtimeReason='이 Codex CLI의 실행 상태를 해석하지 못했습니다.')
     return row
