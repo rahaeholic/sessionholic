@@ -53,6 +53,7 @@ class FakeReader:
         self.turn_page_size = None
         self.item_page_delay = 0
         self.repeat_item_cursor = False
+        self.repeat_turn_cursor = False
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -97,12 +98,14 @@ class FakeReader:
 
     def proxy(self, binary, path, deadline):
         owner = self
+        repeat_turn_cursor = self.repeat_turn_cursor
         class Client:
             def __enter__(self):
                 return self
             def __exit__(self, *args):
                 pass
             def call(self, method, params):
+                nonlocal repeat_turn_cursor
                 owner.calls.append((method, copy.deepcopy(params)))
                 if method == 'thread/loaded/list':
                     if owner.fail_after and owner.send_calls:
@@ -158,6 +161,9 @@ class FakeReader:
                         raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
                     if params.get('itemsView') == 'notLoaded':
                         page_turns = [{**turn, 'items': [], 'itemsView': 'notLoaded'} for turn in page_turns]
+                    if repeat_turn_cursor and params.get('cursor') == '1':
+                        repeat_turn_cursor = False
+                        return {'data': page_turns, 'nextCursor': '1'}
                     return {'data': page_turns, 'nextCursor': str(end) if end < len(turns) else None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
@@ -513,6 +519,55 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual((receipt['delivery'], receipt['turnId'], receipt['readbackConfirmed']),
                          ('completed', 'turn-1', True))
         self.assertEqual(self.reader.send_calls, 0)
+
+    def test_items_without_turn_summary_still_require_history_lookup(self):
+        self.reader.turn_page_size = 1
+        self.reader.repeat_turn_cursor = True
+        old_turn = {'id': 'old-turn', 'status': 'failed', 'items': [
+            {'type': 'userMessage', 'clientId': 'request-old', 'content': [{'type': 'text', 'text': '과거 질문'}]},
+            {'type': 'agentMessage', 'text': '과거 답변'}]}
+        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
+        for action in ('read', 'receipt', 'send'):
+            with self.subTest(action=action):
+                self.reader.calls.clear()
+                result = self.runtime.chat({'action': action, 'source': self.source, 'requestId': 'request-old',
+                                            'input': [{'type': 'text', 'text': '과거 질문'}]})
+                if action != 'send':
+                    self.assertEqual(result['messages'], [])
+                    self.assertTrue(result['olderOmitted'])
+                receipt = result['receipts'][0] if action == 'read' else result
+                self.assertEqual((receipt['delivery'], receipt['confirmed']), ('failed', True))
+                cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/turns/list']
+                initial_read = [None, '1'] if action == 'send' else []
+                self.assertEqual(cursors, initial_read + [None, '1', None, '1', '2'])
+        self.assertEqual(self.reader.send_calls, 0)
+
+        old_turn['status'] = 'completed'
+        self.reader.fork_id = str(uuid.uuid4())
+        self.assertEqual(self.model_command('fork', old_turn['id'])['status'], 'created')
+        forks = [params['lastTurnId'] for method, params in self.reader.calls if method == 'thread/fork']
+        self.assertEqual(forks, [old_turn['id']])
+
+    def test_repeated_cursor_does_not_resend_request_with_oversized_turn_summary(self):
+        request_id = 'request-old'
+        request_text = 'x' * 8192
+        old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
+            {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
+        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
+        self.reader.turn_page_size = 1
+        self.reader.repeat_turn_cursor = True
+        self.reader.large_page_response = True
+        self.reader.oversized_turn_ids = {'old-turn'}
+        self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
+
+        result = self.send(request=request_id, text=request_text)
+
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual([turn['id'] for turn in self.reader.thread['turns']], ['old-turn', 'middle', 'latest'])
+        self.assertFalse(result['canRetry'])
 
     def test_page_unsupported_full_read_allows_first_send_without_history_lookup(self):
         self.reader.unsupported_pages = True
