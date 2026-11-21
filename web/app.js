@@ -3021,7 +3021,9 @@ function updateCard(node, s, now, folderHint = "") {
   const rawTitle = cardLine(s.title);
   const title = cardTitle(s);
   const snippet = cardLine(s.snippet);
-  const preview = snippet && snippet !== rawTitle && snippet !== title ? snippet : "";
+  const waiting = s.phase === "needs_input" && !s.stale && s.runtimeKnown !== false;
+  const question = waiting && typeof s.waitingFor === "string" ? cardLine(s.waitingFor) : "";
+  const preview = question || (snippet && snippet !== rawTitle && snippet !== title ? snippet : "");
   const agent = AGENTS[s.agent] || s.agent || "에이전트";
   const host = s.hostLabel || s.host || "기기 확인 필요";
   const account = cardLine(s.account);
@@ -3033,7 +3035,7 @@ function updateCard(node, s, now, folderHint = "") {
   node.className = `card${selectedKey === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(selectedKey === s.key));
   node.cardLabel = [unread ? "읽지 않음" : "", "프로젝트: " + project, "작업: " + title,
-    preview ? "대화 미리보기: " + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
+    preview ? (question ? "답변 대기: " : "대화 미리보기: ") + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
     label, attention, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
     s.stale ? "마지막 확인 기준" : "", sessionRemoved(s) ? "목록에서 지움" : ""].filter(Boolean).join(". ");
   markCardTerminal(node, s);

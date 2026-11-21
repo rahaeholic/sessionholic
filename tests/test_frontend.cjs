@@ -4096,6 +4096,17 @@ test('card activation keeps exact home identity and one initial read, while remo
   assert.equal(requests.length, 2); assert.equal(requests[1].body.source.home, '.codex-first');
 });
 
+test('live input card shows the waiting reason until the session becomes stale', () => {
+  const c = client(undefined, noChatTimers);
+  const session = recentSession('question', {phase: 'needs_input', waitingFor: '어느 행사인가요?', snippet: '이전 답변'});
+  c.renderGroups([session], 1100);
+  const card = byClass(c.get('groups'), 'card')[0];
+  assert.equal(byClass(card, 'card-snippet')[0].textContent, '어느 행사인가요?');
+  assert.match(card.attributes['aria-label'], /답변 대기: 어느 행사인가요/);
+  c.renderGroups([{...session, stale: true}], 1101);
+  assert.equal(byClass(card, 'card-snippet')[0].textContent, '이전 답변');
+});
+
 test('changing list filters removes hidden cards without changing the selected source and different preview text stays explicitly a conversation preview', () => {
   const c = client(undefined, noChatTimers);
   const first = recentSession('preview-a', { title: '설정 점검', snippet: '이전에 확인한 대화의 본문', project: 'First project' });
