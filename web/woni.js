@@ -580,7 +580,16 @@
   function isDone(task) { return (taskSaving.get(task.id) || task.taskStatus) === "done"; }
   function reopenStatus(task) { return kindOf(task) === "delegated" && task.previousStatus === "reported" ? "reported" : "open"; }
   function attentionClass(text) { return String(text || "").includes("확인 필요") ? " is-attention" : ""; }
+  // 고정 소개 대신 지금 상태 한 줄(기디언 머리와 같은 원칙, 2026-11-21): 작업 중 · 할 일 확인, 없으면 한 줄로 그렇다고.
+  // 대화를 그릴 때와 할 일 수가 들어올 때 둘 다 다시 쓴다(할 일 배지와 어긋나지 않게).
+  let statusRunning = 0;
+  function renderStatus() {
+    const counts = tasks?.counts || {}, check = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
+    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.")
+      : [statusRunning ? `작업 중 ${statusRunning}` : "", check ? `할 일 확인 ${check}` : ""].filter(Boolean).join(" · ") || "지금 기다리는 일 없어요";
+  }
   function taskBadge() {
+    renderStatus();
     const counts = tasks?.counts || {}, count = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
     tasksBadge.hidden = !(count > 0); tasksBadge.textContent = count > 99 ? "99+" : String(count);
     tasksBadge.setAttribute("aria-hidden", "true");
@@ -1473,10 +1482,7 @@
     $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
     renderReplyPicks();
     const running = data.activity?.running || 0;
-    // 고정 소개 대신 지금 상태 한 줄(기디언 머리와 같은 원칙, 2026-11-21): 작업 중 · 할 일 확인, 없으면 한 줄로 그렇다고.
-    const counts = tasks?.counts || {}, check = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
-    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.")
-      : [running ? `작업 중 ${running}` : "", check ? `할 일 확인 ${check}` : ""].filter(Boolean).join(" · ") || "지금 기다리는 일 없어요";
+    statusRunning = running; renderStatus();
     renderSide();
   }
   // A working answer shows quiet dots, a failed one the failure colour (style.css); the class stays as before.
