@@ -599,6 +599,45 @@ class WindowsRuntimeTest(unittest.TestCase):
                         self.send(request='request-unseen', text='새 질문')
                     self.assertEqual(self.reader.send_calls, 0)
 
+    def test_first_read_oversized_summary_keeps_seen_request_unconfirmed(self):
+        request_id = 'request-old'
+        request_text = 'x' * 8192
+        old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
+            {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
+        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
+        self.reader.turn_page_size = 1
+        self.reader.large_page_response = True
+        self.reader.oversized_turn_ids = {'old-turn'}
+        self.reader.repeat_item_cursor = True
+        self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
+
+        with self.assertRaisesRegex(ValueError, '정확한 소유 서버'):
+            self.send(request='request-unseen', text='새 질문')
+        with patch.dict(self.reader.thread, {'cwd': str(self.home / 'different-project')}):
+            with self.assertRaisesRegex(ValueError, '정확한 소유 서버'):
+                self.send(request=request_id, text=request_text)
+        self.assertFalse(list(self.runtime.store.root.glob('chat-*.json')))
+        self.reader.calls.clear()
+
+        result = self.send(request=request_id, text=request_text)
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['canRetry']), ('unknown', False, False))
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual(len(list(self.runtime.store.root.glob('chat-*.json'))), 1)
+        item_cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/items/list']
+        turn_cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/turns/list']
+        self.assertEqual(item_cursors, [None, '1'])
+        self.assertEqual(turn_cursors, [None, '1', '2'])
+
+        self.reader.repeat_item_cursor = False
+        self.reader.thread['turns'].extend(
+            {'id': f'new-{i}', 'status': 'completed', 'items': [{'type': 'userMessage',
+             'content': [{'type': 'text', 'text': '새 질문'}]}]} for i in range(wc.HISTORY_PAGE))
+        self.assertEqual(self.send(request=request_id, text=request_text), result)
+        self.assertEqual(self.reader.send_calls, 0)
+
     def test_repeated_history_cursor_keeps_seen_request_unconfirmed(self):
         self.reader.turn_page_size = 1
         self.reader.turn_cursor_repeats = 2
