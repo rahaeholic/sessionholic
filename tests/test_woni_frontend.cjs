@@ -65,7 +65,8 @@ test('원이 답 말풍선 끝에 답한 시각만 작게 달고, 메뉴에는 �
   assert.equal(bubbleTime(answers[2]), undefined);
   // 날짜까지 든 시각은 말풍선을 눌러 여는 메뉴에 그대로 있다.
   const menuTime = answer => answer.children.find(item => item.className === 'woni-message-actions')?.children.find(item => item.className === 'woni-message-time');
-  assert.match(menuTime(answers[0]).textContent, /2026\.\s*11\.\s*06\..*13:23/);
+  // 날짜 구분자는 실행 환경의 ICU 데이터에 따라 '2026. 11. 06.' 또는 '2026/11/06'(Node 일부 빌드)이라 숫자만 본다.
+  assert.match(menuTime(answers[0]).textContent, /2026[./]\s*11[./]\s*06\.?.*13:23/);
   assert.equal(menuTime(answers[1]), undefined);
 });
 
