@@ -473,6 +473,13 @@
         ...(result.truncated ? [el("p", "", "결과의 앞부분만 표시합니다.")] : []), action("닫기", () => { original.hidden = true; }));
     } catch (_) { if (current === epoch && dialog.open) original.replaceChildren(el("p", "", "작업 결과를 불러오지 못했어요."), action("닫기", () => { original.hidden = true; })); }
   }
+  // 2026-11-21 라이언 "원이·기디언 같은 디자인시스템": 작업도 기디언과 같은 한 줄 행(상태 점 · 제목 · 시각, 둘째 줄 지금 상태).
+  function workTime(item) {
+    const at = Number(item.finishedAt) || Number(item.updatedAt) || Number(item.createdAt) || 0;
+    if (!validSeconds(at)) return "";
+    return dayKeyFormat.format(new Date(at * 1000)) === dayKeyFormat.format(new Date()) ? clockLabel(at)
+      : `${Number(dayKeyFormat.format(new Date(at * 1000)).slice(5, 7))}/${Number(dayKeyFormat.format(new Date(at * 1000)).slice(8, 10))}`;
+  }
   function renderWork() {
     const nodes = [];
     if (workError) nodes.push(el("p", "woni-status", workData ? "연결을 확인하지 못해 이전 작업 현황을 보여 줍니다." : workError));
@@ -481,23 +488,29 @@
     const groups = [["지금", running], ["최근 24시간", workData.recent || []]];
     for (const [title, rows] of groups) {
       if (!rows.length && title !== "지금") continue;
-      nodes.push(el("h3", "", title));
-      if (!rows.length) nodes.push(el("p", "woni-status", "지금 진행 중인 원이 작업이 없어요."));
+      nodes.push(el("h3", "agent-caption", rows.length ? `${title} ${rows.length}` : title));
+      if (!rows.length) { nodes.push(el("p", "agent-empty", "지금 진행 중인 원이 작업이 없어요.")); continue; }
+      const group = el("div", "agent-group");
       for (const item of rows) {
-        const card = el("article", "woni-work-card");
-        card.append(el("h4", "", item.streamTitle || item.text || "원이 작업"));
-        if (item.streamTitle && item.text) card.append(el("p", "", item.text));
+        const busy = item.status === "queued" || item.status === "running";
         const state = item.status === "queued" ? "순서를 기다리고 있어요" : item.status === "running" ? (item.progress || item.steps?.at(-1)?.tool || "작업하고 있어요")
           : item.status === "complete" ? "답변 완료" : "확인이 필요해요";
-        card.append(el("p", "", state));
+        const row = el("button", "agent-row"); row.type = "button";
+        row.dataset.state = busy ? "progress" : item.status === "complete" ? "done" : "wait";
+        const title = item.streamTitle || item.text || "원이 작업";
+        row.append(el("strong", "", title), el("span", "", item.streamTitle && item.text ? `${state} · ${item.text}` : state), el("small", "", workTime(item)));
+        row.setAttribute("aria-label", `${title}, ${state}${item.id ? ", 대화에서 이어보기" : ""}`);
+        if (item.id) row.addEventListener("click", () => { leaveStream(); jumpTo(item.id); }); else row.disabled = true;
+        const wrapper = el("div", "agent-item"); wrapper.append(row);
+        const subtasks = [];
         for (const batch of item.batches || []) for (const task of batch.tasks || []) {
           const label = `${task.title || "하위 작업"} · ${{ queued: "대기", waiting: "자리 대기", running: "진행 중", ok: "완료", error: "오류", timeout: "시간 초과", stopped: "중단됨", busy: "시작 못 함" }[task.status] || "상태 확인 필요"}`;
-          if (task.status === "ok") card.append(action(label + " · 결과 보기", () => showWorkerResult(batch, task)));
-          else card.append(el("p", "", label));
+          subtasks.push(task.status === "ok" ? action(label + " · 결과 보기", () => showWorkerResult(batch, task)) : el("span", "agent-empty", label));
         }
-        if (item.id) card.append(action("대화에서 이어보기 →", () => { leaveStream(); jumpTo(item.id); }));
-        nodes.push(card);
+        if (subtasks.length) { const box = el("div", "agent-subtasks"); box.append(...subtasks); wrapper.append(box); }
+        group.append(wrapper);
       }
+      nodes.push(group);
     }
     work.replaceChildren(...nodes);
   }
@@ -1459,7 +1472,10 @@
     $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
     renderReplyPicks();
     const running = data.activity?.running || 0;
-    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.") : running ? `작업 중 ${running}건` : "나의 개인 비서";
+    // 고정 소개 대신 지금 상태 한 줄(기디언 머리와 같은 원칙, 2026-11-21): 작업 중 · 할 일 확인, 없으면 한 줄로 그렇다고.
+    const counts = tasks?.counts || {}, check = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
+    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.")
+      : [running ? `작업 중 ${running}` : "", check ? `할 일 확인 ${check}` : ""].filter(Boolean).join(" · ") || "지금 기다리는 일 없어요";
     renderSide();
   }
   // A working answer shows quiet dots, a failed one the failure colour (style.css); the class stays as before.

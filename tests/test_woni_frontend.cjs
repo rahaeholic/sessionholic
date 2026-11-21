@@ -300,7 +300,8 @@ test('답글은 원래 대화 ID를 유지하고 작업 화면에서 같은 대�
   assert.equal(sent[0].replyTo.id, 'old-1'); assert.equal(sent[0].replyTo.part, 'answer');
   nodes['woni-work-tab'].click(); await new Promise(setImmediate);
   assert.equal(nodes['woni-work'].hidden, false);
-  assert.ok(nodes['woni-work'].children.some(child => child.className === 'woni-work-card'));
+  // 2026-11-21: 작업도 기디언과 같은 한 줄 행(agent-row)이다.
+  assert.ok(nodes['woni-work'].children.some(child => child.className === 'agent-group' && child.children.some(item => item.children[0]?.className === 'agent-row')));
 });
 
 test('잠금 뒤 늦게 도착한 작업 응답은 다시 열었을 때 남지 않는다', async () => {
