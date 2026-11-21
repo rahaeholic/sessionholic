@@ -234,6 +234,9 @@
     // Equal-sized tiles are an explicit arrange() action.
     const compact = root.innerWidth <= 700;
     doc.body.classList.toggle("workspace-compact", compact && enabled);
+    // One pane on screen (the last one left, a maximized pane, or phone-wide tabs): there is nothing to tell
+    // apart, so the active pane's blue frame is not drawn around the whole window (Ryan 2026-11-21).
+    doc.body.classList.toggle("workspace-one-pane", enabled && (list.length === 1 || maximized || compact));
     for (const [id, row] of panes) {
       const included = list.includes(id), shown = included && (!(maximized || compact) || active === id);
       row.node.hidden = !included;

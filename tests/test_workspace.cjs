@@ -230,9 +230,13 @@ test("closing a pane only closes its view, guards pending sends, and closing pri
   assert.equal(f.workspace.visible("p1"), true);
   assert.equal(f.calls.filter(([name]) => name === "api").length, 0);
   f.workspace.add({ key: "session-c" }); f.attach("p2");
+  assert.equal(f.document.body.classList.contains("workspace-one-pane"), false, "two panes side by side: the active one is framed");
   f.workspace.closePane("p1");
   assert.equal(f.workspace.visible("p1"), false);
   assert.equal(f.workspace.visible("p2"), true);
+  // Ryan 2026-11-21 "창 1개만 있는데 왜 창 테두리에 파란선이 뜨지": the last pane is not framed as the active one.
+  assert.equal(f.document.body.classList.contains("workspace-split"), true);
+  assert.equal(f.document.body.classList.contains("workspace-one-pane"), true);
   assert.equal(f.nodes.get("workspace-primary").parentNode, f.nodes.get("session-workspace"));
 });
 
@@ -580,8 +584,10 @@ test('desktop splits preserve the chosen direction and ratios until explicit arr
   }
   f.workspace.handleKey(combo('Enter'));
   assert.equal(f.nodes.get('workspace-arrange').textContent, '분할로 돌아가기');
+  assert.equal(f.document.body.classList.contains('workspace-one-pane'), true, 'a maximized pane is the only one on screen');
   f.nodes.get('workspace-arrange').fire('click', {});
   assert.equal(f.nodes.get('workspace-arrange').textContent, '세로 정렬');
+  assert.equal(f.document.body.classList.contains('workspace-one-pane'), false);
   assert.deepEqual(f.preferences.get('workspace').tree, saved.tree, 'returning from a maximized pane preserves the prior layout');
   f.nodes.get('workspace-arrange').fire('click', {});
   const arranged = f.workspace.geometry(f.preferences.get('workspace').tree).panes;

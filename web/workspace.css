@@ -21,6 +21,7 @@ body.workspace-split .workspace-pane-active .workspace-pane-label { color: var(-
 body.workspace-split #session-workspace { display: block; position: relative; min-width: 0; min-height: 0; overflow: hidden; background: var(--sep); }
 body.workspace-split .workspace-pane { position: absolute; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; border: 2px solid transparent; border-radius: 5px; background: var(--surface); }
 body.workspace-split .workspace-pane-active { border-color: var(--accent); }
+body.workspace-split.workspace-one-pane .workspace-pane-active { border-color: transparent; }
 body.workspace-split .workspace-pane-active > .workspace-pane-bar .workspace-pane-title { color: var(--accent); font-weight: 600; }
 body.workspace-split #workspace-primary > #detail { display: flex; position: relative; width: 100%; flex: 1; min-height: 0; }
 /* The first pane's sheets rise from its bottom edge, as the other panes' (documents of their own) do (app.js paneSheet). */
