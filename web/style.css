@@ -213,18 +213,18 @@
   .woni-dialog[data-drawer="open"] .woni-main { transform: translateX(min(82%, 360px)); box-shadow: var(--shadow-nav); }
   .woni-dialog[data-drawer="open"] .woni-scrim { opacity: 1; visibility: visible; transform: translateX(min(82%, 360px)); transition: opacity var(--dur-edge) ease, transform var(--dur-edge) var(--ease-out); }
 }
-.woni-head { display: flex; flex: none; align-items: center; gap: 4px; padding: 10px 10px 4px 6px; }
-.woni-head > div { min-width: 0; }
-.woni-head-title { flex: 1; padding-left: 4px; }
+.woni-head, .agent-head { display: flex; flex: none; align-items: center; gap: 4px; padding: 10px 10px 4px 6px; }
+.woni-head > div, .agent-head > div { min-width: 0; }
+.woni-head-title, .agent-head-title { flex: 1; padding-left: 4px; }
 .woni-head .icon-button.woni-menu { color: var(--label); background: transparent; }
 @media (hover: hover) { .woni-head .icon-button.woni-menu:hover { background: var(--fill-soft); } }
 .woni-head .icon-button.woni-menu:active { background: var(--fill); }
-.woni-head h2 { margin: 0; font-size: var(--fs-title); font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; }
-.woni-status { margin: 2px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
+.woni-head h2, .agent-head h2 { margin: 0; font-size: var(--fs-title); font-weight: 700; line-height: 1.25; letter-spacing: -0.01em; }
+.woni-status, .agent-status { margin: 2px 0 0; color: var(--label-2); font-size: var(--fs-cap); line-height: 1.4; }
 /* The close button keeps a 44px target around a small grey disc, as in iOS sheets. */
-.woni-head .icon-button { color: var(--label-2); font-size: 1.25rem; line-height: 1; background: radial-gradient(circle, var(--fill) 15px, transparent 15.5px); }
-.woni-head .icon-button:active { background: radial-gradient(circle, var(--fill-press) 15px, transparent 15.5px); }
-.woni-head-actions { display: flex; flex: none; align-items: center; }
+.woni-head .icon-button, .agent-head .icon-button { color: var(--label-2); font-size: 1.25rem; line-height: 1; background: radial-gradient(circle, var(--fill) 15px, transparent 15.5px); }
+.woni-head .icon-button:active, .agent-head .icon-button:active { background: radial-gradient(circle, var(--fill-press) 15px, transparent 15.5px); }
+.woni-head-actions, .agent-head-actions { display: flex; flex: none; align-items: center; }
 .woni-head .woni-find-open { color: var(--label); }
 .woni-head .woni-find-open[aria-pressed="true"] { color: var(--accent-strong); background: radial-gradient(circle, var(--accent-tint) 15px, transparent 15.5px); }
 .woni-tabs, .woni-segment { display: flex; flex: none; gap: 2px; padding: 2px; border-radius: 10px; background: var(--fill); }
@@ -330,27 +330,25 @@
 .woni-work { padding: 8px 20px 20px; }
 .woni-work h3 { margin: 16px 4px 8px; color: var(--label-2); font-size: var(--fs-sub); font-weight: 600; }
 .woni-work > .woni-status { margin: 12px 4px; font-size: var(--fs-sub); }
-.woni-work-card { margin-bottom: 8px; padding: 14px 16px; border-radius: var(--radius); background: var(--fill-soft); overflow-wrap: anywhere; }
-.woni-work-card h4 { margin: 0 0 6px; font-size: var(--fs-body); font-weight: 600; line-height: 1.4; }
-.woni-work-card p { margin: 4px 0; color: var(--label-2); font-size: var(--fs-sub); }
-.woni-work-card button { margin-left: -8px; }
+.woni-work .agent-group { margin-bottom: 8px; }
+.woni-work .agent-subtasks { display: flex; flex-wrap: wrap; gap: 0 4px; padding: 0 12px 8px 29px; }
 .woni-original { flex: none; max-height: 35%; overflow: auto; margin: 0 16px 8px; padding: 12px 14px; border-radius: var(--radius); background: var(--fill-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
 .woni-original strong { display: block; margin-bottom: 6px; }
 .woni-message-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .woni-message-file { padding: 5px 9px; border-radius: 8px; background: var(--fill); font-size: var(--fs-cap); }
 .woni-form { flex: none; padding: 8px 12px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--sep); }
 /* One rounded field holds the text and its tools; the whole field shows focus. */
-.woni-composer { border: 1px solid var(--sep); border-radius: 22px; background: var(--fill-soft); transition: border-color var(--dur-fast) ease, box-shadow var(--dur-fast) ease; }
-.woni-composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring-soft); }
-.woni-form textarea { display: block; width: 100%; min-height: 48px; max-height: 180px; padding: 12px 16px 2px; resize: none; field-sizing: content; font: inherit; font-size: max(16px, var(--fs-body)); line-height: 1.45; color: var(--label); background: transparent; border: 0; border-radius: 22px 22px 0 0; }
-.woni-form textarea::placeholder { color: var(--label-3); }
-.woni-form textarea:focus-visible { outline: none; }
-.woni-actions { display: flex; align-items: center; gap: 2px; padding: 0 6px 6px; }
+.woni-composer, .agent-composer { border: 1px solid var(--sep); border-radius: 22px; background: var(--fill-soft); transition: border-color var(--dur-fast) ease, box-shadow var(--dur-fast) ease; }
+.woni-composer:focus-within, .agent-composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring-soft); }
+.woni-form textarea, .agent-composer textarea { display: block; width: 100%; min-height: 48px; max-height: 180px; padding: 12px 16px 2px; resize: none; field-sizing: content; font: inherit; font-size: max(16px, var(--fs-body)); line-height: 1.45; color: var(--label); background: transparent; border: 0; border-radius: 22px 22px 0 0; }
+.woni-form textarea::placeholder, .agent-composer textarea::placeholder { color: var(--label-3); }
+.woni-form textarea:focus-visible, .agent-composer textarea:focus-visible { outline: none; }
+.woni-actions, .agent-actions { display: flex; align-items: center; gap: 2px; padding: 0 6px 6px; }
 .woni-tool { display: grid; place-items: center; width: 40px; height: 40px; border: 0; border-radius: 50%; background: transparent; color: var(--label-2); cursor: pointer; }
 @media (hover: hover) { .woni-tool:hover { background: var(--fill); } }
 .woni-tool:focus-visible, .woni-file-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.woni-hint { flex: 1; padding-left: 4px; color: var(--label-3); font-size: var(--fs-cap); }
-.woni-actions .primary { min-height: 40px; padding: 0 16px; border-radius: 999px; font-size: var(--fs-sub); }
+.woni-hint, .agent-hint { flex: 1; padding-left: 4px; color: var(--label-3); font-size: var(--fs-cap); }
+.woni-actions .primary, .agent-actions .primary { min-height: 40px; padding: 0 16px; border-radius: 999px; font-size: var(--fs-sub); }
 .woni-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .woni-attachments[hidden], .woni-tool[hidden] { display: none; }
 .woni-file { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 8px; border-radius: 8px; background: var(--fill); font-size: var(--fs-cap); }
@@ -505,7 +503,7 @@
   .woni-side { flex: none; width: 248px; border-right: 1px solid var(--sep); }
   .woni-side-item { min-height: 44px; font-size: var(--fs-body); }
   .woni-head .icon-button.woni-menu, .woni-scrim, .woni-tabs { display: none; }
-  .woni-head { padding: 14px 12px 8px 20px; }
+  .woni-head, .agent-head { padding: 14px 12px 8px 20px; }
   .woni-messages, .woni-work, .woni-panel { padding-inline: max(24px, calc((100% - 760px) / 2)); }
   .woni-form { padding-inline: max(16px, calc((100% - 792px) / 2)); }
   .woni-filter, .woni-original { margin-inline: max(16px, calc((100% - 760px) / 2)); }
@@ -8627,3 +8625,28 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] #draft-paste { min-width: 44px; width: 44px; min-height: 44px; padding: 0; font-size: 0; }
 :root[data-compact-mobile="true"] #detail #chat-send::after,
 :root[data-compact-mobile="true"] #draft-paste::after { content: "↑"; font-size: 22px; line-height: 1; }
+
+/* ── 에이전트 창 공통(원이·기디언, 2026-11-21 라이언 "같은 디자인시스템으로 통일") ──────────────
+   Head: name + one live status line + grey-disc icon buttons (.agent-head = .woni-head above).
+   Lists: grouped rows on a fill-soft group over the window surface; each row one line — a state dot,
+   the title, a short time on the right — and one quiet second line. Colours mean the same in both:
+   accent = in progress, orange = waiting on Ryan / being handled, green = done, red = failed. */
+.agent-caption { margin: 16px 4px 6px; color: var(--label-2); font-size: var(--fs-cap); font-weight: 600; }
+.agent-group { overflow: hidden; border-radius: var(--radius); background: var(--fill-soft); }
+.agent-group > * + * { border-top: 1px solid var(--sep); }
+.agent-row { display: grid; grid-template-columns: 9px auto minmax(0, 1fr) auto; grid-template-areas: "dot title title time" ". steps meta meta";
+  column-gap: 8px; row-gap: 3px; align-items: center; width: 100%; min-height: 52px; padding: 10px 12px; border: 0; background: transparent;
+  color: var(--label); font: inherit; text-align: left; cursor: pointer; }
+.agent-row::before { content: ""; grid-area: dot; width: 9px; height: 9px; border-radius: 50%; background: var(--label-3); }
+.agent-row[data-state="progress"]::before { background: var(--accent); }
+.agent-row[data-state="wait"]::before { background: var(--orange-dot); }
+.agent-row[data-state="done"]::before { background: var(--green-dot); }
+.agent-row[data-state="failed"]::before { background: var(--red); }
+.agent-row > strong { grid-area: title; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-body); font-weight: 600; }
+.agent-row > span { grid-area: meta; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--label-2); font-size: var(--fs-cap); }
+.agent-row > small { grid-area: time; color: var(--label-2); font-size: var(--fs-cap); white-space: nowrap; font-variant-numeric: tabular-nums; }
+@media (hover: hover) { .agent-row:hover { background: var(--fill-soft); } }
+.agent-row:active { background: var(--fill); }
+.agent-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.agent-row[aria-current="true"] { background: var(--accent-tint); }
+.agent-empty { margin: 4px 4px 0; color: var(--label-2); font-size: var(--fs-sub); }
