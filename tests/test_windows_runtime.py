@@ -52,6 +52,8 @@ class FakeReader:
         self.oversized_turn_ids = set()
         self.turn_page_size = None
         self.item_page_delay = 0
+        self.repeat_item_cursor = False
+        self.turn_cursor_repeats = 0
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -96,12 +98,15 @@ class FakeReader:
 
     def proxy(self, binary, path, deadline):
         owner = self
+        repeat_item_cursor = self.repeat_item_cursor
+        turn_cursor_repeats = self.turn_cursor_repeats
         class Client:
             def __enter__(self):
                 return self
             def __exit__(self, *args):
                 pass
             def call(self, method, params):
+                nonlocal turn_cursor_repeats
                 owner.calls.append((method, copy.deepcopy(params)))
                 if method == 'thread/loaded/list':
                     if owner.fail_after and owner.send_calls:
@@ -119,12 +124,16 @@ class FakeReader:
                         raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
                     if owner.item_page_delay:
                         time.sleep(owner.item_page_delay)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('synthetic proxy deadline expired')
                     data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
                             for item in turn.get('items', [])]
                     data.reverse()
                     start = int(params.get('cursor') or 0)
-                    end = start + params['limit']
+                    end = start + (1 if repeat_item_cursor else params['limit'])
                     page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
+                    if repeat_item_cursor and start == 1:
+                        page['nextCursor'] = '1'
                     if owner.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
                         if params['limit'] <= 1:
                             raise wc.OversizedReply('synthetic app-server page exceeds 8 MiB')
@@ -153,6 +162,9 @@ class FakeReader:
                         raise wc.OversizedReply('synthetic summary page exceeds 8 MiB')
                     if params.get('itemsView') == 'notLoaded':
                         page_turns = [{**turn, 'items': [], 'itemsView': 'notLoaded'} for turn in page_turns]
+                    if turn_cursor_repeats and params.get('cursor') == '1':
+                        turn_cursor_repeats -= 1
+                        return {'data': page_turns, 'nextCursor': '1'}
                     return {'data': page_turns, 'nextCursor': str(end) if end < len(turns) else None}
                 if method == 'model/list':
                     result = getattr(owner, 'catalog', {'data': [], 'nextCursor': None})
@@ -290,6 +302,24 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(len(visible), 75)
         self.assertEqual(visible.count('중간 답변'), 25)
         self.assertFalse(result['olderOmitted'])
+
+    def test_delayed_repeated_item_cursor_leaves_time_to_send_once(self):
+        self.reader.thread['turns'] = [{'id': 'old-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': 'old-request', 'content': [{'type': 'text', 'text': '과거 질문'}]},
+            {'type': 'reasoning', 'text': '숨김'},
+            {'type': 'agentMessage', 'text': '과거 답변'}]}]
+        self.reader.repeat_item_cursor = True
+        self.reader.item_page_delay = .035
+        elapsed = 0.0
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        with patch.object(time, 'monotonic', lambda: elapsed), patch.object(time, 'sleep', advance):
+            with self.subTest(check='confirmed'):
+                self.assertTrue(self.send()['confirmed'])
+        self.assertEqual(self.reader.send_calls, 1)
 
     def test_recent_state_retains_failed_turns_outside_the_message_window(self):
         self.reader.thread['turns'] = [
@@ -489,6 +519,142 @@ class WindowsRuntimeTest(unittest.TestCase):
                                      'input': [{'type': 'text', 'text': '과거 요청'}]})
         self.assertEqual((receipt['delivery'], receipt['turnId'], receipt['readbackConfirmed']),
                          ('completed', 'turn-1', True))
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_items_without_turn_summary_still_require_history_lookup(self):
+        self.reader.turn_page_size = 1
+        self.reader.turn_cursor_repeats = 1
+        old_turn = {'id': 'old-turn', 'status': 'failed', 'items': [
+            {'type': 'userMessage', 'clientId': 'request-old', 'content': [{'type': 'text', 'text': '과거 질문'}]},
+            {'type': 'agentMessage', 'text': '과거 답변'}]}
+        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
+        for action in ('read', 'receipt', 'send'):
+            with self.subTest(action=action):
+                self.reader.calls.clear()
+                result = self.runtime.chat({'action': action, 'source': self.source, 'requestId': 'request-old',
+                                            'input': [{'type': 'text', 'text': '과거 질문'}]})
+                if action != 'send':
+                    self.assertEqual(result['messages'], [])
+                    self.assertTrue(result['olderOmitted'])
+                receipt = result['receipts'][0] if action == 'read' else result
+                self.assertEqual((receipt['delivery'], receipt['confirmed']), ('failed', True))
+                cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/turns/list']
+                initial_read = [None, '1'] if action == 'send' else []
+                self.assertEqual(cursors, initial_read + [None, '1', None, '1', '2'])
+        self.assertEqual(self.reader.send_calls, 0)
+
+        old_turn['status'] = 'completed'
+        self.reader.fork_id = str(uuid.uuid4())
+        self.assertEqual(self.model_command('fork', old_turn['id'])['status'], 'created')
+        forks = [params['lastTurnId'] for method, params in self.reader.calls if method == 'thread/fork']
+        self.assertEqual(forks, [old_turn['id']])
+
+    def test_repeated_cursor_does_not_resend_request_with_oversized_turn_summary(self):
+        request_text = 'x' * 8192
+        self.reader.turn_page_size = 1
+        self.reader.large_page_response = True
+        self.reader.oversized_turn_ids = {'old-turn'}
+
+        def proxy(*args):
+            client = self.reader.proxy(*args)
+            if first_connection_only:
+                self.reader.turn_cursor_repeats = 0
+                self.reader.repeat_item_cursor = False
+            return client
+
+        self.runtime.proxy_factory = proxy
+        for first_connection_only, first_items_repeat in ((False, False), (True, False), (True, True)):
+            with self.subTest(first_connection_only=first_connection_only, first_items_repeat=first_items_repeat):
+                request_id = f'request-old-{int(first_connection_only)}-{int(first_items_repeat)}'
+                old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
+                    {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
+                    {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
+                self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                               {'id': 'latest', 'status': 'interrupted', 'items': []}]
+                if first_items_repeat:
+                    for turn in self.reader.thread['turns'][1:]:
+                        turn['items'] = [{'type': 'userMessage', 'content': [{'type': 'text', 'text': '최근 질문'}]}]
+                self.reader.repeat_item_cursor = first_items_repeat
+                self.reader.turn_cursor_repeats = 1
+                self.reader.calls.clear()
+                self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
+
+                result = self.send(request=request_id, text=request_text)
+
+                self.assertEqual(self.reader.send_calls, 0)
+                self.assertEqual((result['delivery'], result['confirmed'], result['canRetry']), ('unknown', False, False))
+                not_loaded = any(method == 'thread/turns/list' and params.get('itemsView') == 'notLoaded'
+                                 for method, params in self.reader.calls)
+                self.assertIs(not_loaded, not first_connection_only)
+                self.reader.thread['turns'].extend(
+                    {'id': f'new-{i}', 'status': 'completed', 'items': [{'type': 'userMessage',
+                     'content': [{'type': 'text', 'text': '새 질문'}]}]} for i in range(wc.HISTORY_PAGE))
+                self.assertEqual(self.send(request=request_id, text=request_text), result)
+                self.assertEqual(self.reader.send_calls, 0)
+                if first_connection_only:
+                    del self.reader.thread['turns'][3:]
+                    self.reader.turn_cursor_repeats = 1
+                    with self.assertRaises(wc.OversizedReply):
+                        self.send(request='request-unseen', text='새 질문')
+                    self.assertEqual(self.reader.send_calls, 0)
+
+    def test_first_read_oversized_summary_keeps_seen_request_unconfirmed(self):
+        request_id = 'request-old'
+        request_text = 'x' * 8192
+        old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
+            {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
+        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
+        self.reader.turn_page_size = 1
+        self.reader.large_page_response = True
+        self.reader.oversized_turn_ids = {'old-turn'}
+        self.reader.repeat_item_cursor = True
+        self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
+
+        with self.assertRaisesRegex(ValueError, '정확한 소유 서버'):
+            self.send(request='request-unseen', text='새 질문')
+        with patch.dict(self.reader.thread, {'cwd': str(self.home / 'different-project')}):
+            with self.assertRaisesRegex(ValueError, '정확한 소유 서버'):
+                self.send(request=request_id, text=request_text)
+        self.assertFalse(list(self.runtime.store.root.glob('chat-*.json')))
+        self.reader.calls.clear()
+
+        result = self.send(request=request_id, text=request_text)
+
+        self.assertEqual((result['delivery'], result['confirmed'], result['canRetry']), ('unknown', False, False))
+        self.assertEqual(self.reader.send_calls, 0)
+        self.assertEqual(len(list(self.runtime.store.root.glob('chat-*.json'))), 1)
+        item_cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/items/list']
+        turn_cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/turns/list']
+        self.assertEqual(item_cursors, [None, '1'])
+        self.assertEqual(turn_cursors, [None, '1', '2'])
+
+        self.reader.repeat_item_cursor = False
+        self.reader.thread['turns'].extend(
+            {'id': f'new-{i}', 'status': 'completed', 'items': [{'type': 'userMessage',
+             'content': [{'type': 'text', 'text': '새 질문'}]}]} for i in range(wc.HISTORY_PAGE))
+        self.assertEqual(self.send(request=request_id, text=request_text), result)
+        self.assertEqual(self.reader.send_calls, 0)
+
+    def test_repeated_history_cursor_keeps_seen_request_unconfirmed(self):
+        self.reader.turn_page_size = 1
+        self.reader.turn_cursor_repeats = 2
+        self.reader.thread['turns'] = [
+            {'id': 'old-turn', 'status': 'completed', 'items': [
+                {'type': 'userMessage', 'clientId': 'request-old', 'content': [{'type': 'text', 'text': '과거 질문'}]}]},
+            {'id': 'middle', 'status': 'interrupted', 'items': []},
+            {'id': 'latest', 'status': 'interrupted', 'items': []},
+        ]
+        args = {'source': self.source, 'requestId': 'request-old'}
+        receipt = self.runtime.chat({**args, 'action': 'receipt'})
+        self.assertEqual((receipt['delivery'], receipt['confirmed'], receipt['canRetry']), ('unknown', False, False))
+        cursors = [params.get('cursor') for method, params in self.reader.calls if method == 'thread/turns/list']
+        self.assertEqual(cursors, [None, '1', None, '1'])
+
+        send = self.send(request='request-old', text='과거 질문')
+        self.assertEqual((send['delivery'], send['confirmed'], send['canRetry']), ('unknown', False, False))
         self.assertEqual(self.reader.send_calls, 0)
 
     def test_page_unsupported_full_read_allows_first_send_without_history_lookup(self):

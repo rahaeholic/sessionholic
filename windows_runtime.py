@@ -553,7 +553,8 @@ class WindowsRuntime:
         if self._resume_pending(observed):
             raise ValueError(RESUME_PENDING_REASON)
 
-    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None, allow_incomplete_requests=False):
+    def _thread(self, client, identity, cwd, request_ids=(), turn_id=None, allow_incomplete_requests=False,
+                seen_request_ids=()):
         loaded, complete = _loaded(client)
         if identity['id'] not in loaded:
             raise ValueError('PC 원본 세션이 현재 서버에 열려 있지 않습니다.')
@@ -572,20 +573,27 @@ class WindowsRuntime:
             missing_requests = set(request_ids) - found_requests
             found_turn = any(turn.get('id') == turn_id for turn in turns if isinstance(turn, dict))
             if missing_requests or (turn_id is not None and not found_turn):
-                matches, history_complete = wc.codex_find_history(client, identity['id'], missing_requests,
-                                                                  turn_id if not found_turn else None)
+                item_request_ids = set(seen_request_ids).union(thread.get('_itemRequestIds', ()))
+                try:
+                    matches, history_complete = wc.codex_find_history(client, identity['id'], missing_requests,
+                                                                      turn_id if not found_turn else None)
+                except wc.HistoryCursorRepeat as error:
+                    if turn_id is not None or not missing_requests <= item_request_ids:
+                        raise
+                    matches, history_complete = error.matches, False
                 matched_requests = {item.get('clientId') for turn in matches
                                     for item in turn.get('items') or [] if isinstance(item, dict)
                                     and item.get('type') == 'userMessage'}
                 matched_turn = turn_id is None or found_turn or any(turn.get('id') == turn_id for turn in matches)
                 if not history_complete and (not matched_turn or
-                                             missing_requests - matched_requests and not allow_incomplete_requests):
+                                             missing_requests - matched_requests - item_request_ids
+                                             and not allow_incomplete_requests):
                     raise ValueError('PC 대화 기록의 이전 요청 또는 분기 지점을 모두 확인하지 못했습니다.')
                 thread['_lookupTurns'] = matches
         _state(thread)
         return thread
 
-    def _codex(self, source, deadline, request_ids=(), turn_id=None):
+    def _codex(self, source, deadline, request_ids=(), turn_id=None, send_request_id=None):
         identity = _identity(source)
         rows = self.reader.database_rows(identity['id'])
         if len(rows) != 1 or rows[0].get('archived') or source.get('cwd') and wc._norm(source['cwd']) != wc._norm(rows[0]['cwd']):
@@ -601,7 +609,14 @@ class WindowsRuntime:
                         raise ValueError('PC 서버 전체 실행 목록을 확인하지 못했습니다.')
                     if identity['id'] not in loaded:
                         continue
-                    thread = self._thread(client, identity, rows[0]['cwd'], request_ids, turn_id)
+                    try:
+                        thread = self._thread(client, identity, rows[0]['cwd'], request_ids, turn_id)
+                    except wc.OversizedReply as error:
+                        if (send_request_id not in error.item_request_ids
+                                or wc._norm(error.thread_cwd) != wc._norm(rows[0]['cwd'])):
+                            raise
+                        # Keep the item evidence for the receipt after verifying the owning server.
+                        thread = {'_itemRequestIds': (send_request_id,)}
                 state = wc._json(path.parent / 'server-state.json', self.reader.codex_home)
                 process = self.reader.process_reader(state.get('server_pid'))
                 if not process:
@@ -1009,7 +1024,8 @@ class WindowsRuntime:
         elif action == 'receipt':
             request_ids = [args['requestId']]
         try:
-            observed = self._codex(source, time.monotonic() + 12, request_ids)
+            observed = self._codex(source, time.monotonic() + 12, request_ids,
+                                   send_request_id=args['requestId'] if action == 'send' else None)
         except (OSError, ValueError, TimeoutError):
             if action not in ('read', 'capabilities'):
                 raise
@@ -1232,15 +1248,32 @@ class WindowsRuntime:
                 if prior.get('digest') != digest or (prior.get('binding') is not None and prior['binding'] != binding):
                     raise ValueError('같은 요청 ID로 다른 메시지를 보낼 수 없습니다.')
                 return prior['result']
-            with self.proxy_factory(self.reader.binary, observed['path'], time.monotonic() + 10) as client:
+            thread = observed['thread']
+            connection = nullcontext() if 'turns' not in thread else self.proxy_factory(
+                self.reader.binary, observed['path'], time.monotonic() + 10)
+            with connection as client:
                 self._verify_endpoint(observed)
                 self._require_resume_verified(observed)
                 # The local receipt was checked under this lock above. An oversized remote
                 # history page may hide an old client ID; it must not block this new request.
-                thread = self._thread(client, identity, observed['cwd'], (request_id,),
-                                      allow_incomplete_requests=True)
+                seen_request_ids = set(thread.get('_itemRequestIds', ()))
+                if client is not None:
+                    try:
+                        thread = self._thread(client, identity, observed['cwd'], (request_id,),
+                                              allow_incomplete_requests=True, seen_request_ids=seen_request_ids)
+                    except wc.OversizedReply as error:
+                        if wc._norm(error.thread_cwd) == wc._norm(observed['cwd']):
+                            seen_request_ids.update(error.item_request_ids)
+                        if request_id not in seen_request_ids:
+                            raise
+                        thread = {}  # Item history identifies the request even when turn summaries fail.
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
+                    return before
+                # The item proves the request exists even when its delivery status is unavailable.
+                if request_id in seen_request_ids or request_id in thread.get('_itemRequestIds', ()):
+                    before = {**before, **named}
+                    self.store.save(name, {'digest': digest, 'binding': binding, 'result': before, **named})
                     return before
                 if args.get('requireIdle') is True and _state(thread)['phase'] != 'idle':
                     return {**before, 'delivery': 'rejected', 'reason': '해당 대화가 작업 중이어서 보내지 않았습니다.'}

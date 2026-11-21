@@ -647,6 +647,15 @@ class RpcReplyError(ValueError):
 class OversizedReply(ValueError):
     """A complete WebSocket response exceeded the bounded JSON size."""
 
+    item_request_ids = ()
+    thread_cwd = None
+
+
+class HistoryCursorRepeat(ValueError):
+    def __init__(self, matches):
+        super().__init__('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        self.matches = matches
+
 
 def _summary_items(turn):
     return [item for item in turn.get('items') or [] if isinstance(item, dict)]
@@ -690,6 +699,8 @@ def codex_recent_thread(server, thread_id):
         return result
     entries, cursor, method = [], None, 'thread/items/list'
     oversized_item = False
+    repeated_cursor = False
+    seen = set()
     try:
         for unused in range(HISTORY_PAGES):
             params = {'threadId': thread_id, 'limit': HISTORY_PAGE, 'sortDirection': 'desc'}
@@ -709,11 +720,18 @@ def codex_recent_thread(server, thread_id):
             cursor = page.get('nextCursor')
             if not cursor:
                 break
+            if isinstance(cursor, str):
+                if cursor in seen:
+                    repeated_cursor = True
+                    break
+                seen.add(cursor)
             edge = _codex_window_edge(entries)
             if edge and any(entry['turnId'] == edge and entry['item'].get('type') == 'userMessage' for entry in entries):
                 break
         items_cursor = cursor
         wanted = {entry['turnId'] for entry in entries}
+        item_request_ids = sorted({item['clientId'] for item in (entry['item'] for entry in entries)
+                                   if item.get('type') == 'userMessage' and isinstance(item.get('clientId'), str)})
         talk = sum(1 for entry in entries if _codex_conversation_item(entry['item']))
 
         def short(turns):
@@ -724,6 +742,7 @@ def codex_recent_thread(server, thread_id):
             return talk + sum(_summary_talk(turn) for turn in turns[last + 1:]) < MESSAGE_LIMIT
 
         turns, cursor, method = [], None, 'thread/turns/list'
+        seen.clear()
         for unused in range(HISTORY_PAGES):
             params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
                       'sortDirection': 'desc', 'itemsView': 'summary'}
@@ -731,19 +750,27 @@ def codex_recent_thread(server, thread_id):
                 params['cursor'] = cursor
             try:
                 page = server.call(method, params)
-            except OversizedReply:
+            except OversizedReply as error:
                 # The visible window is complete; a later status-only page must
                 # not make that already usable conversation unreadable.
                 if wanted <= {turn['id'] for turn in turns} and not short(turns):
                     break
+                error.item_request_ids = item_request_ids
+                error.thread_cwd = thread.get('cwd')
                 raise
             data = page.get('data') if isinstance(page, dict) else None
             if not isinstance(data, list) or any(not isinstance(turn, dict) or not isinstance(turn.get('id'), str) for turn in data):
                 raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
             turns.extend(data)
             cursor = page.get('nextCursor')
-            if not cursor or (len(turns) >= STATUS_TURN_LIMIT
-                              and {turn['id'] for turn in turns} >= wanted and not short(turns)):
+            if not cursor:
+                break
+            if isinstance(cursor, str):
+                if cursor in seen:
+                    repeated_cursor = True
+                    break
+                seen.add(cursor)
+            if len(turns) >= STATUS_TURN_LIMIT and {turn['id'] for turn in turns} >= wanted and not short(turns):
                 break
     except RpcReplyError as error:
         if error.code == -32601 or (error.code == -32600 and ('unknown variant `%s`' % method) in str(error)):
@@ -776,7 +803,8 @@ def codex_recent_thread(server, thread_id):
     thread['turns'] = list(reversed(kept + summarized))
     thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
                               for turn in reversed(turns)]
-    thread['olderUnread'] = oversized_item or bool(items_cursor) and (
+    thread['_itemRequestIds'] = item_request_ids
+    thread['olderUnread'] = oversized_item or repeated_cursor or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}
 
@@ -842,8 +870,10 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
             limit = HISTORY_PAGE
             if cursor is None:
                 return matches(), not (request_ids - set(found)) and (turn_id is None or found_turn is not None)
-            if not isinstance(cursor, str) or not cursor or cursor in seen:
+            if not isinstance(cursor, str) or not cursor:
                 raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+            if cursor in seen:
+                raise HistoryCursorRepeat(matches())
             seen.add(cursor)
             continue
         data = page.get('data') if isinstance(page, dict) else None
@@ -862,8 +892,10 @@ def codex_find_history(server, thread_id, request_ids=(), turn_id=None):
         cursor = page.get('nextCursor')
         if cursor is None:
             return matches(), not skipped_oversized
-        if not isinstance(cursor, str) or not cursor or cursor in seen:
+        if not isinstance(cursor, str) or not cursor:
             raise ValueError('PC 대화 기록의 다음 페이지를 확인하지 못했습니다.')
+        if cursor in seen:
+            raise HistoryCursorRepeat(matches())
         seen.add(cursor)
 
 

@@ -848,6 +848,69 @@ class WindowsCollectorTest(unittest.TestCase):
         self.assertEqual(result['messages'][-1]['turnId'], 'turn-1')
         self.assertEqual(result['messages'][-1]['messageId'], 'answer-1')
 
+    def test_recent_pages_stop_on_repeated_cursor_and_keep_partial_history(self):
+        for repeating in ('thread/items/list', 'thread/turns/list', None):
+            with self.subTest(repeating=repeating):
+                class OneRowProxy(FakeProxy):
+                    def call(self, method, params):
+                        if method in ('thread/items/list', 'thread/turns/list'):
+                            page = super().call(method, {**params, 'limit': 1})
+                            if method == repeating and params.get('cursor') == '1':
+                                page['nextCursor'] = '1'
+                            return page
+                        return super().call(method, params)
+
+                calls = []
+                thread = {'id': self.sid, 'turns': [
+                    {'id': 'older', 'status': 'completed', 'items': []},
+                    {'id': 'latest', 'status': 'completed', 'items': [
+                        {'type': 'userMessage', 'content': [{'type': 'text', 'text': '질문'}]},
+                        {'type': 'agentMessage', 'text': '답변'}]}]}
+                result = wc.codex_recent_thread(OneRowProxy([thread], calls), self.sid)['thread']
+                with self.subTest(check='cursor requests'):
+                    for method in ('thread/items/list', 'thread/turns/list'):
+                        cursors = [params.get('cursor') for name, params in calls if name == method]
+                        self.assertEqual((len(cursors), cursors[:2]), (2, [None, '1']), method)
+                with self.subTest(check='unique history'):
+                    self.assertEqual([turn['id'] for turn in result['_statusTurns']], ['older', 'latest'])
+                    items = [item for turn in result['turns'] for item in turn['items']]
+                    self.assertEqual([item['type'] for item in items], ['userMessage', 'agentMessage'])
+                self.assertIs(result['olderUnread'], repeating is not None)
+
+    def test_live_read_is_partial_when_turn_summary_cursor_repeats(self):
+        self.endpoint()
+
+        class RepeatingTurnProxy(FakeProxy):
+            def call(self, method, params):
+                if method != 'thread/turns/list':
+                    return super().call(method, params)
+                page = super().call(method, {**params, 'limit': 1})
+                if params.get('cursor') == '1':
+                    page['nextCursor'] = '1'
+                return page
+
+        self.reader.proxy_factory = lambda *args: RepeatingTurnProxy([self.live], self.calls)
+        for empty_recent_turns in (True, False):
+            with self.subTest(empty_recent_turns=empty_recent_turns):
+                self.calls.clear()
+                self.live['turns'] = [
+                    {'id': 'turn-%d' % i, 'status': 'completed', 'items': [
+                        {'type': 'userMessage', 'content': [{'type': 'text', 'text': '질문 %d' % i}]},
+                        {'type': 'agentMessage', 'text': '답변 %d' % i}]}
+                    for i in range(3)]
+                if empty_recent_turns:
+                    for turn in self.live['turns'][1:]:
+                        turn.update(status='interrupted', items=[])
+                result = self.reader.read('codex', self.sid, '.codex')
+                cursors = [params.get('cursor') for method, params in self.calls if method == 'thread/turns/list']
+                self.assertEqual(cursors, [None, '1'])
+                self.assertTrue(result['olderOmitted'])
+                expected = [(role, '%s %d' % (word, i), 'turn-%d' % i, 'completed')
+                            for i in (() if empty_recent_turns else (1, 2))
+                            for role, word in (('user', '질문'), ('assistant', '답변'))]
+                self.assertEqual([(row['role'], row['text'], row['turnId'], row.get('turnStatus'))
+                                  for row in result['messages']], expected)
+
     def test_live_read_falls_back_when_the_server_does_not_support_history_pages(self):
         self.endpoint()
         self.unsupported_pages = True
