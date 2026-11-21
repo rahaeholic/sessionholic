@@ -331,7 +331,10 @@
 .woni-work h3 { margin: 16px 4px 8px; color: var(--label-2); font-size: var(--fs-sub); font-weight: 600; }
 .woni-work > .woni-status { margin: 12px 4px; font-size: var(--fs-sub); }
 .woni-work .agent-group { margin-bottom: 8px; }
-.woni-work .agent-subtasks { display: flex; flex-wrap: wrap; gap: 0 4px; padding: 0 12px 8px 29px; }
+.woni-work .agent-subtasks { display: grid; gap: 0; padding: 0 12px 8px 29px; }
+/* The work view's own button look (accent link) must not dress the shared rows. */
+.woni-work button.agent-row { min-height: 52px; padding: 10px 12px; border-radius: 0; color: var(--label); font-size: var(--fs-body); }
+.woni-work .agent-subtasks button, .woni-work .agent-subtasks span { justify-self: stretch; min-height: 32px; padding: 4px 0; overflow: hidden; text-align: left; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-cap); }
 .woni-original { flex: none; max-height: 35%; overflow: auto; margin: 0 16px 8px; padding: 12px 14px; border-radius: var(--radius); background: var(--fill-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
 .woni-original strong { display: block; margin-bottom: 6px; }
 .woni-message-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
