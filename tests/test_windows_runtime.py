@@ -52,6 +52,7 @@ class FakeReader:
         self.oversized_turn_ids = set()
         self.turn_page_size = None
         self.item_page_delay = 0
+        self.repeat_item_cursor = False
         self.send_calls = 0
         self.mutate_hook = None
         self.resume_hook = None
@@ -119,12 +120,16 @@ class FakeReader:
                         raise wc.RpcReplyError('unknown variant `thread/items/list`', -32600)
                     if owner.item_page_delay:
                         time.sleep(owner.item_page_delay)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('synthetic proxy deadline expired')
                     data = [{'turnId': turn['id'], 'item': item} for turn in owner.thread.get('turns', [])
                             for item in turn.get('items', [])]
                     data.reverse()
                     start = int(params.get('cursor') or 0)
-                    end = start + params['limit']
+                    end = start + (1 if owner.repeat_item_cursor else params['limit'])
                     page = {'data': data[start:end], 'nextCursor': str(end) if end < len(data) else None}
+                    if owner.repeat_item_cursor and start == 1:
+                        page['nextCursor'] = '1'
                     if owner.large_page_response and len(json.dumps(page).encode()) > 8 * 1024 * 1024:
                         if params['limit'] <= 1:
                             raise wc.OversizedReply('synthetic app-server page exceeds 8 MiB')
@@ -290,6 +295,24 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(len(visible), 75)
         self.assertEqual(visible.count('중간 답변'), 25)
         self.assertFalse(result['olderOmitted'])
+
+    def test_delayed_repeated_item_cursor_leaves_time_to_send_once(self):
+        self.reader.thread['turns'] = [{'id': 'old-turn', 'status': 'completed', 'items': [
+            {'type': 'userMessage', 'clientId': 'old-request', 'content': [{'type': 'text', 'text': '과거 질문'}]},
+            {'type': 'reasoning', 'text': '숨김'},
+            {'type': 'agentMessage', 'text': '과거 답변'}]}]
+        self.reader.repeat_item_cursor = True
+        self.reader.item_page_delay = .035
+        elapsed = 0.0
+
+        def advance(seconds):
+            nonlocal elapsed
+            elapsed += seconds
+
+        with patch.object(time, 'monotonic', lambda: elapsed), patch.object(time, 'sleep', advance):
+            with self.subTest(check='confirmed'):
+                self.assertTrue(self.send()['confirmed'])
+        self.assertEqual(self.reader.send_calls, 1)
 
     def test_recent_state_retains_failed_turns_outside_the_message_window(self):
         self.reader.thread['turns'] = [

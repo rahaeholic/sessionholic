@@ -690,6 +690,8 @@ def codex_recent_thread(server, thread_id):
         return result
     entries, cursor, method = [], None, 'thread/items/list'
     oversized_item = False
+    repeated_cursor = False
+    seen = set()
     try:
         for unused in range(HISTORY_PAGES):
             params = {'threadId': thread_id, 'limit': HISTORY_PAGE, 'sortDirection': 'desc'}
@@ -709,6 +711,11 @@ def codex_recent_thread(server, thread_id):
             cursor = page.get('nextCursor')
             if not cursor:
                 break
+            if isinstance(cursor, str):
+                if cursor in seen:
+                    repeated_cursor = True
+                    break
+                seen.add(cursor)
             edge = _codex_window_edge(entries)
             if edge and any(entry['turnId'] == edge and entry['item'].get('type') == 'userMessage' for entry in entries):
                 break
@@ -724,6 +731,7 @@ def codex_recent_thread(server, thread_id):
             return talk + sum(_summary_talk(turn) for turn in turns[last + 1:]) < MESSAGE_LIMIT
 
         turns, cursor, method = [], None, 'thread/turns/list'
+        seen.clear()
         for unused in range(HISTORY_PAGES):
             params = {'threadId': thread_id, 'limit': HISTORY_PAGE,
                       'sortDirection': 'desc', 'itemsView': 'summary'}
@@ -742,8 +750,14 @@ def codex_recent_thread(server, thread_id):
                 raise ValueError('Codex turn 기록 형식이 올바르지 않습니다.')
             turns.extend(data)
             cursor = page.get('nextCursor')
-            if not cursor or (len(turns) >= STATUS_TURN_LIMIT
-                              and {turn['id'] for turn in turns} >= wanted and not short(turns)):
+            if not cursor:
+                break
+            if isinstance(cursor, str):
+                if cursor in seen:
+                    repeated_cursor = True
+                    break
+                seen.add(cursor)
+            if len(turns) >= STATUS_TURN_LIMIT and {turn['id'] for turn in turns} >= wanted and not short(turns):
                 break
     except RpcReplyError as error:
         if error.code == -32601 or (error.code == -32600 and ('unknown variant `%s`' % method) in str(error)):
@@ -776,7 +790,7 @@ def codex_recent_thread(server, thread_id):
     thread['turns'] = list(reversed(kept + summarized))
     thread['_statusTurns'] = [{'id': turn['id'], 'status': turn.get('status')}
                               for turn in reversed(turns)]
-    thread['olderUnread'] = oversized_item or bool(items_cursor) and (
+    thread['olderUnread'] = oversized_item or repeated_cursor or bool(items_cursor) and (
         len(entries) >= ROW_LIMIT or not (cursor is None and len(summarized) == len(turns) - (last + 1)))
     return {**result, 'thread': thread}
 
