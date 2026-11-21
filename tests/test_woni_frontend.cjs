@@ -20,15 +20,16 @@ function fixture(call, storage = new Map(), host = undefined, extra = {}) {
       showModal() { this.open = true; },
       close() { this.open = false; this.listeners.close?.(); } };
   }
-  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
+  for (const id of ['woni-dialog', 'woni-open', 'woni-unread', 'woni-input', 'woni-messages', 'woni-status', 'woni-form', 'woni-close', 'woni-files', 'woni-attach', 'woni-attachments', 'woni-send', 'woni-mic', 'woni-chat-tab', 'woni-work-tab', 'woni-work', 'woni-filter', 'woni-filter-label', 'woni-filter-clear', 'woni-reply', 'woni-reply-label', 'woni-reply-clear', 'woni-reply-suggestions', 'woni-original', 'woni-tasks-tab', 'woni-tasks-badge', 'woni-notes-tab', 'woni-tasks', 'woni-notes', 'woni-notice', 'woni-find', 'woni-find-open', 'woni-quick', 'woni-quick-options', 'woni-side', 'woni-main', 'woni-menu', 'woni-scrim']) nodes[id] = element();
+  nodes['woni-quick-options'].hidden = true;
   nodes['woni-form'].submit = element();
-  const context = { document: { getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
+  const context = { document: { ...element(), getElementById: id => nodes[id], createElement: element }, window: { RyanOneHost: host },
     crypto: { randomUUID: () => 'request-123456' }, sessionStorage: {
       getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
     setTimeout: (fn, ms) => { timers.set(++timerId, fn); delays.set(timerId, ms); return timerId; }, clearTimeout: id => { timers.delete(id); }, AbortController, URLSearchParams, CSS: { escape: value => value }, ...extra };
   vm.runInNewContext(fs.readFileSync('web/woni.js', 'utf8'), context);
   const tick = async () => { const waiting = [...timers.values()]; timers.clear(); for (const fn of waiting) await fn(); };
-  return { nodes, storage, app: context.window.SessionholicWoni, call, tick, delays };
+  return { nodes, storage, app: context.window.SessionholicWoni, call, tick, delays, document: context.document, waiting: () => [...timers.keys()].map(id => delays.get(id)) };
 }
 
 test('원이 창을 열면 기존 초안을 유지하며 채팅 입력창에 포커스한다', async () => {
@@ -136,6 +137,50 @@ test('닷츠처럼 원이 말에는 이름·시각을 달지 않고 날짜와 �
   // 말풍선 속 링크·버튼을 누른 것은 메뉴를 열지 않는다.
   answer.listeners.click({ target: { closest: () => ({}) } });
   assert.equal(list().some(node => node.className?.includes('is-open')), false);
+});
+
+test('닫힌 보드는 대기 중 30초, 진행 중 6초, 열린 창은 4초짜리 타이머 하나만 둔다', async () => {
+  let reads = 0, chats = [];
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    if (url === '/api/woni') reads++;
+    return { chats, activity: {}, items: [] };
+  };
+  const { app, nodes, waiting, tick } = fixture(call);
+  await app.check(call); await new Promise(setImmediate);
+  assert.equal(reads, 1);
+  assert.deepEqual(waiting(), [30000]);
+  chats = [{ id: 'active', status: 'queued' }];
+  await tick();
+  assert.deepEqual(waiting(), [6000]);
+  nodes['woni-open'].click(); await new Promise(setImmediate);
+  assert.deepEqual(waiting(), [4000]);
+  nodes['woni-close'].click();
+  assert.equal(reads, 3);
+  assert.deepEqual(waiting(), [6000]);
+  chats = []; await tick();
+  assert.deepEqual(waiting(), [30000]);
+});
+
+test('숨긴 탭은 진행 중 조회가 끝나도 멈추고 복귀 시 한 번 갱신하며 잠금 뒤에는 쉬어 간다', async () => {
+  let reads = 0, finish;
+  const call = async url => {
+    if (url.includes('availability')) return { enabled: true };
+    reads++;
+    return new Promise(resolve => { finish = () => resolve({ chats: [], activity: {} }); });
+  };
+  const { app, document, waiting, tick } = fixture(call);
+  const visibility = hidden => { document.hidden = hidden; document.listeners.visibilitychange(); };
+  document.hidden = true;
+  await app.check(call); assert.equal(reads, 0);
+  visibility(false); assert.equal(reads, 1);
+  visibility(true); finish(); await new Promise(setImmediate);
+  assert.deepEqual(waiting(), []);
+  await tick(); assert.equal(reads, 1);
+  visibility(false); assert.equal(reads, 2);
+  finish(); await new Promise(setImmediate); assert.deepEqual(waiting(), [30000]);
+  visibility(true); assert.deepEqual(waiting(), []);
+  app.lock(); visibility(false); await tick(); assert.equal(reads, 2);
 });
 
 test('팝업을 닫아도 새 답변 배지를 표시하고 확인하면 지운다', async () => {
@@ -1659,4 +1704,27 @@ test('실패·중단 줄은 원이가 쓴 안내를 그대로 보이고, 다시 
   assert.deepEqual(boxes.map(textOf), ['다시 보냈어요. 아래 답을 확인해 주세요.', '다시 보내기']);
   await boxes[1].children[0].click(); await settle();
   assert.deepEqual(sent, [{ text: '근본원인부터 해결해줘', requestId: 'request-123456', retryOf: 'stop', attachments: ['20261111-abcdefabcdef'], replyTo: { id: 'done', part: 'answer' } }]);
+});
+
+test('빠른 답장은 공유 문구를 한 번만 보내고 작성 중인 글을 유지한다', async () => {
+  const sent = [];
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST' && url === '/api/woni') sent.push(options.body.text);
+    return { chats: [], activity: {} };
+  };
+  const { nodes, app } = fixture(call, new Map(), undefined, { quickReplies: () => ['내가 저장한 문구'] });
+  await app.check(call);
+  nodes['woni-open'].click();
+  nodes['woni-input'].value = '내가 저장한 문구';
+  nodes['woni-quick'].click();
+  const options = nodes['woni-quick-options'];
+  assert.equal(options.hidden, false);
+  const choice = options.children[0];
+  assert.equal(choice.textContent, '내가 저장한 문구');
+  await choice.click();
+  await choice.click();
+  assert.deepEqual(sent, ['내가 저장한 문구']);
+  assert.equal(nodes['woni-input'].value, '내가 저장한 문구');
+  assert.equal(options.hidden, true);
 });
