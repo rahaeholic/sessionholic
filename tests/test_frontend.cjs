@@ -3999,6 +3999,20 @@ test('recent cards give project and full task separate priority while retaining 
   assert.equal(s.title, title); assert.equal(s.cwd, '/Users/example/work/service');
 });
 
+test('folder hints count distinct nonempty paths within the same project', () => {
+  const c = client(undefined, noChatTimers);
+  const hints = vm.runInContext('cardFolderHints', c.context);
+  const row = (key, cwd, project = 'repo') => ({ key, cwd, project });
+  const shared = [row('a', '/work/team/repo'), row('b', '/work/team/repo'), row('empty', ''),
+    row('other', '/another/team/repo', 'Other')];
+  assert.deepEqual([...hints(shared).values()].sort(), ['', '', '', 'team / repo']);
+  const peers = hints([...shared, row('short', '/team/repo'), row('long', '/else/team/repo')]);
+  assert.equal(peers.get('a'), 'work / team / repo');
+  assert.equal(peers.get('b'), peers.get('a'));
+  assert.equal(peers.get('short'), 'team / repo');
+  assert.equal(peers.get('long'), 'else / team / repo');
+});
+
 test('recent cards expose only disambiguating folder suffixes, handle home and missing project labels honestly, and search actual cwd', () => {
   const c = client(undefined, noChatTimers);
   const rows = [
@@ -4589,9 +4603,12 @@ test('a message cut at the server limit says so and copies as a visible part onl
 test('pull to refresh reloads the board once and never overlaps a running refresh', async () => {
   const requests = [];
   let release;
-  const c = client(async (url) => {
+  const c = client(async (url, options) => {
     requests.push(url);
-    if (url === '/api/refresh') await new Promise((resolve) => { release = resolve; });
+    if (url === '/api/refresh') {
+      assert.deepEqual(JSON.parse(options.body), { snapshot: false });
+      await new Promise((resolve) => { release = resolve; });
+    }
     return { ok: true, status: 200, json: async () => ({ ok: true, hosts: [], terminals: [] }) };
   }, { setTimeout: (callback, delay) => (delay === 700 ? setImmediate(callback) : 1), clearTimeout() {} });
   c.state.authenticated = true;
@@ -11580,7 +11597,7 @@ test('offline recovery rechecks only its host once and never resumes from a cach
   assert.equal(c.get('chat-recover').textContent, '기기 연결 다시 확인');
   assert.equal(c.chatSupported(entry), false); assert.equal(c.get('chat-send').disabled, true);
   const pending = c.get('chat-recover').events.click(); await c.get('chat-recover').events.click();
-  assert.deepEqual(calls, [{ url: '/api/refresh', body: { host: s.host } }]);
+  assert.deepEqual(calls, [{ url: '/api/refresh', body: { host: s.host, snapshot: false } }]);
   resolveRefresh({ ok: true, status: 200, json: async () => ({ ok: true }) }); await pending;
   assert.equal(entry.text, '연결 후 보낼 초안'); assert.equal(calls.length, 1);
   c.state.offline = true; await c.recoverChatSession(s); assert.equal(calls.length, 1);

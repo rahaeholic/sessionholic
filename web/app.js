@@ -2748,19 +2748,37 @@ function cardFolderParts(s) {
   return parts.length ? parts : ["홈 폴더"];
 }
 function cardFolderHints(shown) {
-  const folders = shown.map((s) => ({ s, project: cardProject(s), parts: cardFolderParts(s), cwd: cardLine(s.cwd) }));
   const hints = new Map();
-  const suffix = (parts, depth) => parts.slice(-depth).join(" / ");
-  for (const folder of folders) {
-    const { s, project, parts, cwd } = folder;
-    if (!parts.length) { hints.set(s.key, ""); continue; }
-    const peers = folders.filter((other) => other.project === project && other.cwd !== cwd && other.parts.length);
-    if (!peers.length && parts.at(-1).toLocaleLowerCase() === project.toLocaleLowerCase()) {
-      hints.set(s.key, ""); continue;
+  const projects = new Map();
+  for (const session of shown) {
+    const project = cardProject(session), cwd = cardLine(session.cwd);
+    if (!projects.has(project)) projects.set(project, new Map());
+    const folders = projects.get(project);
+    if (!folders.has(cwd)) folders.set(cwd, { parts: cardFolderParts(session), keys: [] });
+    folders.get(cwd).keys.push(session.key);
+  }
+  for (const [project, folders] of projects) {
+    const paths = [...folders.values()].filter(({ parts }) => parts.length);
+    const counts = new Map();
+    if (paths.length > 1) {
+      // Count each distinct folder once, even when many cards share it.
+      for (const { parts } of paths) {
+        let suffix = parts.at(-1);
+        for (let i = parts.length - 2; i >= 0; i--) {
+          suffix = parts[i] + " / " + suffix;
+          counts.set(suffix, (counts.get(suffix) || 0) + 1);
+        }
+      }
     }
-    let depth = Math.min(2, parts.length);
-    while (depth < parts.length && peers.some((other) => suffix(other.parts, depth) === suffix(parts, depth))) depth++;
-    hints.set(s.key, suffix(parts, depth));
+    for (const { parts, keys } of folders.values()) {
+      let hint = "";
+      if (parts.length && (paths.length > 1 || parts.at(-1).toLocaleLowerCase() !== project.toLocaleLowerCase())) {
+        hint = parts.slice(-2).join(" / ");
+        for (let i = parts.length - 3; i >= 0 && counts.get(hint) > 1; i--)
+          hint = parts[i] + " / " + hint;
+      }
+      for (const key of keys) hints.set(key, hint);
+    }
   }
   return hints;
 }
@@ -2785,7 +2803,8 @@ function recentOrder(a, b) {
   return openedAt(b) - openedAt(a) || (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0) || titleOrder(a, b);
 }
 function placeChildren(parent, desired) {
-  for (const child of [...parent.children]) if (!desired.includes(child)) parent.removeChild(child);
+  const retained = new Set(desired);
+  for (const child of [...parent.children]) if (!retained.has(child)) parent.removeChild(child);
   for (let index = 0; index < desired.length; index++)
     if (parent.children[index] !== desired[index]) parent.insertBefore(desired[index], parent.children[index] || null);
 }
@@ -2809,10 +2828,16 @@ function renderGroups(shown, now) {
   const folders = cardFolderHints(shown);
   const desired = [];
   const visible = new Set();
-  for (const group of [{ key: "favorites", label: "★ 즐겨찾기", tone: "gray" }, ...GROUPS]) {
-    const items = shown.filter((s) => group.key === "favorites" ? sessionPinned(s) : !sessionPinned(s) && groupOf(s, now) === group.key)
-      .sort(group.key === "rest" ? recentOrder : titleOrder);
+  const groups = [{ key: "favorites", label: "★ 즐겨찾기", tone: "gray" }, ...GROUPS];
+  const byGroup = new Map(groups.map(({ key }) => [key, []]));
+  for (const session of shown) {
+    const key = sessionPinned(session) ? "favorites" : groupOf(session, now);
+    byGroup.get(key).push(session);
+  }
+  for (const group of groups) {
+    const items = byGroup.get(group.key);
     if (!items.length) continue;
+    items.sort(group.key === "rest" ? recentOrder : titleOrder);
     let section = sections.get(group.key);
     if (!section) {
       section = el("section", "group");
@@ -10070,7 +10095,7 @@ async function recoverChatSession(s) {
   entry.error = "";
   updateChatComposer(entry);
   try {
-    await api("/api/refresh", { method: "POST", body: { host: s.host }, authEpoch });
+    await api("/api/refresh", { method: "POST", body: { host: s.host, snapshot: false }, authEpoch });
     assertAuthEpoch(authEpoch);
     await poll(false);
     assertAuthEpoch(authEpoch);
@@ -15559,7 +15584,7 @@ async function manualRefreshOnce() {
     if (!state.csrf) await loadCapabilities(authEpoch);
     assertAuthEpoch(authEpoch);
     state.refreshDeadline = Date.now() + 60000;
-    await api("/api/refresh", { method: "POST", body: {}, authEpoch });
+    await api("/api/refresh", { method: "POST", body: { snapshot: false }, authEpoch });
     assertAuthEpoch(authEpoch);
     state.detailUpdatedAt = null;
     await loadCapabilities(authEpoch);

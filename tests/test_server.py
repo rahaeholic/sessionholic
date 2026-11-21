@@ -185,6 +185,16 @@ class ServerTest(unittest.TestCase):
             finally:
                 restarted.server_close()
 
+    def test_refresh_acknowledgement_skips_the_snapshot_and_validates_the_host(self):
+        cookie, csrf = self.csrf_session()
+        with patch.object(self.board, "request_refresh", wraps=self.board.request_refresh) as refresh, \
+                patch.object(self.httpd.snapshot_responses, "body", side_effect=AssertionError("unused snapshot")):
+            res, body = self.post_json("/api/refresh", {"host": "remote", "snapshot": False}, cookie, csrf)
+            self.assertEqual((res.status, json.loads(body)), (200, {"ok": True}))
+            refresh.assert_called_once_with("remote", force=True)
+            res, _ = self.post_json("/api/refresh", {"host": "missing", "snapshot": False}, cookie, csrf)
+            self.assertEqual(res.status, 400)
+
     def test_refresh_host_must_be_a_string(self):
         cookie, csrf = self.csrf_session()
         for host in (["remote"], 5, {"name": "remote"}):
@@ -543,7 +553,9 @@ class BoardVersionTest(unittest.TestCase):
         self.assertEqual(board.snapshot()["version"], 2)
         self.assertEqual(seen, [1, 2])
         board.snapshot()
-        self.assertFalse(board.request_refresh())
+        with patch.object(board, "state_signature", wraps=board.state_signature) as signature:
+            self.assertFalse(board.request_refresh())
+            signature.assert_not_called()
         self.assertEqual((board.version, seen), (2, [1, 2]))
         board.runner = lambda host, args, timeout: (_ for _ in ()).throw(RuntimeError("SSH 연결 실패"))
         self.assertFalse(board.poll(HOSTS[0]))

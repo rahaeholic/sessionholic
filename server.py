@@ -1309,7 +1309,8 @@ class Board:
                     continue
                 row["refreshing"] = True
                 queued.append(host)
-            self.changed()
+            if queued:
+                self.changed()
         asked = [stream for stream in asked if stream.send(b"refresh\n", wait=True)]
         self.start_polls(queued, full=force)
         return bool(queued or asked)
@@ -4291,6 +4292,8 @@ class Handler(BaseHTTPRequestHandler):
                 if host is not None and not isinstance(host, str):
                     raise ValueError("기기 이름 형식이 올바르지 않습니다.")
                 self.server.board.request_refresh(host, force=True)
+                if data.get("snapshot") is False:
+                    return self.send_json(200, {"ok": True})
                 return self.send_snapshot()
             if path == "/api/usage/refresh" and self.server.usage is not None:
                 return self.send_json(200, self.server.usage.snapshot(force=True))
