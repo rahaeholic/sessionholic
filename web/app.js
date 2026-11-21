@@ -1181,7 +1181,7 @@ function assertAuthEpoch(epoch) {
   throw err;
 }
 function beginAuthEpoch() {
-  usageSamples.clear();
+  state.usageSamples?.clear();
   state.authEpoch++;
   clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
   state.runtimeObservations.clear(); state.runtimeClock = null;
@@ -1896,9 +1896,9 @@ function kstShort(iso) {
   return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
 // Compare fresh readings of the same Codex subscription window in this login.
-const usageSamples = new Map();
 function usageForecast(provider, row, window, at) {
   if (provider.id !== "codex") return "";
+  const usageSamples = state.usageSamples ||= new Map();
   const key = JSON.stringify([provider.id, row.name, window.label]);
   const reset = Date.parse(window.resetsAt) / 1000;
   const left = window.remaining, now = Date.now() / 1000;
@@ -1923,7 +1923,7 @@ function renderUsage(data) {
   if (!box) return;
   const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
   if (!providers.length) {
-    usageSamples.clear();
+    state.usageSamples?.clear();
     box.hidden = true;
     box.dataset.revision = "";
     if ($("usage-dialog")?.open) closeSheet("usage-dialog");
