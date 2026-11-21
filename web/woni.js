@@ -150,10 +150,10 @@
   // target: the Woni answer being replied to. A suggestion tapped while replying to that answer goes as a reply to it.
   async function sendSuggestion(text, target = null) {
     if (pending || sending || uploading) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
-    const reply = target?.part === "answer" ? { id: target.id, part: "answer" } : null;
+    const reply = target ? { id: target.id, part: target.part } : null;
     savePending({ text, requestId: crypto.randomUUID(), ...(reply ? { replyTo: reply } : {}) });
     // The reply bar closes only when it was on this answer; a bar on another message stays for the composer.
-    if (reply && replyTarget?.id === reply.id && replyTarget.part === "answer") replyBox.hidden = true;
+    if (reply && replyTarget?.id === reply.id && replyTarget.part === reply.part) replyBox.hidden = true;
     leaveStream();
     const result = sendPending(); messages.scrollTop = messages.scrollHeight;
     await result;
@@ -294,7 +294,7 @@
     for (const [tab, name] of [[chatTab, "chat"], [tasksTab, "tasks"], [notesTab, "notes"], [workTab, "work"], [findOpen, "find"]]) tab.setAttribute("aria-pressed", String(value === name));
     original.hidden = true;
     if (isChat && dialog.open) markVisibleRead();
-    if (value === "work") { renderWork(); clearTimeout(timer); refresh(); }
+    if (value === "work") { renderWork(); refresh(); }
     if (value === "tasks") { renderTasks(); loadTasks(); }
     if (value === "notes") { renderNotes(); if (!notes && !notesLoading) loadNotes(); }
     if (value === "find") { renderFind(); loadStreams(); }
@@ -427,6 +427,7 @@
     });
     filesBox.replaceChildren(...nodes);
     filesBox.hidden = !!pending || !nodes.length;
+    quick.disabled = !!pending || sending || uploading;
     attach.disabled = !!pending || attachments.length >= maxFiles;
     send.disabled = sending || uploading || !!pending;
     send.textContent = sending ? "전송 중…" : pending ? (pendingState === "uncertain" ? "전송 확인 필요" : "확인 중…") : "보내기";
@@ -1387,7 +1388,7 @@
   }
   function reloadAll() {
     closeDrawer();
-    clearTimeout(timer); refresh(); loadStreams();
+    refresh(); loadStreams();
     if (view === "tasks") loadTasks();
     if (view === "notes" && !note) loadNotes();
     notify("새로 불러오고 있어요.");
@@ -1531,11 +1532,18 @@
       status.textContent = "다시 보냈는지 확인하지 못했어요. 잠시 뒤 목록을 확인해 주세요.";
     } finally {
       resending.delete(chat.id); if (button) button.disabled = false;
-      clearTimeout(timer); refresh();
+      refresh();
     }
   }
+  function scheduleRefresh(immediate = false) {
+    clearTimeout(timer);
+    if (!enabled || document.hidden || reading) return;
+    const delay = dialog.open ? 4000 : runKey ? 6000 : 30000;
+    timer = setTimeout(refresh, immediate ? 0 : delay);
+  }
   async function refresh() {
-    if (!enabled || reading || !api) return;
+    clearTimeout(timer);
+    if (!enabled || document.hidden || reading || !api) return;
     reading = true; const current = authEpoch;
     try {
       const data = await api("/api/woni");
@@ -1545,7 +1553,7 @@
       if (left.length) olderChats = mergeChats(olderChats, left);
       latestData = data; observeReplies(data);
       const key = runningKey(data?.chats), started = key !== runKey; runKey = key;
-      if (dialog.open) {
+      if (dialog.open && !document.hidden) {
         show(data);
         // The to-do list is read when its tab opens and every 30 seconds while it stays open.
         if (view === "tasks" && Date.now() - tasksAt >= 30000) loadTasks();
@@ -1558,7 +1566,7 @@
           else showOriginal(id);
         }
       }
-      if (current === authEpoch && dialog.open && view === "work") {
+      if (current === authEpoch && dialog.open && !document.hidden && view === "work") {
         try {
           const result = await api("/api/woni/activity");
           if (current === authEpoch && dialog.open) { workData = result; workError = ""; }
@@ -1572,9 +1580,10 @@
       }
     } finally {
       reading = false;
-      if (enabled) timer = setTimeout(refresh, current === authEpoch ? (dialog.open ? 4000 : 6000) : 0);
+      scheduleRefresh(current !== authEpoch);
     }
   }
+  document.addEventListener("visibilitychange", refresh);
   open.addEventListener("click", () => {
     if (dialog.open) { setView("chat"); markVisibleRead(); return; }
     pending = savedPending();
@@ -1602,7 +1611,7 @@
     refresh();
   });
   $("woni-close").addEventListener("click", () => dialog.close());
-  dialog.addEventListener("close", () => { closeDrawer(false); clearTimeout(timer); services.voice?.stop(input); epoch++; if (enabled) refresh(); });
+  dialog.addEventListener("close", () => { closeQuick(); closeDrawer(false); services.voice?.stop(input); epoch++; scheduleRefresh(); });
   chatTab.addEventListener("click", () => setView("chat"));
   workTab.addEventListener("click", () => setView("work"));
   tasksTab.addEventListener("click", () => setView("tasks"));
@@ -1628,6 +1637,25 @@
   $("woni-reply-clear").addEventListener("click", () => {
     if (pending) { status.textContent = "이전 메시지의 전송 여부를 먼저 확인해 주세요."; return; }
     replyTarget = null; replyBox.hidden = true; renderReplyPicks();
+  });
+  const quick = $("woni-quick"), quickOptions = $("woni-quick-options");
+  function closeQuick() {
+    quickOptions.hidden = true;
+    quickOptions.replaceChildren();
+    quick.setAttribute("aria-expanded", "false");
+  }
+  quick.addEventListener("click", () => {
+    if (!quickOptions.hidden) { closeQuick(); return; }
+    const replies = quickReplies();
+    quickOptions.replaceChildren(...replies.map((text) => action(text, () => {
+      closeQuick();
+      quick.focus();
+      return sendSuggestion(text, replyTarget);
+    })));
+    if (!replies.length) quickOptions.append(el("span", "", "하던일 설정에서 문구를 추가해 주세요."));
+    quickOptions.hidden = false;
+    quick.setAttribute("aria-expanded", "true");
+    quickOptions.querySelector("button")?.focus();
   });
   attach.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { addFiles(fileInput.files); fileInput.value = ""; });
@@ -1667,7 +1695,7 @@
       if (current === authEpoch) {
         sending = false; renderAttachments();
         if (dialog.open) show(latestData || { chats: [], activity: {} });
-        clearTimeout(timer); refresh();
+        refresh();
       }
     }
   }
@@ -1700,7 +1728,7 @@
     openFromNotification(id) {
       if (typeof id !== "string" || !/^[A-Za-z0-9_-]{1,100}$/.test(id)) return false;
       focusId = id; leaveStream();
-      if (enabled) { open.click(); clearTimeout(timer); refresh(); }
+      if (enabled) { open.click(); refresh(); }
       return true;
     },
     lock() {

@@ -265,6 +265,8 @@ def local_call(data=None, home=None, operation="state", query=None):
         request = Request("http://127.0.0.1:18772/v1/" + WRITE_PATHS[operation], data=body, headers=headers)
     else:
         url = "http://127.0.0.1:18772/v1/" + ("state" if operation == "tasks" else operation)
+        if operation == "state":
+            query = {"view": "chat"}
         request = Request(url + ("?" + urlencode(query) if query else ""), headers=headers)
     try:
         with urlopen(request, timeout=15) as response:
