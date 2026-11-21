@@ -6174,7 +6174,9 @@ test('the machines chip says how many answer and the sheet shows each one\'s CPU
 
 test('usage forecast needs fresh comparable readings and expires at a window change', () => {
   const c = client(undefined, noChatTimers);
+  const base = Math.floor(Date.now() / 1000) - 2400;
   function read(at, left, reset, status = 'ready') {
+    at += base; reset += base;
     c.renderUsage({ available: true, fetchedAt: at, providers: [{ id: 'codex', status,
       rows: [{ name: 'fixture', status, windows: [{ label: '5시간', remaining: left, resetsAt: new Date(reset * 1000).toISOString() }] }] }] });
     return textOf(c.get('usage-body'));

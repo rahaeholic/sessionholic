@@ -1901,9 +1901,9 @@ function usageForecast(provider, row, window, at) {
   if (provider.id !== "codex") return "";
   const key = JSON.stringify([provider.id, row.name, window.label]);
   const reset = Date.parse(window.resetsAt) / 1000;
-  const left = window.remaining;
+  const left = window.remaining, now = Date.now() / 1000;
   if (provider.status !== "ready" || row.status !== "ready" || !Number.isFinite(at) ||
-      !Number.isFinite(left) || left <= 0 || left > 100 || !(reset > at)) {
+      !Number.isFinite(left) || left <= 0 || left > 100 || !(reset > Math.max(at, now)) || now - at > 1800) {
     usageSamples.delete(key);
     return "";
   }
