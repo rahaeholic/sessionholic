@@ -550,29 +550,48 @@ class WindowsRuntimeTest(unittest.TestCase):
         self.assertEqual(forks, [old_turn['id']])
 
     def test_repeated_cursor_does_not_resend_request_with_oversized_turn_summary(self):
-        request_id = 'request-old'
         request_text = 'x' * 8192
-        old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
-            {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
-            {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
-        self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
-                                       {'id': 'latest', 'status': 'interrupted', 'items': []}]
         self.reader.turn_page_size = 1
-        self.reader.turn_cursor_repeats = 1
         self.reader.large_page_response = True
         self.reader.oversized_turn_ids = {'old-turn'}
-        self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
 
-        result = self.send(request=request_id, text=request_text)
+        def proxy(*args):
+            client = self.reader.proxy(*args)
+            if first_connection_only:
+                self.reader.turn_cursor_repeats = 0
+            return client
 
-        self.assertEqual(self.reader.send_calls, 0)
-        self.assertEqual([turn['id'] for turn in self.reader.thread['turns']], ['old-turn', 'middle', 'latest'])
-        self.assertEqual((result['delivery'], result['confirmed'], result['canRetry']), ('unknown', False, False))
-        self.assertTrue(any(method == 'thread/turns/list' and params.get('itemsView') == 'notLoaded'
-                            for method, params in self.reader.calls))
-        self.reader.thread['turns'] = []
-        self.assertEqual(self.send(request=request_id, text=request_text), result)
-        self.assertEqual(self.reader.send_calls, 0)
+        self.runtime.proxy_factory = proxy
+        for first_connection_only in (False, True):
+            with self.subTest(first_connection_only=first_connection_only):
+                request_id = f'request-old-{int(first_connection_only)}'
+                old_turn = {'id': 'old-turn', 'status': 'completed', 'items': [
+                    {'type': 'userMessage', 'clientId': request_id, 'content': [{'type': 'text', 'text': request_text}]},
+                    {'type': 'agentMessage', 'text': 'a' * (8 * 1024 * 1024 - 4096)}]}
+                self.reader.thread['turns'] = [old_turn, {'id': 'middle', 'status': 'interrupted', 'items': []},
+                                               {'id': 'latest', 'status': 'interrupted', 'items': []}]
+                self.reader.turn_cursor_repeats = 1
+                self.reader.calls.clear()
+                self.assertGreater(len(json.dumps({'data': [old_turn], 'nextCursor': None}).encode()), 8 * 1024 * 1024)
+
+                result = self.send(request=request_id, text=request_text)
+
+                self.assertEqual(self.reader.send_calls, 0)
+                self.assertEqual((result['delivery'], result['confirmed'], result['canRetry']), ('unknown', False, False))
+                not_loaded = any(method == 'thread/turns/list' and params.get('itemsView') == 'notLoaded'
+                                 for method, params in self.reader.calls)
+                self.assertIs(not_loaded, not first_connection_only)
+                self.reader.thread['turns'].extend(
+                    {'id': f'new-{i}', 'status': 'completed', 'items': [{'type': 'userMessage',
+                     'content': [{'type': 'text', 'text': '새 질문'}]}]} for i in range(wc.HISTORY_PAGE))
+                self.assertEqual(self.send(request=request_id, text=request_text), result)
+                self.assertEqual(self.reader.send_calls, 0)
+                if first_connection_only:
+                    del self.reader.thread['turns'][3:]
+                    self.reader.turn_cursor_repeats = 1
+                    with self.assertRaises(wc.OversizedReply):
+                        self.send(request='request-unseen', text='새 질문')
+                    self.assertEqual(self.reader.send_calls, 0)
 
     def test_repeated_history_cursor_keeps_seen_request_unconfirmed(self):
         self.reader.turn_page_size = 1

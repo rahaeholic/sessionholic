@@ -1246,8 +1246,13 @@ class WindowsRuntime:
                 # The local receipt was checked under this lock above. An oversized remote
                 # history page may hide an old client ID; it must not block this new request.
                 seen_request_ids = observed['thread'].get('_itemRequestIds', ())
-                thread = self._thread(client, identity, observed['cwd'], (request_id,),
-                                      allow_incomplete_requests=True, seen_request_ids=seen_request_ids)
+                try:
+                    thread = self._thread(client, identity, observed['cwd'], (request_id,),
+                                          allow_incomplete_requests=True, seen_request_ids=seen_request_ids)
+                except wc.OversizedReply:
+                    if request_id not in seen_request_ids:
+                        raise
+                    thread = {}  # The first read identified the request, but readback cannot confirm its status.
                 before = _receipt(identity, request_id, thread)
                 if before['confirmed']:
                     return before
