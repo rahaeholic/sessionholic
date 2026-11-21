@@ -1181,6 +1181,7 @@ function assertAuthEpoch(epoch) {
   throw err;
 }
 function beginAuthEpoch() {
+  usageSamples.clear();
   state.authEpoch++;
   clearTimeout(state.runtimeExpiryTimer); state.runtimeExpiryTimer = null;
   state.runtimeObservations.clear(); state.runtimeClock = null;
@@ -1894,11 +1895,35 @@ function kstShort(iso) {
   const pad = (value) => String(value).padStart(2, "0");
   return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
 }
+// Compare fresh readings of the same Codex subscription window in this login.
+const usageSamples = new Map();
+function usageForecast(provider, row, window, at) {
+  if (provider.id !== "codex") return "";
+  const key = JSON.stringify([provider.id, row.name, window.label]);
+  const reset = Date.parse(window.resetsAt) / 1000;
+  const left = window.remaining;
+  if (provider.status !== "ready" || row.status !== "ready" || !Number.isFinite(at) ||
+      !Number.isFinite(left) || left <= 0 || left > 100 || !(reset > at)) {
+    usageSamples.delete(key);
+    return "";
+  }
+  let sample = usageSamples.get(key);
+  if (!sample || reset !== sample.reset || at < sample.at || left > sample.lastLeft || at - sample.at > 7200) {
+    usageSamples.set(key, { at, reset, left, lastLeft: left });
+    return "";
+  }
+  sample.lastLeft = left;
+  const elapsed = at - sample.at, spent = sample.left - left;
+  if (elapsed < 300 || spent <= 0) return "";
+  const exhausted = at + elapsed * left / spent;
+  return exhausted < reset ? `현재 속도라면 ${kstShort(new Date(exhausted * 1000).toISOString())} 소진 예상` : "";
+}
 function renderUsage(data) {
   const box = $("usage");
   if (!box) return;
   const providers = data?.available && Array.isArray(data.providers) ? data.providers.filter((item) => item && typeof item === "object") : [];
   if (!providers.length) {
+    usageSamples.clear();
     box.hidden = true;
     box.dataset.revision = "";
     if ($("usage-dialog")?.open) closeSheet("usage-dialog");
@@ -1943,6 +1968,8 @@ function renderUsage(data) {
           el("span", "usage-window-value", remaining === null ? "—" : `${remaining}%`),
           el("span", "usage-window-reset", reset ? `${reset} 초기화` : ""));
         item.append(line);
+        const forecast = usageForecast(provider, row, window, data.error ? null : data.fetchedAt);
+        if (forecast) item.append(el("p", "usage-note", forecast));
       }
       section.append(item);
     }

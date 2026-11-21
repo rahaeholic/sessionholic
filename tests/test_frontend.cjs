@@ -6172,6 +6172,20 @@ test('the machines chip says how many answer and the sheet shows each one\'s CPU
   assert.equal(d.state.hardwareUnsupported, true);
 });
 
+test('usage forecast needs fresh comparable readings and expires at a window change', () => {
+  const c = client(undefined, noChatTimers);
+  function read(at, left, reset, status = 'ready') {
+    c.renderUsage({ available: true, fetchedAt: at, providers: [{ id: 'codex', status,
+      rows: [{ name: 'fixture', status, windows: [{ label: '5시간', remaining: left, resetsAt: new Date(reset * 1000).toISOString() }] }] }] });
+    return textOf(c.get('usage-body'));
+  }
+  assert.doesNotMatch(read(1000, 30, 15000), /소진 예상/);
+  assert.match(read(1600, 20, 15000), /소진 예상/);
+  assert.doesNotMatch(read(2200, 20, 15000, 'stale'), /소진 예상/);
+  assert.doesNotMatch(read(2800, 15, 15000), /소진 예상/);
+  assert.doesNotMatch(read(3400, 95, 18000), /소진 예상/);
+});
+
 test('the usage strip shows remaining limits per provider and hides on boards without the endpoint', async () => {
   const c = client(undefined, noChatTimers);
   const box = c.get('usage');
