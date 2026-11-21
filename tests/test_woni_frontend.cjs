@@ -1728,3 +1728,11 @@ test('빠른 답장은 공유 문구를 한 번만 보내고 작성 중인 글�
   assert.equal(nodes['woni-input'].value, '내가 저장한 문구');
   assert.equal(options.hidden, true);
 });
+
+test('원이 머리 상태 줄은 할 일 수가 늦게 와도 배지와 같은 수를 말한다', () => {
+  // 2026-11-21: 배지는 '할 일 1'인데 상태 줄은 '지금 기다리는 일 없어요'로 남았다.
+  const source = fs.readFileSync(require('node:path').join(__dirname, '..', 'web', 'woni.js'), 'utf8');
+  const badge = source.slice(source.indexOf('function taskBadge() {'), source.indexOf('function shownTasks() {'));
+  assert.match(badge, /renderStatus\(\)/, 'the task badge refresh rewrites the status line too');
+  assert.match(source, /statusRunning = running; renderStatus\(\);/);
+});
