@@ -472,6 +472,9 @@ function mobileStartOnList() {
 function shortLayout() {
   return !!window.matchMedia?.("(max-height: 520px)")?.matches;
 }
+function androidDevice() {
+  return /Android/i.test(globalThis.navigator?.userAgent || "");
+}
 // Height an on-screen keyboard takes from the page. Safari shrinks only the
 // visual viewport; Chromium (interactive-widget=resizes-content) shrinks the
 // window too, so both are compared with the window's height before a text
@@ -490,7 +493,8 @@ function keyboardInset() {
   const width = window.innerWidth || 0;
   const layout = window.innerHeight || 0;
   const viewport = window.visualViewport;
-  const visible = viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
+  const visual = viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
+  const visible = androidDevice() && layout ? Math.min(layout, visual) : visual;
   if (state.viewportWidth !== width || !editingText()) {
     state.viewportWidth = width;
     state.viewportTall = layout;
@@ -552,7 +556,10 @@ function navTransition(direction, update) {
 // lays out like the board's first pane, not like a phone, whatever its own width.
 function compactSessionLayout() {
   const desktopPane = !!document.documentElement?.hasAttribute?.("data-desktop-pane");
-  return (phoneLayout() && !desktopPane) || /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || "");
+  const screen = globalThis.screen;
+  const phone = Math.min(screen?.width || 0, screen?.height || 0) < 600 &&
+    /Android|iPhone|iPod/i.test(globalThis.navigator?.userAgent || "");
+  return !desktopPane && (phoneLayout() || phone);
 }
 function ryanOneCompact() { return window.RyanOneHost?.compact === true; }
 function compactSessionActions() {
@@ -593,9 +600,15 @@ function syncRyanOneRecording() {
 }
 function syncCompactSessionLayout() {
   const compact = compactSessionLayout();
+  const focused = !!(state.detailShown || state.terminalVisible);
   document.documentElement.setAttribute?.("data-compact-mobile", String(compact));
-  setClass(document.body, "compact-session", compact && !!(state.detailShown || state.terminalVisible));
-  window.RyanOneHost?.setSessionFocused?.(!!(state.detailShown || state.terminalVisible));
+  setClass(document.body, "compact-session", compact && focused);
+  const host = window.RyanOneHost;
+  if (host?.setSessionFocused && (state.sessionFocusHost !== host || state.sessionFocus !== focused)) {
+    state.sessionFocusHost = host;
+    state.sessionFocus = focused;
+    host.setSessionFocused(focused);
+  }
   const draft = $("terminal-draft");
   if (draft) {
     draft.originalPlaceholder ??= draft.placeholder;
@@ -5685,7 +5698,7 @@ function dictationRepeats(text, part) {
   return i >= chars.length || !word(chars[i]);
 }
 function dictationCumulative() {
-  return /Android/i.test(String(globalThis.navigator?.userAgent || ""));
+  return androidDevice();
 }
 function dictationListening(field) {
   return !!state.dictation && (!field || state.dictation.field === field);
@@ -13288,7 +13301,7 @@ function terminalCellWidth() {
 function dockWidth({ preferred = state.terminalDock } = {}) {
   if (window.SessionholicWorkspace?.managed()) return 0;
   const width = window.innerWidth || 0;
-  if (!preferred || width <= 0 || phoneLayout() || shortLayout()) return 0;
+  if (!preferred || width <= 0 || compactSessionLayout() || shortLayout()) return 0;
   const cell = terminalCellWidth();
   const wanted = Math.max(Math.ceil(cell * DOCK.cols) + DOCK.chrome, Math.round(width * DOCK.share));
   const docked = Math.min(wanted, width - DOCK.minChat);
@@ -15964,15 +15977,15 @@ function renderIpadInputRoom(pane) {
   const value = `${inset}px`;
   if (pane.style.getPropertyValue?.("--ipad-input-room") !== value) pane.style.setProperty("--ipad-input-room", value);
 }
-// The height the app has: the visual viewport (an on-screen keyboard takes its space), except
-// that without a focused text field no keyboard takes space, so a visual viewport shorter than
-// the window is stale: iPadOS reports one for a moment when the app comes back from the
-// background or a minimized window, with no resize after it. Not when pinch-zoomed (the
-// visual viewport is then meant to be smaller).
 function viewportHeight(pane = ipadInputPane()) {
   const viewport = window.visualViewport;
   let height = viewport?.height || window.innerHeight || 800;
   const unzoomed = (viewport?.scale || 1) <= 1.01;
+  // Chrome can resize the layout and visual viewports in different frames.
+  // WebView can resize just one, even after the editor loses focus.
+  if (androidDevice() && window.innerHeight) return unzoomed ? Math.min(window.innerHeight, height) : window.innerHeight;
+  // WebKit can restore a stale, shorter visual viewport when it returns from the
+  // background. With no editor or pinch zoom, use the full window again.
   if (!editingText() && unzoomed && window.innerHeight > height) height = window.innerHeight;
   if (unzoomed && ipadWorkspace()) {
     if (window.SessionholicWorkspace.embedded) return window.innerHeight || height;
@@ -16072,7 +16085,12 @@ function renderKeyboardRoom() {
 function renderAppShift() {
   const viewport = window.visualViewport;
   let top = 0;
-  if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
+  if (androidDevice()) {
+    // Only follow a pan inside the layout viewport. pageTop includes document
+    // scrolling, which can feed back into the translation on each scroll.
+    if (viewport?.height && (viewport.scale || 1) <= 1.01)
+      top = Math.round(Math.max(0, Math.min(viewport.offsetTop || 0, window.innerHeight - viewport.height)));
+  } else if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
     // WebKit may pan the fixed board when an iframe editor gains focus. The
     // unshifted shell starts at zero; offsetTop alone can change without a pan.
     if (!window.SessionholicWorkspace.embedded) {
@@ -16936,13 +16954,25 @@ window.addEventListener("DOMContentLoaded", () => {
     if (state.term) state.term.options.screenReaderMode = state.screenReaderMode;
   });
   window.addEventListener("storage", followStoredSettings);
-  window.addEventListener("resize", updateViewport);
+  const android = androidDevice();
+  let viewportFramePending = false;
+  // Android sends window and visual viewport events for the same change.
+  // Read them together before resizing the composer and terminal.
+  const onViewportResize = android ? () => {
+    if (viewportFramePending) return;
+    viewportFramePending = true;
+    window.requestAnimationFrame(() => {
+      viewportFramePending = false;
+      updateViewport();
+    });
+  } : updateViewport;
+  window.addEventListener("resize", onViewportResize);
   window.addEventListener("beforeunload", warnDraftUnload);
   // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
   for (const id of Object.keys(SHEETS)) sheet(id);
-  window.visualViewport?.addEventListener("resize", updateViewport);
-  // iOS moves the visible area with no resize (its keyboard's own scroll, or a drag).
-  window.visualViewport?.addEventListener("scroll", () => {
+  window.visualViewport?.addEventListener("resize", onViewportResize);
+  // The visible area can pan without a resize, including during keyboard animation.
+  window.visualViewport?.addEventListener("scroll", android ? onViewportResize : () => {
     renderAppShift();
     renderIpadInputRoom(ipadInputPane());
   });

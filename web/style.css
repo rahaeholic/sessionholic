@@ -8615,7 +8615,10 @@ body.terminal-docked .detail-head > .chat-model-controls { grid-column: 1 / -1; 
 :root[data-compact-mobile="true"] .draft-panel { margin: 0; padding: 6px 0 0; border-top: 0; }
 :root[data-compact-mobile="true"] .draft-row { gap: 4px; }
 :root[data-compact-mobile="true"] .draft-row > textarea { flex: 1; min-width: 0; width: 0; }
-:root[data-compact-mobile="true"] #detail .chat-composer { padding: 6px 8px max(6px, env(safe-area-inset-bottom)); gap: 4px; }
+:root[data-compact-mobile="true"] #detail .chat-composer {
+  padding: 6px max(8px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+  gap: 4px;
+}
 :root[data-compact-mobile="true"] #detail .chat-main { flex-wrap: nowrap; gap: 4px; }
 :root[data-compact-mobile="true"] #detail .chat-main > .chat-input { flex: 1; width: 0; min-width: 0; order: 1; padding: 10px; }
 :root[data-compact-mobile="true"] #detail .chat-input,
