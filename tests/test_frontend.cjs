@@ -17671,6 +17671,83 @@ test('iPad room belongs to the top-level screen; desktop, Android and child pane
   c.updateViewport(); assert.equal(vars['--app-height'], '779px', 'parent already reserved the room');
 });
 
+test('Android keeps the session within both viewport sizes during keyboard and window changes', () => {
+  const c = client(undefined, noChatTimers), vars = {}, win = c.context.window;
+  c.context.navigator = { userAgent: 'Mozilla/5.0 (Linux; Android 15; SM-S931N) Chrome/141' };
+  win.matchMedia = q => ({ matches: q === '(pointer: coarse)' || q === '(max-width: 700px)' });
+  c.context.document.documentElement.style = { setProperty: (name, value) => { vars[name] = value; } };
+  const field = { tagName: 'TEXTAREA', id: 'chat-input' };
+  const update = (innerHeight, height, offsetTop, pageTop, active, expectedHeight, expectedShift, scale = 1) => {
+    c.context.document.activeElement = active;
+    Object.assign(win, { innerWidth: 393, innerHeight, visualViewport: { height, offsetTop, pageTop, scale } });
+    c.updateViewport();
+    assert.equal(vars['--app-height'], expectedHeight + 'px');
+    assert.equal(c.state.appShift || 0, expectedShift);
+  };
+  update(820, 820, 0, 0, null, 820, 0);
+  update(480, 820, 0, 0, field, 480, 0); // Chrome or native WebView resizes its layout first.
+  update(480, 480, 0, 32, field, 480, 0); // A document scroll is not a viewport offset.
+  update(480, 820, 0, 32, null, 480, 0);
+  update(820, 820, 0, 0, null, 820, 0);
+  update(820, 480, 30, 62, field, 480, 30); // WebView can still resize only the visual viewport.
+  update(820, 480, 30, 62, null, 480, 30); // Blur can come before the keyboard has gone.
+  update(820, 820, 0, 0, null, 820, 0);
+  update(820, 410, 25, 25, null, 820, 0, 2); // Pinch zoom leaves the session layout in place.
+});
+
+test('Android tablet and wider board child panes keep full session controls', () => {
+  const c = client(undefined, noChatTimers), doc = c.context.document;
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  const compact = () => vm.runInContext('compactSessionLayout()', c.context);
+  c.context.screen = { width: 890, height: 412 };
+  assert.equal(compact(), true, 'landscape phone');
+  c.context.screen = { width: 1280, height: 800 };
+  assert.equal(compact(), false, 'full-size tablet window');
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  assert.equal(compact(), true, 'narrow standalone tablet window');
+  doc.documentElement.hasAttribute = name => name === 'data-desktop-pane';
+  assert.equal(compact(), false, 'narrow pane inside the wide workspace');
+});
+
+test('Android window and visual viewport events measure one layout per frame', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window;
+  const events = {}, heights = [];
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15', onLine: false };
+  c.context.document.documentElement.style.setProperty = (name, value) => {
+    if (name === '--app-height') heights.push(value);
+  };
+  Object.assign(win, { innerHeight: 820, requestAnimationFrame: c.context.requestAnimationFrame,
+    visualViewport: { height: 820, addEventListener(type, fn) { events[type] = fn; } } });
+  c.windowEvents.DOMContentLoaded();
+  win.innerHeight = 480;
+  c.windowEvents.resize();
+  win.visualViewport.height = 480;
+  events.resize();
+  events.scroll();
+  assert.deepEqual(heights, ['820px']);
+  c.flushFrames();
+  assert.deepEqual(heights, ['820px', '480px']);
+  win.innerHeight = win.visualViewport.height = 820;
+  events.resize();
+  c.flushFrames();
+  assert.deepEqual(heights, ['820px', '480px', '820px']);
+});
+
+test('viewport updates only notify the Android host when the session focus changes', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window, calls = [];
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15' };
+  Object.assign(win, { innerWidth: 393, innerHeight: 820 });
+  win.RyanOneHost = { compact: true, setSessionFocused(focused) { calls.push(focused); } };
+  c.updateViewport();
+  c.setDetailShown(true);
+  win.innerHeight = 480;
+  c.updateViewport();
+  win.innerHeight = 820;
+  c.updateViewport();
+  c.setDetailShown(false);
+  assert.deepEqual(calls, [false, true, false]);
+});
+
 test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항상 보인다', () => {
   const css = styleSheet(), html = indexPage();
   assert.doesNotMatch(html, /terminal-keys-toggle/, 'no ⌨ toggle in the terminal input row');
