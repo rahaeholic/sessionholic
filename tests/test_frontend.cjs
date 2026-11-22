@@ -17613,6 +17613,36 @@ test('mobile text input begins on one line, caps at three, and keeps draft and c
   assert.equal(input.style.height, '77px', 'do not move the IME candidate region');
 });
 
+test('Android keystrokes within a draft keep the attachments mounted and save the new text', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15', onLine: true };
+  c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
+  c.context.window.innerHeight = 800;
+  const storage = draftStorage();
+  c.context.localStorage = storage;
+  c.state.authenticated = true;
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input'), attachments = c.get('chat-attachments');
+  input.scrollHeight = input.clientHeight = 42;
+  entry.attachments = [{ id: 'a'.repeat(32), name: 'fixture.txt', size: 12, type: 'text/plain' }];
+  input.value = '하'; input.events.input({ isComposing: false });
+  const tile = attachments.children[0];
+  assert.ok(tile);
+  input.value = '하던일'; input.events.input({ isComposing: false });
+  assert.equal(attachments.children[0], tile);
+  assert.equal([...storage.store.values()].map(JSON.parse).find(row => row.text === '하던일')?.text, '하던일');
+  input.events.compositionstart();
+  const composingTile = attachments.children[0];
+  input.value = '하던일ㅇ'; input.events.input({ isComposing: true });
+  assert.equal(attachments.children[0], composingTile);
+  input.value = '하던일을'; input.events.input({ isComposing: false });
+  assert.equal(entry.composing, false, 'Samsung can commit through input without compositionend');
+  entry.attachments = [];
+  input.value = ''; input.events.input({ isComposing: false });
+  assert.equal(c.get('chat-send').disabled, true);
+  assert.equal(attachments.children.length, 0);
+});
+
 test('mobile session menu keeps model controls and opens only board settings with a draft', () => {
   const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
   c.context.window.matchMedia = q => ({ matches: q === '(max-width: 700px)' });
@@ -17693,6 +17723,10 @@ test('Android keeps the session within both viewport sizes during keyboard and w
   update(820, 480, 30, 62, null, 480, 30); // Blur can come before the keyboard has gone.
   update(820, 820, 0, 0, null, 820, 0);
   update(820, 410, 25, 25, null, 820, 0, 2); // Pinch zoom leaves the session layout in place.
+  win.RyanOneHost = { compact: true };
+  Object.assign(win, { innerWidth: 0, innerHeight: 0, visualViewport: { height: 0 } });
+  c.updateViewport();
+  assert.equal(vars['--app-height'], '820px', 'hiding the native tab never writes a zero-size fallback');
 });
 
 test('Android tablet and wider board child panes keep full session controls', () => {

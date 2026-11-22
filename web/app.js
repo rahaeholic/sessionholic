@@ -6619,9 +6619,17 @@ function buildChatComposer(s) {
     });
   };
   input.addEventListener("input", (event) => {
+    const dictating = !!state.dictation || !!state.dictationParked;
     dictationTyped(input, event);
     if (!editorCurrent()) return;
     if (input.value) warmChat(entry);
+    // In an ongoing draft, ordinary letters cannot change the send controls or
+    // attachment list. Keep those nodes mounted while the keyboard is composing.
+    const draftOnly = androidDevice() && !dictating && !entry.inputCollapsed &&
+      !entry.notice && !entry.dictationNotice && !entry.inputError &&
+      !entry.pending && !entry.outbox?.some((item) => item.pending) &&
+      !(entry.composing && event?.isComposing === false) &&
+      !!entry.text.trim() && !!input.value.trim();
     entry.inputCollapsed = false;
     entry.text = input.value;
     // A final input outside a composition commits it: Android may send one and no compositionend
@@ -6634,8 +6642,13 @@ function buildChatComposer(s) {
     entry.inputError = "";
     entry.revision++;
     entry.slashDismissedText = null;
-    updateSlashMenu(entry, box, input);
-    updateChatComposer(entry);
+    if (!draftOnly || entry.slashChoices?.length || entry.text.trimStart().startsWith("/"))
+      updateSlashMenu(entry, box, input);
+    if (draftOnly) {
+      persistChatDraft(entry);
+      const atMinimum = Math.ceil(parseFloat(input.style.minHeight)) === parseFloat(input.style.height);
+      if (!entry.composing && (!atMinimum || input.scrollHeight > input.clientHeight)) resizeChatInput(entry);
+    } else updateChatComposer(entry);
     if (sendCommit && !entry.composing) settleSendCommit();
   });
   // Phones fold the bars for typing and return to the reader's choice on blur
@@ -16021,6 +16034,9 @@ function viewportHeight(pane = ipadInputPane()) {
   return height;
 }
 function updateViewport() {
+  // Older Android hosts temporarily give the hidden WebView no layout at all.
+  // Keep the last usable size and keyboard baseline until it has a window again.
+  if (ryanOneCompact() && androidDevice() && (!window.innerWidth || !window.innerHeight)) return;
   const pane = ipadInputPane();
   const height = Math.round(viewportHeight(pane));
   document.documentElement.style.setProperty("--app-height", `${height}px`);
