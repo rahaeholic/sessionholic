@@ -493,7 +493,7 @@ function keyboardInset() {
   const width = window.innerWidth || 0;
   const layout = window.innerHeight || 0;
   const viewport = window.visualViewport;
-  const visual = viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
+  const visual = !nativeBoardViewport() && viewport?.height ? viewport.height * (viewport.scale || 1) : layout;
   const visible = androidDevice() && layout ? Math.min(layout, visual) : visual;
   if (state.viewportWidth !== width || !editingText()) {
     state.viewportWidth = width;
@@ -531,7 +531,7 @@ let navToken = 0;
 function navTransition(direction, update) {
   const root = document.documentElement;
   // A committed edge swipe already slid the screens (bindEdgeSwipe).
-  if (state.edge?.phase === "commit" ||
+  if (nativeBoardViewport() || state.edge?.phase === "commit" ||
       typeof document.startViewTransition !== "function" || prefersReducedMotion() || document.hidden || !root?.dataset) {
     update();
     return null;
@@ -562,6 +562,10 @@ function compactSessionLayout() {
   return !desktopPane && (phoneLayout() || phone);
 }
 function ryanOneCompact() { return window.RyanOneHost?.compact === true; }
+function nativeBoardViewport() {
+  return window.RyanOneHost?.layoutViewport === true ||
+    (window.SessionholicWorkspace?.embedded && window.parent?.RyanOneHost?.layoutViewport === true);
+}
 function compactSessionActions() {
   const actions = [];
   if (state.terminalVisible) {
@@ -600,11 +604,13 @@ function syncRyanOneRecording() {
 }
 function syncCompactSessionLayout() {
   const compact = compactSessionLayout();
-  const focused = !!(state.detailShown || state.terminalVisible);
+  const host = window.RyanOneHost;
+  const shown = host?.setSessionLayout ? document.body.classList.contains("show-detail") : state.detailShown;
+  const focused = !!(shown || state.terminalVisible);
   document.documentElement.setAttribute?.("data-compact-mobile", String(compact));
   setClass(document.body, "compact-session", compact && focused);
-  const host = window.RyanOneHost;
-  if (host?.setSessionFocused && (state.sessionFocusHost !== host || state.sessionFocus !== focused)) {
+  if (!state.nativeDetailPending && host?.setSessionFocused &&
+      (state.sessionFocusHost !== host || state.sessionFocus !== focused)) {
     state.sessionFocusHost = host;
     state.sessionFocus = focused;
     host.setSessionFocused(focused);
@@ -660,17 +666,33 @@ function syncCompactConnection() {
 }
 window.addEventListener("ryanone-ready", () => {
   if (!ryanOneCompact()) return;
-  syncCompactSessionLayout();
+  if (nativeBoardViewport()) updateViewport();
+  else syncCompactSessionLayout();
   setReading(true);
 });
 window.addEventListener("ryanone-recording", syncRyanOneRecording);
+
+function finishNativeDetail(id) {
+  const pending = state.nativeDetailPending;
+  if (!pending || pending.id !== id) return;
+  clearTimeout(pending.timer);
+  // The app has laid out the new WebView. Commit its height and the session
+  // view in the same JavaScript turn.
+  updateViewport();
+  state.nativeDetailPending = null;
+  pending.apply();
+}
+window.addEventListener("ryanone-layout", (event) => finishNativeDetail(event.detail));
 
 function setDetailShown(shown, { direction = null, focus = false } = {}) {
   if (!shown && state.inlineTerminal) leaveInlineTerminal({ loadChat: false });
   if (!shown) state.launcherWorkspace = null;
   if (!shown) rememberConversationView();
   if (!shown) closeConversationMenus();
-  const changed = state.detailShown !== shown;
+  const host = window.RyanOneHost;
+  const changed = host?.setSessionLayout
+    ? document.body.classList.contains("show-detail") !== shown || !!state.nativeDetailPending
+    : state.detailShown !== shown;
   state.detailShown = shown;
   const apply = () => {
     if (shown) document.body.classList.add("show-detail");
@@ -689,7 +711,21 @@ function setDetailShown(shown, { direction = null, focus = false } = {}) {
       else restoreSelectedCardFocus();
     }
   };
-  const transition = direction && changed && phoneLayout() ? navTransition(direction, apply) : (apply(), null);
+  let transition = null;
+  if (host?.setSessionLayout && changed && !state.terminalVisible) {
+    const id = state.nativeDetailRequest = (state.nativeDetailRequest || 0) + 1;
+    clearTimeout(state.nativeDetailPending?.timer);
+    state.nativeDetailPending = { id, apply, timer: setTimeout(() => finishNativeDetail(id), 750) };
+    state.sessionFocusHost = host;
+    state.sessionFocus = shown;
+    host.setSessionLayout(shown, id);
+  } else {
+    if (state.nativeDetailPending) {
+      clearTimeout(state.nativeDetailPending.timer);
+      state.nativeDetailPending = null;
+    }
+    transition = direction && changed && phoneLayout() ? navTransition(direction, apply) : (apply(), null);
+  }
   syncEvents();
   if (chatVisible()) tickWorking();
   else stopWorkingClock();
@@ -6976,9 +7012,19 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
   const viewport = viewportHeight();
-  const cap = entry.inputCollapsed || sentDraftHidden(entry) ? base : Math.max(base,
+  const hidden = sentDraftHidden(entry);
+  const cap = entry.inputCollapsed || hidden ? base : Math.max(base,
     Math.min(line * (entry.expanded ? 11 : compactSessionLayout() ? 3 : 6) + padding + border, viewport * 0.34, viewport - 200));
   const minimum = Math.min(cap, entry.expanded && !compactSessionLayout() ? 3 * line + padding + border : base);
+  const width = nativeBoardViewport() ? input.clientWidth : 0;
+  if (width) {
+    // A keyboard animation rarely changes the editor's line cap. Avoid
+    // collapsing and remeasuring the same draft on every intermediate frame.
+    const previous = input.viewportMeasure;
+    if (previous?.width === width && previous.value === input.value && previous.line === line &&
+        previous.minimum === minimum && previous.cap === cap && previous.hidden === hidden) return;
+    input.viewportMeasure = { width, value: input.value, line, minimum, cap, hidden };
+  } else input.viewportMeasure = null;
   const list = $("messages");
   const listHeight = list?.clientHeight;
   const atBottom = list && list.scrollHeight - list.scrollTop - listHeight < 50;
@@ -6997,7 +7043,6 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   input.style.height = `${Math.ceil(height)}px`;
   // A sent draft is kept but drawn empty (.is-sent-draft): its lines past the one-line cap
   // give no scrollbar to an editor that shows nothing.
-  const hidden = sentDraftHidden(entry);
   input.style.overflowY = content > cap && !hidden ? "auto" : "hidden";
   const scroll = input.value && !hidden ? inputScroll : 0;
   if (input.scrollTop !== scroll) input.scrollTop = scroll;
@@ -15991,6 +16036,7 @@ function renderIpadInputRoom(pane) {
   if (pane.style.getPropertyValue?.("--ipad-input-room") !== value) pane.style.setProperty("--ipad-input-room", value);
 }
 function viewportHeight(pane = ipadInputPane()) {
+  if (nativeBoardViewport() && window.innerHeight) return window.innerHeight;
   const viewport = window.visualViewport;
   let height = viewport?.height || window.innerHeight || 800;
   const unzoomed = (viewport?.scale || 1) <= 1.01;
@@ -16080,7 +16126,8 @@ function renderKeyboardRoom() {
   // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
   // stay above it.
   const viewport = window.visualViewport;
-  const covered = open && viewport ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
+  const covered = !nativeBoardViewport() && open && viewport
+    ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
   document.documentElement.style?.setProperty?.("--kb-inset", `${covered}px`);
   const classes = document.body?.classList;
   const changed = !!classes?.contains?.("keyboard-beside") !== beside;
@@ -16101,10 +16148,11 @@ function renderKeyboardRoom() {
 function renderAppShift() {
   const viewport = window.visualViewport;
   let top = 0;
-  if (androidDevice()) {
+  const native = nativeBoardViewport();
+  if (native || androidDevice()) {
     // Only follow a pan inside the layout viewport. pageTop includes document
     // scrolling, which can feed back into the translation on each scroll.
-    if (viewport?.height && (viewport.scale || 1) <= 1.01)
+    if (!native && viewport?.height && (viewport.scale || 1) <= 1.01)
       top = Math.round(Math.max(0, Math.min(viewport.offsetTop || 0, window.innerHeight - viewport.height)));
   } else if (ipadWorkspace() && (viewport?.scale || 1) <= 1.01) {
     // WebKit may pan the fixed board when an iframe editor gains focus. The
@@ -16188,6 +16236,7 @@ function traceKeyboardRoom() {
 // height is read again now and a little after.
 function settleViewport() {
   updateViewport();
+  if (nativeBoardViewport()) return;
   window.requestAnimationFrame?.(() => updateViewport());
   for (const delay of [250, 1000]) setTimeout(updateViewport, delay);
 }
@@ -16982,13 +17031,17 @@ window.addEventListener("DOMContentLoaded", () => {
       updateViewport();
     });
   } : updateViewport;
-  window.addEventListener("resize", onViewportResize);
+  window.addEventListener("resize", () => nativeBoardViewport() ? updateViewport() : onViewportResize());
   window.addEventListener("beforeunload", warnDraftUnload);
   // Dialog sheets: drag handle, detents and outside taps (BottomSheet).
   for (const id of Object.keys(SHEETS)) sheet(id);
-  window.visualViewport?.addEventListener("resize", onViewportResize);
+  window.visualViewport?.addEventListener("resize", () => {
+    if (!nativeBoardViewport()) onViewportResize();
+  });
   // The visible area can pan without a resize, including during keyboard animation.
-  window.visualViewport?.addEventListener("scroll", android ? onViewportResize : () => {
+  window.visualViewport?.addEventListener("scroll", android ? () => {
+    if (!nativeBoardViewport()) onViewportResize();
+  } : () => {
     renderAppShift();
     renderIpadInputRoom(ipadInputPane());
   });

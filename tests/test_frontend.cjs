@@ -17782,6 +17782,47 @@ test('viewport updates only notify the Android host when the session focus chang
   assert.deepEqual(calls, [false, true, false]);
 });
 
+test('native board changes the visible session only for the matching layout acknowledgement', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window, doc = c.context.document;
+  const classes = new Set(), requests = [], heights = [];
+  doc.body.classList = { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) };
+  doc.documentElement.style.setProperty = (name, value) => { if (name === '--app-height') heights.push(value); };
+  Object.assign(win, { innerWidth: 384, innerHeight: 727,
+    RyanOneHost: { compact: true, layoutViewport: true, setSessionLayout: (...args) => requests.push(args) } });
+  c.setDetailShown(true, { direction: 'push' });
+  assert.equal(classes.has('show-detail'), false);
+  c.setDetailShown(false, { direction: 'pop' });
+  assert.deepEqual(requests, [[true, 1], [false, 2]]);
+  c.windowEvents['ryanone-layout']({ detail: 1 });
+  assert.equal(heights.length, 0);
+  c.windowEvents['ryanone-layout']({ detail: 2 });
+  assert.equal(classes.has('show-detail'), false);
+  c.setDetailShown(true);
+  win.innerHeight = 857;
+  c.windowEvents['ryanone-layout']({ detail: 3 });
+  assert.equal(heights.at(-1), '857px');
+  assert.equal(classes.has('show-detail'), true);
+});
+
+test('host-controlled keyboard resizes the board only when the native layout changes', () => {
+  const c = client(undefined, noChatTimers), win = c.context.window, doc = c.context.document;
+  const events = {}, heights = [];
+  c.context.navigator = { userAgent: 'Mozilla/5.0 Android 15', onLine: false };
+  doc.documentElement.style.setProperty = (name, value) => { if (name === '--app-height') heights.push(value); };
+  Object.assign(win, { innerWidth: 384, innerHeight: 857,
+    RyanOneHost: { compact: true, layoutViewport: true },
+    visualViewport: { height: 857, offsetTop: 0, addEventListener: (type, fn) => { events[type] = fn; } } });
+  c.windowEvents.DOMContentLoaded();
+  Object.assign(win.visualViewport, { height: 515, offsetTop: 9 });
+  events.resize(); events.scroll();
+  c.flushFrames();
+  assert.deepEqual(heights, ['857px']);
+  win.innerHeight = 467;
+  c.windowEvents.resize();
+  assert.deepEqual(heights, ['857px', '467px']);
+  assert.equal(c.state.appShift || 0, 0);
+});
+
 test('터미널 특수키는 휴대폰 압축 화면에서도 접지 않고 항상 보인다', () => {
   const css = styleSheet(), html = indexPage();
   assert.doesNotMatch(html, /terminal-keys-toggle/, 'no ⌨ toggle in the terminal input row');
