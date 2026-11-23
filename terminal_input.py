@@ -71,14 +71,14 @@ class TerminalInputs:
             return False
 
     @contextmanager
-    def _connection(self):
+    def _connection(self, timeout=2):
         connection = None
         try:
             settings.safe_path(self.path, private=True)
             settings.safe_path(self.path.with_name(self.path.name + '-journal'), private=True, allow_missing=True)
             if self.path.stat().st_size > MAX_DATABASE_BYTES:
                 raise RuntimeError('터미널 입력 기록 파일이 허용 크기를 넘습니다.')
-            connection = sqlite3.connect(str(self.path), timeout=2, isolation_level=None)
+            connection = sqlite3.connect(str(self.path), timeout=timeout, isolation_level=None)
             connection.execute('PRAGMA journal_mode=DELETE')
             connection.execute('PRAGMA synchronous=FULL')
             page_size = connection.execute('PRAGMA page_size').fetchone()[0]
@@ -144,20 +144,27 @@ class TerminalInputs:
             raise ValueError('영구 종료를 확인한 터미널의 입력 기록만 정리할 수 있습니다.')
         return self.prune_all_closed([{'id': terminal_id, 'closed': True}])
 
-    def prune_all_closed(self, terminal_records):
+    def prune_all_closed(self, terminal_records, *, wait=True, forgotten=()):
         if not isinstance(terminal_records, list):
             raise ValueError('터미널 종료 기록이 올바르지 않습니다.')
-        hashes = sorted({self._terminal(row.get('id')) for row in terminal_records
+        hashes = sorted({self._terminal(row.get('id')) for row in [*terminal_records, *forgotten]
                          if isinstance(row, dict) and row.get('closed') is True})
         if not hashes:
             return {'pruned': 0}
+        batches = [hashes[begin:begin + 200] for begin in range(0, len(hashes), 200)]
+        filters = [(' WHERE terminal_hash IN (' + ','.join('?' for unused in batch) + ')', batch)
+                   for batch in batches]
         pruned = 0
-        with self._connection() as connection:
+        with self._connection(timeout=2 if wait else 0) as connection:
+            # A poll can check again for rows it still lists. For forgotten rows,
+            # take the write lock before consuming their only tombstone evidence:
+            # another writer's uncommitted receipt would be invisible to a SELECT.
+            if not wait and not forgotten and not any(connection.execute(
+                    'SELECT 1 FROM receipts' + clause + ' LIMIT 1', batch).fetchone() for clause, batch in filters):
+                return {'pruned': 0}
             connection.execute('BEGIN IMMEDIATE')
-            for begin in range(0, len(hashes), 200):
-                batch = hashes[begin:begin + 200]
-                result = connection.execute('DELETE FROM receipts WHERE terminal_hash IN (' +
-                    ','.join('?' for unused in batch) + ')', batch)
+            for clause, batch in filters:
+                result = connection.execute('DELETE FROM receipts' + clause, batch)
                 pruned += result.rowcount
             connection.execute('COMMIT')
         return {'pruned': pruned}

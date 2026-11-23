@@ -1100,6 +1100,14 @@ class TerminalManager:
                 self._changed()
             return result
 
+    def list_linked(self, link):
+        """Apply observed links before another operation can change the terminal rows."""
+        with self.lock:
+            records = self.list()
+            if link(records):
+                return [self._public(terminal) for terminal in self.terminals.values()]
+            return records
+
     def _foreign_message(self, terminal):
         return ("이 터미널은 다른 tmux 소켓(%s)에서 열려 이 보드(%s)에서 다룰 수 없습니다. "
                 "인스턴스의 tmux 소켓 이름을 확인해 주세요." % (terminal.record["socket"], self.socket_name))

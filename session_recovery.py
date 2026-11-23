@@ -291,13 +291,8 @@ class RecoverySessions:
             matches = [row for row in self._read()["sessions"].values() if self._matches(row, identity)]
             return copy.deepcopy(matches[0]) if len(matches) == 1 else None
 
-    def remember(self, source, terminal_id=None, closed_reason=None):
-        """Save only a trusted native locator; callers catch failures after an existing launch.
-
-        Repeated observations do not invent a new openedAt or rewrite the store. A real
-        user opening may pass source.openedAt. A legacy `user` close is not proof that
-        the CLI ended; only server-confirmed explicitTermination marks that fact.
-        """
+    @staticmethod
+    def _entry(source, terminal_id, closed_reason):
         native = _identity(source, locator=True)
         if source.get("linkConfidence") == "estimated":
             raise RecoveryError("추정한 세션 연결은 복귀 대상으로 저장하지 않습니다.", "invalid_recovery_session", 400)
@@ -306,53 +301,86 @@ class RecoverySessions:
             raise RecoveryError("복귀 연결의 근거를 확인해 주세요.", "invalid_recovery_session", 400)
         display = {key: _text(source[key], limit) for key, limit in DISPLAY_FIELDS.items() if source.get(key)}
         stamps = {key: _stamp(source[key]) for key in ("openedAt", "updatedAt") if source.get(key) is not None}
+        return native, display, stamps, terminal_id, closed_reason, source.get("explicitTermination", False)
+
+    def _merge(self, data, entry):
+        native, display, stamps, terminal_id, closed_reason, explicit = entry
+        key = _key(native)
+        prior = data["sessions"].get(key)
+        if prior and prior["source"]["cwd"] != native["cwd"] and native["agent"] == "claude":
+            # A Claude session's folder follows its shell (a worktree, a cd) while it stays the
+            # same session; its transcript, and so its resume, keep the folder first remembered.
+            native["cwd"] = prior["source"]["cwd"]
+        # Only a Claude locator has a kind, and it changes as the board attaches to or resumes the
+        # same session (a background agent resumed in a terminal runs interactive): the latest is
+        # kept, and a recovery rechecks it on the host before it runs.
+        if prior and prior["source"]["cwd"] != native["cwd"]:
+            raise RecoveryError("기존 복귀 대상의 작업 폴더가 바뀌었습니다.", "recovery_session_conflict", 409)
+        origin = copy.deepcopy(prior["provenance"]) if prior else {"kind": "terminal-native", "closure": "none"}
+        if terminal_id is not None:
+            origin["terminalId"] = terminal_id
+        if closed_reason is not None:
+            origin.update(closedReason=closed_reason, closure="legacy_user_close" if closed_reason == "user" else "connection")
+        if prior and prior['provenance']['closure'] == 'legacy_user_close':
+            origin.update(closedReason='user', closure='legacy_user_close')
+        if explicit or (prior and prior["provenance"]["closure"] == "explicit_termination"):
+            origin["closure"] = "explicit_termination"
+        row = {**(prior or {}), "source": native, **display, **stamps, "provenance": origin}
+        if "openedAt" not in row:
+            row["openedAt"] = int(time.time())
+        _record(row)
+        if row == prior:
+            return data, row
+
+        data = {**data, "sessions": {**data["sessions"], key: row}, "revision": data["revision"] + 1}
+        while len(data["sessions"]) > MAX_REFS or len(self._encode(data)) > MAX_BYTES:
+            candidates = [candidate for candidate in data["sessions"] if candidate != key]
+            if not candidates:
+                raise RecoveryError("복귀 정보의 저장 한도에 도달했습니다.", "recovery_sessions_full", 409)
+            oldest = min(candidates, key=lambda candidate: (data["sessions"][candidate]["openedAt"], candidate))
+            del data["sessions"][oldest]
+        return data, row
+
+    def remember(self, source, terminal_id=None, closed_reason=None):
+        """Save only a trusted native locator; callers catch failures after an existing launch.
+
+        Repeated observations do not invent a new openedAt or rewrite the store. A real
+        user opening may pass source.openedAt. A legacy `user` close is not proof that
+        the CLI ended; only server-confirmed explicitTermination marks that fact.
+        """
+        entry = self._entry(source, terminal_id, closed_reason)
         with self._storage(write=True):
             data = self._read()
-            key = _key(native)
-            prior = data["sessions"].get(key)
-            if prior and prior["source"]["cwd"] != native["cwd"] and native["agent"] == "claude":
-                # A Claude session's folder follows its shell (a worktree, a cd) while it stays the
-                # same session; its transcript, and so its resume, keep the folder first remembered.
-                native["cwd"] = prior["source"]["cwd"]
-            # Only a Claude locator has a kind, and it changes as the board attaches to or resumes the
-            # same session (a background agent resumed in a terminal runs interactive): the latest is
-            # kept, and a recovery rechecks it on the host before it runs.
-            if prior and prior["source"]["cwd"] != native["cwd"]:
-                raise RecoveryError("기존 복귀 대상의 작업 폴더가 바뀌었습니다.", "recovery_session_conflict", 409)
-            origin = copy.deepcopy(prior["provenance"]) if prior else {"kind": "terminal-native", "closure": "none"}
-            if terminal_id is not None:
-                origin["terminalId"] = terminal_id
-            if closed_reason is not None:
-                origin.update(closedReason=closed_reason, closure="legacy_user_close" if closed_reason == "user" else "connection")
-            if prior and prior['provenance']['closure'] == 'legacy_user_close':
-                origin.update(closedReason='user', closure='legacy_user_close')
-            if source.get("explicitTermination") or (prior and prior["provenance"]["closure"] == "explicit_termination"):
-                origin["closure"] = "explicit_termination"
-            row = {**(prior or {}), "source": native, **display, **stamps, "provenance": origin}
-            if "openedAt" not in row:
-                row["openedAt"] = int(time.time())
-            _record(row)
-            if row == prior:
-                return copy.deepcopy(row)
-            data["sessions"][key] = row
-            data["revision"] += 1
-            while len(data["sessions"]) > MAX_REFS or len(self._encode(data)) > MAX_BYTES:
-                candidates = [candidate for candidate in data["sessions"] if candidate != key]
-                if not candidates:
-                    raise RecoveryError("복귀 정보의 저장 한도에 도달했습니다.", "recovery_sessions_full", 409)
-                oldest = min(candidates, key=lambda candidate: (data["sessions"][candidate]["openedAt"], candidate))
-                del data["sessions"][oldest]
-            self._write(data)
+            updated, row = self._merge(data, entry)
+            if updated is not data:
+                self._write(updated)
             return copy.deepcopy(row)
 
-    def forget(self, ref):
+    def remember_many(self, observations):
+        """Apply a terminal listing with one validated read and at most one file write."""
+        if not observations:
+            return
+        with self._storage(write=True):
+            data = updated = self._read()
+            for source, terminal_id, closed_reason in observations:
+                try:
+                    updated, _ = self._merge(updated, self._entry(source, terminal_id, closed_reason))
+                except RecoveryError:
+                    continue  # One bad observation does not discard the other records.
+            if updated is not data:
+                self._write(updated)
+
+    def forget(self, ref, *, expected=None):
         identity = _identity(ref)
         with self._storage(write=True):
             data = self._read()
             matches = [key for key, row in data["sessions"].items() if self._matches(row, identity)]
             if len(matches) != 1:
                 return False
-            del data["sessions"][matches[0]]
+            key = matches[0]
+            if expected is not None and data["sessions"][key] != expected:
+                return False
+            del data["sessions"][key]
             data["revision"] += 1
             self._write(data)
             return True

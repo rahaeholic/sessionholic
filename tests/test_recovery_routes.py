@@ -188,6 +188,41 @@ class ExactRecoveryTest(unittest.TestCase):
         self.assertEqual((caught.exception.status, caught.exception.payload['code']), (410, 'recovery_session_gone'))
         self.assertIsNone(self.flow.recoveries.get(REF))
 
+    def test_missing_probe_cannot_forget_a_record_changed_during_the_probe(self):
+        self.terms.records = []
+        old = int(time.time() - 2 * self.flow.RECOVERY_GRACE)
+        self.flow.recoveries.remember({**self.native, 'openedAt': old})
+
+        def probe(*args, **kwargs):
+            self.flow.recoveries.remember({**self.native, 'explicitTermination': True})
+            raise self.missing()
+
+        from transfer import WorkerError
+        with patch.object(self.flow.transfers, 'rpc', side_effect=probe), self.assertRaises(WorkerError):
+            self.flow.resolve_source(REF, verify=True)
+        self.assertEqual(self.flow.recoveries.get(REF)['provenance']['closure'], 'explicit_termination')
+
+    def test_capture_batches_valid_rows_and_retries_an_atomic_write_failure(self):
+        other = {**self.native, 'id': self.native['id'][:-1] + '2'}
+        self.terms.records = [
+            {'id': 'a' * 32, 'nativeSource': self.native, 'title': 'updated fixture'},
+            {'id': 'b' * 32, 'nativeSource': {**self.native, 'cwd': '/fixture/conflict'}},
+            {'id': 'c' * 32, 'nativeSource': other},
+        ]
+        store = self.flow.recoveries
+        before = store.snapshot()
+        with patch.object(store, '_write', side_effect=OSError('fixture')):
+            self.flow.capture_recoveries()
+        self.assertEqual(store.snapshot(), before)
+        with patch.object(store, '_read', wraps=store._read) as read, \
+                patch.object(store, '_write', wraps=store._write) as write:
+            self.flow.capture_recoveries()
+        read.assert_called_once()
+        write.assert_called_once()
+        self.assertEqual(store.get(REF)['title'], 'updated fixture')
+        self.assertEqual(store.get(other)['provenance']['terminalId'], 'c' * 32)
+        self.assertEqual(store.snapshot()['revision'], before['revision'] + 2)
+
     def test_opening_a_new_or_changed_conversation_keeps_it(self):
         self.terms.records = []
         from transfer import WorkerError

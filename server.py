@@ -1683,6 +1683,8 @@ class Workflow:
         self.plans, self.requests = {}, {}
         from session_recovery import RecoverySessions
         self.recoveries = RecoverySessions(state_dir)
+        # Keep a poll's observation and capture ordered with forgetting missing records.
+        self.recovery_observation = threading.Lock()
         # self.lock guards these dictionaries only; remote work runs outside it. A request id
         # in flight (inflight: id -> (signature, Event)) is run once and waited for by repeats,
         # and one route's launch at a time (route_locks) keeps its terminal reused, not doubled.
@@ -1735,8 +1737,8 @@ class Workflow:
         if isinstance(result, dict) and isinstance(result.get("terminal"), dict):
             self.remember_recovery({**result["terminal"], 'openedAt': int(time.time())})
 
-    def remember_recovery(self, terminal):
-        """Keep only server-written exact identities; this never changes launch success."""
+    @staticmethod
+    def _recovery_entry(terminal):
         info = {**(terminal.get("metadata") or {}), **terminal}
         native = info.get("nativeSource")
         if not isinstance(native, dict) or info.get("linkConfidence") == "estimated":
@@ -1746,15 +1748,23 @@ class Workflow:
         reason = info.get("closedReason")
         if reason == "user" and info.get("closeEffect") in ("view", "terminal"):
             reason = "view_closed"
+        return source, info.get("id"), reason
+
+    def remember_recovery(self, terminal):
+        """Keep only server-written exact identities; this never changes launch success."""
+        entry = self._recovery_entry(terminal)
+        if entry is None:
+            return
         try:
-            self.recoveries.remember(source, terminal_id=info.get("id"), closed_reason=reason)
+            self.recoveries.remember(*entry)
         except (ValueError, RuntimeError, OSError):
             pass
 
     def capture_recoveries(self, records=None):
         try:
-            for terminal in records if records is not None else self.terminals.list():
-                self.remember_recovery(terminal)
+            terminals = records if records is not None else self.terminals.list()
+            entries = [entry for terminal in terminals if (entry := self._recovery_entry(terminal)) is not None]
+            self.recoveries.remember_many(entries)
         except (ValueError, RuntimeError, OSError):
             pass
 
@@ -1845,9 +1855,10 @@ class Workflow:
             return False
         held = record.get("provenance", {}).get("terminalId")
         try:
-            if held and any(terminal.get("id") == held for terminal in self.terminals.list()):
-                return False
-            return self.recoveries.forget(record["source"])
+            with self.recovery_observation:
+                if held and any(terminal.get("id") == held for terminal in self.terminals.list()):
+                    return False
+                return self.recoveries.forget(record["source"], expected=record)
         except (ValueError, RuntimeError, OSError):
             return False
 
@@ -1898,15 +1909,16 @@ class Workflow:
     PROGRAM_REFRESH = 60   # seconds between launcher reads on one host
     PROGRAM_STALE = 300    # a named program is read again after this long (the launcher may switch)
 
-    def describe_launchers(self):
+    def describe_launchers(self, terminals=None):
         """Name what each 새 세션 terminal runs (`launcher_programs` on its host), in the background:
         a list read never waits on SSH. A change is saved on the terminal and announced."""
         if getattr(self.terminals, "set_program", None) is None:
             return
-        try:
-            terminals = self.terminals.list()
-        except (RuntimeError, OSError, ValueError):
-            return
+        if terminals is None:
+            try:
+                terminals = self.terminals.list()
+            except (RuntimeError, OSError, ValueError):
+                return
         now = time.time()
         live, due = {}, {}
         for terminal in terminals:
@@ -2431,7 +2443,22 @@ class Workflow:
 
     LINK_WINDOW = 1800  # a launcher's first session counts within 30 minutes of its terminal
 
+    def linked_terminals(self):
+        observe = getattr(self.terminals, "list_linked", None)
+        if observe is not None:
+            return observe(self._link_observed_sessions)
+        records = self.terminals.list()
+        return self.terminals.list() if self._link_observed_sessions(records) else records
+
     def link_new_sessions(self):
+        if getattr(self.terminals, "link_native", None) is None:
+            return
+        try:
+            self.linked_terminals()
+        except (RuntimeError, OSError, ValueError):
+            pass
+
+    def _link_observed_sessions(self, terminals):
         """A "새 세션" terminal names no session when it opens; its launcher starts one later.
         The earliest session that appears on its host after it opened (30 seconds of clock
         difference allowed), and no other terminal names, is recorded as its own, once: its
@@ -2443,10 +2470,6 @@ class Workflow:
         another launcher's session ambiguous."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
-            return
-        try:
-            terminals = self.terminals.list()
-        except (RuntimeError, OSError, ValueError):
             return
         def session_host(terminal):
             if terminal.get("program") == "claude-agents":
@@ -2490,6 +2513,7 @@ class Workflow:
             for _started, native in candidates:
                 key = json.dumps(self.identity(native), sort_keys=True)
                 shared[key] = shared.get(key, 0) + 1
+        linked = False
         for terminal, candidates in found:
             candidates = [item for item in candidates
                           if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
@@ -2500,8 +2524,10 @@ class Workflow:
             try:
                 if record(terminal["id"], native, confidence="estimated"):
                     taken.add(json.dumps(self.identity(native), sort_keys=True))
+                    linked = True
             except (KeyError, ValueError, RuntimeError, OSError):
                 continue
+        return linked
 
     @staticmethod
     def _native_of(host, agent, row):
@@ -3784,21 +3810,22 @@ class Handler(BaseHTTPRequestHandler):
                 if url.path == "/api/terminals":
                     # Read before the list: a change in between is announced with a newer
                     # version, so the client reads again rather than missing it.
-                    self.server.workflow.link_new_sessions()
-                    self.server.workflow.describe_launchers()
                     version = self.server.events.terminals_version
-                    records = self.server.terminals.list()
-                    self.server.workflow.capture_recoveries(records)
-                    result = {"terminals": records, "version": version}
-                    # Rows the terminal list forgot (old closes) still may have receipts.
-                    take = getattr(self.server.terminals, "take_forgotten", None)
-                    forgotten = take() if take else []
-                    try:
-                        self.server.terminal_inputs.prune_all_closed(records + forgotten)
-                    except (ValueError, RuntimeError, OSError):
-                        if forgotten:
-                            self.server.terminals.restore_forgotten(forgotten)
-                        result["inputCleanupPending"] = True
+                    workflow = self.server.workflow
+                    with workflow.recovery_observation:
+                        records = workflow.linked_terminals()
+                        workflow.capture_recoveries(records)
+                        result = {"terminals": records, "version": version}
+                        # Rows the terminal list forgot (old closes) still may have receipts.
+                        take = getattr(self.server.terminals, "take_forgotten", None)
+                        forgotten = take() if take else []
+                        try:
+                            self.server.terminal_inputs.prune_all_closed(records, wait=False, forgotten=forgotten)
+                        except (ValueError, RuntimeError, OSError):
+                            if forgotten:
+                                self.server.terminals.restore_forgotten(forgotten)
+                            result["inputCleanupPending"] = True
+                    workflow.describe_launchers(records)
                     return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)
                 if match:

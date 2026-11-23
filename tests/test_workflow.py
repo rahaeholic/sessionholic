@@ -1,7 +1,9 @@
 import http.client
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 import json
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -393,6 +395,88 @@ class SecurityTest(unittest.TestCase):
         self.httpd.events.terminals_changed()
         res, body = self.request('GET', '/api/terminals', headers=self.auth())
         self.assertEqual(json.loads(body)['version'], 1)
+
+    def test_concurrent_lists_share_each_observation_with_linking(self):
+        from terminal import TerminalManager
+
+        path = Path(self.temp.name) / 'fixture-terminals'
+        path.mkdir(mode=0o700)
+        socket = 'fixture-http-list'
+        existing, launcher = 'a' * 32, 'b' * 32
+        native = {**REF, 'cwd': SOURCE['cwd']}
+        now = int(time.time())
+        metadata = {
+            existing: {'mode': 'attach', 'nativeSource': native, 'linkConfidence': 'exact'},
+            launcher: {'mode': 'new-session', 'host': HOST['name'], 'createdAt': now,
+                       'program': 'codex', 'programAt': now},
+        }
+        (path / 'sessions.json').write_text(json.dumps([
+            {'id': tid, 'name': 'sb-' + tid, 'key': 'fixture-' + tid, 'socket': socket, 'metadata': meta}
+            for tid, meta in metadata.items()
+        ]), encoding='utf-8')
+        manager = TerminalManager(state_dir=path, socket_name=socket)
+        self.httpd.terminals = self.httpd.workflow.terminals = manager
+        manager.add_listener(self.httpd.events.terminals_changed)
+        started = {**SOURCE, 'id': SOURCE['id'][:-1] + '2', 'startedAt': now}
+        self.board.runner = lambda *_: {'codex': [SOURCE, started], 'claude': []}
+        self.board.poll(HOST)
+        version_before = self.httpd.events.terminals_version
+
+        def read(_):
+            response, body = self.request('GET', '/api/terminals', headers=self.auth())
+            self.assertEqual(response.status, 200)
+            return json.loads(body)
+
+        with patch.object(manager, '_live_names', return_value={'sb-' + tid for tid in metadata}) as tmux, \
+                patch.object(manager, 'link_native', wraps=manager.link_native) as link, \
+                ThreadPoolExecutor(max_workers=4) as pool:
+            answers = list(pool.map(read, range(4)))
+        self.assertEqual(tmux.call_count, len(answers))
+        link.assert_called_once_with(launcher, {**native, 'id': started['id']}, confidence='estimated')
+        for answer in answers:
+            rows = {row['id']: row for row in answer['terminals']}
+            self.assertEqual(rows[existing]['nativeSource'], native)
+            self.assertEqual(rows[launcher]['metadata']['nativeSource']['id'], started['id'])
+            self.assertEqual(rows[launcher]['linkConfidence'], 'estimated')
+        self.assertEqual(min(answer['version'] for answer in answers), version_before)
+        self.assertGreater(self.httpd.events.terminals_version, version_before)
+        self.assertIsNotNone(self.httpd.workflow.recoveries.get(REF))
+        self.assertIsNone(self.httpd.workflow.recoveries.get({**REF, 'id': started['id']}))
+
+    def test_forgotten_receipts_retry_after_concurrent_reservation(self):
+        active, gone = 'a' * 32, 'b' * 32
+        self.terms.records = [{'id': active, 'alive': True, 'closed': False}]
+        forgotten = [{'id': gone, 'closed': True}]
+
+        def take():
+            rows = forgotten.copy()
+            forgotten.clear()
+            return rows
+
+        inputs = self.httpd.terminal_inputs
+        path = '/api/terminal/' + active + '/input'
+        payload = {'text': 'fixture', 'requestId': 'live-input-0001'}
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+        with closing(sqlite3.connect(inputs.path, isolation_level=None)) as reserving, \
+                patch.object(self.terms, 'take_forgotten', side_effect=take, create=True), \
+                patch.object(self.terms, 'restore_forgotten', side_effect=forgotten.extend, create=True):
+            reserving.execute('BEGIN IMMEDIATE')
+            reserving.execute('INSERT INTO receipts VALUES (?, ?, ?, ?)',
+                             ('a' * 64, inputs._terminal(gone), 'b' * 64, 'unknown'))
+            response, body = self.request('GET', '/api/terminals', headers=self.auth())
+            self.assertEqual(response.status, 200)
+            self.assertTrue(json.loads(body)['inputCleanupPending'])
+            self.assertEqual(forgotten, [{'id': gone, 'closed': True}])
+
+            reserving.execute('COMMIT')
+            response, body = self.request('GET', '/api/terminals', headers=self.auth())
+            self.assertEqual(response.status, 200)
+            self.assertNotIn('inputCleanupPending', json.loads(body))
+            self.assertFalse(forgotten)
+            self.assertEqual(reserving.execute('SELECT terminal_hash FROM receipts').fetchall(),
+                             [(inputs._terminal(active),)])
+        self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
+        self.assertEqual(self.terms.calls, [('write', active, 'fixture')])
 
     def test_close_succeeds_and_reports_failed_receipt_cleanup_for_refresh_retry(self):
         self.terms.records = [{'id': 'a'*32, 'alive': True, 'closed': False}]
