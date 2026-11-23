@@ -478,6 +478,61 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(self.request('POST', path, payload, self.auth())[0].status, 200)
         self.assertEqual(self.terms.calls, [('write', active, 'fixture')])
 
+    def test_listed_close_retries_cleanup_after_input_reservation_commits(self):
+        ending, active = 'a' * 32, 'b' * 32
+        self.terms.records = [{'id': tid, 'alive': True, 'closed': False} for tid in (ending, active)]
+        inputs = self.httpd.terminal_inputs
+        inputs.max_records = 1
+        reserved, release = threading.Event(), threading.Event()
+        connect, write = inputs._connection, self.terms.write
+
+        @contextmanager
+        def pause_reservation(*args, **kwargs):
+            with connect(*args, **kwargs) as db:
+                inserted = False
+
+                def trace(sql):
+                    nonlocal inserted
+                    if sql.startswith('INSERT INTO receipts'):
+                        inserted = True
+                    elif sql == 'COMMIT' and inserted:
+                        reserved.set()
+                        release.wait(3)
+
+                db.set_trace_callback(trace)
+                yield db
+
+        def write_live(tid, text):
+            if self.terms.records[0]['closed'] and tid == ending:
+                raise RuntimeError('fixture terminal closed')
+            write(tid, text)
+
+        ending_path = '/api/terminal/' + ending + '/input'
+        active_path = '/api/terminal/' + active + '/input'
+        payload = {'text': 'fixture', 'requestId': 'close-race-input'}
+        with patch.object(inputs, '_connection', side_effect=pause_reservation), \
+                patch.object(self.terms, 'write', side_effect=write_live), ThreadPoolExecutor(max_workers=1) as pool:
+            submitting = pool.submit(self.request, 'POST', ending_path, payload, self.auth())
+            try:
+                self.assertTrue(reserved.wait(2))
+                self.terms.records[0].update(alive=False, closed=True)
+                response, body = self.request('GET', '/api/terminals', headers=self.auth())
+                self.assertEqual(response.status, 200)
+                self.assertTrue(json.loads(body).get('inputCleanupPending'))
+            finally:
+                release.set()
+            self.assertEqual(submitting.result(3)[0].status, 409)
+
+        self.assertEqual(self.request('POST', active_path, payload, self.auth())[0].status, 409)
+        response, body = self.request('GET', '/api/terminals', headers=self.auth())
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('inputCleanupPending', json.loads(body))
+        with closing(sqlite3.connect(inputs.path)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM receipts').fetchone()[0], 0)
+        for _ in range(2):
+            self.assertEqual(self.request('POST', active_path, payload, self.auth())[0].status, 200)
+        self.assertEqual(self.terms.calls, [('write', active, 'fixture')])
+
     def test_close_succeeds_and_reports_failed_receipt_cleanup_for_refresh_retry(self):
         self.terms.records = [{'id': 'a'*32, 'alive': True, 'closed': False}]
         with patch.object(self.httpd.terminal_inputs, 'prune_all_closed', side_effect=RuntimeError('fixture disk error')):

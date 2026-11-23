@@ -156,13 +156,13 @@ class TerminalInputs:
                    for batch in batches]
         pruned = 0
         with self._connection(timeout=2 if wait else 0) as connection:
-            # A poll can check again for rows it still lists. For forgotten rows,
-            # take the write lock before consuming their only tombstone evidence:
-            # another writer's uncommitted receipt would be invisible to a SELECT.
-            if not wait and not forgotten and not any(connection.execute(
-                    'SELECT 1 FROM receipts' + clause + ' LIMIT 1', batch).fetchone() for clause, batch in filters):
-                return {'pruned': 0}
+            # Check under the write lock so an uncommitted reservation cannot
+            # look like an empty result for a terminal that just closed.
             connection.execute('BEGIN IMMEDIATE')
+            if not wait and not any(connection.execute(
+                    'SELECT 1 FROM receipts' + clause + ' LIMIT 1', batch).fetchone() for clause, batch in filters):
+                connection.execute('COMMIT')
+                return {'pruned': 0}
             for clause, batch in filters:
                 result = connection.execute('DELETE FROM receipts' + clause, batch)
                 pruned += result.rowcount
