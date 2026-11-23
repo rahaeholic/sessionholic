@@ -801,15 +801,42 @@ test('먼저 알림에도 답글 추천이 뜨고, 최근 답·라이언 메시�
 test('Android 호스트가 있을 때만 정확한 대화로 이동하고 기존 웹은 유지한다', async () => {
   const calls = [];
   const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
-  const host = { version: 1, openWoni(id) { calls.push(id); return true; } };
-  const { nodes, app } = fixture(call, new Map(), host);
+  for (const version of [1, 2]) {
+    calls.length = 0;
+    const host = { version, openWoni(id) { calls.push(id); return true; } };
+    const { nodes, app } = fixture(call, new Map(), host);
+    await app.check(call);
+    nodes['woni-open'].click();
+    assert.deepEqual(calls, ['']);
+    assert.notEqual(nodes['woni-dialog'].open, true);
+    app.openFromNotification('chat-42');
+    assert.deepEqual(calls, ['', 'chat-42']);
+    assert.notEqual(nodes['woni-dialog'].open, true);
+  }
+});
+
+test('원이 반복 조회는 같은 말풍선을 유지하고 바뀐 답변·첨부·답글과 실행 상태를 반영한다', async () => {
+  let chats = [{ id: 'chat-1', text: '질문', progress: '확인 중', status: 'running' }];
+  let running = 1;
+  const call = async url => url.includes('availability') ? { enabled: true }
+    : { chats: JSON.parse(JSON.stringify(chats)), activity: { running } };
+  const { nodes, app, tick } = fixture(call);
   await app.check(call);
-  nodes['woni-open'].click();
-  assert.deepEqual(calls, ['']);
-  assert.notEqual(nodes['woni-dialog'].open, true);
-  app.openFromNotification('chat-42');
-  assert.deepEqual(calls, ['', 'chat-42']);
-  assert.notEqual(nodes['woni-dialog'].open, true);
+  nodes['woni-open'].click(); await new Promise(setImmediate);
+  const list = nodes['woni-messages'];
+  list.clientHeight = 300; list.scrollHeight = 1000; list.scrollTop = 160;
+  const first = list.children[0];
+  running = 2;
+  await tick();
+  assert.equal(list.children[0], first);
+  assert.match(nodes['woni-status'].textContent, /작업 중 2/);
+  assert.equal(list.scrollTop, 160);
+  chats = [{ ...chats[0], status: 'complete', answer: '답변 도착',
+    attachments: [{ name: '자료.pdf' }], replyTo: { id: 'older', who: '원이', excerpt: '이전 답변' } }];
+  await tick();
+  assert.notEqual(list.children[0], first);
+  assert.match(textOf(list), /이전 답변.*자료.pdf.*답변 도착/);
+  assert.equal(list.scrollTop, 160);
 });
 
 test('작성 중인 웹 초안이나 미확인 전송은 네이티브 이동 대신 웹에서 이어 간다', async () => {
@@ -817,7 +844,7 @@ test('작성 중인 웹 초안이나 미확인 전송은 네이티브 이동 대
   for (const pending of [false, true]) {
     const storage = new Map();
     const calls = [];
-    const { nodes, app } = fixture(call, storage, { version: 1, openWoni(id) { calls.push(id); return true; } });
+    const { nodes, app } = fixture(call, storage, { version: 2, openWoni(id) { calls.push(id); return true; } });
     await app.check(call);
     if (pending) storage.set('sessionholic:woni:pending', JSON.stringify({ text: '미확인 요청', requestId: 'pending-001', attachments: ['file-1'], replyTo: { id: 'chat-1', part: 'answer' } }));
     else nodes['woni-input'].value = '기존 초안';
@@ -827,6 +854,27 @@ test('작성 중인 웹 초안이나 미확인 전송은 네이티브 이동 대
     assert.equal(app.hasDraft(), true);
     assert.deepEqual(calls, []);
   }
+});
+
+test('v2 호스트에서도 업로드 중이거나 첨부만 남은 원이 초안은 웹에서 이어 간다', async () => {
+  const calls = [], host = { version: 1, openWoni: () => false };
+  const call = async url => url.includes('availability') ? { enabled: true } : { chats: [], activity: {} };
+  const { nodes, app } = fixture(call, new Map(), host);
+  let finishUpload;
+  await app.check(call, { upload: () => new Promise(resolve => { finishUpload = resolve; }) });
+  nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-files'].files = [{ name: '자료.pdf', size: 1 }];
+  nodes['woni-files'].listeners.change();
+  host.version = 2;
+  host.openWoni = id => { calls.push(id); return true; };
+  nodes['woni-close'].click();
+  nodes['woni-open'].click();
+  assert.equal(nodes['woni-dialog'].open, true);
+  finishUpload({ id: 'file-1' }); await new Promise(setImmediate);
+  nodes['woni-close'].click();
+  nodes['woni-open'].click();
+  assert.equal(nodes['woni-dialog'].open, true);
+  assert.deepEqual(calls, []);
 });
 
 test('Android 호스트 거절과 예외는 일반 웹 대화로 돌아간다', async () => {

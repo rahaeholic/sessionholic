@@ -1488,6 +1488,18 @@ function sessionRuntime(s, key, fetchedAt, following) {
     runtimeReadReason: live?.runtimeReadReason || null,
     listedPhase: s.phase, listedRuntimeKnown: s.runtimeKnown, listedRuntimeReason: s.runtimeReason };
 }
+function listedSessionKey(host, s) {
+  // A Claude row listed without an id is told apart by its process (or folder and start).
+  return [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
+    ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
+}
+function listedSession(host, s, key, following) {
+  const row = { ...s, host: host.name, stale: !host.ok };
+  // The list's own phase stands again once it changed since the conversation was read,
+  // or, for a conversation no longer open, once the host was read again after it.
+  return labeledSession({ ...row, ...sessionRuntime(row, key, host.fetchedAt, following),
+    account: sessionAccountLabel(row), hostLabel: host.label, fetchedAt: host.fetchedAt, key });
+}
 function allSessions() {
   const out = [];
   // The open conversation is read again every few seconds; its own read stands until then.
@@ -1497,22 +1509,7 @@ function allSessions() {
       ...(host.data?.claude || []),
       ...(host.data?.codex || []),
     ]) {
-      // A Claude row listed without an id is told apart by its process (or folder and start).
-      const key = [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
-        ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
-      // The list's own phase stands again once it changed since the conversation was read,
-      // or, for a conversation no longer open, once the host was read again after it (a quick
-      // turn may end where it began).
-      out.push(labeledSession({
-        ...s,
-        ...sessionRuntime({ ...s, host: host.name, stale: !host.ok }, key, host.fetchedAt, following),
-        host: host.name,
-        account: sessionAccountLabel({ ...s, host: host.name }),
-        hostLabel: host.label,
-        stale: !host.ok,
-        fetchedAt: host.fetchedAt,
-        key,
-      }));
+      out.push(listedSession(host, s, listedSessionKey(host, s), following));
     }
   }
   for (const session of state.nativeSessions.values()) {
@@ -1542,8 +1539,8 @@ function allSessions() {
 // card, header and counts follow the read until the list's phase changes.
 function noteLivePhase(s, data, selected = null, authEpoch = state.authEpoch) {
   // The selected session's row, when the caller just found it, is this one.
-  const listed = selected && selected.key === s?.key ? selected : allSessions().find((value) => value.key === s?.key);
-  if (!listed || authEpoch !== state.authEpoch || state.selected !== listed.key || listed.nativeSource && !listed.recoverySource ||
+  const listed = selected?.key === s?.key ? selected : selectedSession();
+  if (!listed || listed.key !== s?.key || authEpoch !== state.authEpoch || state.selected !== listed.key || listed.nativeSource && !listed.recoverySource ||
       data?.stale === true || !BADGES[data?.phase] || conversationIdentity(s) !== conversationIdentity(listed) ||
       chatKey(data.route || {}) !== chatKey(sourceOf(listed))) return;
   if (listed.agent === "claude" && listed.sessionId && data.route?.sessionId && data.route.sessionId !== listed.sessionId) return;
@@ -1576,7 +1573,7 @@ function noteLivePhase(s, data, selected = null, authEpoch = state.authEpoch) {
   // Redrawn only where it shows (a detail not drawn yet takes it when drawn).
   // This read is the news: the header shows it without reading the
   // conversation again, and the list follows.
-  const shown = allSessions().find((value) => value.key === listed.key);
+  const shown = selectedSession();
   const changed = shown && detailRevision(listed) !== detailRevision(shown);
   if (changed && state.detailFor === listed.key) {
     state.detailRevision = detailRevision(shown);
@@ -1601,7 +1598,16 @@ function accountOf(s) {
     : `codex:${s.home || ".codex"}`;
 }
 function selectedSession() {
-  return allSessions().find((s) => s.key === state.selected);
+  const key = state.selected;
+  if (!key) return;
+  // A recovered session can replace its listed alias. Use the merged view in that case.
+  if (state.nativeSessions.size) return allSessions().find((s) => s.key === key);
+  for (const host of state.snapshot?.hosts || []) {
+    if (!key.startsWith(host.name + "|")) continue;
+    const matches = (row) => listedSessionKey(host, row) === key;
+    const row = host.data?.claude?.find(matches) || host.data?.codex?.find(matches);
+    if (row) return listedSession(host, row, key, chatVisible() ? key : null);
+  }
 }
 // Recovery references are navigation hints from the server, never launch instructions.
 // Claude's sole default account historically omitted home; Codex always names its account.
@@ -1614,8 +1620,8 @@ function sameRecoverySource(a, b) {
   const key = recoveryIdentity(a);
   return !!key && key === recoveryIdentity(b) && (a.agent !== "claude" || !a.sessionId || a.sessionId === b.sessionId);
 }
-function recentRecoveries() {
-  const sessions = allSessions(), seen = new Set();
+function recentRecoveries(sessions = allSessions()) {
+  const seen = new Set();
   return (Array.isArray(state.snapshot?.recoverySessions) ? state.snapshot.recoverySessions : []).filter((ref) => {
     const key = recoveryIdentity(ref);
     if (!key || seen.has(key) || ref.closedReason === "user" || ref.removedAt || ref.terminatedAt || ref.closedByBoard) return false;
@@ -1624,12 +1630,11 @@ function recentRecoveries() {
     return !listed || !sessionRemoved(listed);
   }).slice(0, 20);
 }
-function renderRecoveries() {
+function renderRecoveries(sessions = allSessions()) {
   const section = $("session-recoveries"), list = $("session-recovery-list");
   if (!section || !list) return;
-  const sessions = allSessions();
   const sameConversation = (ref, source) => sameRecoverySource(ref, source) && (!ref.cwd || ref.cwd === source.cwd || sameClaudeConversation(ref, source));
-  const refs = recentRecoveries().filter((ref) => !sessions.some((s) => sameConversation(ref, s)) &&
+  const refs = recentRecoveries(sessions).filter((ref) => !sessions.some((s) => sameConversation(ref, s)) &&
     !state.terminals.some((terminal) => {
       const native = terminal.nativeSource || terminal.metadata?.nativeSource;
       return terminal.alive && terminal.linkConfidence !== "estimated" && terminal.metadata?.linkConfidence !== "estimated" &&
@@ -1755,14 +1760,14 @@ let cardRelationIndex = null;
 function renderSessionList(sessions, now) {
   cardRelationIndex = window.SessionholicRelations?.buildRelationIndex(sessions) || null;
   setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
-  renderRecoveries();
+  renderRecoveries(sessions);
   if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
   // Updating list conditions must not redraw a retained conversation or reset
   // its scroll anchor when the same source is opened again from a work card.
   const base = sessions.filter((session) => matches(session, now, { phase: false }));
   const shown = state.phaseFilter ? base.filter((session) => groupOf(session, now) === state.phaseFilter) : base;
   renderCounts(base); renderSessionCategories(sessions, now);
-  renderFilters(sessions.filter((session) => sessionCategoryOf(session) === state.sessionCategory));
+  renderFilters(sessions.filter((session) => sessionCategoryOf(session) === state.sessionCategory), sessions);
   renderGroups(shown, now);
   $("session-count").textContent = `${shown.length}개`;
 }
@@ -1831,7 +1836,8 @@ function render() {
     return;
   }
   if (selected) {
-    refreshDetail(selected); renderSessionRelations(selected, sessions);
+    refreshDetail(selected);
+    renderSessionRelations(selected, sessions, embedded ? null : cardRelationIndex);
     const list = $("messages"), entry = state.chats.get(chatKey(sourceOf(selected)));
     if (list?.conversationSource === chatKey(sourceOf(selected))) renderWorkContext(selected, entry, (list.conversationRows || []).map((row) => row.message));
   }
@@ -2706,7 +2712,8 @@ function renderSessionCategories(sessions, now) {
     control.setAttribute("aria-label", counts[category] === null ? `${label}, 아직 확인하지 않음` : `${label} ${counts[category]}개`);
     $(`session-category-${category}-count`).textContent = counts[category] === null ? "-" : String(counts[category]);
   }
-  $("groups").setAttribute("aria-labelledby", `session-category-${state.sessionCategory}`);
+  const groups = $("groups"), labelledBy = `session-category-${state.sessionCategory}`;
+  if (groups.getAttribute?.("aria-labelledby") !== labelledBy) groups.setAttribute("aria-labelledby", labelledBy);
   $("session-category-note").hidden = state.sessionCategory !== "agent" || !!state.filters.initiator || !!botFilter();
   const others = Object.keys(SESSION_CATEGORIES).filter((category) => category !== state.sessionCategory && counts[category] > 0);
   const other = others[0];
@@ -2742,7 +2749,7 @@ function prepareSessionListFor(session) {
   return changed;
 }
 const FILTER_FIELDS = ["filter-host", "filter-agent", "filter-project", "filter-account", "filter-initiator"];
-function renderFilters(sessions) {
+function renderFilters(sessions, all = allSessions()) {
   const active = Object.values(state.filters).filter(Boolean).length + (state.showOld ? 1 : 0) + (state.showRemoved ? 1 : 0);
   $("filter-count").textContent = active ? String(active) : "";
   const open = $("filter-open");
@@ -2753,23 +2760,29 @@ function renderFilters(sessions) {
   const box = $("filter-fields");
   // A select being used keeps its element (and the open picker).
   if (FILTER_FIELDS.includes(document.activeElement?.id)) return;
-  box.replaceChildren();
-  for (const [key, label, pick] of [
+  const fields = [
     ["host", "기기", (s) => [s.host, s.hostLabel]],
     ["agent", "에이전트", (s) => [s.agent, AGENTS[s.agent]]],
     ["project", "프로젝트", (s) => [s.project, s.project]],
     ["account", "계정 설정", (s) => [s.account, s.account]],
     ["initiator", "시작 주체", (s) => [initiatorOf(s), INITIATOR_LABELS[initiatorOf(s)]]],
-  ]) {
+  ].map(([key, label, pick]) => {
     const options = new Map(sessions.map(pick).filter(([v]) => v));
     if (key === "initiator") {
       for (const [value, text] of Object.entries(INITIATOR_LABELS)) options.set(value, text);
       // Every bot that opened a listed session, from all tabs (its requests are in 봇 요청).
-      for (const session of allSessions()) {
+      for (const session of all) {
         const bot = botNameOf(session);
         if (bot) options.set(BOT_FILTER_PREFIX + bot, `봇 · ${bot}`);
       }
     }
+    return { key, label, options };
+  });
+  const revision = JSON.stringify(fields.map(({ key, options }) => [key, state.filters[key], [...options]]));
+  if (box.filterRevision === revision) return;
+  box.filterRevision = revision;
+  box.replaceChildren();
+  for (const { key, label, options } of fields) {
     const field = el("label", null, label);
     const select = el("select");
     select.id = `filter-${key}`;
@@ -2879,6 +2892,7 @@ function recentOrder(a, b) {
   return openedAt(b) - openedAt(a) || (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0) || titleOrder(a, b);
 }
 function placeChildren(parent, desired) {
+  if (parent.children.length === desired.length && desired.every((child, index) => parent.children[index] === child)) return;
   const retained = new Set(desired);
   for (const child of [...parent.children]) if (!retained.has(child)) parent.removeChild(child);
   for (let index = 0; index < desired.length; index++)
@@ -2924,7 +2938,7 @@ function renderGroups(shown, now) {
       section.cardHeading = head;
       section.cardCount = count;
     }
-    section.cardCount.textContent = items.length;
+    if (section.cardCount.textContent !== String(items.length)) section.cardCount.textContent = String(items.length);
     const children = [section.cardHeading];
     for (const session of items) {
       const source = chatKey(sourceOf(session));
@@ -2973,7 +2987,7 @@ function renderGroups(shown, now) {
     }
     desired.push(empty);
   }
-  box.setAttribute?.("aria-busy", String(loading));
+  if (box.getAttribute?.("aria-busy") !== String(loading)) box.setAttribute?.("aria-busy", String(loading));
   placeChildren(box, desired);
   if (focused && visible.has(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
   if (typeof scroll === "number") pane.scrollTop = scroll;
@@ -3090,7 +3104,6 @@ function card(s) {
   return row;
 }
 function updateCard(node, s, now, folderHint = "") {
-  node.draggable = true;
   const p = node.cardParts;
   const write = (target, value) => { if (target.textContent !== value) target.textContent = value; };
   const project = cardProject(s);
@@ -3108,16 +3121,23 @@ function updateCard(node, s, now, folderHint = "") {
   const unread = sessionUnread(s, now);
   const attention = cardAttention(s);
   const selectedKey = window.SessionholicWorkspace?.managed() ? window.SessionholicWorkspace.activeSessionKey() : state.selected;
+  const pinned = sessionPinned(s), removed = sessionRemoved(s), oneShot = sessionOneShot(s);
+  const initiator = initiatorLabel(s), linkedGoals = window.SessionholicGoals?.linkedTitles?.(s) || "";
+  const revision = JSON.stringify([project, title, preview, s.agent, agent, host, account, label, tone, time, unread,
+    attention, selectedKey === s.key, pinned, removed, oneShot, initiator, linkedGoals, s.stale, folderHint]);
+  if (node.cardRevision === revision) { markCardTerminal(node, s); return; }
+  node.cardRevision = revision;
+  node.draggable = true;
   node.className = `card${selectedKey === s.key ? " selected" : ""}`;
   node.setAttribute("aria-pressed", String(selectedKey === s.key));
   node.cardLabel = [unread ? "읽지 않음" : "", "프로젝트: " + project, "작업: " + title,
     preview ? (question ? "답변 대기: " : "대화 미리보기: ") + preview : "", folderHint ? "작업 폴더: " + folderHint : "",
     label, attention, agent, "기기: " + host, account ? "계정 설정: " + account : "", time,
-    s.stale ? "마지막 확인 기준" : "", sessionRemoved(s) ? "목록에서 지움" : ""].filter(Boolean).join(". ");
+    s.stale ? "마지막 확인 기준" : "", removed ? "목록에서 지움" : ""].filter(Boolean).join(". ");
   markCardTerminal(node, s);
   node.title = `${project}\n${title}\nShift+클릭: 새 창에서 보기`;
   const place = folderHint ? `${project} · ${folderHint}` : project;
-  write(p.title, (sessionPinned(s) ? "★ " : "") + title); p.title.title = title;
+  write(p.title, (pinned ? "★ " : "") + title); p.title.title = title;
   write(p.snippet, preview); p.snippet.hidden = !preview; p.snippet.title = preview;
   write(p.badge, label); p.badge.className = `badge ${tone}`;
   if (p.attention) { write(p.attention, attention); p.attention.hidden = !attention; }
@@ -3125,14 +3145,13 @@ function updateCard(node, s, now, folderHint = "") {
   write(p.project, place); p.project.title = place;
   write(p.time, time);
   write(p.host, host); p.host.title = `기기: ${host}`;
-  write(p.initiator, initiatorLabel(s));
-  p.execution.hidden = !sessionOneShot(s);
-  const linkedGoals = window.SessionholicGoals?.linkedTitles?.(s) || "";
+  write(p.initiator, initiator);
+  p.execution.hidden = !oneShot;
   write(p.goals, linkedGoals);
   p.goals.hidden = !linkedGoals;
   p.stale.hidden = !s.stale;
   p.stale.title = s.stale ? "기기에 연결되지 않아 마지막으로 확인한 정보입니다." : "";
-  if (p.removed) p.removed.hidden = !sessionRemoved(s);
+  if (p.removed) p.removed.hidden = !removed;
   if (p.unread) { p.unread.hidden = !unread; p.unread.title = unread ? "아직 열어 보지 않은 결과" : ""; }
 }
 function cardAttention(s, relationIndex = cardRelationIndex) {
@@ -3377,11 +3396,13 @@ function markCardTerminal(node, s) {
   const terminal = terminalForSession(s);
   const open = !!terminal;
   const label = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
+  const ariaLabel = typeof node.cardLabel === "string" && (open ? `${node.cardLabel}. ${label}` : node.cardLabel);
+  if (mark.cardTerminalLabel === label && node.cardTerminalLabel === ariaLabel && mark.hidden === !open) return;
+  mark.cardTerminalLabel = label; node.cardTerminalLabel = ariaLabel;
   const text = mark.querySelector?.(".terminal-mark-label");
   if (text) text.textContent = label;
   if (mark.hidden !== !open) mark.hidden = !open;
-  if (typeof node.cardLabel === "string")
-    node.setAttribute("aria-label", open ? `${node.cardLabel}. ${label}` : node.cardLabel);
+  if (ariaLabel !== false) node.setAttribute("aria-label", ariaLabel);
 }
 function terminalEstimated(terminal) {
   if (!terminal) return false;
@@ -4455,13 +4476,14 @@ function drawDetail(s) {
   queueMicrotask(() => syncSessionTerminal(s));
   if (!state.chromeVisible && touchDevice()) showTapHint();
 }
-function renderSessionRelations(s, sessions = allSessions()) {
+function renderSessionRelations(s, sessions = allSessions(), relationIndex = null) {
   const api = window.SessionholicRelations, host = $("session-relations");
   if (!api || !host || $("detail").dataset.key !== s.key) return;
-  const index = api.buildRelationIndex(sessions), relations = api.relationsFor(index, s);
+  const index = relationIndex || api.buildRelationIndex(sessions);
   const revision = api.relationRevision(index, s);
   if (host.relationRevision === revision) return;
   host.relationRevision = revision;
+  const relations = api.relationsFor(index, s);
   const parent = relations.parent, children = relations.children, ownerIdentity = conversationIdentity(s), authEpoch = state.authEpoch;
   if (host.childOwner !== ownerIdentity || host.childEpoch !== authEpoch) {
     host.childPanels = new Map(); host.childOwner = ownerIdentity; host.childEpoch = authEpoch;
@@ -5194,7 +5216,11 @@ function updateChatDeliveryEvidence(entry) {
     receipt?.status === "failed" && receipt.confirmed === true);
   const visible = retained && files.length > 0;
   box.hidden = !visible;
-  if (!visible) { box.replaceChildren(); box.deliveryRevision = null; return false; }
+  if (!visible) {
+    if (box.deliveryRevision) box.replaceChildren();
+    box.deliveryRevision = null;
+    return false;
+  }
   const labels = { accepted: "전송 접수", queued: "전송 접수", completed: "응답 종료",
     interrupted: "접수 후 중단", unknown: "전송 결과 미확인", failed: "접수 후 오류" };
   const label = pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
@@ -6387,10 +6413,12 @@ function updateSlashMenu(entry, box = $("chat-composer"), input = $("chat-input"
   const prefix = /^\/([a-z]*)$/.exec(entry.text.trim());
   const choices = prefix && !entry.composing && entry.slashDismissedText !== entry.text
     ? CHAT_COMMANDS.filter((item) => item.name.startsWith(prefix[1])) : [];
-  $("chat-slash-options")?.remove?.();
+  const previous = $("chat-slash-options");
+  entry.slashChoices = choices;
+  if (!choices.length && !previous && input?.getAttribute?.("aria-expanded") === "false") return;
+  previous?.remove?.();
   input?.removeAttribute?.("aria-activedescendant");
   input?.setAttribute("aria-expanded", String(!!choices.length));
-  entry.slashChoices = choices;
   if (!choices.length || !box || !input || !currentChat(entry)) return;
   entry.slashIndex = Math.min(entry.slashIndex || 0, choices.length - 1);
   const menu = el("div", "chat-slash-options");
@@ -6586,7 +6614,7 @@ function buildChatComposer(s) {
   // Their final input belongs to that editor, never to a newly mounted draft.
   entry.composing = false;
   const editorEpoch = ++entry.editorEpoch;
-  const editorCurrent = () => entry.editorEpoch === editorEpoch && currentChat(entry);
+  const editorCurrent = (selected) => entry.editorEpoch === editorEpoch && currentChat(entry, selected);
   const box = el("section", `chat-composer${entry.expanded ? "" : " is-compact"}`);
   box.id = "chat-composer";
   box.setAttribute("aria-label", "실제 세션에 메시지 보내기");
@@ -6632,7 +6660,7 @@ function buildChatComposer(s) {
   for (const [name, value] of [["spellcheck", "false"], ["autocorrect", "off"], ["autocomplete", "off"], ["autocapitalize", "off"]]) input.setAttribute(name, value);
   input.value = entry.text;
   const beginNextDraft = () => {
-    if (!editorCurrent() || entry.composing || !draftIsPending(entry)) return;
+    if (entry.composing || !draftIsPending(entry) || !editorCurrent()) return;
     entry.pending.preserveDraft = true;
     entry.text = input.value = "";
     entry.attachments = [];
@@ -6657,7 +6685,11 @@ function buildChatComposer(s) {
   input.addEventListener("input", (event) => {
     const dictating = !!state.dictation || !!state.dictationParked;
     dictationTyped(input, event);
-    if (!editorCurrent()) return;
+    const selected = selectedSession() || null;
+    if (!editorCurrent(selected)) return;
+    const hadText = !!entry.text.trim(), wasComposing = entry.composing, wasCollapsed = entry.inputCollapsed;
+    const wasPending = draftIsPending(entry), wasBlocked = chatPendingBlocks(entry);
+    const hadNotice = !!(entry.notice || entry.dictationNotice || entry.inputError);
     if (input.value) warmChat(entry);
     // In an ongoing draft, ordinary letters cannot change the send controls or
     // attachment list. Keep those nodes mounted while the keyboard is composing.
@@ -6680,11 +6712,13 @@ function buildChatComposer(s) {
     entry.slashDismissedText = null;
     if (!draftOnly || entry.slashChoices?.length || entry.text.trimStart().startsWith("/"))
       updateSlashMenu(entry, box, input);
-    if (draftOnly) {
+    if (dictating || wasCollapsed || hadText !== !!entry.text.trim() || wasComposing !== entry.composing ||
+        wasPending !== draftIsPending(entry) || wasBlocked !== chatPendingBlocks(entry) || hadNotice) {
+      updateChatComposer(entry, selected, { deferResize: true });
+    } else {
       persistChatDraft(entry);
-      const atMinimum = Math.ceil(parseFloat(input.style.minHeight)) === parseFloat(input.style.height);
-      if (!entry.composing && (!atMinimum || input.scrollHeight > input.clientHeight)) resizeChatInput(entry);
-    } else updateChatComposer(entry);
+      if (!entry.composing) queueChatInputResize(entry, input);
+    }
     if (sendCommit && !entry.composing) settleSendCommit();
   });
   // Phones fold the bars for typing and return to the reader's choice on blur
@@ -6719,7 +6753,7 @@ function buildChatComposer(s) {
     entry.text = input.value;
     entry.revision++;
     updateSlashMenu(entry, box, input);
-    updateChatComposer(entry);
+    updateChatComposer(entry, undefined, { deferResize: true });
     settleSendCommit();
   });
   input.addEventListener("keydown", (event) => {
@@ -6976,12 +7010,13 @@ function buildChatComposer(s) {
   });
   return box;
 }
-function splitInputContentHeight(input, fallback) {
-  if (!ipadWorkspace() || !input.clientWidth) return fallback();
-  const style = window.getComputedStyle(input);
+const CHAT_INPUT_MEASURE_STYLES = ["fontFamily", "fontSize", "fontWeight", "fontStyle", "lineHeight", "letterSpacing",
+  "whiteSpace", "overflowWrap", "wordBreak", "paddingTop", "paddingBottom", "direction", "tabSize"];
+function inputContentHeight(input, style, fallback) {
+  if (!style || !input.clientWidth) return fallback();
   // A detached node has no layout. This inert measurement field sits outside
   // the pane flow and never receives focus, a selection, or keyboard events.
-  let measure = state.ipadInputMeasure;
+  let measure = state.chatInputMeasure;
   if (!measure) {
     measure = document.createElement("textarea");
     measure.tabIndex = -1;
@@ -6989,9 +7024,9 @@ function splitInputContentHeight(input, fallback) {
     measure.setAttribute("aria-hidden", "true");
     measure.style.cssText = "position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;height:0;min-height:0;max-height:none;overflow:hidden;box-sizing:content-box;border:0;margin:0;";
     document.body.append(measure);
-    state.ipadInputMeasure = measure;
+    state.chatInputMeasure = measure;
   }
-  for (const key of ["fontFamily", "fontSize", "fontWeight", "fontStyle", "lineHeight", "letterSpacing", "whiteSpace", "overflowWrap", "wordBreak", "paddingTop", "paddingBottom", "direction", "tabSize"])
+  for (const key of CHAT_INPUT_MEASURE_STYLES)
     measure.style[key] = style[key];
   measure.style.width = `${Math.max(1,input.clientWidth - parseFloat(style.paddingLeft || 0) - parseFloat(style.paddingRight || 0))}px`;
   measure.style.paddingLeft = measure.style.paddingRight = "0px";
@@ -7000,6 +7035,15 @@ function splitInputContentHeight(input, fallback) {
   const height = measure.scrollHeight;
   measure.value = "";
   return height;
+}
+function queueChatInputResize(entry, input) {
+  if (typeof requestAnimationFrame !== "function") { resizeChatInput(entry); return; }
+  if (input.resizeQueued) return;
+  input.resizeQueued = true;
+  requestAnimationFrame(() => {
+    input.resizeQueued = false;
+    if ($("chat-input") === input) resizeChatInput(entry);
+  });
 }
 function resizeChatInput(entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
@@ -7012,19 +7056,14 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const border = (parseFloat(style?.borderTopWidth) || 1) + (parseFloat(style?.borderBottomWidth) || 1);
   const base = Math.max(44, line + padding + border);
   const viewport = viewportHeight();
-  const hidden = sentDraftHidden(entry);
+  const compact = compactSessionLayout(), hidden = sentDraftHidden(entry), split = !!ipadWorkspace();
   const cap = entry.inputCollapsed || hidden ? base : Math.max(base,
-    Math.min(line * (entry.expanded ? 11 : compactSessionLayout() ? 3 : 6) + padding + border, viewport * 0.34, viewport - 200));
-  const minimum = Math.min(cap, entry.expanded && !compactSessionLayout() ? 3 * line + padding + border : base);
-  const width = nativeBoardViewport() ? input.clientWidth : 0;
-  if (width) {
-    // A keyboard animation rarely changes the editor's line cap. Avoid
-    // collapsing and remeasuring the same draft on every intermediate frame.
-    const previous = input.viewportMeasure;
-    if (previous?.width === width && previous.value === input.value && previous.line === line &&
-        previous.minimum === minimum && previous.cap === cap && previous.hidden === hidden) return;
-    input.viewportMeasure = { width, value: input.value, line, minimum, cap, hidden };
-  } else input.viewportMeasure = null;
+    Math.min(line * (entry.expanded ? 11 : compact ? 3 : 6) + padding + border, viewport * 0.34, viewport - 200));
+  const minimum = Math.min(cap, entry.expanded && !compact ? 3 * line + padding + border : base);
+  const measureKey = JSON.stringify([input.clientWidth, input.value, input.wrap, hidden, split, entry.expanded, minimum, cap,
+    style?.paddingLeft, style?.paddingRight, style?.borderTopWidth, style?.borderBottomWidth,
+    ...CHAT_INPUT_MEASURE_STYLES.map((key) => style?.[key])]);
+  if (input.chatMeasureKey === measureKey && input.style.height === input.chatMeasuredHeight) return;
   const list = $("messages");
   const listHeight = list?.clientHeight;
   const atBottom = list && list.scrollHeight - list.scrollTop - listHeight < 50;
@@ -7035,7 +7074,7 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const wasAtEnd = inputScroll + (input.clientHeight || 0) >= (input.scrollHeight || 0) - line - 2;
   input.style.minHeight = `${minimum}px`;
   input.style.maxHeight = `${cap}px`;
-  const content = input.value ? splitInputContentHeight(input, () => {
+  const content = input.value ? inputContentHeight(input, style, () => {
     input.style.height = "0px";
     return input.scrollHeight;
   }) + border || minimum : minimum;
@@ -7044,6 +7083,8 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   // A sent draft is kept but drawn empty (.is-sent-draft): its lines past the one-line cap
   // give no scrollbar to an editor that shows nothing.
   input.style.overflowY = content > cap && !hidden ? "auto" : "hidden";
+  input.chatMeasureKey = measureKey;
+  input.chatMeasuredHeight = input.style.height;
   const scroll = input.value && !hidden ? inputScroll : 0;
   if (input.scrollTop !== scroll) input.scrollTop = scroll;
   if (document.activeElement === input && input.selectionEnd === input.value.length && content > cap && wasAtEnd && !hidden)
@@ -7052,7 +7093,7 @@ function resizeChatInput(entry, selected = selectedSession() || null) {
   const toggle = $("chat-expand");
   toggle.textContent = height > base + 1 || entry.expanded ? "접기" : "펼치기";
   toggle.setAttribute("aria-expanded", String(height > base + 1 || entry.expanded));
-  if (atBottom && (!ipadWorkspace() || list.clientHeight !== listHeight)) setMessagesScroll(list, list.scrollHeight);
+  if (atBottom && list.clientHeight !== listHeight) setMessagesScroll(list, list.scrollHeight);
   // A taller composer moves the bottom of the list: the 맨 아래 button sits above it again.
   renderJump();
 }
@@ -7547,7 +7588,7 @@ function receiptNotice(entry) {
   if (["completed", "interrupted"].includes(status) && phase === "working") return "";
   return chatReceiptCopy(entry.receipt);
 }
-function updateChatComposer(entry, selected = selectedSession() || null) {
+function updateChatComposer(entry, selected = selectedSession() || null, { deferResize = false } = {}) {
   persistChatDraft(entry);
   if (!currentChat(entry, selected) || $("chat-composer")?.dataset.source !== chatKey(entry.source)) return;
   updateModelControls(entry, selected);
@@ -7618,7 +7659,8 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   const dictating = state.dictation?.field === input;
   const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.connecting ? "같은 대화에 연결하고 있습니다…" : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported && connectable ? receiptNotice(entry) || "보내면 이 대화를 다시 연결합니다." : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
-  $("chat-status").textContent = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
+  const statusText = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
+  if ($("chat-status").textContent !== statusText) $("chat-status").textContent = statusText;
   $("chat-status").setAttribute("data-attention", String(!!(offline || chatHostOffline(entry, selected) || entry.error || entry.receipt?.status === "unknown")));
   const deliveryVisible = updateChatDeliveryEvidence(entry);
   const chips = $("chat-attachments");
@@ -7630,10 +7672,11 @@ function updateChatComposer(entry, selected = selectedSession() || null) {
   const selectedCaption = draftSent
     ? `전송 요청 첨부 ${entry.attachments.length}개 · 결과 미확인`
     : `전송 전 첨부 ${entry.attachments.length}개 · 업로드 완료`;
-  attachmentsLabel.textContent = selectedCaption;
+  if (attachmentsLabel.textContent !== selectedCaption) attachmentsLabel.textContent = selectedCaption;
   chips.setAttribute("aria-label", selectedCaption);
   renderAttachmentTiles(entry, chips);
-  resizeChatInput(entry, selected);
+  if (deferResize) queueChatInputResize(entry, input);
+  else resizeChatInput(entry, selected);
   // Entered from the keyboard before its state said it takes text: the input once it does,
   // unless the focus went elsewhere meanwhile (back to the list, another control).
   if (state.inputFocusFor && state.inputFocusFor === selected?.key && conversationHasFocus()) focusPendingInput();
@@ -7747,6 +7790,11 @@ function renderAttachmentTiles(entry, box = $("chat-attachments")) {
   entry.thumbs ||= new Map();
   entry.uploadQueue ||= [];
   pruneThumbs(entry);
+  const revision = entry.uploadQueue.length ? null : JSON.stringify([entry.attachments,
+    entry.attachments.map((file) => entry.thumbs.get(file.id)), !!entry.sending, !!entry.pending]);
+  if (revision !== null && box.attachmentEntry === entry && box.attachmentRevision === revision &&
+      box.children.length === entry.attachments.length) return;
+  box.attachmentEntry = entry; box.attachmentRevision = revision;
   const tiles = [
     ...entry.attachments.map((file) => attachmentTile(entry, file, { key: file.id })),
     ...entry.uploadQueue.map((item) => attachmentTile(entry, item.file, { key: item.key, uploading: item })),
@@ -10330,6 +10378,8 @@ function toolGroupNode() {
   return row;
 }
 function updateToolGroup(row, items) {
+  const previous = row.messageItem.items;
+  if (previous.length === items.length && previous.every((item, index) => item === items[index])) return;
   const title = toolGroupTitle(items);
   const kinds = toolGroupKinds(items);
   if (row.toolTitle.textContent !== title) row.toolTitle.textContent = title;
@@ -10976,10 +11026,10 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     while (start + length < previous.length && length < keys.length && previous[start + length].key === keys[length]) length++;
     if (length > overlap) { overlap = length; shift = start; }
   }
-  const lined = new Set(previous.slice(shift, shift + overlap));
   const available = new Map();
-  for (const item of previous) {
-    if (lined.has(item)) continue;
+  for (let index = 0; index < previous.length; index++) {
+    if (index >= shift && index < shift + overlap) continue;
+    const item = previous[index];
     if (!available.has(item.key)) available.set(item.key, []);
     available.get(item.key).push(item);
   }
@@ -11045,7 +11095,8 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     longMessageControls(s, entry, item);
     return item;
   });
-  groupMessageRows(rows);
+  const sameRows = overlap === keys.length && overlap === previous.length;
+  if (!sameRows) groupMessageRows(rows);
   // Only the newest answer can show the separately observed session settings; older
   // answers use their own recorded metadata and never inherit the current model.
   let latest = rows.length - 1;
@@ -11058,7 +11109,8 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     const observed = [settings?.model, settings?.effort].filter((value) => typeof value === "string" && value);
     const parts = recorded.length ? recorded : observed;
     const prefix = recorded.length ? "" : settings?.observed === "last_response" ? "최근 응답 " : "현재 ";
-    item.row.modelLabel.textContent = parts.length ? `(${prefix}${parts.join(" · ")})` : "";
+    const label = parts.length ? `(${prefix}${parts.join(" · ")})` : "";
+    if (item.row.modelLabel.textContent !== label) item.row.modelLabel.textContent = label;
   });
   const desired = toolGroupRows(list, rows);
   const preview = historyPreviewRow(s, entry);
@@ -11140,13 +11192,15 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
     desired.unshift(notice);
   }
   desired.push(...tail);
+  const sameChildren = list.children.length === desired.length &&
+    desired.every((child, index) => list.children[index] === child);
   // While reading back, the first row on screen that stays keeps its place:
   // rows dropped above it (the server's window moving during a turn) or
   // a grown tool group no longer push the text being read up.
   const keep = new Set(desired);
   let anchor = null;
   let anchorOffset = 0;
-  if (!stick) {
+  if (!stick && !sameChildren) {
     for (const child of [...list.children]) {
       if (!keep.has(child)) continue;
       const box = rowBox(list, child);
@@ -11160,12 +11214,14 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
   }
   // Keep unchanged text nodes mounted: mobile selections and expanded tool
   // records survive reads, including new messages appended during a turn.
-  for (const child of [...list.children]) {
-    if (!keep.has(child)) list.removeChild(child);
-  }
-  for (let index = 0; index < desired.length; index++) {
-    if (list.children[index] !== desired[index])
-      list.insertBefore(desired[index], list.children[index] || null);
+  if (!sameChildren) {
+    for (const child of [...list.children]) {
+      if (!keep.has(child)) list.removeChild(child);
+    }
+    for (let index = 0; index < desired.length; index++) {
+      if (list.children[index] !== desired[index])
+        list.insertBefore(desired[index], list.children[index] || null);
+    }
   }
   list.conversationSource = source;
   list.conversationRows = rows;
@@ -11173,7 +11229,7 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
   const anchorBox = anchor && !stick ? rowBox(list, anchor) : null;
   if (stick) setMessagesScroll(list, list.scrollHeight);
   else if (anchorBox) setMessagesScroll(list, anchorBox.top - anchorOffset);
-  else setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
+  else if (!sameChildren) setMessagesScroll(list, scroll + warningHeight - oldWarningHeight);
   if (!options.readOnly) {
     if (working) tickWorking();
     else stopWorkingClock();
@@ -11181,7 +11237,7 @@ function renderMessages(s, messages, error = "", fresh = false, options = {}) {
   // While reading back, count what arrived below instead of jumping to it. A
   // row that only got its time (Codex's final answer takes its turn's end) is
   // not new, nor this board's own message that took the place of its bubble.
-  if (!stick && previous.length) {
+  if (!stick && previous.length && !sameRows) {
     const before = new Set(previous);
     const loose = (item) => JSON.stringify([item.message.role, item.message.text, attachmentMetadata(item.message.attachments)]);
     const gone = new Map();
@@ -14202,11 +14258,12 @@ function resizeDraft() {
   const input = $("terminal-draft");
   if (!input?.style || state.composing) return;
   const before = input.style.height;
-  const content = splitInputContentHeight(input, () => {
+  const style = window.getComputedStyle?.(input);
+  const content = inputContentHeight(input, ipadWorkspace() ? style : null, () => {
     input.style.height = "auto";
     return input.scrollHeight;
   });
-  const line = parseFloat(window.getComputedStyle?.(input)?.lineHeight) || 22;
+  const line = parseFloat(style?.lineHeight) || 22;
   input.style.height = `${Math.min(content, line * (compactSessionLayout() ? 3 : 4) + 20)}px`;
   // A taller or shorter input bar changes the terminal's rows; refit so no line is hidden.
   if (input.style.height !== before) requestAnimationFrame(fitTerminal);
@@ -16094,7 +16151,8 @@ function updateViewport() {
   syncChromeMode();
   syncCompactSessionLayout();
   const selected = selectedSession();
-  if (selected) resizeChatInput(chatEntry(selected));
+  if (selected) resizeChatInput(chatEntry(selected), selected);
+  renderJump();
   fitTerminal();
   positionBoardStatusPanel();
 }

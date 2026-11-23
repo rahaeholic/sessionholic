@@ -3380,20 +3380,28 @@ test('chat grows while typing or pasting, shrinks after deletion and bounds long
   const input = c.get('chat-input');
   c.context.window.innerHeight = 800;
   Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * (input.value.split('\n').length) });
+  input.value = '첫 줄\n둘째 줄'; input.events.input();
   input.value = '첫 줄\n둘째 줄\n셋째 줄'; input.events.input();
+  assert.equal(entry.text, input.value, 'the draft is current before the next paint');
+  assert.equal(input.style.height, undefined, 'repeated input leaves layout to the next frame');
+  c.flushFrames();
   assert.equal(input.style.height, '88px');
   assert.equal(c.get('chat-expand').textContent, '접기');
   input.value = Array(20).fill('긴 글').join('\n'); input.events.input();
+  c.flushFrames();
   assert.equal(input.style.height, '154px');
   assert.equal(input.style.overflowY, 'auto');
   c.get('chat-expand').events.click();
   assert.equal(input.style.height, '44px');
   assert.equal(entry.text, Array(20).fill('긴 글').join('\n'));
   input.value += '\n계속 작성'; input.events.input();
+  c.flushFrames();
   assert.equal(input.style.height, '154px');
   input.value = '짧게'; input.events.input();
+  c.flushFrames();
   assert.equal(input.style.height, '44px');
   input.value = ''; input.events.input();
+  c.flushFrames();
   assert.equal(input.style.height, '44px');
   assert.equal(input.style.overflowY, 'hidden');
   c.get('chat-expand').events.click();
@@ -3401,6 +3409,7 @@ test('chat grows while typing or pasting, shrinks after deletion and bounds long
   input.events.compositionstart();
   input.value = '조합 첫 줄\n둘째 줄\n셋째 줄';
   input.events.compositionend(); // Some IMEs commit without a following input event.
+  c.flushFrames();
   assert.equal(input.style.height, '88px');
   assert.equal(entry.inputCollapsed, false);
   assert.equal(findId(composer, 'chat-input'), input);
@@ -3429,6 +3438,7 @@ test('chat resize preserves active Korean composition and respects keyboard view
   assert.equal(entry.editorEpoch, epoch);
   assert.equal(c.context.document.activeElement, input);
   input.events.compositionend();
+  c.flushFrames();
   assert.equal(input.style.height, '100px');
   assert.equal(input.style.overflowY, 'auto');
   c.context.window.visualViewport.height = 240;
@@ -3444,6 +3454,7 @@ test('a sent draft kept but drawn empty gives the editor no scrollbar until it s
   const input = c.get('chat-input');
   Object.defineProperty(input, 'scrollHeight', { get: () => 20 + 22 * input.value.split('\n').length });
   input.value = entry.text = Array(8).fill('보낸 긴 글').join('\n'); input.events.input();
+  c.flushFrames();
   assert.equal(input.style.overflowY, 'auto', '긴 초안은 스크롤된다');
   // Sent and not yet confirmed: the bubble shows it, the editor keeps it drawn empty.
   entry.pending = { requestId: 'sent-request', revision: entry.revision, text: entry.text, attachments: [] };
@@ -3455,6 +3466,35 @@ test('a sent draft kept but drawn empty gives the editor no scrollbar until it s
   entry.pending = null;
   c.updateChatComposer(entry);
   assert.equal(input.style.overflowY, 'auto');
+});
+
+test('an unchanged narrow draft is remeasured when the font changes from 16px to 24px', () => {
+  const c = client(undefined, noChatTimers), { s, entry } = selectChat(c);
+  wireTree(c, c.buildChatComposer(s));
+  const input = c.get('chat-input');
+  input.value = entry.text = '줄바꿈 경계에 있는 한글 초안';
+  input.clientWidth = 200;
+  let fontSize = '16px', measurements = 0;
+  c.context.window.getComputedStyle = () => ({ fontSize, lineHeight: '24px', paddingLeft: '10px',
+    paddingRight: '10px', paddingTop: '10px', paddingBottom: '10px' });
+  const doc = c.context.document, create = doc.createElement;
+  doc.body.append = () => {};
+  doc.createElement = (tag) => {
+    const node = create(tag);
+    if (tag === 'textarea') Object.defineProperty(node, 'scrollHeight', { get() {
+      measurements++;
+      return node.style.fontSize === '16px' ? 44 : 68;
+    } });
+    return node;
+  };
+  c.resizeChatInput(entry, s);
+  assert.equal(input.style.height, '46px');
+  c.resizeChatInput(entry, s);
+  assert.equal(measurements, 1);
+  fontSize = '24px';
+  c.resizeChatInput(entry, s);
+  assert.equal(input.style.height, '70px');
+  assert.equal(measurements, 2);
 });
 
 test('programmatic clipboard insertion grows the editor and accepted delivery shrinks it without clearing newer drafts', async () => {
@@ -3472,6 +3512,7 @@ test('programmatic clipboard insertion grows the editor and accepted delivery sh
   assert.equal(input.value, '');
   assert.equal(input.style.height, '44px');
   input.value = text; input.events.input();
+  c.flushFrames();
   entry.pending = { requestId: 'older-draft-request', revision: entry.revision - 1 };
   c.applyChatReceipt(entry, { requestId: 'older-draft-request', status: 'accepted' });
   assert.equal(input.value, text);

@@ -13,7 +13,7 @@
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
   let pendingState = "uncertain";
   let enabled = false, focusId = null;
-  // The message whose menu (time · reply · copy · stream) is open. The list is rebuilt on every refresh, so it is kept by key.
+  // The open message menu stays on its message when the conversation redraws.
   let menuKey = null;
   // Ryan One 1.40.0 ("여러개를 병렬로 지시하니까 이전 대화 찾기가 어렵네"): /api/woni holds Woni's latest 60 chats
   // (latestData, which the read mark and badges use). Earlier pages and an opened stream are kept apart and merged
@@ -317,6 +317,9 @@
   function renderReplyPicks() {
     const target = replyTarget, latest = shownRows.length ? latestRowId(shownRows) : latestAnswerId(latestData?.chats);
     const picks = target?.part === "answer" && !pending && !replyBox.hidden && target.id !== latest ? target.suggestions || [] : [];
+    const revision = JSON.stringify([picks.length ? target.id : null, picks]);
+    if (replyPicks.dataset.revision === revision) return;
+    replyPicks.dataset.revision = revision;
     replyPicks.replaceChildren(...picks.map((text) => action(text, () => sendSuggestion(text, target))));
     replyPicks.hidden = !picks.length;
   }
@@ -585,8 +588,9 @@
   let statusRunning = 0;
   function renderStatus() {
     const counts = tasks?.counts || {}, check = (Number(counts.due) || 0) + (Number(counts.followup) || 0);
-    status.textContent = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.")
+    const text = pending ? (pendingState === "uncertain" ? "전송 확인이 필요해요." : "메시지를 전달하고 있어요.")
       : [statusRunning ? `작업 중 ${statusRunning}` : "", check ? `할 일 확인 ${check}` : ""].filter(Boolean).join(" · ") || "지금 기다리는 일 없어요";
+    if (status.textContent !== text) status.textContent = text;
   }
   function taskBadge() {
     renderStatus();
@@ -1015,13 +1019,13 @@
   }
   function loadedChats() { return mergedChats(Array.isArray(latestData?.chats) ? latestData.chats : []); }
   // Whether Woni holds chats above the first one shown. An older Woni server (no chatsHasMore or seq) has none to give.
-  function canLoadOlder() {
+  function canLoadOlder(chats) {
     if (filter) return streamChatsFor === filter.id && streamHasMore;
-    const first = loadedChats()[0];
+    const first = (chats || loadedChats())[0];
     return latestData?.chatsHasMore === true && Number.isInteger(first?.seq) && first.seq > 0;
   }
   // The line at the top of the list: loading, a failure with its retry, more to fetch, or the start of a stream.
-  function olderRow(shown) {
+  function olderRow(shown, hasOlder) {
     if (olderLoading) { const line = el("p", "woni-older", "이전 대화를 불러오고 있어요."); line.setAttribute("role", "status"); return [line]; }
     if (olderError) {
       const box = el("div", "woni-older is-error"), text = el("span", "", olderError);
@@ -1029,7 +1033,7 @@
       box.append(text, button("다시 시도", "quiet", () => { const retry = olderRetry || loadOlder; olderError = ""; olderRetry = null; retry(); }));
       return [box];
     }
-    if (canLoadOlder()) return [button("이전 대화 더 보기", "quiet woni-older-more", () => loadOlder())];
+    if (hasOlder) return [button("이전 대화 더 보기", "quiet woni-older-more", () => loadOlder())];
     if (filter && streamChatsFor === filter.id && shown) return [el("p", "woni-divider", `이 흐름의 첫 대화 · 모두 ${shown}개`)];
     return [];
   }
@@ -1433,14 +1437,32 @@
       }
       savePending(null); renderAttachments();
     }
+    const allChats = mergedChats(chats), visibleChats = filter ? allChats.filter((chat) => chat.stream === filter.id) : allChats;
+    const now = Date.now() / 1000, hasOlder = canLoadOlder(allChats);
+    const revision = JSON.stringify([visibleChats, dayNumber(now), filter?.id, streamChatsFor, hasOlder,
+      olderLoading, olderError, highlight, menuKey, pending,
+      pending && [pendingState, sending, attachments, replyTarget,
+        allChats.find((chat) => chat.id === pending.replyTo?.id)]]);
+    if (!messages.dataset.loaded || messages.chatRevision !== revision) {
+      drawChatRows(visibleChats, now, hasOlder, keepPlace);
+      messages.chatRevision = revision;
+    }
+    filterBox.hidden = view !== "chat" || !filter;
+    const filterLabel = $("woni-filter-label"), label = filter ? `흐름: ${filter.title}` : "";
+    if (filterLabel.textContent !== label) filterLabel.textContent = label;
+    renderReplyPicks();
+    const running = data.activity?.running || 0;
+    statusRunning = running; renderStatus();
+    renderSide();
+  }
+  function drawChatRows(visibleChats, now, hasOlder, keepPlace) {
     const atEnd = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
     const oldHeight = messages.scrollHeight, oldTop = messages.scrollTop;
-    const nodes = [], visibleChats = mergedChats(chats).filter((item) => !filter || item.stream === filter.id);
-    nodes.push(...olderRow(visibleChats.length));
+    const nodes = olderRow(visibleChats.length, hasOlder);
     // Rows, not chats (chatRows): a stream shows its own chats by the same rule, so an answer apart in the whole
     // list may sit right under its ask there. The 👉 suggestions go under the bottom answer of the rows shown.
     const rows = chatRows(visibleChats), byId = new Map(visibleChats.map((chat) => [chat.id, chat]));
-    const dividers = timeDividers(rows, byId), latestId = latestRowId(rows);
+    const dividers = timeDividers(rows, byId, now), latestId = latestRowId(rows);
     const found = highlight && rowFor(rows, highlight.id, highlight.part)?.key;
     shownRows = rows;
     for (const item of rows) {
@@ -1476,14 +1498,8 @@
     }
     messages.replaceChildren(...nodes);
     if (atEnd || !messages.dataset.loaded) messages.scrollTop = messages.scrollHeight;
-    else if (keepPlace) messages.scrollTop = oldTop + messages.scrollHeight - oldHeight;
+    else messages.scrollTop = keepPlace ? oldTop + messages.scrollHeight - oldHeight : oldTop;
     messages.dataset.loaded = "1";
-    filterBox.hidden = view !== "chat" || !filter;
-    $("woni-filter-label").textContent = filter ? `흐름: ${filter.title}` : "";
-    renderReplyPicks();
-    const running = data.activity?.running || 0;
-    statusRunning = running; renderStatus();
-    renderSide();
   }
   // A working answer shows quiet dots, a failed one the failure colour (style.css); the class stays as before.
   function stateRow(state, node) { node.dataset.state = state; return node; }
@@ -1595,7 +1611,8 @@
     pending = savedPending();
     if (!input.value && !attachments.length && !uploading && !pending && !replyTarget && !sending) {
       try {
-        if (window.RyanOneHost?.version === 1 && window.RyanOneHost.openWoni(focusId || "") === true) {
+        const host = window.RyanOneHost;
+        if ((host?.version === 1 || host?.version === 2) && host.openWoni?.(focusId || "") === true) {
           focusId = null;
           return;
         }
@@ -1742,6 +1759,7 @@
       closeDrawer(false);
       if (dialog.open) dialog.close(); open.hidden = true; messages.replaceChildren(); delete messages.dataset.loaded;
       input.value = ""; attachments = []; replyTarget = null; replyBox.hidden = true; replyPicks.replaceChildren(); replyPicks.hidden = true;
+      delete replyPicks.dataset.revision; messages.chatRevision = null;
       filter = null; latestData = null; workData = null; resetHistory();
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       readThrough = null; serverRead = 0; readPosting = 0; streamRead = Object.create(null); streamMarks = false; streamPosting = Object.create(null);
