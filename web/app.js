@@ -16126,7 +16126,8 @@ function renderKeyboardRoom() {
   // What the keyboard covers of the window's bottom (iOS keeps the window's height): toasts
   // stay above it.
   const viewport = window.visualViewport;
-  const covered = open && viewport ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
+  const covered = !nativeBoardViewport() && open && viewport
+    ? Math.max(0, Math.round((window.innerHeight || 0) - (viewport.offsetTop || 0) - viewport.height)) : 0;
   document.documentElement.style?.setProperty?.("--kb-inset", `${covered}px`);
   const classes = document.body?.classList;
   const changed = !!classes?.contains?.("keyboard-beside") !== beside;
