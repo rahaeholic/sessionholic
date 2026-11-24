@@ -6,6 +6,7 @@ import socket
 import struct
 from pathlib import Path
 import sys
+import sqlite3
 import tempfile
 import threading
 import time
@@ -1012,6 +1013,35 @@ class StateDbListingTest(unittest.TestCase):
         self.assertEqual(calls, [("thread/list", True)])
         reply, calls = self.home_threads(full=True)
         self.assertEqual(calls, [("thread/list", None), ("thread/loaded/list", None), ("account/read", None)])
+
+    def test_open_threads_beyond_the_recent_page_keep_their_original_card(self):
+        recent, open_thread, archived, missing = [
+            f"019aaaaa-0000-7000-8000-{i:012d}" for i in range(1, 5)
+        ]
+        calls = []
+
+        class Server:
+            def call(self, method, options):
+                calls.append((method, options))
+                return {"thread": {"id": open_thread, "cwd": "/workspace", "name": "retained work",
+                                   "status": {"type": "idle"}}}
+
+        with tempfile.TemporaryDirectory() as folder:
+            account = Path(folder)
+            with sqlite3.connect(account / "state_5.sqlite") as db:
+                db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, created_at INTEGER,"
+                           "updated_at INTEGER, archived INTEGER, source TEXT)")
+                db.executemany("INSERT INTO threads VALUES (?, '/workspace', 'stored title', 1, 2, ?, 'vscode')",
+                               [(recent, 0), (open_thread, 0), (archived, 1)])
+            page = {"data": [{"id": recent, "status": {"type": "active"}}]}
+            loaded = {recent, open_thread, archived, missing}
+            merged = collector.keep_loaded_threads(Server(), account, page, loaded)
+        rows = [collector.codex_row(row, ".codex", None, "default", loaded, []) for row in merged["data"]]
+        self.assertEqual([row["id"] for row in page["data"]], [recent])
+        self.assertEqual([row["id"] for row in rows], [recent, open_thread])
+        self.assertEqual((rows[1]["title"], rows[1]["phase"], rows[1]["source"], rows[1]["loaded"]),
+                         ("retained work", "idle", "vscode", True))
+        self.assertEqual(calls, [("thread/read", {"threadId": open_thread, "includeTurns": False})])
 
 
 class CodexLoginTest(unittest.TestCase):
