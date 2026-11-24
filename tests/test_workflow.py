@@ -441,7 +441,9 @@ class SecurityTest(unittest.TestCase):
         self.assertEqual(min(answer['version'] for answer in answers), version_before)
         self.assertGreater(self.httpd.events.terminals_version, version_before)
         self.assertIsNotNone(self.httpd.workflow.recoveries.get(REF))
-        self.assertIsNone(self.httpd.workflow.recoveries.get({**REF, 'id': started['id']}))
+        observed = self.httpd.workflow.recoveries.get({**REF, 'id': started['id']})
+        self.assertEqual(observed['provenance'], {'kind': 'listed-native', 'closure': 'none'},
+                         'the collector independently proved the session, but its estimated terminal link was not saved')
 
     def test_forgotten_receipts_retry_after_concurrent_reservation(self):
         active, gone = 'a' * 32, 'b' * 32

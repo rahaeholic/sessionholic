@@ -37,7 +37,7 @@ flowchart LR
 5. `Chat`은 메시지·첨부 요청을 원본 세션이 있는 호스트로 전달하고 결과를 확인합니다. `native_chat.py`는 호스트별 native capability를 검사하고, `attachments.py`는 실제 세션의 작업 경로 안에서 파일을 안전하게 저장·검증합니다.
 6. `terminal.py`는 서버가 검증한 native CLI 명령을 전용 tmux 세션과 PTY에서 실행합니다. 브라우저의 xterm은 해당 PTY에 연결된 터미널 화면입니다. 브라우저 연결을 닫는 것과 CLI 실행을 종료하는 동작은 별도입니다.
 7. `terminal_input.py`는 PTY 입력 전에 요청 해시와 미확인 상태를 SQLite에 저장합니다. 쓰기를 마친 경우만 접수 상태로 바꾸며, 미확인 요청은 재시작 뒤에도 재전송하지 않습니다. 터미널 원문은 이 기록에 넣지 않습니다.
-8. `session_recovery.py`는 터미널 이력과 별도로 정확한 native 복귀 참조를 비공개 atomic JSON에 보존합니다. 목록 밖 복귀는 저장된 참조와 원본의 exact read만으로 검증하고, 실제 연결 직전에 다시 확인합니다. 보기를 닫아도 작업 카드를 자동 정리하지 않으며, Windows의 직접 SSH 연결은 실행 수명 보장이 없어 idle/spare/run 자동 종료 대상에서 제외합니다.
+8. `session_recovery.py`는 터미널 이력과 별도로 수집하거나 정확히 연결한 native 식별자를 비공개 SQLite에 보존합니다. 기존 복귀 JSON은 처음 한 번 트랜잭션 안에서 읽고 원본을 유지합니다. 스냅샷이 첫 50개를 읽고 `GET /api/session/retained?after=…`가 불변 순번 인덱스로 다음 페이지를 읽습니다. 목록에서 지운 표시는 같은 API로 읽고 쓰며, 기존 표시 파일을 별도 SQLite 원장으로 이전해 최근 기록 수에 따라 지우지 않습니다. 목록 밖 복귀는 저장된 참조와 원본의 exact read만으로 검증하고, 실제 연결 직전에 다시 확인합니다. 보기를 닫아도 작업 카드를 자동 정리하지 않으며, Windows의 직접 SSH 연결은 실행 수명 보장이 없어 idle/spare/run 자동 종료 대상에서 제외합니다.
 9. `prompt_receipts.py`는 질문 선택을 전송하기 전에 SQLite FULL commit으로 미확인 영수증을 남깁니다. 원장은 resolved conversation/request ID와 선택·터미널의 해시만 보관하고, 기존 요청은 상태만 반환합니다. `InputNotSent`가 전달 전 실패를 증명할 때만 예약을 취소합니다. 일반 메시지 및 PTY 입력 원장과 별도입니다.
 
 Windows poll과 선택 대화 읽기는 `runtime_observation.py`의 공통 순서·서버 시계를 사용합니다. 나중에 시작한 조회가 우선하며 실패한 adapter도 순서 경계를 남깁니다. 캐시 반환과 실패는 확인된 상태의 lease를 연장하지 않습니다. SSE 대화 digest에서 관측 시각만 제외하고, 실제 새 관측은 최대 30초 간격의 작은 metadata 갱신으로 전달합니다. 의미가 바뀐 상태·이유는 즉시 전달합니다. Windows poll은 기존 snapshot version으로 body/gzip cache를 무효화하며 Mac heartbeat를 전체 세션의 새 확인으로 간주하지 않습니다.

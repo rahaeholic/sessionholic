@@ -1,10 +1,12 @@
 import errno
+import fcntl
 import http.client
 import io
 import json
 import os
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 from pathlib import Path
@@ -44,6 +46,65 @@ def fake_runner(calls):
             return {"host": "remote", "claude": [{"id": "a1b2c3d4", "title": "정산"}], "codex": [], "tmux": [], "errors": []}
         return {"messages": [{"role": "user", "text": "hi"}]}
     return run
+
+
+class SocketDescriptorTest(unittest.TestCase):
+    def test_open_high_descriptor_can_read_and_write_http_without_select_failure(self):
+        class HighDescriptorServer(server.BoardHTTPServer):
+            def get_request(self):
+                conn, address = super().get_request()
+                with conn:
+                    return socket.socket(fileno=fcntl.fcntl(conn.fileno(), fcntl.F_DUPFD, 1100)), address
+
+        class ProbeHandler(server.Handler):
+            def do_GET(self):
+                self.server.descriptor = self.connection.fileno()
+                try:
+                    server.select.select([self.connection], [], [], 0)
+                except ValueError as exc:
+                    self.server.old_probe_error = str(exc)
+                self.server.closed = self.peer_closed()
+                self.send_body(200, b"fixture body", "text/plain")
+
+            def log_message(self, *_):
+                pass
+
+        with HighDescriptorServer(("127.0.0.1", 0), ProbeHandler) as listener:
+            listener.timeout = 3
+            thread = threading.Thread(target=listener.handle_request)
+            thread.start()
+            conn = http.client.HTTPConnection(*listener.server_address, timeout=3)
+            try:
+                conn.request("GET", "/fixture")
+                response = conn.getresponse()
+                self.assertEqual((response.status, response.read()), (200, b"fixture body"))
+                self.assertGreaterEqual(listener.descriptor, 1100)
+                self.assertIn("filedescriptor out of range", listener.old_probe_error)
+                self.assertFalse(listener.closed)
+            finally:
+                conn.close()
+                thread.join(4)
+
+    def test_closed_descriptor_is_ebadf_and_short_http_body_is_incomplete_read(self):
+        left, right = socket.socketpair()
+        with left, right, left.makefile("rb") as reader:
+            os.close(left.fileno())  # Inject the invalid descriptor only in this fixture.
+            try:
+                for operation in (lambda: reader.read(1), lambda: left.sendall(b"x")):
+                    with self.assertRaises(OSError) as error:
+                        operation()
+                    self.assertEqual(error.exception.errno, errno.EBADF)
+            finally:
+                left.detach()
+        left, right = socket.socketpair()
+        with left, right:
+            right.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 12\r\n\r\nshort")
+            right.shutdown(socket.SHUT_WR)
+            with http.client.HTTPResponse(left) as response:
+                response.begin()
+                with self.assertRaises(http.client.IncompleteRead) as error:
+                    response.read()
+                self.assertEqual((error.exception.partial, error.exception.expected), (b"short", 7))
 
 
 class ServerTest(unittest.TestCase):
@@ -312,7 +373,10 @@ class ServerTest(unittest.TestCase):
                       "sessionTidied": body["sessionTidied"], "sessionRemoved": body["sessionRemoved"],
                       "sessionOpened": body["sessionOpened"], "sessionPinned": body["sessionPinned"], "bootId": self.httpd.boot_id,
                       "quickReplyPreferences": {"ok": True, "revision": 0, "quickReplies": None},
-                      "savedPrompts": {"ok": True, "revision": 0}, "recoverySessions": []}
+                      "savedPrompts": {"ok": True, "revision": 0}, "recoverySessions": [],
+                      "retainedNextCursor": None, "retainedDisplayVersion": body["retainedDisplayVersion"],
+                      "retainedCatalog": {"ok": True}}
+            self.assertRegex(body["retainedDisplayVersion"], r"^[a-f0-9]{64}$")
             self.assertEqual(body, served)
             for header in ({}, {"Accept-Encoding": "gzip;q=0"}, {"Accept-Encoding": "identity"}):
                 res, data = self.request("GET", "/api/snapshot", headers={"Authorization": "Bearer " + TOKEN, **header})

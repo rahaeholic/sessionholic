@@ -965,8 +965,13 @@ class SnapshotResponseTest(unittest.TestCase):
         snapshot = self.board.snapshot()
         for name in self.STORES:
             snapshot = getattr(self.httpd, name).decorate(snapshot)
+        handler = object.__new__(server.Handler)
+        handler.server = self.httpd
+        retained, cursor = handler.recovery_sessions()
         snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
-                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': []}
+                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': retained,
+                    'retainedNextCursor': cursor, 'retainedDisplayVersion': handler.retained_display_version(),
+                    'retainedCatalog': {'ok': True}}
         return json.dumps(snapshot, ensure_ascii=False).encode()
 
     def test_an_unchanged_snapshot_is_answered_without_copying_or_reading_any_store(self):

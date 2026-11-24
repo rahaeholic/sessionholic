@@ -118,6 +118,8 @@ class ExactRecoveryTest(unittest.TestCase):
         return WorkerError('정확한 Claude 저장 대화를 확인하지 못했습니다.', 'recover-missing')
 
     def test_sweep_forgets_only_a_conversation_gone_on_its_host(self):
+        self.flow.recoveries.forget(REF)
+        self.flow.recoveries.remember(self.native, 'a' * 32)
         later = time.time() + 2 * self.flow.RECOVERY_GRACE
         self.assertIsNotNone(self.flow.recoveries.get(REF))
         from transfer import WorkerError
@@ -147,6 +149,8 @@ class ExactRecoveryTest(unittest.TestCase):
         self.assertFalse(self.terms.calls)
 
     def test_sweep_never_asks_for_new_listed_offline_closed_or_recently_asked_locators(self):
+        self.flow.recoveries.forget(REF)
+        self.flow.recoveries.remember(self.native, 'a' * 32)
         self.terms.records = []
         later = time.time() + 2 * self.flow.RECOVERY_GRACE
         with patch.object(self.flow.transfers, 'rpc', side_effect=self.missing()) as rpc:
@@ -178,6 +182,8 @@ class ExactRecoveryTest(unittest.TestCase):
         self.assertEqual(rpc.call_count, self.flow.RECOVERY_BATCH)
 
     def test_opening_a_gone_conversation_forgets_it_and_says_so(self):
+        self.flow.recoveries.forget(REF)
+        self.flow.recoveries.remember(self.native, 'a' * 32)
         self.terms.records = []
         old = int(time.time() - 2 * self.flow.RECOVERY_GRACE)
         self.flow.recoveries.remember({**self.native, 'openedAt': old})
@@ -189,6 +195,8 @@ class ExactRecoveryTest(unittest.TestCase):
         self.assertIsNone(self.flow.recoveries.get(REF))
 
     def test_missing_probe_cannot_forget_a_record_changed_during_the_probe(self):
+        self.flow.recoveries.forget(REF)
+        self.flow.recoveries.remember(self.native, 'a' * 32)
         self.terms.records = []
         old = int(time.time() - 2 * self.flow.RECOVERY_GRACE)
         self.flow.recoveries.remember({**self.native, 'openedAt': old})
@@ -210,20 +218,28 @@ class ExactRecoveryTest(unittest.TestCase):
             {'id': 'c' * 32, 'nativeSource': other},
         ]
         store = self.flow.recoveries
-        before = store.snapshot()
-        with patch.object(store, '_write', side_effect=OSError('fixture')):
+        before = store.page()
+        put = store._put
+
+        def fail_second(db, row):
+            if row['source']['id'] == other['id']:
+                raise OSError('fixture failed second upsert')
+            put(db, row)
+
+        with patch.object(store, '_put', side_effect=fail_second):
             self.flow.capture_recoveries()
-        self.assertEqual(store.snapshot(), before)
-        with patch.object(store, '_read', wraps=store._read) as read, \
-                patch.object(store, '_write', wraps=store._write) as write:
+        self.assertEqual(store.page(), before)
+        with patch.object(store, '_database', wraps=store._database) as database, \
+                patch.object(store, '_put', wraps=put) as upsert:
             self.flow.capture_recoveries()
-        read.assert_called_once()
-        write.assert_called_once()
+        database.assert_called_once_with(write=True)
+        self.assertEqual(upsert.call_count, 2)
         self.assertEqual(store.get(REF)['title'], 'updated fixture')
         self.assertEqual(store.get(other)['provenance']['terminalId'], 'c' * 32)
-        self.assertEqual(store.snapshot()['revision'], before['revision'] + 2)
 
     def test_opening_a_new_or_changed_conversation_keeps_it(self):
+        self.flow.recoveries.forget(REF)
+        self.flow.recoveries.remember(self.native, 'a' * 32)
         self.terms.records = []
         from transfer import WorkerError
         for error in (self.missing(), WorkerError('저장된 세션과 원본 작업 경로가 다릅니다.')):
