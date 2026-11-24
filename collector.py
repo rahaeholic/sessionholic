@@ -1079,9 +1079,8 @@ def _open_read_only(sqlite3, database, immutable=False):
     return connection
 
 
-def codex_db_threads(path):
-    """(listed, loaded, failure) like `codex_home_threads`, read from the home's state DB
-    without a daemon: newest unarchived threads of every source, none loaded.
+def codex_db_threads(path, thread_ids=None):
+    """Read the newest unarchived threads or specific unarchived IDs from one home.
     Unknown source kinds stay visible. Nothing starts or writes."""
     import sqlite3
     database = state_db(path)
@@ -1105,10 +1104,14 @@ def codex_db_threads(path):
             optional = [name for name in ("name", "preview", "first_user_message", "originator",
                                           "agent_nickname", "agent_role", "git_sha", "parent_thread_id",
                                           "initiator", "initiator_name", "parent_session_id") if name in columns]
-            rows = connection.execute(
-                "SELECT id, cwd, title, created_at, updated_at, source%s FROM threads WHERE archived = 0"
-                " ORDER BY updated_at DESC LIMIT ?" % "".join(", " + n for n in optional),
-                (CODEX_THREAD_LIMIT,)).fetchall()
+            select = "SELECT id, cwd, title, created_at, updated_at, source%s FROM threads WHERE archived = 0" % (
+                "".join(", " + name for name in optional))
+            if thread_ids is None:
+                rows = connection.execute(select + " ORDER BY updated_at DESC LIMIT ?", (CODEX_THREAD_LIMIT,)).fetchall()
+            else:
+                placeholders = ", ".join("?" for _ in thread_ids)
+                rows = connection.execute(select + f" AND id IN ({placeholders}) ORDER BY updated_at DESC",
+                                          tuple(thread_ids)).fetchall()
         finally:
             connection.close()
     except sqlite3.Error:
@@ -1198,6 +1201,37 @@ def with_login(rows, path):
     return rows
 
 
+def keep_loaded_threads(server, path, listed, loaded):
+    """Add verified open threads that aged out of thread/list's recent page."""
+    rows = listed.get("data") if isinstance(listed, dict) else None
+    if not isinstance(rows, list):
+        return listed
+    listed_ids = {row.get("id") for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)}
+    missing = sorted(sid for sid in loaded - listed_ids if isinstance(sid, str) and SESSION_ID.fullmatch(sid))
+    if not missing:
+        return listed
+    # thread/read can also read archived conversations. Confirm each ID still
+    # belongs to this home's unarchived state before reintroducing it.
+    saved, _, failure = codex_db_threads(path, thread_ids=missing)
+    if failure or not saved["data"]:
+        return listed
+    extra = []
+    for row in saved["data"]:
+        try:
+            reply = server.call("thread/read", {"threadId": row["id"], "includeTurns": False})
+        except RpcReplyError:
+            reply = None
+        except (RpcError, OSError):
+            # Leave the recent list usable if the live connection breaks mid-read.
+            break
+        thread = reply.get("thread") if isinstance(reply, dict) else None
+        if (isinstance(thread, dict) and thread.get("id") == row["id"] and thread.get("cwd") == row["cwd"]
+                and thread.get("archived") is not True):
+            extra.append({**row, **thread})
+    return {**listed, "data": rows + extra}
+
+
+
 def codex_home_threads(path, full=False):
     """One home's thread list over its own daemon connection: (listed, loaded, failure).
     Its signed-in account is noted on the way (codex_login)."""
@@ -1206,6 +1240,7 @@ def codex_home_threads(path, full=False):
             listed, _ = list_threads(server, quick=not full)
             loaded = loaded_threads(server)
             codex_login(server, path)
+            listed = keep_loaded_threads(server, path, listed, loaded)
     except OSError as error:
         if error.errno in (errno.ENOENT, errno.ECONNREFUSED) and daemon_socket_state(path / SOCKET_REL) == "closed":
             return None, None, "stale"
@@ -1904,6 +1939,7 @@ class CodexHome:
                     quick_retry = None if used else now + WATCH_QUICK_RETRY
                 loaded = loaded_threads(client)
                 codex_login(client, self.path)  # Asked again only every CODEX_LOGIN_SECONDS.
+                result = keep_loaded_threads(client, self.path, result, loaded)
                 self.publish((result, loaded, None))
                 listed[0] = True
                 now = clock()
