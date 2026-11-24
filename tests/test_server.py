@@ -374,7 +374,8 @@ class ServerTest(unittest.TestCase):
                       "sessionOpened": body["sessionOpened"], "sessionPinned": body["sessionPinned"], "bootId": self.httpd.boot_id,
                       "quickReplyPreferences": {"ok": True, "revision": 0, "quickReplies": None},
                       "savedPrompts": {"ok": True, "revision": 0}, "recoverySessions": [],
-                      "retainedNextCursor": None, "retainedDisplayVersion": body["retainedDisplayVersion"],
+                      "retainedNextCursor": None, "retainedUserCatalog": {"ok": True},
+                      "retainedDisplayVersion": body["retainedDisplayVersion"],
                       "retainedCatalog": {"ok": True}}
             self.assertRegex(body["retainedDisplayVersion"], r"^[a-f0-9]{64}$")
             self.assertEqual(body, served)
