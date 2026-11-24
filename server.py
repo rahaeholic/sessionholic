@@ -4137,7 +4137,7 @@ class Handler(BaseHTTPRequestHandler):
             source, origin = record["source"], record["provenance"]
             if source["host"] not in hosts:
                 continue
-            presentation = record.get("presentation") or ({"initiator": "human"}
+            presentation = record.get("presentation") or ({"initiator": "human", "initiatorEvidence": "terminal-link"}
                            if origin.get("kind") == "terminal-native" else {})
             row = {**source, **presentation, **{key: record[key] for key in ("title", "account", "openedAt", "updatedAt")
                                 if key in record}, "terminalId": origin.get("terminalId"),

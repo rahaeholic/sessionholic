@@ -29,7 +29,7 @@ NAME = re.compile(r"[A-Za-z0-9_.-]{1,40}\Z")
 CLAUDE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SESSION_ID = re.compile(r"[0-9A-Za-z-]{8,64}\Z")
 TERMINAL_ID = re.compile(r"[0-9a-f]{32}\Z")
-ORIGIN_FIELDS = {"source": 40, "initiator": 16, "originator": 80, "entrypoint": 40,
+ORIGIN_FIELDS = {"source": 40, "initiator": 16, "initiatorEvidence": 40, "originator": 80, "entrypoint": 40,
                  "executionMode": 40, "parentSessionId": 128, "agentRole": 80}
 DISPLAY_FIELDS = {"title": 240, "account": 160, "hostLabel": 160}
 CLOSURES = ("none", "connection", "legacy_user_close", "explicit_termination")

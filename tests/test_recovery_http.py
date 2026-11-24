@@ -186,6 +186,20 @@ class RecoveryHttpTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assert_no_execution()
 
+    def test_retained_initiator_distinguishes_a_terminal_link_from_observed_evidence(self):
+        observed = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000010',
+                    'initiator': 'human', 'initiatorEvidence': 'explicit'}
+        self.board.runner = lambda *_: {'codex': [observed], 'claude': []}
+        self.board.poll(HOST)
+        self.board.runner = lambda *_: {'codex': [], 'claude': []}
+        self.board.poll(HOST)
+
+        rows = {row['id']: row for row in self.snapshot()['recoverySessions']}
+        self.assertEqual((rows[SID]['initiator'], rows[SID]['initiatorEvidence']), ('human', 'terminal-link'))
+        self.assertEqual((rows[observed['id']]['initiator'], rows[observed['id']]['initiatorEvidence']),
+                         ('human', 'explicit'))
+        self.assert_no_execution()
+
     def test_pages_hold_old_released_and_listed_rows_with_bounded_work_and_display_marks(self):
         old = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000023', 'source': 'cli',
                'title': 'fixture from collection only', 'updatedAt': 3}
