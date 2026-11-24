@@ -168,6 +168,21 @@ class PromptReceiptsTest(unittest.TestCase):
             results = list(pool.map(lambda ledger: self.reserve(ledger=ledger), ledgers))
         self.assertEqual(sum(item['reserved'] for item in results), 1)
 
+    def test_sidecar_removed_by_a_concurrent_commit_is_treated_as_absent(self):
+        self.reserve(request_id=RID + '-initial')
+        journal = self.ledger.path.with_name(self.ledger.path.name + '-journal')
+        journal.touch(mode=0o600)
+        validate = self.ledger._private_file
+
+        def remove_before_validation(path):
+            if path == journal:
+                journal.unlink()
+            return validate(path)
+
+        with patch.object(self.ledger, '_private_file', side_effect=remove_before_validation):
+            self.assertTrue(self.reserve()['reserved'])
+            self.assertFalse(self.reserve()['reserved'])
+
     def test_final_storage_failure_keeps_committed_reservation_and_blocks_replay(self):
         self.reserve()
         self.ledger.path.chmod(0o644)
