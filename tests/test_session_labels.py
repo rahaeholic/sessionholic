@@ -968,9 +968,11 @@ class SnapshotResponseTest(unittest.TestCase):
         handler = object.__new__(server.Handler)
         handler.server = self.httpd
         retained, cursor = handler.recovery_sessions()
+        kept = handler.retained_user_sessions(snapshot, retained)
         snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
-                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': retained,
-                    'retainedNextCursor': cursor, 'retainedDisplayVersion': handler.retained_display_version(),
+                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': retained + kept,
+                    'retainedNextCursor': cursor, 'retainedUserCatalog': {'ok': True},
+                    'retainedDisplayVersion': handler.retained_display_version(),
                     'retainedCatalog': {'ok': True}}
         return json.dumps(snapshot, ensure_ascii=False).encode()
 

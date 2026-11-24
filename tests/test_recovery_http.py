@@ -246,6 +246,61 @@ class RecoveryHttpTest(unittest.TestCase):
         self.start_server()
         self.assertIsNotNone(self.flow.recoveries.get(old_ref))
 
+    def test_initial_page_includes_two_exact_manually_opened_conversations_from_one_project(self):
+        def source(n, **fields):
+            return {**self.native, 'id': '019aaaaa-0000-7000-8000-%012d' % n, **fields}
+
+        opened = source(21, title='같은 프로젝트', source='vscode', initiator='unknown')
+        linked = source(22, title='같은 프로젝트')
+        removed = source(23)
+        tidied = source(24)
+        ended = source(25, explicitTermination=True)
+        gideon = source(26)
+        agent = source(27, source='exec')
+        bot = source(28, originator='hermes')
+        automated = source(29, openedAt=100)
+        sources = (opened, linked, removed, tidied, ended, gideon, agent, bot)
+        for ref in (*sources, automated):
+            self.flow.recoveries.remember({**ref, 'openedAt': 100}, closed_reason='released')
+        for ref in sources:
+            self.httpd.session_opened.mark(ref, 100)
+        self.httpd.session_labels.set(opened, '같은 프로젝트')
+        self.httpd.session_removed.mark(removed, 120)
+        self.httpd.session_tidied.mark(tidied, 120)
+        self.flow.recoveries.remember_many([(source(100 + i), None, None) for i in range(450)])
+        _, cursor = self.flow.recoveries.page()
+
+        with patch.object(server.Handler, 'retained_gideon_origins',
+                          return_value={'ok': True, 'sessions': [{'source': gideon}]}):
+            snapshot = self.snapshot()
+            self.assertEqual(snapshot['retainedNextCursor'], cursor)
+            self.assertTrue(snapshot['retainedUserCatalog']['ok'])
+            rows = snapshot['recoverySessions']
+            self.assertEqual(len(rows), RetainedSessions.PAGE_SIZE + 2)
+            self.assertEqual(len({(r['host'], r['agent'], r['home'], r['id']) for r in rows}), len(rows))
+            kept = {row['id']: row for row in rows if row.get('retainedForUser')}
+            self.assertEqual(set(kept), {opened['id'], linked['id']})
+            self.assertEqual((kept[opened['id']]['initiator'], kept[linked['id']]['initiatorEvidence']),
+                             ('unknown', 'terminal-link'))
+            for row in kept.values():
+                self.assertEqual((row['userOpenedAt'], row['lastSeenAt']), (100, 100))
+                self.assertEqual((row['phase'], row['runtimeKnown']), ('unknown', False))
+            code, page = self.request('GET', '/api/session/retained?' + urlencode({'after': cursor}))
+            self.assertEqual(code, 200)
+            self.assertEqual(len(page['sessions']), RetainedSessions.PAGE_SIZE)
+            self.assertEqual(page['displayVersion'], snapshot['retainedDisplayVersion'])
+            self.httpd.session_removed.mark(linked, 130)
+            self.assertNotIn(linked['id'], {row['id'] for row in self.snapshot()['recoverySessions']})
+
+        self.board.changed(force=True)
+        with patch.object(server.Handler, 'retained_gideon_origins', return_value={'ok': False, 'sessions': []}):
+            snapshot = self.snapshot()
+            self.assertTrue(snapshot['retainedCatalog']['ok'])
+            self.assertFalse(snapshot['retainedUserCatalog']['ok'])
+            self.assertEqual(len(snapshot['recoverySessions']), RetainedSessions.PAGE_SIZE)
+        self.assertEqual(self.calls, [])
+        self.assert_no_execution()
+
     def test_retained_manual_view_close_survives_restart_without_a_terminal_row(self):
         current = {'id': 'b' * 32, 'nativeSource': self.native, 'mode': 'attach',
                    'alive': True, 'host': HOST['name'], 'openedAt': 100}

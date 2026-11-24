@@ -535,6 +535,25 @@ class RetainedSessions:
         with self._database() as db:
             return self._find(db, identity)[1]
 
+    def visible_for_sources(self, sources):
+        """Indexed exact matches for the bounded display-mark store."""
+        keys = set()
+        for source in sources:
+            try:
+                ref = _identity(source)
+            except RecoveryError:
+                continue
+            if ref["agent"] == "claude" and not ref.get("sessionId"):
+                continue
+            keys.add(_key(ref))
+        if not keys:
+            return []
+        with self._database() as db:
+            rows = db.execute("""SELECT sessions.value FROM json_each(?) AS wanted
+                                CROSS JOIN sessions ON sessions.locator=wanted.value
+                                WHERE sessions.visible=1""", (json.dumps(sorted(keys)),))
+            return [self._decode(value) for value, in rows]
+
     def _remember(self, db, entry, listed=False):
         stored = db.execute("SELECT value FROM sessions WHERE locator=?", (_key(entry[0]),)).fetchone()
         prior = self._decode(stored[0]) if stored else None

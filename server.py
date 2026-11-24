@@ -3243,7 +3243,7 @@ def history_rpc(server, source, args):
 
 
 # A snapshot field each display store adds; a body is kept only when every one read.
-STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved", "sessionOpened", "retainedCatalog",
+STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved", "sessionOpened", "retainedCatalog", "retainedUserCatalog",
                 "sessionPinned", "quickReplyPreferences", "savedPrompts")
 
 
@@ -3269,12 +3269,14 @@ class SnapshotResponses:
     @staticmethod
     def key_of(server):
         """The key of what a body would be now, or None when the state folder is not safe."""
+        from session_labels import _lstat_key
+
         try:
             settings.safe_path(server.session_labels.directory, directory=True, private=True, allow_missing=True)
         except ValueError:
             return None
         recovery = getattr(getattr(server, "workflow", None), "recoveries", None)
-        recovery_key = recovery.state_key() if recovery is not None else None
+        recovery_key = (recovery.state_key(), _lstat_key(server.session_labels.directory / "bot-owners.json")) if recovery is not None else None
         return (server.board.version, getattr(server.board, 'observation_revision', 0), server.boot_id, recovery_key) + tuple(store.state_key() for store in display_stores(server))
 
     def body(self, handler, gzip_ok):
@@ -4120,8 +4122,16 @@ class Handler(BaseHTTPRequestHandler):
             retained_status = {"ok": True}
         except (ValueError, RuntimeError, OSError):
             recoveries, next_cursor, retained_status = [], None, {"ok": False}
+        try:
+            kept = self.retained_user_sessions(snapshot, recoveries) if retained_status["ok"] else []
+            kept_status = {"ok": retained_status["ok"]}
+        except (GoalError, ValueError, RuntimeError, OSError):
+            kept, kept_status = [], {"ok": False}
+        # Keep the cursor anchored to the ordinary indexed page for existing clients.
+        recoveries.extend(kept)
         return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences,
                 "savedPrompts": prompts, "recoverySessions": recoveries, "retainedNextCursor": next_cursor,
+                "retainedUserCatalog": kept_status,
                 "retainedDisplayVersion": display_version, "retainedCatalog": retained_status}
 
     def retained_display_version(self):
@@ -4131,6 +4141,9 @@ class Handler(BaseHTTPRequestHandler):
     def recovery_sessions(self, after=None):
         """One indexed page of locators and display marks, without contacting hosts."""
         records, next_cursor = self.server.workflow.recoveries.page(after)
+        return self.decorate_recoveries(records), next_cursor
+
+    def decorate_recoveries(self, records):
         hosts = {h["name"]: {"name": h["name"], "data": {"claude": [], "codex": []}}
                  for h in self.server.board.hosts}
         for record in records:
@@ -4152,9 +4165,67 @@ class Handler(BaseHTTPRequestHandler):
             from session_recovery import RecoveryError
             raise RecoveryError("이전 작업의 목록 표시 상태를 확인하지 못했습니다.")
         labels = {h["name"]: h.get("label", h["name"]) for h in self.server.board.hosts}
-        rows = [{**row, "hostLabel": labels[host["name"]]}
+        return [{**row, "hostLabel": labels[host["name"]]}
                 for host in decorated["hosts"] for agent in ("codex", "claude") for row in host["data"][agent]]
-        return rows, next_cursor
+
+    def retained_gideon_origins(self, snapshot):
+        """The public server has no Gideon integration; the private overlay supplies ownership."""
+        if "gideonSessions" in snapshot:
+            return snapshot["gideonSessions"]
+        if getattr(self.server, "gideon_service", None) is None:
+            return {"ok": not bool(os.environ.get("GIDEON_DB")), "sessions": []}
+        try:
+            from sessionholic_bridge import session_origins
+        except ImportError:
+            return {"ok": False, "sessions": []}
+        return session_origins(self.server, snapshot)
+
+    def retained_user_sessions(self, snapshot, first_page):
+        """Fill the initial sidebar from exact, explicitly opened conversations beyond the page."""
+        from collector import session_category
+        from session_labels import _row_key
+        from session_recovery import RecoveryError
+
+        sources = self.server.session_opened.sources()
+        if not sources:
+            return []
+        records = self.server.workflow.recoveries.visible_for_sources(sources)
+        if not records:
+            return []
+        origins = self.retained_gideon_origins(snapshot)
+        if not isinstance(origins, dict) or origins.get("ok") is not True:
+            raise RecoveryError("기디언 소유 대화를 확인하지 못했습니다.")
+
+        def owner_key(row):
+            if row.get("agent") == "claude":
+                return (row.get("host"), "claude", row.get("home") or ".claude", row.get("sessionId"))
+            return (row.get("host"), row.get("agent"), row.get("home"), row.get("id"))
+
+        gideon = {owner_key(record["source"]) for record in origins.get("sessions", [])}
+        live = {owner_key({**row, "host": host["name"], "agent": agent})
+                for host in snapshot["hosts"] for agent in ("codex", "claude")
+                for row in (host.get("data") or {}).get(agent, [])}
+        initial = {_row_key(row): row for row in first_page}
+        rows = self.decorate_recoveries(records)
+        bots = self.server.bot_requests
+        extra, promoted = [], []
+        for row in sorted(rows, key=lambda r: (r.get("userOpenedAt") or 0, _row_key(r) or ""), reverse=True):
+            if (not row.get("userOpenedAt") or row.get("removedAt") is not None or row.get("tidiedAt") is not None
+                    or owner_key(row) in gideon or session_category(row) == "bot" or bots.owns(row)
+                    or row.get("initiator") == "agent" or row.get("initiatorEvidence") == "subagent"
+                    or row.get("parentSessionId") or row.get("agentRole") or row.get("source") == "exec"
+                    or row.get("entrypoint") == "sdk-cli" or row.get("executionMode") == "one-shot"):
+                continue
+            key = _row_key(row)
+            if owner_key(row) in live:
+                continue
+            if key in initial:
+                promoted.append(key)
+            elif len(extra) < self.server.workflow.recoveries.PAGE_SIZE:
+                extra.append({**row, "retainedForUser": True})
+        for key in promoted:
+            initial[key]["retainedForUser"] = True
+        return extra
 
     def send_snapshot(self):
         """send_json(200, self.snapshot()), served by SnapshotResponses while nothing in it changed."""

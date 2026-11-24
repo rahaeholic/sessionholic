@@ -2374,7 +2374,7 @@ function originOf(s) {
   if (botNameOf(s)) return "bot";
   if (s.initiator === "agent" || s.parentSessionId || s.agentRole) return "agent";
   if (s.agent === "claude" && (s.entrypoint === "sdk-cli" || s.executionMode === "one-shot")) return "agent";
-  if (s.initiator === "human") return "human";
+  if (s.initiator === "human" && s.initiatorEvidence !== "terminal-link") return "human";
   if (s.agent === "codex") {
     // How Codex recorded the run decides: its terminal UI or an app's or IDE's connection is
     // opened by hand, exec is a program's run. The originator names the client that last
@@ -2789,7 +2789,11 @@ function botMessageRow(message, request, { first = false } = {}) {
 const SESSION_CATEGORIES = { general: "일반 세션", agent: "에이전트 세션", bot: "봇 요청" };
 function sessionCategoryOf(session) {
   const origin = originOf(session);
-  return origin === "bot" ? "bot" : origin === "human" ? "general" : "agent";
+  if (origin === "bot") return "bot";
+  const kept = session?.retained === true && session.retainedForUser === true &&
+    Number.isInteger(session.userOpenedAt) && session.userOpenedAt > 0 && state.snapshot?.retainedUserCatalog?.ok === true;
+  if (origin === "human" || (origin === "unknown" && kept)) return "general";
+  return "agent";
 }
 // A bot request's own session, once listed: its conversation is what the request shows.
 function sessionForBotRequest(request) {

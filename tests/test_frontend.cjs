@@ -11364,6 +11364,29 @@ test('the origin of a session follows how it was opened: by hand in a terminal, 
   assert.equal(c.initiatorLabel({ agent: 'codex', originator: 'codex_exec', cwd: '/srv/bot/workspaces/slack' }), 'Slack 시작');
 });
 
+test('the initial list shows two manually opened retained conversations from the same project once each', () => {
+  const c = client(undefined, noChatTimers);
+  const host = 'workstation';
+  const row = (id, fields = {}) => ({
+    host, agent: 'codex', home: '.codex-example', cwd: '/fixture/project', id, title: '같은 프로젝트',
+    phase: 'unknown', runtimeKnown: false, retained: true, closedReason: 'released', ...fields,
+  });
+  const first = row('first', { retainedForUser: true, userOpenedAt: 21, initiator: 'unknown' });
+  const second = row('second', { retainedForUser: true, userOpenedAt: 20, initiator: 'human', initiatorEvidence: 'terminal-link' });
+  const linkOnly = row('link-only', { initiator: 'human', initiatorEvidence: 'terminal-link' });
+  const hidden = row('hidden', { retainedForUser: true, userOpenedAt: 22, removedAt: 23 });
+  c.state.snapshot = { serverTime: 100, hosts: [{ name: host, ok: true, data: { codex: [] } }],
+    recoverySessions: [first, second, linkOnly, hidden], retainedDisplayVersion: 'fixture', retainedUserCatalog: { ok: true } };
+  c.state.retainedPage = { version: 'fixture', rows: [row('first', { initiator: 'unknown' })] };
+  c.state.sessionCategory = 'general';
+  const visible = c.allSessions().filter(item => c.matches(item, 100));
+  assert.deepEqual(Array.from(visible, item => item.id), ['first', 'second']);
+  assert.ok(visible.every(item => c.groupOf(item, 100) === 'rest'));
+  assert.deepEqual(Array.from(visible, item => c.initiatorOf(item)), ['unknown', 'unknown']);
+  c.state.snapshot.retainedUserCatalog.ok = false;
+  assert.equal(c.allSessions().filter(item => c.matches(item, 100)).length, 0);
+});
+
 test('Ctrl or Command K focuses the visible unified search without submitting a draft', () => {
   const c = client(undefined, noChatTimers); let prevented = 0;
   c.documentKeydown({ key: 'k', metaKey: true, preventDefault() { prevented++; } });

@@ -287,6 +287,9 @@ class SessionSeen(_KeptRead, Goals):
     def _unavailable(self):
         return GoalError(self.WHAT + '을 안전하게 읽거나 저장하지 못했습니다.', self.CODE + '_unavailable', 503)
 
+    def _decorate_mark(self, row, at):
+        row[self.ROW_FIELD] = at
+
     def _read(self):
         settings.safe_path(self.path, private=True, allow_missing=True)
         try:
@@ -372,7 +375,7 @@ class SessionSeen(_KeptRead, Goals):
                     if key is None:
                         continue
                     found = data['seen'].get(key)
-                    row[self.ROW_FIELD] = found['at'] if found else None
+                    self._decorate_mark(row, found['at'] if found else None)
         return {**snapshot, self.SNAPSHOT_FIELD: {'ok': True, 'since': data['since']}}
 
 
@@ -457,6 +460,20 @@ class SessionOpened(SessionSeen):
     orders its older sessions by it."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-opened', 'openedAt', 'sessionOpened', 'session_opened'
     WHAT = '대화를 연 기록'
+
+    def _decorate_mark(self, row, at):
+        super()._decorate_mark(row, at)
+        # Retained locators also have an automatic openedAt. This field comes only from this store.
+        if at is None:
+            row.pop('userOpenedAt', None)
+        else:
+            row['userOpenedAt'] = at
+
+    def sources(self):
+        with self._storage():
+            data = self._read_cached()
+        marks = (data or {}).get('seen', {})
+        return [dict(mark['source']) for mark in marks.values() if mark['at'] > 0]
 
 
 class SessionPinned(SessionSeen):
