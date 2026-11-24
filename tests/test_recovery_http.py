@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import launch
 import server
+from session_recovery import RetainedSessions, RecoverySessions
 
 
 HOST = {'name': 'fixture-local', 'label': 'Fixture', 'local': True}
@@ -171,7 +172,11 @@ class RecoveryHttpTest(unittest.TestCase):
                 self.httpd.session_removed.mark(source, 300)
             elif flag == 'tidied':
                 self.httpd.session_tidied.mark(source, 300)
-        self.assertEqual([row['id'] for row in self.snapshot()['recoverySessions']], [SID])
+        by_id = {row['id']: row for row in self.snapshot()['recoverySessions']}
+        self.assertEqual(len(by_id), 3)
+        self.assertEqual(by_id['019aaaaa-0000-7000-8000-000000000002']['removedAt'], 300)
+        self.assertEqual(by_id['019aaaaa-0000-7000-8000-000000000003']['tidiedAt'], 300)
+        self.assertTrue(by_id[SID]['retained'])
         for store in (self.httpd.session_removed, self.httpd.session_tidied):
             with self.subTest(metadata=store.NAME):
                 original = store.path.read_bytes()
@@ -181,13 +186,137 @@ class RecoveryHttpTest(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.assert_no_execution()
 
+    def test_pages_hold_old_released_and_listed_rows_with_bounded_work_and_display_marks(self):
+        old = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000023', 'source': 'cli',
+               'title': 'fixture from collection only', 'updatedAt': 3}
+        self.board.runner = lambda *_: {'codex': [old], 'claude': []}
+        self.board.poll(HOST)
+        self.board.runner = lambda *_: {'codex': [], 'claude': []}
+        self.board.poll(HOST)
+        # More than both the old visible cap and the old retention count.
+        observations = [({**self.native, 'id': '019aaaaa-0000-7000-8000-%012d' % (100 + index)}, None, 'released')
+                        for index in range(510)]
+        self.flow.recoveries.remember_many(observations)
+        snapshot = self.snapshot()
+        self.assertEqual(len(snapshot['recoverySessions']), RetainedSessions.PAGE_SIZE)
+        self.assertEqual(snapshot['hosts'][0]['data']['codex'], [])
+        self.assertEqual(self.request('GET', '/api/session/retained?after=abc')[0], 400)
+        self.assertEqual(self.request('GET', '/api/session/retained?after=1', authorized=False)[0], 401)
+
+        old_ref = {**self.ref, 'id': old['id']}
+        self.assertEqual(self.request('POST', '/api/session/remove',
+                                      {'source': old_ref, 'removed': True})[0], 200)
+        visible_state = self.snapshot()
+        self.assertNotEqual(snapshot['retainedDisplayVersion'], visible_state['retainedDisplayVersion'])
+        found = {row['id']: row for row in visible_state['recoverySessions']}
+        after = visible_state['retainedNextCursor']
+        while after:
+            with patch.object(self.flow.recoveries, '_decode', wraps=self.flow.recoveries._decode) as decoded:
+                code, page = self.request('GET', '/api/session/retained?' + urlencode({'after': after}))
+                self.assertLessEqual(decoded.call_count, RetainedSessions.PAGE_SIZE)
+            self.assertEqual(code, 200)
+            self.assertEqual(page['displayVersion'], visible_state['retainedDisplayVersion'])
+            self.assertTrue(found.keys().isdisjoint(row['id'] for row in page['sessions']))
+            found.update({row['id']: row for row in page['sessions']})
+            last_cursor, after = after, page['nextCursor']
+        self.assertEqual(len(found), 512)
+        self.assertEqual(found[SID]['closedReason'], 'released')
+        self.assertEqual(found[old['id']]['source'], 'cli')
+        self.assertIsInstance(found[old['id']]['removedAt'], int)
+        self.assertEqual(self.request('POST', '/api/session/remove',
+                                      {'source': old_ref, 'removed': False})[0], 200)
+        _, page = self.request('GET', '/api/session/retained?' + urlencode({'after': last_cursor}))
+        self.assertIsNone(next(row for row in page['sessions'] if row['id'] == old['id'])['removedAt'])
+        self.assertEqual(self.calls, [])
+        self.close_server()
+        self.start_server()
+        self.assertIsNotNone(self.flow.recoveries.get(old_ref))
+
+    def test_retained_manual_view_close_survives_restart_without_a_terminal_row(self):
+        current = {'id': 'b' * 32, 'nativeSource': self.native, 'mode': 'attach',
+                   'alive': True, 'host': HOST['name'], 'openedAt': 100}
+        self.terms.records = [current]
+
+        def close(tid):
+            self.assertEqual(tid, current['id'])
+            current.update(closed=True, alive=False, closedReason='user', closeEffect='view')
+
+        self.terms.close_terminal = close
+        code, result = self.request('POST', '/api/terminal/' + current['id'] + '/close', {})
+        self.assertEqual((code, result.get('ok')), (200, True))
+        self.close_server()
+        self.start_server()
+        row = self.snapshot()['recoverySessions'][0]
+        self.assertEqual((row['id'], row['closedReason'], row['retained']), (SID, 'view_closed', True))
+        self.assert_no_execution()
+
+    def test_legacy_migration_keeps_exact_identity_and_close_markers_without_reimport(self):
+        state = self.root / 'migration-state'
+        legacy = RecoverySessions(state)
+        implicit = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000034'}
+        explicit = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000035'}
+        ambiguous = {**self.native, 'id': '019aaaaa-0000-7000-8000-000000000036'}
+        legacy.remember(self.native, 'a' * 32, 'released')
+        legacy.remember(implicit, 'b' * 32, 'user')
+        legacy.remember({**explicit, 'explicitTermination': True}, 'c' * 32, 'user')
+        legacy.remember(ambiguous, 'd' * 32, 'user')
+        before = legacy.path.read_bytes()
+        catalog = RetainedSessions(state)
+        self.assertEqual(catalog.page()[0][0]['source'], self.native)
+        for source, tid in ((implicit, 'b'), (explicit, 'c'), (ambiguous, 'e')):
+            catalog.remember(source, tid * 32, 'view_closed')
+        self.assertEqual(catalog.get(implicit)['provenance']['closedReason'], 'view_closed')
+        self.assertEqual(catalog.get(explicit)['provenance']['closure'], 'explicit_termination')
+        self.assertEqual(catalog.get(ambiguous)['provenance']['closure'], 'legacy_user_close')
+        self.assertEqual(catalog.get(ambiguous)['provenance']['terminalId'], 'd' * 32)
+        catalog.remember_many([(explicit, None, None), (ambiguous, None, None)], listed=True)
+        self.assertEqual({row['source']['id'] for row in catalog.page()[0]}, {SID, implicit['id']})
+        self.assertEqual(legacy.path.read_bytes(), before)
+        self.assertTrue(catalog.forget(self.ref))
+        self.assertIsNone(RetainedSessions(state).get(self.ref))
+
+    def test_hidden_marks_migrate_once_and_stop_evicting_older_user_choices(self):
+        from session_labels import SessionRemoved, SessionSeen
+
+        state = self.root / 'removed-migration'
+        old = SessionSeen(state)
+        old.path = state / 'session-removed.json'
+        old.lock_path = state / 'session-removed.lock'
+        old.mark(self.native, 1)
+        before = old.path.read_bytes()
+        with patch('session_labels.MAX_SEEN', 2):
+            removed = SessionRemoved(state)
+            for i in range(10, 15):
+                removed.mark({**self.native, 'id': '019aaaaa-0000-7000-8000-%012d' % i}, i)
+        snapshot = {'hosts': [{'name': HOST['name'], 'data': {'codex': [self.native]}}]}
+        def removed_at():
+            return SessionRemoved(state).decorate(snapshot)['hosts'][0]['data']['codex'][0]['removedAt']
+        self.assertEqual(removed_at(), 1)
+        self.assertTrue(removed.unmark(self.native))
+        self.assertIsNone(removed_at())
+        self.assertEqual(old.path.read_bytes(), before)
+
     def test_corrupt_locator_store_cannot_authorize_native_lookup_or_resurface_recent_work(self):
         self.flow.recoveries.path.write_bytes(b'fixture-corrupt-recovery-locators')
         code, _data = self.recover()
         self.assertNotEqual(code, 200)
-        self.assertEqual(self.snapshot()['recoverySessions'], [])
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot['recoverySessions'], [])
+        self.assertFalse(snapshot['retainedCatalog']['ok'])
         self.assertEqual(self.calls, [])
         self.assert_no_execution()
+
+    def test_snapshot_does_not_cache_a_transient_catalog_read_failure(self):
+        from session_recovery import RecoveryError
+
+        self.snapshot()
+        self.snapshot()  # Warm the snapshot cache before forcing a fresh response.
+        self.board.changed(force=True)
+        with patch.object(self.flow.recoveries, 'page', side_effect=RecoveryError()):
+            self.assertFalse(self.snapshot()['retainedCatalog']['ok'])
+        recovered = self.snapshot()
+        self.assertTrue(recovered['retainedCatalog']['ok'])
+        self.assertEqual(recovered['recoverySessions'][0]['id'], SID)
 
     def test_recovery_locator_survives_http_reload_and_server_restart_after_terminal_trim(self):
         initial = self.snapshot()

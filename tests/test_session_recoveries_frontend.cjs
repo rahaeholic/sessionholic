@@ -20,7 +20,7 @@ function client(fetchImpl = async () => { throw new Error("Unexpected request");
   const calls = [];
   const c = sandbox.fixtureClient((url, options) => { calls.push({ url, method: options.method || "GET", body: options.body }); return fetchImpl(url, options); },
     { setTimeout: () => 1, clearTimeout() {} });
-  Object.assign(c, vm.runInContext("({renderRecoveries,openRecovery,recentRecoveries,recoveryIdentity,sameRecoverySource,recoveryForTerminal,sessionRecentAt})", c.context));
+  Object.assign(c, vm.runInContext("({renderRecoveries,openRecovery,recentRecoveries,recoveryIdentity,sameRecoverySource,recoveryForTerminal,sessionRecentAt,selectedSession})", c.context));
   c.state.authenticated = true;
   c.state.snapshot = { serverTime: NOW, hosts: [{ name: "fixture-pc", label: "작업 PC", ok: true, data: { codex: [], claude: [] } }], recoverySessions: [ref()] };
   // Keep the actual select/prepareSessionListFor logic, with presentation and reads inert.
@@ -53,13 +53,13 @@ test("이미 목록에 있거나 정확한 터미널이 살아 있는 작업은 
   assert.equal(c.recentRecoveries().length, 1, '표시를 숨겨도 원래 복귀 참조는 보존한다');
   assert.equal(c.calls.length, 0);
 });
-test("최근 참조는 최대 20개이며 명시 종료·제거·중복·계정 홈 누락을 노출하지 않는다", () => {
+test("참조 페이지 전체를 보이며 명시 종료·제거·중복·계정 홈 누락을 노출하지 않는다", () => {
   const c = client();
   c.state.snapshot.recoverySessions = [ref({ closedReason: "user" }), ref({ removedAt: NOW }),
     ref({ closedByBoard: true }), ref({ home: "" }), ...Array.from({ length: 25 }, (_, i) => ref({ id: `session-${i}` })), ref({ id: "session-0" })];
   c.renderRecoveries();
-  assert.equal(c.recentRecoveries().length, 20);
-  assert.equal(c.get("session-recovery-list").children.length, 20);
+  assert.equal(c.recentRecoveries().length, 25);
+  assert.equal(c.get("session-recovery-list").children.length, 25);
   assert.equal(c.recentRecoveries()[0].id, "session-0");
 });
 test("목록에 있는 같은 세션만 선택하며 다른 계정·기기로 연결하지 않고 입력·실행을 만들지 않는다", async () => {
@@ -153,4 +153,81 @@ test("방금 열어 본 오래된 대화는 age 필터에 남고 명시 tidy·re
   c.state.snapshot.hosts[0].data.codex[0].removedAt = NOW;
   s = c.allSessions()[0]; assert.equal(c.matches(s, NOW), false);
   c.state.showRemoved = true; assert.equal(c.matches(s, NOW), true);
+});
+
+test("retained 작업은 이전 목록에 남고 숨김·복원 및 계정별 선택을 유지한다", () => {
+  const c = client();
+  const saved = row({ retained: true, source: "cli", updatedAt: 1, openedAt: 1 });
+  const other = { ...saved, home: ".codex-second", removedAt: 2 };
+  c.state.snapshot.recoverySessions = [saved, other];
+  let sessions = c.allSessions();
+  assert.deepEqual(Array.from(sessions, (s) => s.key), ["fixture-pc|codex|.codex|same-thread", "fixture-pc|codex|.codex-second|same-thread"]);
+  assert.equal(c.matches(sessions[0], NOW), true);
+  assert.equal(c.matches(sessions[1], NOW), false);
+  c.state.showRemoved = true;
+  assert.equal(c.matches(sessions[1], NOW), true);
+  c.state.snapshot.hosts[0].data.codex = [row({ updatedAt: 1, phase: "idle", runtimeKnown: true })];
+  sessions = c.allSessions();
+  assert.equal(sessions.length, 2);
+  assert.equal(sessions[0].phase, "idle");
+  assert.equal(sessions[0].key, "fixture-pc|codex|.codex|same-thread");
+  assert.equal(c.matches(sessions[0], NOW), true);
+  c.renderRecoveries(sessions);
+  assert.equal(c.get("session-recoveries").hidden, true);
+});
+
+test("추가 페이지 응답과 표시 세대가 일치할 때만 이전 행을 사용한다", async () => {
+  const c = client((url) => {
+    assert.equal(url, "/api/session/retained?after=55");
+    return response({ sessions: [row({ id: "older-identity", source: "cli", retained: true })],
+      nextCursor: "5", displayVersion: "generation-one" });
+  });
+  c.state.snapshot.retainedDisplayVersion = "generation-one";
+  c.state.snapshot.retainedNextCursor = "55";
+  await vm.runInContext("nextRetainedPage()", c.context);
+  assert.equal(c.allSessions()[0].id, "older-identity");
+  c.state.snapshot.retainedDisplayVersion = "generation-two";
+  assert.equal(c.allSessions().length, 0);
+});
+
+test("선택한 exact 이전 대화는 첫 페이지에서 밀려도 열린 상세의 식별자를 유지한다", async () => {
+  const c = client(async () => response({}));
+  const saved = row({ retained: true, source: "cli" });
+  c.state.snapshot.recoverySessions = [saved];
+  c.select("fixture-pc|codex|.codex|same-thread");
+  assert.equal(c.selectedSession().id, saved.id);
+  c.state.snapshot.recoverySessions = [];
+  assert.equal(c.allSessions().length, 0);
+  assert.equal(c.selectedSession().key, "fixture-pc|codex|.codex|same-thread");
+  assert.equal(c.selectedSession().runtimeKnown, false);
+});
+
+test("잘린 snapshot 본문은 마지막 목록과 같은 세션 선택을 보존한다", async () => {
+  const c = client(async (url) => url === "/api/snapshot"
+    ? { ok: true, status: 200, json: async () => { throw TypeError("fixture body disconnected"); } }
+    : response({}));
+  c.state.snapshot.recoverySessions = [row({ retained: true, source: "cli" })];
+  c.select("fixture-pc|codex|.codex|same-thread");
+  const before = c.state.snapshot;
+  assert.equal(await vm.runInContext("poll(false)", c.context), false);
+  assert.equal(c.state.snapshot, before);
+  assert.equal(c.selectedSession().id, "same-thread");
+});
+
+test("이전 페이지에서 분할 창과 별도 창에 같은 세션을 연다", async () => {
+  const older = row({ id: "older-identity", source: "cli", retained: true }), c = client(async (url) => {
+    if (url === "/api/session/opened") return response({});
+    assert.equal(url, "/api/session/retained?after=55");
+    return response({ sessions: [older], nextCursor: null, displayVersion: "v1" });
+  });
+  c.state.snapshot.retainedDisplayVersion = "v1";
+  c.state.snapshot.retainedNextCursor = "55";
+  c.state.snapshot.recoverySessions = [];
+  const key = "fixture-pc|codex|.codex|older-identity";
+  vm.runInContext(`requestSessionOpen("https://fixture.invalid/?session=${encodeURIComponent(key)}&retainedAfter=55")`, c.context);
+  for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(c.state.selected, key);
+  const shared = vm.runInContext("workspaceHooks().describe().snapshot", c.context);
+  assert.equal(shared.recoverySessions[0].id, older.id);
+  assert.equal(c.state.snapshot.recoverySessions.length, 0, "the original bounded server snapshot is unchanged");
 });

@@ -669,20 +669,22 @@ class TerminalManager:
             self._configure(terminal)
             # A copy-mode left behind by an earlier gateway would capture the keys.
             self._cancel_mode(terminal)
-            master, slave = pty.openpty()
-            terminal.tty = os.ttyname(slave)
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
             attach_env = dict(os.environ)
             attach_env.pop("TMUX", None)
             attach_env.pop("TMUX_PANE", None)
             attach_env["TERM"] = "xterm-256color"
+            master, slave = pty.openpty()
             try:
+                terminal.tty = os.ttyname(slave)
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
                 process = subprocess.Popen(self._command("attach-session", "-t", "=" + terminal.record["name"]),
                                            stdin=slave, stdout=slave, stderr=slave,
                                            env=attach_env, start_new_session=True, close_fds=True)
-            except OSError:
+            except BaseException as exc:
                 os.close(master)
-                raise RuntimeError("터미널 화면을 연결하지 못했습니다.") from None
+                if isinstance(exc, OSError):
+                    raise RuntimeError("터미널 화면을 연결하지 못했습니다.") from None
+                raise
             finally:
                 os.close(slave)
             terminal.process, terminal.fd = process, master
@@ -707,9 +709,10 @@ class TerminalManager:
 
     def _reader(self, terminal, process, descriptor, generation):
         try:
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN)
             while True:
-                ready, _, _ = select.select([descriptor], [], [], 0.5)
-                if not ready:
+                if not poller.poll(500):
                     if process.poll() is not None:
                         break
                     continue
@@ -721,28 +724,30 @@ class TerminalManager:
             pass
         finally:
             try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.terminate()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-            with terminal.io_lock:
-                if terminal.generation == generation:
-                    terminal.fd = None
-                    with terminal.condition:
-                        # A detached client is not a stopped CLI.
-                        try:
-                            terminal.alive = self._exists(terminal)
-                        except RuntimeError:
-                            terminal.alive = False
-                        terminal.condition.notify_all()
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            finally:
+                with terminal.io_lock:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+                    if terminal.generation == generation:
+                        terminal.fd = None
+                        with terminal.condition:
+                            # Free the PTY before probing tmux, which may need another FD.
+                            try:
+                                terminal.alive = self._exists(terminal)
+                            except (RuntimeError, OSError):
+                                terminal.alive = False
+                            terminal.condition.notify_all()
 
     def read(self, terminal_id, after=0, wait=20, epoch=None, fresh=False):
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
@@ -801,9 +806,11 @@ class TerminalManager:
             # A full PTY input queue must not tie up an HTTP worker indefinitely.
             deadline = time.monotonic() + 2
             sent = 0
+            poller = select.poll()
+            poller.register(terminal.fd, select.POLLOUT)
             while sent < len(data):
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not select.select([], [terminal.fd], [], remaining)[1]:
+                if remaining <= 0 or not poller.poll(max(1, int(remaining * 1000))):
                     raise RuntimeError("터미널 입력 대기 시간이 초과되었습니다.")
                 try:
                     sent += os.write(terminal.fd, data[sent:sent + 1024])
@@ -1400,6 +1407,8 @@ class TerminalManager:
             live -= 1
         return True
 
+    preserve_before_trim = None
+
     def _trim_closed(self):
         """Free the output of rows closed CLOSED_OUTPUT_SECONDS ago and forget the oldest of
         them past CLOSED_KEEP (USER_CLOSED_KEEP for the user's own closes); the caller holds
@@ -1421,6 +1430,11 @@ class TerminalManager:
         forget = user[:max(0, len(user) - USER_CLOSED_KEEP)] + other[:max(0, len(other) - CLOSED_KEEP)]
         if not forget:
             return False
+        try:
+            if self.preserve_before_trim is not None:
+                self.preserve_before_trim([self._public(terminal) for terminal in forget])
+        except (OSError, ValueError, RuntimeError):
+            return False  # Keep the terminal's evidence if its locator could not be saved.
         before = dict(self.terminals)
         for terminal in forget:
             del self.terminals[terminal.record["id"]]

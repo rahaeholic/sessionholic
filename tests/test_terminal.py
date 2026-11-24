@@ -1,4 +1,5 @@
 import base64
+import errno
 import io
 import json
 import os
@@ -17,6 +18,48 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import terminal  # noqa: E402
+
+
+class PtyDescriptorTest(unittest.TestCase):
+    def test_failed_pty_setup_closes_both_descriptors(self):
+        manager = terminal.TerminalManager.__new__(terminal.TerminalManager)
+        manager._exists = lambda _: True
+        manager._configure = manager._cancel_mode = lambda _: None
+        item = terminal._Terminal({'id': 'a' * 32, 'metadata': {}}, 1024)
+        master, slave = terminal.pty.openpty()
+        with patch.object(terminal.pty, 'openpty', return_value=(master, slave)), \
+                patch.object(terminal, 'subprocess') as subprocess_mock, \
+                patch.object(terminal.fcntl, 'ioctl', side_effect=OSError('fixture PTY setup failure')):
+            with self.assertRaises(RuntimeError):
+                manager._attach(item)
+            subprocess_mock.Popen.assert_not_called()
+        for fd in (master, slave):
+            with self.assertRaises(OSError) as error:
+                os.fstat(fd)
+            self.assertEqual(error.exception.errno, errno.EBADF)
+
+
+    def test_reader_releases_pty_even_when_follow_up_process_operations_fail(self):
+        manager = terminal.TerminalManager.__new__(terminal.TerminalManager)
+        manager._exists = Mock(side_effect=OSError(errno.EMFILE, 'fixture descriptor pressure'))
+        for wait_error in (None, OSError(errno.ECHILD, 'fixture child already reaped')):
+            with self.subTest(wait_error=wait_error):
+                item = terminal._Terminal({'id': 'a' * 32, 'metadata': {}}, 1024)
+                read_fd, write_fd = os.pipe()
+                os.close(write_fd)
+                item.fd = read_fd
+                process = Mock()
+                process.wait.side_effect = wait_error
+                if wait_error:
+                    with self.assertRaises(OSError):
+                        manager._reader(item, process, read_fd, item.generation)
+                else:
+                    manager._reader(item, process, read_fd, item.generation)
+                self.assertIsNone(item.fd)
+                self.assertFalse(item.alive)
+                with self.assertRaises(OSError) as error:
+                    os.fstat(read_fd)
+                self.assertEqual(error.exception.errno, errno.EBADF)
 
 
 class IdleRunContractTest(unittest.TestCase):

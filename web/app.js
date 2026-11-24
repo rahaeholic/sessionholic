@@ -1018,7 +1018,10 @@ function requestedSessionFrom(url) {
 function requestSessionOpen(url) {
   const key = requestedSessionFrom(url);
   if (!key) return false;
-  state.openRequest = { key, until: Date.now() + 120000 };
+  let after;
+  try { after = new URL(url, globalThis.location?.origin || "http://board.invalid").searchParams.get("retainedAfter"); }
+  catch { /* requestedSessionFrom already validated the session link. */ }
+  state.openRequest = { key, until: Date.now() + 120000, ...(after && /^[1-9][0-9]{0,18}$/.test(after) ? { after } : {}) };
   openRequestedSession();
   return true;
 }
@@ -1033,7 +1036,15 @@ function openRequestedSession() {
   const request = state.openRequest;
   if (!request) return;
   if (Date.now() > request.until) { state.openRequest = null; return; }
-  if (!state.authenticated || state.launchBusy || !allSessions().some((session) => session.key === request.key)) return;
+  if (!state.authenticated || state.launchBusy) return;
+  if (!allSessions().some((session) => session.key === request.key)) {
+    if (request.after && state.snapshot?.retainedDisplayVersion && !state.retainedLoading) {
+      const after = request.after;
+      delete request.after;
+      loadRetainedPage(after).then(() => { if (state.openRequest === request) openRequestedSession(); });
+    }
+    return;
+  }
   state.openRequest = null;
   // Over an open terminal too (or beside one of another session): the conversation
   // shows, and back returns to the terminal.
@@ -1049,6 +1060,9 @@ function openSessionWindow(s) {
   if (!state.authenticated || !allSessions().some((row) => row.key === s?.key)) return;
   const url = new URL("/", window.location.origin);
   url.searchParams.set("window", "1"); url.searchParams.set("session", s.key);
+  const page = state.retainedPage;
+  if (page && page.version === state.snapshot?.retainedDisplayVersion &&
+      page.rows.some((row) => sameRecoverySource(row, s))) url.searchParams.set("retainedAfter", page.after);
   let opened;
   try {
     // Open synchronously from the click. Detach before navigating, while the
@@ -1339,7 +1353,16 @@ async function api(path, { method = "GET", body, signal: callerSignal, authEpoch
       });
     } catch (err) { assertAuthEpoch(authEpoch); throw apiTimedOut(limit, path) || err; }
     assertAuthEpoch(authEpoch);
-    data = await response.json().catch(() => ({}));
+    try {
+      data = await response.json();
+    } catch (err) {
+      assertAuthEpoch(authEpoch);
+      const timedOut = apiTimedOut(limit, path);
+      if (timedOut) throw timedOut;
+      if (response.ok && ["/api/snapshot", "/api/session/retained", "/api/chat/state", "/api/chat/send"].includes(apiPathname(path)))
+        throw new Error("서버 응답을 끝까지 받지 못했습니다.");
+      data = {};
+    }
     if (response.status === 401) {
       showLogin();
       const err = new Error("로그인이 필요합니다.");
@@ -1512,6 +1535,42 @@ function allSessions() {
       out.push(listedSession(host, s, listedSessionKey(host, s), following));
     }
   }
+  const listedByRecovery = new Map();
+  for (const session of out) {
+    const identity = recoveryIdentity(session);
+    if (!identity) continue;
+    const matches = listedByRecovery.get(identity) || [];
+    matches.push(session);
+    listedByRecovery.set(identity, matches);
+  }
+  const older = state.retainedPage?.version === state.snapshot?.retainedDisplayVersion ? state.retainedPage?.rows : null;
+  const retained = [...(state.snapshot?.recoverySessions || []), ...(older || [])].filter((row) => row.retained === true);
+  const retainedByKey = new Map();
+  for (const row of retained) {
+    const identity = recoveryIdentity(row);
+    if (!identity) continue;
+    const previous = retainedByKey.get(identity);
+    if (!retainedByKey.has(identity)) retainedByKey.set(identity, row);
+    else if (previous && (!sameRecoverySource(row, previous) || !sameRecoverySource(previous, row)))
+      retainedByKey.set(identity, null);
+  }
+  for (const [identity, row] of retainedByKey) {
+    if (!row) continue; // An ambiguous saved selector cannot become an actionable card.
+    const listed = listedByRecovery.get(identity);
+    if (listed) {
+      if (listed.length === 1 && sameRecoverySource(row, listed[0]) && sameRecoverySource(listed[0], row) &&
+          (row.cwd === listed[0].cwd || sameClaudeConversation(row, listed[0]))) {
+        listed[0].retained = true;
+        listed[0].closedReason = row.closedReason;
+      }
+      continue;
+    }
+    const host = (state.snapshot?.hosts || []).find((item) => item.name === row.host);
+    if (!host) continue;
+    // The default Claude account used an empty home in listed keys and draft storage.
+    const session = { ...row, home: row.agent === "claude" ? undefined : row.home, recoverySource: true };
+    out.push(listedSession(host, session, listedSessionKey(host, session), following));
+  }
   for (const session of state.nativeSessions.values()) {
     if (out.some((s) => s.key === session.key)) continue;
     const aliases = out.map((value, index) => ({ value, index })).filter(({ value }) =>
@@ -1597,17 +1656,26 @@ function accountOf(s) {
     ? "claude:default"
     : `codex:${s.home || ".codex"}`;
 }
+function heldSelectedSession() {
+  const held = state.selectedHeld;
+  if (!held || held.key !== state.selected) return;
+  const host = (state.snapshot?.hosts || []).find((item) => item.name === held.host);
+  if (!host) return;
+  const { runtimeObservation, ...row } = held;
+  return listedSession(host, { ...row, retained: true, recoverySource: true,
+    phase: "unknown", runtimeKnown: false }, held.key, held.key);
+}
 function selectedSession() {
   const key = state.selected;
   if (!key) return;
   // A recovered session can replace its listed alias. Use the merged view in that case.
-  if (state.nativeSessions.size) return allSessions().find((s) => s.key === key);
-  for (const host of state.snapshot?.hosts || []) {
+  if (!state.nativeSessions.size) for (const host of state.snapshot?.hosts || []) {
     if (!key.startsWith(host.name + "|")) continue;
     const matches = (row) => listedSessionKey(host, row) === key;
     const row = host.data?.claude?.find(matches) || host.data?.codex?.find(matches);
     if (row) return listedSession(host, row, key, chatVisible() ? key : null);
   }
+  return allSessions().find((s) => s.key === key) || heldSelectedSession();
 }
 // Recovery references are navigation hints from the server, never launch instructions.
 // Claude's sole default account historically omitted home; Codex always names its account.
@@ -1628,7 +1696,7 @@ function recentRecoveries(sessions = allSessions()) {
     seen.add(key);
     const listed = sessions.find((s) => sameRecoverySource(ref, s));
     return !listed || !sessionRemoved(listed);
-  }).slice(0, 20);
+  });
 }
 function renderRecoveries(sessions = allSessions()) {
   const section = $("session-recoveries"), list = $("session-recovery-list");
@@ -1704,7 +1772,7 @@ async function openRecovery(ref) {
 function groupOf(s, now = state.snapshot?.serverTime || Date.now() / 1000) {
   if (s.phase === "needs_input") return "needs_input";
   if (s.phase === "working") return "working";
-  if (sessionTidied(s) || sessionRemoved(s)) return "rest";
+  if (sessionTidied(s) || sessionRemoved(s) || s.retained && s.closedReason && s.loaded !== true) return "rest";
   if (["idle", "done", "closed"].includes(s.phase) && now - (s.updatedAt || 0) <= FINISHED_SECONDS) return "finished";
   return "rest";
 }
@@ -1731,10 +1799,11 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
   // An explicit removal takes precedence over status, search and the age filter.
   const removed = sessionRemoved(s);
   if (removed && !state.showRemoved) return false;
+  if (s.retained && sessionTidied(s) && !state.showOld && !removed) return false;
   if (
     !state.showOld && !removed && !sessionPinned(s) &&
     groupOf(s, now) === "rest" &&
-    (now - sessionRecentAt(s) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
+    (!s.retained && now - sessionRecentAt(s) > RECENT_SECONDS || (sessionTidied(s) && !state.search))
   )
     return false;
   if (!state.search) return true;
@@ -1757,10 +1826,66 @@ function matches(s, now, { phase = true, category = true, initiator = true } = {
 }
 
 let cardRelationIndex = null;
+function renderRetainedPager() {
+  const pager = $("retained-pager");
+  if (!pager) return;
+  const page = state.retainedPage;
+  const next = $("retained-next"), previous = $("retained-previous");
+  pager.hidden = !state.authenticated || state.sessionCategory === "bot" || !(page || state.snapshot?.retainedNextCursor);
+  previous.hidden = !page;
+  next.hidden = !(page ? page.next : state.snapshot?.retainedNextCursor);
+  previous.disabled = next.disabled = !!state.retainedLoading;
+  $("retained-status").textContent = state.retainedLoading ? "이전 작업을 불러오는 중…" : state.retainedError || "";
+}
+async function loadRetainedPage(after, back = []) {
+  if (!state.authenticated || state.retainedLoading) return;
+  const authEpoch = state.authEpoch, run = {};
+  const pagerFocus = ["retained-next", "retained-previous"].includes(document.activeElement?.id);
+  let changed = false;
+  state.retainedLoading = run; state.retainedError = "";
+  renderRetainedPager();
+  try {
+    const result = await api(`/api/session/retained?after=${encodeURIComponent(after)}`, { authEpoch });
+    if (state.retainedLoading !== run || authEpoch !== state.authEpoch) return;
+    if (result.displayVersion !== state.snapshot?.retainedDisplayVersion) {
+      state.retainedError = "목록 표시 상태가 바뀌었습니다. 다시 눌러 주세요.";
+      poll(false, { capabilities: false });
+      return;
+    }
+    state.retainedPage = { after, back, rows: result.sessions || [], next: result.nextCursor, version: result.displayVersion };
+    changed = true;
+  } catch (err) {
+    if (!err.unauthorized && !err.staleAuth && state.retainedLoading === run)
+      state.retainedError = "이전 작업을 불러오지 못했습니다. 잠시 후 다시 눌러 주세요.";
+  } finally {
+    if (state.retainedLoading === run) {
+      state.retainedLoading = null;
+      render();
+      if (changed) window.SessionholicWorkspace?.dataChanged?.("snapshot");
+      if (pagerFocus) ($("retained-next").hidden ? $("retained-previous") : $("retained-next")).focus?.();
+    }
+  }
+}
+function nextRetainedPage() {
+  const page = state.retainedPage;
+  const after = page ? page.next : state.snapshot?.retainedNextCursor;
+  if (after) return loadRetainedPage(after, page ? [...page.back, page.after] : []);
+}
+function previousRetainedPage() {
+  const page = state.retainedPage;
+  if (!page || state.retainedLoading) return;
+  if (page.back.length) return loadRetainedPage(page.back.at(-1), page.back.slice(0, -1));
+  state.retainedPage = null;
+  render();
+  window.SessionholicWorkspace?.dataChanged?.("snapshot");
+  $("retained-next")?.focus();
+}
+
 function renderSessionList(sessions, now) {
   cardRelationIndex = window.SessionholicRelations?.buildRelationIndex(sessions) || null;
   setClass($("task-list-pane"), "is-bot-category", state.sessionCategory === "bot");
   renderRecoveries(sessions);
+  renderRetainedPager();
   if (state.sessionCategory === "bot") { renderSessionCategories(sessions, now); renderBotRequests(); return; }
   // Updating list conditions must not redraw a retained conversation or reset
   // its scroll anchor when the same source is opened again from a work card.
@@ -1817,18 +1942,18 @@ function render() {
   syncLauncherWorkspace();
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  const reading = state.detailShown && sessions.find((session) => session.key === state.selected);
+  const selected = sessions.find((session) => session.key === state.selected) || heldSelectedSession();
+  const reading = state.detailShown && selected;
   if (reading && !sharedSessionSidebar() && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   const embedded = window.SessionholicWorkspace?.embedded;
   if (!embedded) { renderHosts(now); renderFreshness(now); renderAttention(sessions); }
   // The conversation on screen is read, also when it answers or finishes while shown
   // (before the list is drawn, so its card never flashes a dot).
-  const shownSession = window.SessionholicWorkspace?.readingActive() !== false && chatVisible() && sessions.find((s) => s.key === state.selected);
+  const shownSession = window.SessionholicWorkspace?.readingActive() !== false && chatVisible() && selected;
   if (shownSession && sessionUnread(shownSession, now)) markSeen(shownSession);
   if (!embedded) { renderSessionList(sessions, now); renderHistorySearch(); }
-  if (state.sessionCategory === "bot" && !sessions.some((s) => s.key === state.selected)) { window.SessionholicGoals?.update?.(sessions); return; }
+  if (state.sessionCategory === "bot" && !selected) { window.SessionholicGoals?.update?.(sessions); return; }
   const wasEmpty = !state.selected;
-  const selected = sessions.find((s) => s.key === state.selected);
   window.SessionholicGoals?.update?.(sessions);
   // Its conversation listed now: it takes its place beside the docked terminal.
   if (!selected && state.docked && state.terminal && !state.dockBeside && dockedSessionFor(state.terminal)) {
@@ -2740,7 +2865,7 @@ function prepareSessionListFor(session) {
   if (state.phaseFilter && groupOf(session) !== state.phaseFilter) { state.phaseFilter = ""; changed = true; }
   const now = state.snapshot?.serverTime || Date.now() / 1000;
   if (!sessionRemoved(session) && !state.showOld && groupOf(session) === "rest" &&
-      (now - sessionRecentAt(session) > RECENT_SECONDS || sessionTidied(session))) {
+      (!session.retained && now - sessionRecentAt(session) > RECENT_SECONDS || sessionTidied(session))) {
     state.showOld = true; $("show-old").checked = true; changed = true;
   }
   if (state.search && !matches(session, now)) {
@@ -4107,7 +4232,11 @@ function select(key) {
   if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
   if (state.selected !== key) closeQuickReplies();
-  const target = allSessions().find((session) => session.key === key);
+  const target = allSessions().find((session) => session.key === key) || (state.selected === key ? heldSelectedSession() : null);
+  // The window can advance while this conversation is open. Keep its exact
+  // selector for the active pane without adding another row to the list.
+  state.selectedHeld = target && recoveryIdentity(target) && (target.retained || conversationUUID(target.id) || target.sessionId)
+    ? target : null;
   const bot = target && botRequestForNative(sourceOf(target));
   if (target && window.SessionholicWorkspace?.readingActive() !== false && sessionUnread(target)) markSeen(target);
   if (target) markOpened(target);
@@ -7932,6 +8061,8 @@ function applyChatReceipt(entry, receipt, selected) {
     return;
   }
   if (entry.pending && receipt.requestId !== entry.pending.requestId) return;
+  if (receipt.status === "unknown" && entry.receipt?.requestId === receipt.requestId &&
+      (entry.receipt.confirmed === true || entry.receipt.readbackConfirmed === true)) return;
   const fallback = entry.pending?.attachmentDetails ||
     (entry.receipt?.requestId === receipt.requestId ? entry.receipt.attachments : []);
   entry.receipt = { ...receipt, attachments: attachmentMetadata(Array.isArray(receipt.attachments) ? receipt.attachments : fallback) };
@@ -9123,7 +9254,7 @@ function recoverChatSend(entry, item) {
   const pending = entry.pending?.requestId === item.requestId ? entry.pending : item.pending;
   if (!pending || item.state !== "uncertain" || pending.source?.agent !== "codex" ||
       networkOffline() || !currentChat(entry) || !chatSupported(entry) || entry.sending ||
-      chatKey(pending.source) !== chatKey(entry.source)) return;
+      chatKey(pending.source) !== chatKey(entry.source) || pending.source?.sessionId !== entry.source?.sessionId) return;
   item.state = "sending";
   return dispatchChat(entry, pending, state.authEpoch, true);
 }
@@ -9156,6 +9287,7 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
       ...(recovering ? { recoverReceipt: true } : {}),
     }, authEpoch });
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
+    if (!result?.status) throw new Error("메시지 전송 결과가 비어 있습니다.");
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
     const status = recovering && result.status === "failed" && result.receipt?.confirmed !== true ? "unknown" : result.status;
@@ -9194,8 +9326,12 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
         // HTTP status alone cannot establish whether the native runtime started.
         sent = true;
         const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
-        applyChatReceipt(entry, receipt);
-        entry.error = chatReceiptCopy(receipt);
+        // A status read may already have settled this same send before its
+        // HTTP response was lost. Keep that evidence and the next draft.
+        if (unconfirmedChatRequests(entry).some((request) => request.requestId === pending.requestId)) {
+          applyChatReceipt(entry, receipt);
+          entry.error = chatReceiptCopy(receipt);
+        }
       }
     }
   } finally {
@@ -15683,7 +15819,10 @@ async function pollOnce(refresh = false, { capabilities = true } = {}) {
   try {
     const snapshot = await api(`/api/snapshot${refresh ? "?refresh=1" : ""}`, { authEpoch });
     assertAuthEpoch(authEpoch);
+    const retainedPage = state.retainedPage;
     state.snapshot = snapshot;
+    if (retainedPage && retainedPage.version !== snapshot.retainedDisplayVersion && !state.retainedLoading)
+      loadRetainedPage(retainedPage.after, retainedPage.back);
     if (snapshot.quickReplyPreferences) adoptQuickReplyPreferences(snapshot.quickReplyPreferences);
     serverBooted(snapshot?.bootId);
     if (Number.isInteger(snapshot?.version)) state.snapshotVersion = snapshot.version;
@@ -16012,6 +16151,7 @@ function showLogin() {
   state.capabilitiesBoot = null;
   state.refreshDeadline = 0;
   state.snapshot = null;
+  state.retainedPage = state.retainedLoading = state.selectedHeld = null; state.retainedError = "";
   cardRelationIndex = null;
   state.snapshotVersion = null;
   state.eventsSnapshotVersion = null;
@@ -16598,7 +16738,10 @@ function workspaceHooks() {
       : state.launcherWorkspace?.terminalId ? { terminalId: state.launcherWorkspace.terminalId, mode: state.terminalVisible ? "terminal" : "chat" }
       : state.terminalVisible && state.terminal ? { terminalId: state.terminal.id, mode: "terminal" } : null;
     lastRef = ref || (state.selected && lastRef?.key === state.selected ? lastRef : null);
-    return { authenticated: state.authenticated, snapshot: state.snapshot, ref: lastRef,
+    const page = state.retainedPage;
+    const sharedSnapshot = page && page.version === state.snapshot?.retainedDisplayVersion ?
+      { ...state.snapshot, recoverySessions: [...(state.snapshot.recoverySessions || []), ...page.rows] } : state.snapshot;
+    return { authenticated: state.authenticated, snapshot: sharedSnapshot, ref: lastRef,
       title: s?.title || (state.terminalVisible && state.terminal ? terminalTitle(state.terminal, "새 세션") : lastRef ? "저장한 세션 확인 중" : ""),
       route: s ? [s.hostLabel || s.host, AGENTS[s.agent] || s.agent, s.account].filter(Boolean).join(" · ") : "",
       terminalId: state.terminal?.id, terminalVisible: state.terminalVisible,
@@ -16934,6 +17077,8 @@ window.addEventListener("DOMContentLoaded", () => {
   });
   $("body-search-start")?.addEventListener("click", () => startHistorySearch({ more: !!state.historySearch.cursor }));
   $("body-search-stop")?.addEventListener("click", () => { cancelHistorySearch(); renderHistorySearch(); });
+  $("retained-next").addEventListener("click", nextRetainedPage);
+  $("retained-previous").addEventListener("click", previousRetainedPage);
   $("show-old").addEventListener("change", (event) => {
     state.showOld = event.target.checked;
     render();

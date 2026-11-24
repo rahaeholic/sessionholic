@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -389,6 +390,66 @@ class SessionRemoved(SessionSeen):
     Display only: the native session and its history stay as they are."""
     NAME, ROW_FIELD, SNAPSHOT_FIELD, CODE = 'session-removed', 'removedAt', 'sessionRemoved', 'session_removed'
     WHAT = '목록에서 지운 기록'
+
+
+    def __init__(self, state_dir, clock=time.time):
+        super().__init__(state_dir, clock)
+        self.legacy = SessionSeen(state_dir, clock)
+        self.legacy.path, self.legacy.lock_path = self.path, self.lock_path
+        self.legacy.WHAT, self.legacy.CODE = self.WHAT, self.CODE
+        self.path = self.directory / 'session-removed.sqlite'
+        self.lock_path = self.path.with_name(self.path.name + '-journal')
+
+    def _initialize(self, db):
+        db.execute('CREATE TABLE marks (identity TEXT PRIMARY KEY, at INTEGER NOT NULL)')
+        db.execute('CREATE TABLE metadata (since INTEGER NOT NULL)')
+        with self.legacy._storage():
+            old = self.legacy._read()
+        db.execute('INSERT INTO metadata VALUES (?)', (old['since'] if old else int(self.clock()),))
+        if old:
+            db.executemany('INSERT INTO marks VALUES (?, ?)', ((key, row['at']) for key, row in old['seen'].items()))
+
+    @contextmanager
+    def _database(self, *, write=False):
+        from session_recovery import private_sqlite
+        try:
+            with private_sqlite(self.directory, self.path, self._initialize, write=write) as db:
+                yield db
+        except (OSError, ValueError, sqlite3.Error):
+            raise self._unavailable() from None
+
+    def mark(self, source, at):
+        if type(at) is not int or at < 0:
+            raise GoalError('기록할 시점이 올바르지 않습니다.', 'invalid_' + self.CODE)
+        key = _key(_identity(source))
+        with self._database(write=True) as db:
+            old = db.execute('SELECT at FROM marks WHERE identity=?', (key,)).fetchone()
+            if old and old[0] >= at:
+                return {'seenAt': old[0]}, False
+            db.execute('INSERT INTO marks VALUES (?, ?) ON CONFLICT(identity) DO UPDATE SET at=excluded.at', (key, at))
+            return {'seenAt': at}, True
+
+    def unmark(self, source):
+        key = _key(_identity(source))
+        with self._database(write=True) as db:
+            return db.execute('DELETE FROM marks WHERE identity=?', (key,)).rowcount > 0
+
+    def decorate(self, snapshot, in_place=False):
+        if not in_place:
+            snapshot = copy.deepcopy(snapshot)
+        try:
+            with self._database() as db:
+                since = db.execute('SELECT since FROM metadata').fetchone()[0]
+                for host in snapshot.get('hosts', []):
+                    for agent in ('codex', 'claude'):
+                        for row in (host.get('data') or {}).get(agent, []):
+                            key = _row_key({**row, 'host': host['name'], 'agent': agent})
+                            if key is not None:
+                                found = db.execute('SELECT at FROM marks WHERE identity=?', (key,)).fetchone()
+                                row[self.ROW_FIELD] = found[0] if found else None
+        except GoalError as exc:
+            return {**snapshot, self.SNAPSHOT_FIELD: {'ok': False, **exc.payload}}
+        return {**snapshot, self.SNAPSHOT_FIELD: {'ok': True, 'since': since}}
 
 
 class SessionOpened(SessionSeen):

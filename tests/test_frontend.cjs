@@ -17405,6 +17405,37 @@ test('기록 탭에서 전송 결과 불명은 같은 메시지만 잠그고 다
   assert.equal(vm.runInContext('sessionDetailMode()', c.context), 'chat');
 });
 
+test('전송 연결이 끊기기 전에 받은 세션 영수증은 유지하고 다음 한글 초안은 보존한다', async () => {
+  for (const ending of ['disconnect', 'empty', 'unknown']) {
+    const { c, s, entry } = inlineDetailClient();
+    let finish, requestId, sends = 0;
+    c.context.fetch = async (url, options) => {
+      const body = JSON.parse(options.body);
+      if (url === '/api/chat/send') {
+        sends++; requestId = body.requestId;
+        return new Promise((resolve, reject) => { finish = () => ending === 'disconnect' ? reject(Error('fixture disconnect')) :
+          resolve({ ok: true, status: 200, json: async () => ending === 'empty' ? {} : { status: 'unknown', receipt: { requestId } } }); });
+      }
+      assert.equal(url, '/api/chat/state');
+      assert.deepEqual(body.source, { ...c.sourceOf(s) });
+      return { ok: true, status: 200, json: async () => attachmentState(entry,
+        [{ requestId, status: 'completed', confirmed: true, readbackConfirmed: true }], []) };
+    };
+    entry.text = '한 번 전송할 질문'; entry.revision++;
+    const send = c.sendChat(entry); await settle();
+    entry.text = c.get('chat-input').value = '다음 한글 초안'; entry.revision++; entry.composing = true;
+    await c.loadChatState(s, true);
+    assert.equal(entry.pending, null);
+    finish(); await send; await settle();
+    assert.equal(sends, 1);
+    assert.equal(entry.receipt.status, 'completed');
+    assert.equal(entry.error, '');
+    assert.equal(entry.text, '다음 한글 초안');
+    assert.equal(entry.composing, true);
+    assert.equal(entry.sending, false);
+  }
+});
+
 test('기록에서 원본 capability를 잃어도 작성창은 유지하고 일회성 기록은 입력을 허용하지 않는다', async () => {
   const { c, s, entry } = inlineDetailClient(); let calls = 0;
   c.context.fetch = async () => { calls++; throw Error('no dispatch without capability'); };

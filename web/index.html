@@ -313,6 +313,11 @@
             </div>
             <p class="sr-only" role="status">세션을 확인하고 있습니다…</p>
           </div>
+          <nav id="retained-pager" aria-label="이전 작업 목록" hidden>
+            <button id="retained-previous" class="secondary" type="button" hidden>앞 페이지</button>
+            <button id="retained-next" class="secondary" type="button">이전 작업 더 보기</button>
+            <span id="retained-status" role="status"></span>
+          </nav>
           <p class="list-footnote">터미널에서 작업하고, 아래 작성창에서 메시지를 보내세요.</p>
           <!-- Shown where a hardware keyboard is (or was seen); opens the shortcuts. -->
           <button id="keyboard-hint" class="keyboard-hint" type="button" hidden aria-haspopup="dialog"
