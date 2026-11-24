@@ -1,3 +1,4 @@
+import errno
 import http.client
 import io
 import json
@@ -69,6 +70,25 @@ class ServerTest(unittest.TestCase):
         data = res.read()
         conn.close()
         return res, data
+
+    def test_chat_disconnect_does_not_emit_a_second_response(self):
+        handler = object.__new__(server.Handler)
+        handler.path = "/api/chat/state"
+        handler.command = "POST"
+        handler.headers = {}
+        handler.log_date_time_string = lambda: "test"
+        handler.responded = False
+        sent = []
+        handler.send_response = lambda code: (sent.append(code), setattr(handler, "responded", True))
+        handler.send_header = lambda *args: None
+        handler.end_headers = lambda: None
+        handler.wfile = SimpleNamespace(write=lambda _: (_ for _ in ()).throw(
+            ConnectionAbortedError(errno.ECONNABORTED, "client left")))
+        with patch("server.sys.stderr", new_callable=io.StringIO) as trace:
+            handler.guarded(lambda: handler.send_json(200, {"ok": True}))
+        self.assertEqual(sent, [200])
+        self.assertTrue(handler.close_connection)
+        self.assertIn("/api/chat/state disconnected response", trace.getvalue())
 
     def login_cookie(self):
         res, _ = self.request("POST", "/login", json.dumps({"token": TOKEN}), {"Content-Type": "application/json"})

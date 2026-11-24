@@ -1607,6 +1607,9 @@ class Chat:
 
     def _prepare_send(self, data):
         source, host = self.source(data.get('source'))
+        if type(data.get('recoverReceipt', False)) is not bool or (
+                data.get('recoverReceipt') and source.get('agent') != 'codex'):
+            raise ValueError('이 세션에서는 같은 요청으로 전송을 복구할 수 없습니다.')
         if type(data.get('requireIdle', False)) is not bool:
             raise ValueError('작업 상태 조건을 확인해 주세요.')
         expected_cwd = (data.get('source') or {}).get('cwd')
