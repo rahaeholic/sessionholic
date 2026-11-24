@@ -465,7 +465,14 @@ def scrub_payload(value):
 
 
 # A write to a client that already left.
-CLIENT_GONE = (BrokenPipeError, ConnectionResetError)
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+SOCKET_DISCONNECTED = {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ENOTCONN}
+if sys.platform == "darwin":
+    SOCKET_DISCONNECTED.add(errno.EPROTOTYPE)
+
+
+class RequestBodyDisconnected(ConnectionAbortedError):
+    """Client socket closed while reading an HTTP request body."""
 # launchd appends this server's stdout and stderr to files it never rotates (every request
 # writes a line); past this size such a file is rotated (rotate_own_logs), checked this often.
 LOG_ROTATE_BYTES = 20 * 1024 * 1024
@@ -3269,12 +3276,14 @@ class Handler(BaseHTTPRequestHandler):
         self.responded = False
         try:
             route()
+        except RequestBodyDisconnected:
+            self.disconnected("request")
         except CLIENT_GONE as exc:
-            # Once the answer has started, a broken connection is the client leaving (a closed
-            # tab, a phone asleep), not this route's failure; before it, it is logged as usual.
-            if not self.responded:
+            if self.responded:
+                self.disconnected("response")
+            else:
                 log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
-            self.close_connection = True
+                self.close_connection = True
         except Exception as exc:
             log_failure(f"{self.command} {urlparse(self.path).path} 처리", exc)
             if self.responded:
@@ -3284,6 +3293,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": INTERNAL_ERROR})
             except OSError:
                 self.close_connection = True
+
+    def disconnected(self, phase):
+        self.close_connection = True
+        path = urlparse(self.path).path
+        if path in ("/api/chat/send", "/api/chat/state"):
+            sys.stderr.write(f"{self.log_date_time_string()} {self.command} {path} disconnected {phase}\n")
 
     def parse_request(self):
         self.started = time.monotonic()
@@ -3320,10 +3335,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
-        except CLIENT_GONE:
-            # The client left before the answer: nothing more can reach it, and the route
-            # did its work (a write error is never taken for the route's own failure).
-            self.close_connection = True
+        except OSError as exc:
+            if isinstance(exc, CLIENT_GONE) or exc.errno in SOCKET_DISCONNECTED:
+                self.disconnected("response")
+                return
+            raise
 
     def send_json(self, code, data, extra=None):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -3336,8 +3352,11 @@ class Handler(BaseHTTPRequestHandler):
             for key, value in {**SECURITY_HEADERS, **extra}.items():
                 self.send_header(key, value)
             self.end_headers()
-        except CLIENT_GONE:
-            self.close_connection = True
+        except OSError as exc:
+            if isinstance(exc, CLIENT_GONE) or exc.errno in SOCKET_DISCONNECTED:
+                self.disconnected("response")
+                return
+            raise
 
     def tailscale_authorized(self):
         """Trust identity headers only from the opted-in loopback HTTPS Serve route.
@@ -3431,7 +3450,15 @@ class Handler(BaseHTTPRequestHandler):
             self.discard_body(length)
             raise ValueError("요청이 비었거나 너무 큽니다.")
         try:
-            data = json.loads(self.rfile.read(length))
+            body = self.rfile.read(length)
+        except OSError as exc:
+            if isinstance(exc, CLIENT_GONE) or exc.errno in SOCKET_DISCONNECTED:
+                raise RequestBodyDisconnected("request body disconnected") from exc
+            raise
+        if len(body) != length:
+            raise RequestBodyDisconnected("incomplete request body")
+        try:
+            data = json.loads(body)
         except (ValueError, UnicodeError):
             raise ValueError("요청 형식이 올바르지 않습니다.") from None
         if not isinstance(data, dict):
@@ -3845,6 +3872,8 @@ class Handler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 return self.send_json(409, {"error": str(exc)})
             except (OSError, ImportError) as exc:
+                if self.responded:
+                    raise
                 return self.send_json(503, {"error": unavailable_message(exc)})
             return self.send_json(404, {"error": "없는 경로입니다."})
         return self.static(url.path, url.query)
@@ -4434,6 +4463,8 @@ class Handler(BaseHTTPRequestHandler):
             safe = {"dispatchState": "not_started"} if path == "/api/session/action" and not getattr(self, "control_dispatched", False) else {}
             return self.send_json(409, {"error": str(exc), **safe})
         except (OSError, ImportError) as exc:
+            if self.responded:
+                raise
             return self.send_json(503, {"error": unavailable_message(exc, "실행 연결을 준비하지 못했어요. 원래 작업은 유지됩니다.")})
         return self.send_json(404, {"error": "없는 경로입니다."})
 

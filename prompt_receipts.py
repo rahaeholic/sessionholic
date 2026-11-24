@@ -126,7 +126,7 @@ class PromptReceipts:
 
     @staticmethod
     def _private_file(path):
-        settings.safe_path(path, private=True)
+        # The parent is already validated. A single lstat also rejects links.
         info = path.lstat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
@@ -161,9 +161,11 @@ class PromptReceipts:
                 raise PromptReceiptError()
             for suffix in ('-journal', '-wal', '-shm'):
                 auxiliary = self.path.with_name(self.path.name + suffix)
-                settings.safe_path(auxiliary, private=True, allow_missing=True)
-                if auxiliary.exists():
+                try:
                     self._private_file(auxiliary)
+                except FileNotFoundError:
+                    # Another connection can commit and remove its journal here.
+                    pass
             connection = sqlite3.connect(str(self.path), timeout=2, isolation_level=None)
             connection.execute('PRAGMA journal_mode=DELETE')
             connection.execute('PRAGMA synchronous=FULL')

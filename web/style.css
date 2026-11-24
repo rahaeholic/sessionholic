@@ -7123,6 +7123,12 @@ input.switch:focus-visible {
     margin-bottom: -14px;
   }
 }
+.msg-recovery {
+  margin: 0;
+}
+.msg-recovery::before {
+  content: none;
+}
 /* "··· 작업 중" after the newest message while the agent works. */
 .msg-working .working-bubble {
   display: inline-flex;

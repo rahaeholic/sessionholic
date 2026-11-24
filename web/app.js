@@ -6662,7 +6662,8 @@ function buildChatComposer(s) {
   const beginNextDraft = () => {
     if (entry.composing || !draftIsPending(entry) || !editorCurrent()) return;
     entry.pending.preserveDraft = true;
-    entry.text = input.value = "";
+    entry.text = "";
+    if (input.value) input.value = "";
     entry.attachments = [];
     entry.revision++;
     updateChatComposer(entry);
@@ -6740,6 +6741,7 @@ function buildChatComposer(s) {
   input.addEventListener("compositionstart", () => {
     dictationFieldEvent(input, "compstart");
     if (!editorCurrent()) return;
+    beginNextDraft();
     entry.composing = true;
     updateSlashMenu(entry, box, input);
     updateChatComposer(entry);
@@ -7598,7 +7600,8 @@ function updateChatComposer(entry, selected = selectedSession() || null, { defer
   $("chat-composer").classList.toggle?.("is-busy", entry.data?.phase === "working" || entry.sending || !!entry.uploads);
   $("chat-composer").classList.toggle?.("is-error", !!entry.error || entry.receipt?.status === "failed" && !receiptSuperseded(entry));
   $("chat-composer").classList.toggle?.("is-unknown", !!entry.pending && !entry.sending);
-  setClass($("chat-composer"), "is-sent-draft", sentDraftHidden(entry));
+  const retainedDraft = sentDraftHidden(entry);
+  setClass($("chat-composer"), "is-sent-draft", retainedDraft);
   const offline = networkOffline();
   const blocked = offline || !(supported || connectable) || entry.sending || chatPendingBlocks(entry) || !!entry.uploads || !!entry.uploadQueue?.length || !!entry.commandBusy;
   const recovery = chatRecovery(entry, selected);
@@ -7614,6 +7617,15 @@ function updateChatComposer(entry, selected = selectedSession() || null, { defer
   // Reads and pending sends never lock drafting or dictation. The request and
   // its receipt retain an immutable copy; only the same unresolved message is blocked.
   const input = $("chat-input");
+  // Keep the submitted draft in the request, with an actually empty editable field.
+  // WebKit can discard the first replacement when beforeinput clears an old value.
+  if (retainedDraft) {
+    if (input.value === entry.text && input.value) input.value = "";
+    input.dataset.retainedDraft = "1";
+  } else if (input.dataset.retainedDraft && !entry.composing) {
+    if (!input.value) input.value = entry.text;
+    delete input.dataset.retainedDraft;
+  }
   input.placeholder = chatPlaceholder(oneShot);
   // Drafting belongs to this conversation, not to a transient send capability.
   // A refresh/offline read must never blur IME or interrupt speech recognition.
@@ -9098,17 +9110,28 @@ async function sendChat(entry, message = null) {
     previous.pending = { ...entry.pending, preserveDraft: true };
   }
   entry.pending = pending;
-  entry.stateEpoch++;
-  entry.sending = true;
-  entry.connecting = !chatSupported(entry) && chatCanConnect(entry);
   entry.error = "";
   entry.notice = "";
-  // The bubble shows at once, translucent, and becomes the real message
-  // when the transcript has it. A failed earlier attempt is superseded.
+  // The bubble shows at once and becomes the transcript message when recorded.
   entry.outbox = (entry.outbox || []).filter((item) => item.state !== "failed");
   entry.outbox.push({ requestId: pending.requestId, text: pending.text, attachments: pending.attachmentDetails,
     attachmentObjects: attachments, state: "sending", status: "", reason: "", at: Date.now(),
     ...outboxOrigin(entry.conversation?.messages) });
+  return dispatchChat(entry, pending, authEpoch);
+}
+function recoverChatSend(entry, item) {
+  const pending = entry.pending?.requestId === item.requestId ? entry.pending : item.pending;
+  if (!pending || item.state !== "uncertain" || pending.source?.agent !== "codex" ||
+      networkOffline() || !currentChat(entry) || !chatSupported(entry) || entry.sending ||
+      chatKey(pending.source) !== chatKey(entry.source)) return;
+  item.state = "sending";
+  return dispatchChat(entry, pending, state.authEpoch, true);
+}
+async function dispatchChat(entry, pending, authEpoch, recovering = false) {
+  entry.stateEpoch++;
+  entry.sending = true;
+  entry.connecting = !chatSupported(entry) && chatCanConnect(entry);
+  persistChatDraft(entry);
   updateChatComposer(entry);
   refreshConversationView(entry, true);
   // Whether the message may be in the transcript now (내 질문 is read again a while after).
@@ -9130,11 +9153,13 @@ async function sendChat(entry, message = null) {
     dispatched = true;
     const result = await api("/api/chat/send", { method: "POST", body: {
       source: pending.source, requestId: pending.requestId, text: pending.text, attachments: pending.attachments,
+      ...(recovering ? { recoverReceipt: true } : {}),
     }, authEpoch });
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
     if (result.receipt?.requestId && result.receipt.requestId !== pending.requestId)
       throw new Error("요청 확인 번호가 일치하지 않습니다.");
-    applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: result.status || "unknown" });
+    const status = recovering && result.status === "failed" && result.receipt?.confirmed !== true ? "unknown" : result.status;
+    applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: status || "unknown" });
     sent = result.status !== "failed";
     if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
     // A Claude send may have attached the session's board terminal: its marks show it now.
@@ -9142,7 +9167,7 @@ async function sendChat(entry, message = null) {
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
       haptic("error");
-      if (!dispatched || err.dispatchState === "not_started") {
+      if (!recovering && (!dispatched || err.dispatchState === "not_started")) {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -9168,8 +9193,9 @@ async function sendChat(entry, message = null) {
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
         sent = true;
-        entry.receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
-        entry.error = chatReceiptCopy(entry.receipt);
+        const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
+        applyChatReceipt(entry, receipt);
+        entry.error = chatReceiptCopy(receipt);
       }
     }
   } finally {
@@ -9177,7 +9203,9 @@ async function sendChat(entry, message = null) {
     entry.sending = false;
     entry.connecting = false;
     if (entry.receipt?.requestId === pending.requestId) markOutbox(entry, pending.requestId, entry.receipt);
-    else if (entry.pending?.requestId === pending.requestId) markOutbox(entry, pending.requestId, { status: "unknown" });
+    else if (entry.pending?.requestId === pending.requestId || entry.outbox?.some((item) =>
+      item.pending?.requestId === pending.requestId && item.state === "sending"))
+      markOutbox(entry, pending.requestId, { status: "unknown" });
     updateChatComposer(entry);
     refreshConversationView(entry);
     // The result (sent, refused or unknown) is read in the composer's status.
@@ -9191,7 +9219,7 @@ async function sendChat(entry, message = null) {
 // Memory only, per conversation. "sending" until the server answers; then
 // "sent" (accepted or queued), "uncertain" (no answer: that message cannot be
 // duplicated) or "failed" (never started: the draft or retry bubble retains it).
-const OUTBOX_LABELS = { connecting: "연결 중…", sending: "전송 중…", uncertain: "전송 확인 중", sent: "전송됨",
+const OUTBOX_LABELS = { connecting: "연결 중…", sending: "전송 중…", uncertain: "전송 확인 중", sent: "서버 접수 · 대화 반영 대기", recorded: "대화 반영 확인",
   queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
 const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
 const OUTBOX_MAX_MS = 15 * 60 * 1000;
@@ -9451,7 +9479,8 @@ function outboxRows(list, entry) {
       list.outboxNodes.set(item.requestId, row);
     }
     const name = entry.connecting && entry.pending?.requestId === item.requestId ? "connecting"
-      : item.state === "sent" && item.status === "queued" ? "queued" : item.state;
+      : item.state === "sent" && item.status === "queued" ? "queued"
+      : item.state === "sent" && item.recorded ? "recorded" : item.state;
     const className = `msg user is-outbox is-${item.state}`;
     if (row.className !== className) row.className = className;
     const revision = `${name}|${item.reason}`;
@@ -9463,7 +9492,24 @@ function outboxRows(list, entry) {
         const retry = button("다시 보내기", "msg-retry", () => retryOutbox(entry, item));
         retry.setAttribute("aria-label", "보내지 못한 메시지 다시 보내기");
         row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS.failed + (item.reason ? ` · ${item.reason}` : "")), retry);
-      } else row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS[name] || OUTBOX_LABELS.uncertain));
+      } else {
+        row.deliveryStatus.replaceChildren(el("span", "msg-delivery-text", OUTBOX_LABELS[name] || OUTBOX_LABELS.uncertain));
+        if (name === "uncertain") {
+          row.deliveryStatus.append(button("상태 확인", "msg-retry msg-recovery", () => {
+            const s = selectedSession();
+            if (s && currentChat(entry, s)) {
+              state.chatPollCount = 0;
+              return loadChatState(s, true);
+            }
+          }));
+          if (entry.source?.agent === "codex") {
+            const recover = button("전송 복구", "msg-retry msg-recovery", () => recoverChatSend(entry, item));
+            recover.title = "기존 요청 번호로 확인하고, 아직 도착하지 않았으면 한 번 보냅니다.";
+            row.deliveryStatus.append(recover);
+          }
+          if (item.text) row.deliveryStatus.append(button("복사", "msg-retry msg-recovery", () => copyText(item.text, "메시지를 복사했습니다.")));
+        }
+      }
     }
     rows.push(row);
   }
