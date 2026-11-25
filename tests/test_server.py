@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import resource
 import shlex
 import shutil
 import socket
@@ -50,11 +51,20 @@ def fake_runner(calls):
 
 class SocketDescriptorTest(unittest.TestCase):
     def test_open_high_descriptor_can_read_and_write_http_without_select_failure(self):
+        minimum_fd = 1100
+        limits = resource.getrlimit(resource.RLIMIT_NOFILE)
+        soft, hard = limits
+        if soft != resource.RLIM_INFINITY and soft <= minimum_fd:
+            if hard != resource.RLIM_INFINITY and hard <= minimum_fd:
+                self.skipTest("The process hard descriptor limit cannot provide fd 1100")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (minimum_fd + 1, hard))
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, limits)
+
         class HighDescriptorServer(server.BoardHTTPServer):
             def get_request(self):
                 conn, address = super().get_request()
                 with conn:
-                    return socket.socket(fileno=fcntl.fcntl(conn.fileno(), fcntl.F_DUPFD, 1100)), address
+                    return socket.socket(fileno=fcntl.fcntl(conn.fileno(), fcntl.F_DUPFD, minimum_fd)), address
 
         class ProbeHandler(server.Handler):
             def do_GET(self):
@@ -78,7 +88,7 @@ class SocketDescriptorTest(unittest.TestCase):
                 conn.request("GET", "/fixture")
                 response = conn.getresponse()
                 self.assertEqual((response.status, response.read()), (200, b"fixture body"))
-                self.assertGreaterEqual(listener.descriptor, 1100)
+                self.assertGreaterEqual(listener.descriptor, minimum_fd)
                 self.assertIn("filedescriptor out of range", listener.old_probe_error)
                 self.assertFalse(listener.closed)
             finally:
