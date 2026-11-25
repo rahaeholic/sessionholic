@@ -793,7 +793,7 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
         self.assertEqual(relinked['a']['linkConfidence'], 'estimated')
 
-    def test_cleared_estimate_still_competes_in_the_same_list(self):
+    def test_cleared_estimate_still_competes_on_the_next_list(self):
         a_id, b_id = 'a' * 32, 'b' * 32
         ssh = {'mode': 'new-session', 'host': 'local', 'program': 'ssh', 'programHost': 'remote'}
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
@@ -827,12 +827,59 @@ class LinkNewSessionTest(unittest.TestCase):
                         rows = {row['id']: row for row in self.flow.linked_terminals()}
                         self.assertNotIn('nativeSource', rows[a_id])
                         self.assertNotIn('nativeSource', rows[b_id])
+                        self.assertTrue(all('linkHold' not in row for row in rows.values()))
+                        rows = {row['id']: row for row in self.flow.linked_terminals()}
                         self.assertTrue(all(row.get('linkHold') is True for row in rows.values()))
                         if competitor_closes:
                             names.remove('sb-' + b_id)
                         self.assertTrue(all('nativeSource' not in row for row in self.flow.linked_terminals()))
                         stored = [row['metadata'] for row in json.loads(saved.read_text())]
                         self.assertTrue(all('nativeSource' not in meta and meta.get('linkHold') is True for meta in stored))
+                finally:
+                    manager.close()
+
+    def test_released_estimate_becomes_available_on_the_next_list(self):
+        a_id, b_id = 'a' * 32, 'b' * 32
+        for a_program, b_uses_ssh, reverse_terminals, reverse_sessions in product(
+                ('ssh', 'claude'), (False, True), (False, True), (False, True)):
+            with self.subTest(a_program=a_program, b_uses_ssh=b_uses_ssh,
+                              reverse_terminals=reverse_terminals, reverse_sessions=reverse_sessions):
+                own = codex_row('1', 995 if b_uses_ssh else 990)
+                independent = codex_row('2', 1001)
+                expected = server.Workflow._native_of('local', 'codex', own)
+                a = {'mode': 'new-session', 'host': 'local', 'createdAt': 1000,
+                     'nativeSource': expected, 'linkConfidence': 'estimated', 'program': a_program}
+                if a_program == 'ssh':
+                    a['programHost'] = 'remote'
+                b = {'mode': 'new-session', 'host': 'local', 'createdAt': 985, 'program': 'codex'}
+                if b_uses_ssh:
+                    b.update(host='remote', createdAt=990, program='ssh', programHost='local')
+                records = [(a_id, a), (b_id, b)]
+                if reverse_terminals:
+                    records.reverse()
+                socket = 'fixture-r3-released'
+                state = Path(tempfile.mkdtemp(dir=self.temp.name))
+                saved = state / 'sessions.json'
+                saved.write_text(json.dumps([
+                    {'id': uid, 'name': 'sb-' + uid, 'key': 'fixture-' + uid, 'socket': socket, 'metadata': meta}
+                    for uid, meta in records
+                ]), encoding='utf-8')
+                manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                try:
+                    self.flow.terminals = manager
+                    self.rows['local']['codex'] = [independent, own] if reverse_sessions else [own, independent]
+                    self.board.poll(LOCAL)
+                    with patch.object(manager, '_live_names', return_value={'sb-' + a_id, 'sb-' + b_id}):
+                        rows = self.flow.linked_terminals()
+                        self.assertTrue(all('nativeSource' not in row and 'linkHold' not in row for row in rows))
+                        stored = [row['metadata'] for row in json.loads(saved.read_text())]
+                        self.assertTrue(all('nativeSource' not in meta and 'linkHold' not in meta for meta in stored))
+                        for _ in range(2):
+                            rows = {row['id']: row for row in self.flow.linked_terminals()}
+                            self.assertEqual(rows[b_id]['nativeSource'], expected)
+                            self.assertEqual(rows[b_id]['linkConfidence'], 'estimated')
+                        stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
+                        self.assertEqual(stored[b_id]['nativeSource'], expected)
                 finally:
                     manager.close()
 

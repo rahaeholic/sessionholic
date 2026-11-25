@@ -2522,7 +2522,8 @@ class Workflow:
         Match the earliest unclaimed interactive session for that agent or SSH destination,
         or persist a hold on further estimates if another terminal shares that candidate.
         Only other hosts allow 30 seconds of clock difference. If a confirmed program
-        contradicts an estimate, discard it so the next observation can link again."""
+        contradicts an estimate, discard it. Defer new estimates and holds to the next
+        observation after any successful removal."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2581,6 +2582,9 @@ class Workflow:
                     pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
                 elif program == "ssh":
                     unresolved_ssh.append(terminal)
+        if changed:
+            # Re-evaluate candidates from a fresh list after releasing a claim.
+            return changed
         claimable_hosts = {host for _, host, can_link in pending if can_link}
         if not claimable_hosts:
             return changed
