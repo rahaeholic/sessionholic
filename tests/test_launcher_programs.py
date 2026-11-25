@@ -265,11 +265,29 @@ class ProgramTest(unittest.TestCase):
                          {FIRST: {"program": "ssh", "cwd": None, "sshHost": "beaulink", "pid": 12}})
         self.assertEqual(lp.program_of("/usr/bin/ssh -t host"), {"program": "ssh", "cwd": None, "sshHost": "host"})
         # Option values are no destination; a login is not part of the host; nothing named, nothing claimed.
-        self.assertEqual(lp.program_of("ssh -tt -o ConnectTimeout=10 -p 22 -i /k/id me@pc.local cmd --payload x")["sshHost"], "pc.local")
+        self.assertEqual(lp.program_of("ssh -tt -o ConnectTimeout=10 me@pc.local cmd --payload x")["sshHost"], "pc.local")
+        self.assertNotIn("sshHost", lp.program_of("ssh -tt -p 22 -i /k/id me@pc.local cmd --payload x"))
         self.assertNotIn("sshHost", lp.program_of("ssh -o BatchMode=yes"))
         self.assertNotIn("sshHost", lp.program_of("ssh 'bad;host' cmd"))
         # No launcher named: no claim either way.
         self.assertEqual(lp.describe([terminal], LAUNCHER, []), {FIRST: {"program": None}})
+
+    def test_ssh_destination_requires_allowlisted_options_before_it(self):
+        for key, value in (("BatchMode", "yes"), ("ConnectTimeout", "10"),
+                           ("ServerAliveInterval", "30"), ("ServerAliveCountMax", "3"),
+                           ("StrictHostKeyChecking", "accept-new"), ("RequestTTY", "force"),
+                           ("ForwardAgent", "no"), ("Compression", "yes")):
+            for form in ("-o {}={}", "-o{}={}"):
+                with self.subTest(key=key, form=form):
+                    command = "ssh -tTAaqvxXYC46 " + form.format(key.swapcase(), value) + " fixture-pc codex --flag"
+                    self.assertEqual(lp.program_of(command)["sshHost"], "fixture-pc")
+        for options in ("-J relay", "-l user", "-p22", "-i/key", "-L port", "-N", "--", "-toBatchMode=yes",
+                        "-o RequestTTY=", "-oBatchMode", "-o User=test", "-oBatchMode=yes=again",
+                        "-oConnectTimeout=10,20", "-o BatchMode=yes!"):
+            with self.subTest(options=options):
+                self.assertNotIn("sshHost", lp.program_of(f"ssh {options} fixture-pc"))
+        self.assertNotIn("sshHost", lp.program_of("ssh fixture-pc -t codex"))
+        self.assertEqual(lp.program_of("ssh fixture-pc codex -t")["sshHost"], "fixture-pc")
 
     def test_a_host_without_a_launcher_reports_nothing(self):
         with patch("launch.new_session", side_effect=ValueError("no launcher")):

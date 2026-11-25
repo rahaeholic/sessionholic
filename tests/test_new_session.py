@@ -528,7 +528,7 @@ class LinkNewSessionTest(unittest.TestCase):
                     self.assertNotIn('sshHost', observed)
                     self.terminal.update(program='ssh', programHost=observed.get('sshHost'))
                     self.assertEqual(self.link(), [])
-        command = '/usr/bin/ssh -L 9000:localhost:9000 -T remote codex -N'
+        command = '/usr/bin/ssh -T remote codex -N'
         observed = launcher_programs.describe([self.terminal], command.split(), [(20, 1, 1001, command)])
         self.terminal.update(program='ssh', programHost=observed[self.terminal['id']]['sshHost'])
         self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
@@ -553,12 +553,14 @@ class LinkNewSessionTest(unittest.TestCase):
                         self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
                         self.assertIn('nativeSource', other)
 
-    def test_ssh_destination_override_does_not_claim_the_configured_alias(self):
+    def test_ssh_unapproved_arguments_do_not_claim_the_configured_alias(self):
         candidate = codex_row('1', 1008)
         self.rows['remote']['codex'] = [candidate]
         self.terminal.update(host='local', program=None)
         for options in ('-oHostName=unlisted.example', '-o HOSTNAME=unlisted.example',
-                        '-o HostName unlisted.example', '-F /fixture/ssh.conf', '-F/fixture/ssh.conf'):
+                        '-o HostName unlisted.example', '-F /fixture/ssh.conf', '-F/fixture/ssh.conf',
+                        '-o LogLevel ERROR -oHostName=unlisted.example',
+                        '-o LogLevel ERROR -F /fixture/alternate.conf', '-o User'):
             for command in (f'/usr/bin/ssh {options} remote', f'/usr/bin/ssh remote {options}'):
                 with self.subTest(command=command):
                     for launcher, rows in (
@@ -574,6 +576,17 @@ class LinkNewSessionTest(unittest.TestCase):
         observed = launcher_programs.describe([self.terminal], command.split(), [(20, 1, 1001, command)])
         self.terminal.update(program='ssh', programHost=observed[self.terminal['id']]['sshHost'])
         self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
+
+    def test_ssh_launcher_command_links_to_its_registered_pc(self):
+        candidate = codex_row('1', 1008)
+        self.rows['remote']['codex'] = [candidate]
+        command = ('ssh -t -o BatchMode=yes -o ConnectTimeout=10 fixture-pc '
+                   'python.exe C:/x/start-project.py --payload X; exit $LASTEXITCODE')
+        observed = launcher_programs.describe([self.terminal], command.split(), [(20, 1, 1001, command)])
+        self.assertEqual(observed[self.terminal['id']]['sshHost'], 'fixture-pc')
+        self.terminal.update(host='local', program='ssh', programHost='fixture-pc')
+        with patch.dict(self.board.hosts[1], ssh='fixture-pc'):
+            self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
 
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'

@@ -26,10 +26,12 @@ LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
 INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python", "node"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
-# ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
-SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
-# These modes do not run a remote command or login shell.
-SSH_NO_SHELL_OPTIONS = set("GNOQsVWZ")
+# The process table has lost argv boundaries. Only simple SSH options qualify
+# for destination matching.
+SSH_FLAGS = set("tTAaqvxXYC46")
+SSH_CONFIG_KEYS = {"batchmode", "connecttimeout", "serveraliveinterval", "serveralivecountmax",
+                   "stricthostkeychecking", "requesttty", "forwardagent", "compression"}
+SSH_CONFIG_VALUE = re.compile(r"[A-Za-z0-9._-]+")
 # A host name or alias, never an option (`ssh -G` is asked about it).
 SSH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
@@ -96,39 +98,21 @@ def program_of(command):
     # SSH is work of its own, never a menu. Only a remote command or shell can own a session.
     if name == "ssh":
         found, words = {"program": "ssh", "cwd": None}, iter(rest)
-        destination = None
         for word in words:
-            if word == "--":
-                if destination is None:
-                    destination = next(words, None)
+            if not word.startswith("-"):
+                host = word.rsplit("@", 1)[-1]
+                # SSH can parse options after a destination. A non-option here
+                # starts the remote command, whose remaining arguments do not matter.
+                if SSH_NAME.fullmatch(host) and not next(words, "").startswith("-"):
+                    found["sshHost"] = host
                 break
-            if not word.startswith("-") or word == "-":
-                if destination is not None:
-                    break  # The remote command and its arguments are not SSH options.
-                destination = word
-                continue
-            for end, option in enumerate(word[1:], 2):
-                # An alternate config or HostName override can change where the
-                # alias connects, independently of the board's normal resolver.
-                if option in SSH_NO_SHELL_OPTIONS or option == "F":
+            if word.startswith("-o"):
+                option = word[2:] or next(words, "")
+                key, _, value = option.partition("=")
+                if key.lower() not in SSH_CONFIG_KEYS or not SSH_CONFIG_VALUE.fullmatch(value):
                     return found
-                if option in SSH_VALUE_OPTIONS:
-                    value = word[end:] or next(words, "")
-                    if option == "o":
-                        key, _, session_type = value.lower().partition("=")
-                        if key == "hostname":
-                            return found
-                        if key == "sessiontype":
-                            session_type = session_type or next(words, "").lower()
-                            if session_type == "=":
-                                session_type = next(words, "").lower()
-                            if session_type.lstrip("=").strip("'\"") in ("none", "subsystem"):
-                                return found
-                    break
-        if destination:
-            host = destination.rsplit("@", 1)[-1]
-            if SSH_NAME.fullmatch(host):
-                found["sshHost"] = host
+            elif not word[1:] or not set(word[1:]) <= SSH_FLAGS:
+                return found
         return found
     return None
 
