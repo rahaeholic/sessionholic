@@ -303,6 +303,12 @@ def local_call(data=None, home=None, operation="state", query=None):
         if operation == "chat":
             return chats[0] if chats else {}
         output = {"enabled": True, "chats": chats, "activity": result.get("activity", {})}
+        archive = result.get("archiveFollowup")
+        if isinstance(archive, dict):
+            card = {key: archive[key] for key in ("title", "status", "summary", "evidence", "draft")
+                    if isinstance(archive.get(key), str) and 0 < len(archive[key]) <= 300}
+            if {"title", "status", "summary"} <= card.keys():
+                output["archiveFollowup"] = card
         # The state holds Woni's latest 60 chats; these say whether earlier ones can be fetched with /v1/chats.
         if isinstance(result.get("chatsHasMore"), bool):
             output["chatsHasMore"] = result["chatsHasMore"]

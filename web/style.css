@@ -329,7 +329,13 @@
 .woni-answer-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 .woni-work { padding: 8px 20px 20px; }
 .woni-work h3 { margin: 16px 4px 8px; color: var(--label-2); font-size: var(--fs-sub); font-weight: 600; }
-.woni-work > .woni-status { margin: 12px 4px; font-size: var(--fs-sub); }
+.woni-work-activity > .woni-status { margin: 12px 4px; font-size: var(--fs-sub); }
+.woni-archive-card { background: var(--fill-soft); border-radius: var(--radius); padding: 12px; overflow-wrap: anywhere; }
+.woni-work .woni-archive-card h3 { margin: 0 0 6px; color: var(--label); font-size: var(--fs-body); }
+.woni-archive-card p { margin: 4px 0; }
+.woni-archive-card small { display: block; color: var(--label-2); }
+.woni-archive-card button { min-height: 44px; color: var(--accent-strong); }
+.woni-archive-card button:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
 .woni-work .agent-group { margin-bottom: 8px; }
 .woni-work .agent-subtasks { display: grid; gap: 0; padding: 0 12px 8px 29px; }
 /* The work view's own button look (accent link) must not dress the shared rows. */
