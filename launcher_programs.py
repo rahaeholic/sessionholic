@@ -1,9 +1,10 @@
 """What each "새 세션" terminal ended up running on this host, read from the process table.
 
 A 새 세션 terminal runs this host's launcher (the host settings' `launcher`). Its launcher
-process starts when the terminal opens, so the board's creation time names it; the first
-agent CLI below it is the program: Claude's agent view (`claude agents`, with its --cwd),
-Claude, or Codex. Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
+process starts when the terminal opens, so the board's creation time names it. A menu launcher
+reports the nearest agent CLI or SSH below it. A direct Codex or Claude launch is ambiguous
+when another program is recognized below it.
+Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
 import itertools
@@ -23,10 +24,14 @@ PAIRING_LIMIT = 6  # terminals weighed together at most; more name none
 PS = "/bin/ps"
 LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
-INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python"}
+INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python", "node"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
-# ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
-SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
+# The process table has lost argv boundaries. Only simple SSH options qualify
+# for destination matching.
+SSH_FLAGS = set("tTAaqvxXYC46")
+SSH_CONFIG_KEYS = {"batchmode", "connecttimeout", "serveraliveinterval", "serveralivecountmax",
+                   "stricthostkeychecking", "requesttty", "forwardagent", "compression"}
+SSH_CONFIG_VALUE = re.compile(r"[A-Za-z0-9._-]+")
 # A host name or alias, never an option (`ssh -G` is asked about it).
 SSH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
@@ -90,19 +95,24 @@ def program_of(command):
             if identifier == rest[rest.index("resume") + 1]:
                 found["sessionId"] = identifier
         return found
-    # A session the launcher opened on another host (a PC's): work of its own, never a menu.
-    # Its destination (the first word that is no option or option value) names that host.
+    # SSH is work of its own, never a menu. Only a remote command or shell can own a session.
     if name == "ssh":
         found, words = {"program": "ssh", "cwd": None}, iter(rest)
         for word in words:
-            if word.startswith("-") and len(word) > 1:
-                if word[-1] in SSH_VALUE_OPTIONS:
-                    next(words, None)
-                continue
-            host = word.rsplit("@", 1)[-1]
-            if SSH_NAME.fullmatch(host):
-                found["sshHost"] = host
-            break
+            if not word.startswith("-"):
+                host = word.rsplit("@", 1)[-1]
+                # SSH can parse options after a destination. A non-option here
+                # starts the remote command, whose remaining arguments do not matter.
+                if SSH_NAME.fullmatch(host) and not next(words, "").startswith("-"):
+                    found["sshHost"] = host
+                break
+            if word.startswith("-o"):
+                option = word[2:] or next(words, "")
+                key, _, value = option.partition("=")
+                if key.lower() not in SSH_CONFIG_KEYS or not SSH_CONFIG_VALUE.fullmatch(value):
+                    return found
+            elif not word[1:] or not set(word[1:]) <= SSH_FLAGS:
+                return found
         return found
     return None
 
@@ -189,18 +199,25 @@ def describe(terminals, launcher, rows):
         if len(matches) != 1:
             result[identifier] = {"program": None}
             continue
-        found, queue, seen = None, [matches[0]], set()
-        while queue and found is None:
+        root = matches[0]
+        root_program = program_of(by_pid[root][2])
+        found, seen = None, {root}
+        queue = sorted(children.get(root, []))
+        while queue:
             pid = queue.pop(0)
             if pid in seen:
                 continue
             seen.add(pid)
-            if pid != matches[0]:
-                found = program_of(by_pid[pid][2])
-                if found is not None:
-                    found = {**found, "pid": pid}
-                    break
+            program = program_of(by_pid[pid][2])
+            if program is not None:
+                found = {**program, "pid": pid}
+                break
             queue.extend(sorted(children.get(pid, [])))
+        if found is not None and root_program is not None and root_program["program"] in ("codex", "claude"):
+            result[identifier] = {"program": None}
+            continue
+        if found is None and root_program is not None:
+            found = {**root_program, "pid": root}
         # Its own launcher, with nothing chosen below it yet: the menu still waits.
         result[identifier] = found or {"program": None, "launcher": True}
     return result

@@ -2201,6 +2201,8 @@ class Workflow:
                 metadata = {"title": label + (" · " + LAUNCH_PRESETS[preset]["label"] if preset else ""),
                             "host": host["name"], "mode": "new-session", "createdAt": int(time.time()),
                             **({"preset": preset} if preset else {})}
+                if host.get("platform") == "windows":
+                    metadata["windowsSingleChoice"] = len(host["launcher"]["choices"]) == 1
                 if spec.get("holdName"):
                     metadata["holdName"] = spec["holdName"]
                 terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
@@ -2516,38 +2518,94 @@ class Workflow:
             pass
 
     def _link_observed_sessions(self, terminals):
-        """A "새 세션" terminal names no session when it opens; its launcher starts one later.
-        The earliest session that appears on its host after it opened (30 seconds of clock
-        difference allowed), and no other terminal names, is recorded as its own, once: its
-        card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
-        (Codex `exec`, Claude background agents) are never taken. A launcher seen running an
-        agent takes only that agent's sessions; one seen running SSH takes its session from the
-        board host its destination names (a PC's), never its own host's; one running Claude's agent
-        view (background sessions only) or SSH to an unknown host takes none and so never makes
-        another launcher's session ambiguous."""
+        """Estimate a "새 세션" link after observing Codex, Claude, or SSH to a known board host.
+        Match the earliest unclaimed interactive session for that agent or SSH destination,
+        or persist a hold on further estimates if another terminal shares that candidate.
+        Only other hosts allow 30 seconds of clock difference. If a confirmed program
+        contradicts an estimate, discard it. After a removal, recompute holds from a
+        fresh list and leave new estimates for the next observation."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
+        unlink = getattr(self.terminals, "unlink_estimated_native", None)
+        hold = getattr(self.terminals, "hold_native_link", None)
+        windows_hosts = {h["name"] for h in self.board.hosts if not h.get("local") and h.get("platform") == "windows"}
+
         def session_host(terminal):
-            if terminal.get("program") == "claude-agents":
+            program = terminal.get("program")
+            origin = terminal.get("host")
+            if origin in windows_hosts:
+                # This terminal may outlive changes to the PC's launcher settings.
+                if terminal.get("windowsSingleChoice") is not True:
+                    return None
+                if program is None:
+                    return origin
+            if program in ("codex", "claude"):
+                return origin
+            if program != "ssh":
                 return None
-            if terminal.get("program") != "ssh":
-                return terminal.get("host")
             target = terminal.get("programHost")
-            return next((h["name"] for h in self.board.hosts if target and h["name"] != terminal.get("host")
+            return next((h["name"] for h in self.board.hosts if target and h["name"] != origin
                          and target in (h["name"], h.get("ssh"))), None)
-        pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
-                          and not t.get("closed") and not t.get("nativeSource") and session_host(t)
-                          and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
-        if not pending:
-            return
+
+        released = False
+        deferred = set()
+        for terminal in terminals:
+            if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
+                continue
+            host = session_host(terminal)
+            origin = terminal.get("host")
+            program = terminal.get("program")
+            native = terminal.get("nativeSource")
+            if not native or unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
+                continue
+            wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
+            wrong_agent = program in ("codex", "claude") and native["agent"] != program
+            if not (wrong_host or wrong_agent):
+                continue
+            deferred.add(terminal["id"])
+            try:
+                if unlink(terminal["id"], native):
+                    released = True
+            except (KeyError, ValueError, RuntimeError, OSError):
+                pass
+        if released:
+            # A released claim must be visible when deciding which candidates overlap.
+            terminals = self.terminals.list()
+        changed = released
+        pending = []
+        unresolved_ssh = []
+        for terminal in terminals:
+            if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
+                continue
+            if terminal.get("nativeSource") and terminal["id"] not in deferred:
+                continue
+            host = session_host(terminal)
+            origin = terminal.get("host")
+            program = terminal.get("program")
+            # Unobserved launchers and Windows menus still compete for sessions
+            # on their own host, even when they cannot claim one themselves.
+            candidate_host = host or (origin if program is None else None)
+            if type(terminal.get("createdAt")) is int:
+                if candidate_host:
+                    pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
+                elif program == "ssh":
+                    unresolved_ssh.append(terminal)
+        claimable_hosts = {host for _, host, can_link in pending if can_link}
+        if not claimable_hosts:
+            return changed
+        # An SSH whose destination is unconfirmed can still own a session on
+        # another host. Count it for ambiguity without letting it claim one.
+        pending.extend((terminal, host, False) for terminal in unresolved_ssh
+                       for host in claimable_hosts if host != terminal.get("host"))
         taken = {json.dumps(self.identity(t["nativeSource"]), sort_keys=True) for t in terminals
                  if isinstance(t.get("nativeSource"), dict)}
+        local_hosts = {h["name"] for h in self.board.hosts if h.get("local")}
         found = []
-        for terminal in pending:
-            host = session_host(terminal)
+        for terminal, host, can_link in sorted(pending, key=lambda item: item[0]["createdAt"]):
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
+            earliest = opened if host in local_hosts else opened - 30
             candidates = []
             program = terminal.get("program")
             for agent in ("codex", "claude"):
@@ -2557,34 +2615,41 @@ class Workflow:
                     native = self._native_of(host, agent, row)
                     started = row.get("startedAt")
                     if (native is None or type(started) is not int
-                            or not opened - 30 <= started <= opened + self.LINK_WINDOW
+                            or not earliest <= started <= opened + self.LINK_WINDOW
                             or json.dumps(self.identity(native), sort_keys=True) in taken):
                         continue
                     candidates.append((started, native))
-            found.append((terminal, candidates))
+            found.append((terminal, candidates, can_link))
         # A session that could be either of two terminals still waiting on its host (both opened
         # before it started) is neither's: start times cannot tell them apart, and a wrong link
         # shows another conversation beside the terminal and opens the wrong one from its card.
         shared = {}
-        for _terminal, candidates in found:
+        for _terminal, candidates, _can_link in found:
             for _started, native in candidates:
                 key = json.dumps(self.identity(native), sort_keys=True)
                 shared[key] = shared.get(key, 0) + 1
-        linked = False
-        for terminal, candidates in found:
+        for terminal, candidates, can_link in found:
+            if not can_link:
+                continue
             candidates = [item for item in candidates
-                          if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
-                          and json.dumps(self.identity(item[1]), sort_keys=True) not in taken]
+                          if json.dumps(self.identity(item[1]), sort_keys=True) not in taken]
             if not candidates:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]
+            key = json.dumps(self.identity(native), sort_keys=True)
+            terminal_id = terminal["id"]
             try:
-                if record(terminal["id"], native, confidence="estimated"):
-                    taken.add(json.dumps(self.identity(native), sort_keys=True))
-                    linked = True
+                # Neither a later candidate nor a later observation resolves this ambiguity.
+                if shared[key] > 1:
+                    if hold is not None and hold(terminal_id):
+                        changed = True
+                    continue
+                if not released and terminal_id not in deferred and record(terminal_id, native, confidence="estimated"):
+                    taken.add(key)
+                    changed = True
             except (KeyError, ValueError, RuntimeError, OSError):
                 continue
-        return linked
+        return changed
 
     @staticmethod
     def _native_of(host, agent, row):

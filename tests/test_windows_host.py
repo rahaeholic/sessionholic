@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import chat
 import server
+import terminal
 import transfer
 from transfer import Transfers
 import test_goals_http as http_fixture
@@ -251,11 +252,61 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertIn("@{Label='Claude · it''s'; Exe='C:\\Tools\\claude.exe'; Args=@(); Cwd=''}", script)
         self.assertIn("Read-Host '선택'", script)
         self.assertNotIn(HOST['label'], script)
-        # One choice runs straight away, with no menu.
-        one = decoded(self.flow.transfers.windows_launcher(HOST, server.windows_launcher_setting(
-            {'choices': LAUNCHER['choices'][:1]})))
+        # Restore the actual menu metadata and exercise input with fake tmux I/O.
+        state = self.root / 'menu-terminals'
+        state.mkdir()
+        menu_id = 'f' * 32
+        socket = 'fixture-windows-menu'
+        saved = state / 'sessions.json'
+        saved.write_text(json.dumps([{'id': menu_id, 'name': 'sb-' + menu_id, 'key': key,
+                                      'socket': socket, 'metadata': meta}]), encoding='utf-8')
+        self.board.state[HOST['name']]['data']['codex'] = [{**ROW, 'startedAt': meta['createdAt'] + 1}]
+        self.board.state[HOST['name']]['data']['claude'] = []
+        manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+        self.addCleanup(manager.close)
+        self.flow.terminals = manager
+        with patch.object(manager, '_live_names', return_value={'sb-' + menu_id}), \
+                patch.object(manager, '_run', return_value=SimpleNamespace(returncode=0)), \
+                patch.object(manager, '_attach'), patch.object(terminal.time, 'sleep'):
+            self.assertNotIn('nativeSource', self.flow.linked_terminals()[0])
+            manager.send_keys(menu_id, ['Up'])
+            row = self.flow.linked_terminals()[0]
+            self.assertTrue(row['typed'])
+            self.assertNotIn('nativeSource', row)
+            manager.paste(menu_id, '1', submit=True)
+            self.assertNotIn('nativeSource', self.flow.linked_terminals()[0])
+            self.assertNotIn('nativeSource', json.loads(saved.read_text())[0]['metadata'])
+
+        host['launcher'] = server.windows_launcher_setting({'choices': LAUNCHER['choices'][:1]})
+        manager.close()
+        records = json.loads(saved.read_text())
+        legacy_id = 'd' * 32
+        legacy_metadata = {key: value for key, value in meta.items() if key != 'windowsSingleChoice'}
+        records.append({'id': legacy_id, 'name': 'sb-' + legacy_id, 'key': 'legacy-menu',
+                        'socket': socket, 'metadata': legacy_metadata})
+        saved.write_text(json.dumps(records), encoding='utf-8')
+        restored = terminal.TerminalManager(state_dir=state, socket_name=socket)
+        self.addCleanup(restored.close)
+        self.flow.terminals = restored
+        with patch.object(restored, '_live_names', return_value={'sb-' + menu_id, 'sb-' + legacy_id}):
+            rows = self.flow.linked_terminals()
+            self.assertEqual({row['id'] for row in rows}, {menu_id, legacy_id})
+            for row in rows:
+                self.assertNotIn('nativeSource', row)
+        for record in json.loads(saved.read_text()):
+            self.assertNotIn('nativeSource', record['metadata'])
+        self.flow.terminals = self.terms
+        self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-one'})
+        _, one_argv, one_meta = created[-1]
+        one = decoded(one_argv)
         self.assertNotIn('Read-Host', one)
         self.assertIn("& $c.Exe @($c.Args)", one)
+        row = {**one_meta, 'id': 'e' * 32, 'alive': True, 'typed': False}
+        self.board.state[HOST['name']]['data']['codex'] = [{**ROW, 'startedAt': one_meta['createdAt'] + 1}]
+        self.terms.list = lambda: [row]
+        self.terms.link_native = Mock(return_value=True)
+        self.flow.linked_terminals()
+        self.terms.link_native.assert_called_once_with('e' * 32, {**REF, 'cwd': ROW['cwd']}, confidence='estimated')
         self.board.state[HOST['name']]['ok'] = False
         self.assertFalse(self.flow.new_session_status(host, online=False)['available'])
         with self.assertRaisesRegex(RuntimeError, '연결할 수 없어'):
