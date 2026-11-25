@@ -2516,38 +2516,56 @@ class Workflow:
             pass
 
     def _link_observed_sessions(self, terminals):
-        """A "새 세션" terminal names no session when it opens; its launcher starts one later.
-        The earliest session that appears on its host after it opened (30 seconds of clock
-        difference allowed), and no other terminal names, is recorded as its own, once: its
-        card then shows "터미널 열림" and continuing it opens this terminal. Automated runs
-        (Codex `exec`, Claude background agents) are never taken. A launcher seen running an
-        agent takes only that agent's sessions; one seen running SSH takes its session from the
-        board host its destination names (a PC's), never its own host's; one running Claude's agent
-        view (background sessions only) or SSH to an unknown host takes none and so never makes
-        another launcher's session ambiguous."""
+        """Estimate a "새 세션" link after observing Codex, Claude, or SSH to a known board host.
+        Match the earliest unambiguous, unclaimed interactive session for that agent or SSH
+        destination. Only hosts other than the board's local host allow 30 seconds of clock
+        difference. If a confirmed program contradicts an estimate, discard it so the next
+        observation can link again."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
+        unlink = getattr(self.terminals, "unlink_estimated_native", None)
+
         def session_host(terminal):
-            if terminal.get("program") == "claude-agents":
-                return None
-            if terminal.get("program") != "ssh":
+            program = terminal.get("program")
+            if program in ("codex", "claude"):
                 return terminal.get("host")
+            if program != "ssh":
+                return None
             target = terminal.get("programHost")
             return next((h["name"] for h in self.board.hosts if target and h["name"] != terminal.get("host")
                          and target in (h["name"], h.get("ssh"))), None)
-        pending = sorted((t for t in terminals if t.get("mode") == "new-session" and t.get("alive")
-                          and not t.get("closed") and not t.get("nativeSource") and session_host(t)
-                          and type(t.get("createdAt")) is int), key=lambda t: t["createdAt"])
+
+        changed = False
+        pending = []
+        for terminal in terminals:
+            if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
+                continue
+            host = session_host(terminal)
+            if not host:
+                continue
+            native = terminal.get("nativeSource")
+            program = terminal.get("program")
+            if not native:
+                if type(terminal.get("createdAt")) is int:
+                    pending.append((terminal, host))
+            elif (unlink is not None and terminal.get("linkConfidence") == "estimated"
+                  and (native["host"] != host or program in ("codex", "claude") and native["agent"] != program)):
+                try:
+                    if unlink(terminal["id"], native):
+                        changed = True
+                except (KeyError, ValueError, RuntimeError, OSError):
+                    continue
         if not pending:
-            return
+            return changed
         taken = {json.dumps(self.identity(t["nativeSource"]), sort_keys=True) for t in terminals
                  if isinstance(t.get("nativeSource"), dict)}
+        local_hosts = {h["name"] for h in self.board.hosts if h.get("local")}
         found = []
-        for terminal in pending:
-            host = session_host(terminal)
+        for terminal, host in sorted(pending, key=lambda item: item[0]["createdAt"]):
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
+            earliest = opened if host in local_hosts else opened - 30
             candidates = []
             program = terminal.get("program")
             for agent in ("codex", "claude"):
@@ -2557,7 +2575,7 @@ class Workflow:
                     native = self._native_of(host, agent, row)
                     started = row.get("startedAt")
                     if (native is None or type(started) is not int
-                            or not opened - 30 <= started <= opened + self.LINK_WINDOW
+                            or not earliest <= started <= opened + self.LINK_WINDOW
                             or json.dumps(self.identity(native), sort_keys=True) in taken):
                         continue
                     candidates.append((started, native))
@@ -2570,7 +2588,6 @@ class Workflow:
             for _started, native in candidates:
                 key = json.dumps(self.identity(native), sort_keys=True)
                 shared[key] = shared.get(key, 0) + 1
-        linked = False
         for terminal, candidates in found:
             candidates = [item for item in candidates
                           if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
@@ -2581,10 +2598,10 @@ class Workflow:
             try:
                 if record(terminal["id"], native, confidence="estimated"):
                     taken.add(json.dumps(self.identity(native), sort_keys=True))
-                    linked = True
+                    changed = True
             except (KeyError, ValueError, RuntimeError, OSError):
                 continue
-        return linked
+        return changed
 
     @staticmethod
     def _native_of(host, agent, row):

@@ -1039,6 +1039,25 @@ class TerminalManager:
         self._changed()
         return True
 
+    def unlink_estimated_native(self, terminal_id, native):
+        """Clear only the estimate still matching the observed native source."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+            previous = terminal.record["metadata"]
+            if (previous.get("linkConfidence") != "estimated" or not previous.get("nativeSource")
+                    or previous["nativeSource"] != native):
+                return False
+            metadata = dict(previous)
+            del metadata["nativeSource"], metadata["linkConfidence"]
+            terminal.record["metadata"] = metadata
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+        self._changed()
+        return True
+
     def list(self):
         with self.lock, self._listing():
             result = []

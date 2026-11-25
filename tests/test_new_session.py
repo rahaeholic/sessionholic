@@ -455,7 +455,7 @@ class LinkNewSessionTest(unittest.TestCase):
         runner = lambda host, args, timeout: {**self.rows[host['name']], 'errors': []}
         self.board = server.Board([LOCAL, REMOTE], 60, runner)
         self.terminal = {'id': 'f' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True, 'closed': False,
-                         'createdAt': 1000}
+                         'createdAt': 1000, 'program': 'codex'}
         self.terms = LinkTerminals([self.terminal])
         self.flow = server.Workflow(self.board, self.terms, self.temp.name)
 
@@ -464,6 +464,64 @@ class LinkNewSessionTest(unittest.TestCase):
             self.board.poll(host)
         self.flow.link_new_sessions()
         return [native for _, native in self.terms.linked]
+
+    def test_unobserved_launcher_waits_and_links_only_after_ssh_destination_is_known(self):
+        self.terminal.update(host='local', program=None)
+        self.rows['local']['codex'] = [codex_row('1', 990), codex_row('2', 1001)]
+        self.rows['remote']['codex'] = [codex_row('3', 1003)]
+        self.assertEqual(self.link(), [])
+        self.terminal.update(program='ssh', programHost='remote')
+        self.assertEqual([native['id'] for native in self.link()], [codex_row('3', 0)['id']])
+
+    def test_local_candidates_start_at_or_after_opening(self):
+        self.terminal['host'] = 'local'
+        self.rows['local']['codex'] = [codex_row('1', 990), codex_row('2', 1000)]
+        self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
+
+    def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
+        socket = 'fixture-link-correction'
+        old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
+        actual = codex_row('2', 1003)
+        remote_match = server.Workflow._native_of('remote', 'codex', codex_row('3', 1004))
+        launcher = {'mode': 'new-session', 'host': 'local', 'createdAt': 1000, 'title': 'fixture',
+                    'nativeSource': old, 'linkConfidence': 'estimated', 'program': 'ssh', 'programHost': 'remote'}
+        fixtures = {'a': launcher,
+                    'b': {**launcher, 'linkConfidence': 'exact'},
+                    'c': {**launcher, 'nativeSource': remote_match},
+                    'd': {**launcher, 'program': 'claude'},
+                    'e': {**launcher, 'program': 'codex', 'nativeSource': remote_match},
+                    'f': {**launcher, 'program': 'codex'}}
+        state = Path(self.temp.name) / 'terminals'
+        state.mkdir(mode=0o700)
+        saved = state / 'sessions.json'
+        saved.write_text(json.dumps([
+            {'id': letter * 32, 'name': 'sb-' + letter * 32, 'key': 'fixture-' + letter,
+             'socket': socket, 'metadata': metadata}
+            for letter, metadata in fixtures.items()
+        ]), encoding='utf-8')
+        manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+        self.addCleanup(manager.close)
+        self.flow.terminals = manager
+        self.rows['remote']['codex'] = [actual]
+        self.board.poll(REMOTE)
+
+        self.assertFalse(manager.unlink_estimated_native('a' * 32, remote_match))
+        self.assertFalse(manager.unlink_estimated_native('b' * 32, old))
+        with patch.object(manager, '_save', side_effect=OSError('fixture disk failure')):
+            with self.assertRaises(OSError):
+                manager.unlink_estimated_native('a' * 32, old)
+        with patch.object(manager, '_live_names', return_value={'sb-' + letter * 32 for letter in fixtures}):
+            self.assertEqual(manager.list()[0]['metadata'], launcher)
+            cleared = {row['id'][0]: row['metadata'] for row in self.flow.linked_terminals()}
+            for letter in 'ade':
+                self.assertEqual(cleared[letter], {key: value for key, value in fixtures[letter].items()
+                                                  if key not in ('nativeSource', 'linkConfidence')})
+            for letter in 'bcf':
+                self.assertEqual(cleared[letter], fixtures[letter])
+            self.assertEqual({row['id'][0]: row['metadata'] for row in json.loads(saved.read_text())}, cleared)
+            relinked = {row['id'][0]: row for row in self.flow.linked_terminals()}
+        self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
+        self.assertEqual(relinked['a']['linkConfidence'], 'estimated')
 
     def test_the_first_interactive_session_after_the_terminal_opened_on_its_host_is_its_own(self):
         self.rows['remote']['codex'] = [codex_row('1', 900), codex_row('2', 1060, source='exec'),
@@ -481,7 +539,7 @@ class LinkNewSessionTest(unittest.TestCase):
         # A second 새 세션 opened two seconds later: a session started after both is not the
         # first one's for being earlier (it may well be the second's), so neither takes it.
         second = {'id': 'e' * 32, 'mode': 'new-session', 'host': 'remote', 'alive': True, 'closed': False,
-                  'createdAt': 1002}
+                  'createdAt': 1002, 'program': 'codex'}
         self.terms.rows.append(second)
         self.rows['remote']['codex'] = [codex_row('1', 1003)]
         self.assertEqual(self.link(), [])
@@ -508,7 +566,7 @@ class LinkNewSessionTest(unittest.TestCase):
         # Opened on the local host, its launcher went to `remote` over SSH (a PC's 새 세션).
         self.terminal.update(host='local', program='ssh', programHost='remote')
         self.rows['local']['codex'] = [codex_row('5', 1001)]
-        self.rows['remote']['codex'] = [codex_row('1', 1003)]
+        self.rows['remote']['codex'] = [codex_row('2', 969), codex_row('1', 970)]
         self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'codex', 'id': codex_row('1', 0)['id'],
                                         'home': '.codex', 'cwd': '/work/project'}])
         self.assertEqual(self.terminal['linkConfidence'], 'estimated')
@@ -520,6 +578,7 @@ class LinkNewSessionTest(unittest.TestCase):
             self.assertEqual(self.link(), [], target)
 
     def test_a_claude_session_counts_with_its_session_id(self):
+        self.terminal['program'] = 'claude'
         self.rows['remote']['claude'] = [{'id': 'agent-0001', 'kind': 'interactive', 'cwd': '/work/project',
                                           'sessionId': '0f9c3a52-1b7e-4c1a-9d6e-5a4b3c2d1e0f', 'startedAt': 1020}]
         self.assertEqual(self.link(), [{'host': 'remote', 'agent': 'claude', 'id': 'agent-0001', 'home': None,
