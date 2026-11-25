@@ -2548,6 +2548,7 @@ class Workflow:
 
         changed = False
         pending = []
+        unresolved_ssh = []
         for terminal in terminals:
             if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
                 continue
@@ -2559,8 +2560,11 @@ class Workflow:
                 # Unobserved launchers and Windows menus still compete for sessions
                 # on their own host, even when they cannot claim one themselves.
                 candidate_host = host or (origin if program is None else None)
-                if candidate_host and type(terminal.get("createdAt")) is int:
-                    pending.append((terminal, candidate_host, bool(host)))
+                if type(terminal.get("createdAt")) is int:
+                    if candidate_host:
+                        pending.append((terminal, candidate_host, bool(host)))
+                    elif program == "ssh":
+                        unresolved_ssh.append(terminal)
                 continue
             if unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
                 continue
@@ -2572,8 +2576,13 @@ class Workflow:
                         changed = True
                 except (KeyError, ValueError, RuntimeError, OSError):
                     continue
-        if not pending:
+        claimable_hosts = {host for _, host, can_link in pending if can_link}
+        if not claimable_hosts:
             return changed
+        # An SSH whose destination is unconfirmed can still own a session on
+        # another host. Count it for ambiguity without letting it claim one.
+        pending.extend((terminal, host, False) for terminal in unresolved_ssh
+                       for host in claimable_hosts if host != terminal.get("host"))
         taken = {json.dumps(self.identity(t["nativeSource"]), sort_keys=True) for t in terminals
                  if isinstance(t.get("nativeSource"), dict)}
         local_hosts = {h["name"] for h in self.board.hosts if h.get("local")}

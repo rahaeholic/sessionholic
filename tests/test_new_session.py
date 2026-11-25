@@ -588,6 +588,31 @@ class LinkNewSessionTest(unittest.TestCase):
         with patch.dict(self.board.hosts[1], ssh='fixture-pc'):
             self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
 
+    def test_ssh_with_unconfirmed_destination_can_only_make_remote_candidates_ambiguous(self):
+        allowed = launcher_programs.program_of('ssh -t -o BatchMode=yes remote codex')
+        unconfirmed = launcher_programs.program_of('ssh -t -o LogLevel=ERROR remote codex')
+        self.assertNotIn('sshHost', unconfirmed)
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                first = {**self.terminal, 'host': 'local', 'program': allowed['program'],
+                         'programHost': allowed['sshHost']}
+                second = {**self.terminal, 'id': 'e' * 32, 'host': 'local', 'createdAt': 1020,
+                          'program': unconfirmed['program']}
+                self.terms.rows = [second, first] if reverse else [first, second]
+                self.terms.linked.clear()
+                other_session = codex_row('1', 1024)
+                self.rows['remote']['codex'] = [other_session]
+                self.assertEqual(self.link(), [])
+                own_session = codex_row('2', 1030)
+                self.rows['remote']['codex'].append(own_session)
+                self.assertEqual(self.link(), [])
+                self.assertTrue(all('nativeSource' not in row for row in self.terms.rows))
+
+                earlier = codex_row('3', 989)  # 31 seconds before the unconfirmed SSH.
+                self.rows['remote']['codex'].append(earlier)
+                self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', earlier)])
+                self.assertNotIn('nativeSource', second)
+
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
@@ -637,6 +662,9 @@ class LinkNewSessionTest(unittest.TestCase):
             for letter in 'bcf':
                 self.assertEqual(cleared[letter], fixtures[letter])
             self.assertEqual({row['id'][0]: row['metadata'] for row in json.loads(saved.read_text())}, cleared)
+            ambiguous = {row['id'][0]: row for row in self.flow.linked_terminals()}
+            self.assertNotIn('nativeSource', ambiguous['a'])
+            self.assertTrue(manager.set_program('9' * 32, {'program': 'claude'}))
             relinked = {row['id'][0]: row for row in self.flow.linked_terminals()}
         self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
         self.assertEqual(relinked['a']['linkConfidence'], 'estimated')
