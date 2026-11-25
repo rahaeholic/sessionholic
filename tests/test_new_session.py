@@ -513,6 +513,46 @@ class LinkNewSessionTest(unittest.TestCase):
                 expected = [server.Workflow._native_of(host, 'codex', candidate)] if candidate else []
                 self.assertEqual(self.link(), expected)
 
+    def test_ssh_without_a_remote_session_cannot_claim_a_remote_candidate(self):
+        candidate = codex_row('1', 1003)
+        self.rows['remote']['codex'] = [candidate]
+        for options in ('-N', '-fNT -L 9000:localhost:9000', '-W localhost:9000', '-O forward',
+                        '-o SessionType=none', '-oSessionType=none', '-o SessionType none',
+                        '-o SessionType =none', '-o SessionType="none"'):
+            for command in (f'/usr/bin/ssh {options} remote', f'/usr/bin/ssh remote {options}'):
+                with self.subTest(command=command):
+                    self.terminal.update(host='local', program=None)
+                    rows = [(20, 1, 1001, command)]
+                    observed = launcher_programs.describe([self.terminal], command.split(), rows)[self.terminal['id']]
+                    self.assertEqual(observed['program'], 'ssh')
+                    self.assertNotIn('sshHost', observed)
+                    self.terminal.update(program='ssh', programHost=observed.get('sshHost'))
+                    self.assertEqual(self.link(), [])
+        command = '/usr/bin/ssh -L 9000:localhost:9000 -T remote codex -N'
+        observed = launcher_programs.describe([self.terminal], command.split(), [(20, 1, 1001, command)])
+        self.terminal.update(program='ssh', programHost=observed[self.terminal['id']]['sshHost'])
+        self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
+
+    def test_windows_menu_blocks_other_terminals_from_claiming_its_candidates(self):
+        pc = self.board.hosts[1]
+        with patch.dict(pc, platform='windows'):
+            for route in ({'host': 'local', 'program': 'ssh', 'programHost': 'remote'},
+                          {'host': 'remote', 'program': None, 'windowsSingleChoice': True}):
+                for reverse in (False, True):
+                    with self.subTest(route=route, reverse=reverse):
+                        menu = {'id': 'e' * 32, 'mode': 'new-session', 'alive': True, 'host': 'remote',
+                                'createdAt': 1000, 'windowsSingleChoice': False, 'typed': True}
+                        other = {'id': 'f' * 32, 'mode': 'new-session', 'alive': True, 'createdAt': 1005, **route}
+                        self.terms.rows = [other, menu] if reverse else [menu, other]
+                        self.terms.linked.clear()
+                        candidate = codex_row('1', 1008)
+                        self.rows['remote']['codex'] = [candidate]
+                        self.assertEqual(self.link(), [])
+                        self.assertTrue(all('nativeSource' not in row for row in self.terms.rows))
+                        menu.update(alive=False, closed=True)
+                        self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
+                        self.assertIn('nativeSource', other)
+
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))

@@ -2556,9 +2556,9 @@ class Workflow:
             program = terminal.get("program")
             native = terminal.get("nativeSource")
             if not native:
-                # Unobserved launchers can make an own-host candidate ambiguous before
-                # they are eligible to claim it.
-                candidate_host = host or (origin if program is None and origin not in windows_hosts else None)
+                # Unobserved launchers and Windows menus still compete for sessions
+                # on their own host, even when they cannot claim one themselves.
+                candidate_host = host or (origin if program is None else None)
                 if candidate_host and type(terminal.get("createdAt")) is int:
                     pending.append((terminal, candidate_host, bool(host)))
                 continue

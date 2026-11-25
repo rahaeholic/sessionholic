@@ -28,6 +28,8 @@ INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python", "node"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
 # ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
+# These modes do not run a remote command or login shell.
+SSH_NO_SHELL_OPTIONS = set("GNOQsVWZ")
 # A host name or alias, never an option (`ssh -G` is asked about it).
 SSH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
@@ -91,19 +93,38 @@ def program_of(command):
             if identifier == rest[rest.index("resume") + 1]:
                 found["sessionId"] = identifier
         return found
-    # A session the launcher opened on another host (a PC's): work of its own, never a menu.
-    # Its destination (the first word that is no option or option value) names that host.
+    # SSH is work of its own, never a menu. Only a remote command or shell can own a session.
     if name == "ssh":
         found, words = {"program": "ssh", "cwd": None}, iter(rest)
+        destination = None
         for word in words:
-            if word.startswith("-") and len(word) > 1:
-                if word[-1] in SSH_VALUE_OPTIONS:
-                    next(words, None)
+            if word == "--":
+                if destination is None:
+                    destination = next(words, None)
+                break
+            if not word.startswith("-") or word == "-":
+                if destination is not None:
+                    break  # The remote command and its arguments are not SSH options.
+                destination = word
                 continue
-            host = word.rsplit("@", 1)[-1]
+            for end, option in enumerate(word[1:], 2):
+                if option in SSH_NO_SHELL_OPTIONS:
+                    return found
+                if option in SSH_VALUE_OPTIONS:
+                    value = word[end:] or next(words, "")
+                    if option == "o":
+                        key, _, session_type = value.lower().partition("=")
+                        if key == "sessiontype":
+                            session_type = session_type or next(words, "").lower()
+                            if session_type == "=":
+                                session_type = next(words, "").lower()
+                            if session_type.lstrip("=").strip("'\"") in ("none", "subsystem"):
+                                return found
+                    break
+        if destination:
+            host = destination.rsplit("@", 1)[-1]
             if SSH_NAME.fullmatch(host):
                 found["sshHost"] = host
-            break
         return found
     return None
 
