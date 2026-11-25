@@ -2201,6 +2201,8 @@ class Workflow:
                 metadata = {"title": label + (" · " + LAUNCH_PRESETS[preset]["label"] if preset else ""),
                             "host": host["name"], "mode": "new-session", "createdAt": int(time.time()),
                             **({"preset": preset} if preset else {})}
+                if host.get("platform") == "windows":
+                    metadata["windowsSingleChoice"] = len(host["launcher"]["choices"]) == 1
                 if spec.get("holdName"):
                     metadata["holdName"] = spec["holdName"]
                 terminal = self.terminals.create(key, spec["argv"], spec["cwd"], spec["env"], metadata)
@@ -2525,20 +2527,19 @@ class Workflow:
         if record is None:
             return
         unlink = getattr(self.terminals, "unlink_estimated_native", None)
-        windows_choices = {h["name"]: len((h.get("launcher") or {}).get("choices", []))
-                           for h in self.board.hosts if not h.get("local") and h.get("platform") == "windows"}
+        windows_hosts = {h["name"] for h in self.board.hosts if not h.get("local") and h.get("platform") == "windows"}
 
         def session_host(terminal):
             program = terminal.get("program")
             origin = terminal.get("host")
+            if origin in windows_hosts:
+                # This terminal may outlive changes to the PC's launcher settings.
+                if terminal.get("windowsSingleChoice") is not True:
+                    return None
+                if program is None:
+                    return origin
             if program in ("codex", "claude"):
                 return origin
-            # The board knows its Windows SSH destination, but a multi-choice
-            # launcher waits for input before it can have a session there.
-            if program is None and origin in windows_choices:
-                choices = windows_choices[origin]
-                if choices == 1 or (choices > 1 and terminal.get("typed") is True):
-                    return origin
             if program != "ssh":
                 return None
             target = terminal.get("programHost")
@@ -2557,11 +2558,11 @@ class Workflow:
             if not native:
                 # Unobserved launchers can make an own-host candidate ambiguous before
                 # they are eligible to claim it.
-                candidate_host = host or (origin if program is None and origin not in windows_choices else None)
+                candidate_host = host or (origin if program is None and origin not in windows_hosts else None)
                 if candidate_host and type(terminal.get("createdAt")) is int:
                     pending.append((terminal, candidate_host, bool(host)))
                 continue
-            if unlink is None or terminal.get("linkConfidence") != "estimated":
+            if unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
                 continue
             wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
             wrong_agent = program in ("codex", "claude") and native["agent"] != program

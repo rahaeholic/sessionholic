@@ -479,7 +479,7 @@ class LinkNewSessionTest(unittest.TestCase):
         self.rows['local']['codex'] = [codex_row('1', 990), codex_row('2', 1000)]
         self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
 
-    def test_codex_named_launchers_route_by_child_program_unless_ssh_is_a_shell_tool(self):
+    def test_direct_cli_with_another_program_is_ambiguous_but_menu_uses_nearest_child(self):
         local, remote = codex_row('1', 1003), codex_row('2', 1004)
         self.rows['local']['codex'] = [local]
         self.rows['remote']['codex'] = [remote]
@@ -487,11 +487,20 @@ class LinkNewSessionTest(unittest.TestCase):
         tool_ssh = [(21, 20, 1002, '/bin/zsh -c tool'), (22, 21, 1003, '/usr/bin/ssh remote')]
         codex = '/opt/example/codex'
         node = '/opt/example/node /opt/example/codex.js'
-        cases = [(codex, [ssh], 'ssh', 21, 'remote', remote),
-                 (node, [ssh], 'ssh', 21, 'remote', remote),
-                 (codex, [], 'codex', 20, 'local', local),
-                 (codex, tool_ssh, 'codex', 20, 'local', local),
-                 (node, tool_ssh + [(23, 20, 1002, '/vendor/codex')], 'codex', 23, 'local', local)]
+        menu = [(21, 20, 1002, '/usr/bin/python3 /opt/example/menu.py')]
+        shell = (23, 22, 1004, '/bin/zsh -c tool')
+        cases = [(codex, [], 'codex', 20, 'local', local),
+                 (codex, [ssh], None, None, None, None),
+                 (node, [ssh], None, None, None, None),
+                 (codex, tool_ssh, None, None, None, None),
+                 ('/opt/example/claude', tool_ssh, None, None, None, None),
+                 (codex, [tool_ssh[0], (22, 21, 1003, '/opt/example/claude -p fixture')], None, None, None, None),
+                 (codex + ' resume ' + local['id'],
+                  [tool_ssh[0], (22, 21, 1003, '/opt/other/codex exec fixture')], None, None, None, None),
+                 ('/bin/zsh /opt/example/menu', menu + [(22, 21, 1003, codex), shell,
+                  (24, 23, 1005, '/usr/bin/ssh remote')], 'codex', 22, 'local', local),
+                 ('/bin/zsh /opt/example/menu', menu + [(22, 21, 1003, '/usr/bin/ssh remote')],
+                  'ssh', 22, 'remote', remote)]
         for command, children, program, pid, host, candidate in cases:
             with self.subTest(command=command, children=children):
                 self.terminal.pop('nativeSource', None)
@@ -499,9 +508,10 @@ class LinkNewSessionTest(unittest.TestCase):
                 self.terminal.update(host='local', program=None)
                 rows = [(20, 1, 1001, command), *children]
                 observed = launcher_programs.describe([self.terminal], command.split(), rows)[self.terminal['id']]
-                self.assertEqual((observed['program'], observed['pid']), (program, pid))
+                self.assertEqual((observed['program'], observed.get('pid')), (program, pid))
                 self.terminal.update(program=observed['program'], programHost=observed.get('sshHost'))
-                self.assertEqual(self.link(), [server.Workflow._native_of(host, 'codex', candidate)])
+                expected = [server.Workflow._native_of(host, 'codex', candidate)] if candidate else []
+                self.assertEqual(self.link(), expected)
 
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
@@ -540,6 +550,9 @@ class LinkNewSessionTest(unittest.TestCase):
             before = {row['id'][0]: row['metadata'] for row in manager.list()}
             self.assertEqual(before['a'], launcher)
             self.assertEqual(before['9'], fixtures['9'])
+            # An observation can become inconclusive without invalidating a saved estimate.
+            self.assertTrue(manager.set_program('f' * 32, {'program': None}))
+            fixtures['f'] = {row['id'][0]: row['metadata'] for row in manager.list()}['f']
             self.assertTrue(manager.set_program('9' * 32, {'program': 'ssh'}))
             fixtures['9'] = {row['id'][0]: row['metadata'] for row in manager.list()}['9']
             cleared = {row['id'][0]: row['metadata'] for row in self.flow.linked_terminals()}

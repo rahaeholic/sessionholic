@@ -1,8 +1,9 @@
 """What each "새 세션" terminal ended up running on this host, read from the process table.
 
 A 새 세션 terminal runs this host's launcher (the host settings' `launcher`). Its launcher
-process starts when the terminal opens, so the board's creation time names it. Prefer the
-nearest agent CLI or SSH below it, with the launcher itself as the direct-execution fallback.
+process starts when the terminal opens, so the board's creation time names it. A menu launcher
+reports the nearest agent CLI or SSH below it. A direct Codex or Claude launch is ambiguous
+when another program is recognized below it.
 Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
@@ -191,25 +192,21 @@ def describe(terminals, launcher, rows):
             continue
         root = matches[0]
         root_program = program_of(by_pid[root][2])
-        root_is_codex = root_program is not None and root_program["program"] == "codex"
         found, seen = None, {root}
-        queue = [(pid, False) for pid in sorted(children.get(root, []))]
+        queue = sorted(children.get(root, []))
         while queue:
-            pid, through_shell = queue.pop(0)
+            pid = queue.pop(0)
             if pid in seen:
                 continue
             seen.add(pid)
-            command = by_pid[pid][2]
-            program = program_of(command)
+            program = program_of(by_pid[pid][2])
             if program is not None:
-                # SSH through a shell under a Codex process can be a tool call.
-                # A direct SSH child still identifies a Codex-named launcher.
-                if root_is_codex and through_shell and program["program"] == "ssh":
-                    continue
                 found = {**program, "pid": pid}
                 break
-            shell = Path(command.partition(" ")[0]).name.lstrip("-") in ("bash", "sh", "zsh")
-            queue.extend((child, through_shell or shell) for child in sorted(children.get(pid, [])))
+            queue.extend(sorted(children.get(pid, [])))
+        if found is not None and root_program is not None and root_program["program"] in ("codex", "claude"):
+            result[identifier] = {"program": None}
+            continue
         if found is None and root_program is not None:
             found = {**root_program, "pid": root}
         # Its own launcher, with nothing chosen below it yet: the menu still waits.
