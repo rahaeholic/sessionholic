@@ -229,6 +229,13 @@ class WoniBridgeTest(unittest.TestCase):
         older = self.call('state', {'chats': [], 'chatTotal': -1, 'chatsHasMore': 'yes'})[0]
         self.assertNotIn('chatTotal', older); self.assertNotIn('chatsHasMore', older)
 
+    def test_archive_card_passes_only_the_shared_card_fields(self):
+        card = {'title': '썸머홀릭 콘텐츠 색인', 'status': '확인 필요', 'summary': '직접 처리하고 있나요?',
+                'draft': '맥북프로 상태를 먼저 확인해 줘.'}
+        result = self.call('state', {'archiveFollowup': {**card, 'private': 'ignored', 'evidence': 'a' * 301}})[0]
+        self.assertEqual(result['archiveFollowup'], card)
+        self.assertNotIn('archiveFollowup', self.call('state', {'archiveFollowup': {'title': card['title']}})[0])
+
     def test_chat_history_reads_take_only_known_bounded_keys(self):
         # Ryan One 1.40.0: earlier chats, a stream from its start, a search and the stream list. Reads only, with the read token.
         (self.woni / 'config.json').write_text(json.dumps({'token': 'write-credential', 'readToken': 'read-credential'}))

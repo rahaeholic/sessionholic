@@ -11,6 +11,7 @@
   const resending = new Set();  // failed asks being resent (one request each)
   let attachments = [], uploading = false, uploadAbort = null, composing = false, compositionEndedAt = 0, authEpoch = 0;
   let replyTarget = null, filter = null, view = "chat", latestData = null, workData = null, workError = "";
+  let archiveStale = false, archiveRevision = null;
   let pendingState = "uncertain";
   let enabled = false, focusId = null;
   // The open message menu stays on its message when the conversation redraws.
@@ -484,10 +485,34 @@
     return dayKeyFormat.format(new Date(at * 1000)) === dayKeyFormat.format(new Date()) ? clockLabel(at)
       : `${Number(dayKeyFormat.format(new Date(at * 1000)).slice(5, 7))}/${Number(dayKeyFormat.format(new Date(at * 1000)).slice(8, 10))}`;
   }
+  const archivePanel = el("section", "woni-archive-card"), workActivity = el("div", "woni-work-activity");
+  archivePanel.hidden = true;
+  work.append(archivePanel, workActivity);
+  function renderArchiveFollowup() {
+    const card = latestData?.archiveFollowup;
+    const revision = JSON.stringify([card, archiveStale]);
+    if (archiveRevision === revision) return;
+    archiveRevision = revision;
+    archivePanel.hidden = !card;
+    if (!card) { archivePanel.replaceChildren(); return; }
+    const label = (archiveStale ? "이전 확인 · " : "") + card.status;
+    const nodes = [el("h3", "", card.title), el("strong", "", label), el("p", "", card.summary)];
+    if (card.evidence) nodes.push(el("small", "", card.evidence));
+    if (card.draft && !archiveStale) nodes.push(action("원이 대화에 붙이기", () => {
+      if (input.value.trim() || attachments.length || uploading || pending || replyTarget) {
+        notify("작성 중인 대화를 먼저 정리해 주세요.");
+        return;
+      }
+      input.value = card.draft;
+      leaveStream(); setView("chat"); redraw(); input.focus?.();
+    }));
+    archivePanel.replaceChildren(...nodes);
+  }
   function renderWork() {
+    renderArchiveFollowup();
     const nodes = [];
     if (workError) nodes.push(el("p", "woni-status", workData ? "연결을 확인하지 못해 이전 작업 현황을 보여 줍니다." : workError));
-    if (!workData) { if (!workError) nodes.push(el("p", "woni-status", "작업 현황을 불러오고 있어요.")); work.replaceChildren(...nodes); return; }
+    if (!workData) { if (!workError) nodes.push(el("p", "woni-status", "작업 현황을 불러오고 있어요.")); workActivity.replaceChildren(...nodes); return; }
     const running = [...(workData.running || []), ...(workData.loose || [])];
     const groups = [["지금", running], ["최근 24시간", workData.recent || []]];
     for (const [title, rows] of groups) {
@@ -516,7 +541,7 @@
       }
       nodes.push(group);
     }
-    work.replaceChildren(...nodes);
+    workActivity.replaceChildren(...nodes);
   }
 
   // Ryan 2026-11-10: "할일, 시킨일 등. 기록 노트 원문 정도는 볼 필요도 있고" — the Ryan One app's to-do and record
@@ -1573,7 +1598,7 @@
       // A finished chat pushed out of the 60-chat window stays as an earlier chat, so the list keeps no gap.
       const left = slidOut(latestData?.chats || [], Array.isArray(data?.chats) ? data.chats : []);
       if (left.length) olderChats = mergeChats(olderChats, left);
-      latestData = data; observeReplies(data);
+      latestData = data; archiveStale = false; observeReplies(data);
       const key = runningKey(data?.chats), started = key !== runKey; runKey = key;
       if (dialog.open && !document.hidden) {
         show(data);
@@ -1597,6 +1622,7 @@
       }
     } catch (_) {
       if (current === authEpoch && dialog.open) {
+        archiveStale = true;
         status.textContent = "원이에 연결하지 못했어요. 잠시 후 다시 확인해 주세요.";
         if (view === "work") { workError = "작업 현황을 확인하지 못했어요."; renderWork(); }
       }
@@ -1763,7 +1789,8 @@
       filter = null; latestData = null; workData = null; resetHistory();
       pending = null; pendingState = "uncertain"; sending = false; seen = null; unread.clear(); badge();
       readThrough = null; serverRead = 0; readPosting = 0; streamRead = Object.create(null); streamMarks = false; streamPosting = Object.create(null);
-      original.replaceChildren(); original.hidden = true; work.replaceChildren(); resetPanels(); renderAttachments();
+      archiveStale = false; renderArchiveFollowup();
+      original.replaceChildren(); original.hidden = true; workActivity.replaceChildren(); resetPanels(); renderAttachments();
       clearTimeout(noticeTimer); $("woni-notice").hidden = true; $("woni-notice").textContent = "";
       streamsAt = 0; runKey = ""; renderSide(true);
     },

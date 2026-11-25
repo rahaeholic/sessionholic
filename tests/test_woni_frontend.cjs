@@ -346,7 +346,37 @@ test('답글은 원래 대화 ID를 유지하고 작업 화면에서 같은 대�
   nodes['woni-work-tab'].click(); await new Promise(setImmediate);
   assert.equal(nodes['woni-work'].hidden, false);
   // 2026-11-21: 작업도 기디언과 같은 한 줄 행(agent-row)이다.
-  assert.ok(nodes['woni-work'].children.some(child => child.className === 'agent-group' && child.children.some(item => item.children[0]?.className === 'agent-row')));
+  const activity = nodes['woni-work'].children.find(child => child.className === 'woni-work-activity');
+  assert.ok(activity.children.some(child => child.className === 'agent-group' && child.children.some(item => item.children[0]?.className === 'agent-row')));
+});
+
+test('색인 카드를 읽고, 앞선 초안을 보존하며, 명시적 전송 전에는 요청하지 않는다', async () => {
+  const sent = [];
+  const draft = '색인 상태부터 확인해 줘.';
+  const call = async (url, options) => {
+    if (url.includes('availability')) return { enabled: true };
+    if (options?.method === 'POST') { sent.push(options.body); return {}; }
+    if (url.includes('/activity')) return { running: [], recent: [] };
+    return { chats: [], archiveFollowup: { title: '썸머홀릭 콘텐츠 색인', status: '확인 필요',
+      summary: '직접 처리하고 있나요?', evidence: '맥북프로 · 분석 11/25 13:45', draft } };
+  };
+  const { nodes, app, tick } = fixture(call);
+  await app.check(call); nodes['woni-open'].click(); await new Promise(setImmediate);
+  nodes['woni-work-tab'].click(); await new Promise(setImmediate);
+  const card = nodes['woni-work'].children.find(child => child.className === 'woni-archive-card');
+  assert.equal(card.children[0].textContent, '썸머홀릭 콘텐츠 색인');
+  assert.equal(card.children[1].textContent, '확인 필요');
+  const button = card.children.find(child => child.textContent === '원이 대화에 붙이기');
+  nodes['woni-input'].value = '기존 초안';
+  button.click();
+  assert.equal(nodes['woni-input'].value, '기존 초안');
+  await tick();
+  assert.equal(card.children.find(child => child.textContent === '원이 대화에 붙이기'), button);
+  nodes['woni-input'].value = '';
+  button.click();
+  assert.equal(nodes['woni-input'].value, draft);
+  assert.equal(nodes['woni-messages'].hidden, false);
+  assert.equal(sent.length, 0);
 });
 
 test('잠금 뒤 늦게 도착한 작업 응답은 다시 열었을 때 남지 않는다', async () => {
