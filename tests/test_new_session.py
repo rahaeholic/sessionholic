@@ -752,7 +752,7 @@ class LinkNewSessionTest(unittest.TestCase):
                     'd': {**launcher, 'program': 'claude'},
                     'e': {**launcher, 'program': 'codex', 'nativeSource': remote_match},
                     'f': {**launcher, 'program': 'codex'},
-                    '9': {**launcher, 'program': None, 'programHost': None}}
+                    '9': {**launcher, 'createdAt': 1100, 'program': None, 'programHost': None}}
         state = Path(self.temp.name) / 'terminals'
         state.mkdir(mode=0o700)
         saved = state / 'sessions.json'
@@ -789,11 +789,52 @@ class LinkNewSessionTest(unittest.TestCase):
             for letter in 'bcf':
                 self.assertEqual(cleared[letter], fixtures[letter])
             self.assertEqual({row['id'][0]: row['metadata'] for row in json.loads(saved.read_text())}, cleared)
-            # Resolve the competitor before the first attempt to relink.
-            self.assertTrue(manager.set_program('9' * 32, {'program': 'claude'}))
             relinked = {row['id'][0]: row for row in self.flow.linked_terminals()}
         self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
         self.assertEqual(relinked['a']['linkConfidence'], 'estimated')
+
+    def test_cleared_estimate_still_competes_in_the_same_list(self):
+        a_id, b_id = 'a' * 32, 'b' * 32
+        ssh = {'mode': 'new-session', 'host': 'local', 'program': 'ssh', 'programHost': 'remote'}
+        old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
+        a_session, b_session = codex_row('2', 1035), codex_row('3', 1040)
+        cases = product((False, True), (False, True), (False, True), (False, True))
+        for windows, reverse_terminals, reverse_sessions, competitor_closes in cases:
+            with self.subTest(windows=windows, reverse_terminals=reverse_terminals,
+                              reverse_sessions=reverse_sessions, competitor_closes=competitor_closes):
+                first = {**ssh, 'createdAt': 1000, 'nativeSource': old, 'linkConfidence': 'estimated'}
+                second = {**ssh, 'createdAt': 1030}
+                if windows:
+                    second = {'mode': 'new-session', 'host': 'remote', 'createdAt': 1030, 'windowsSingleChoice': True}
+                records = [(a_id, first), (b_id, second)]
+                if reverse_terminals:
+                    records.reverse()
+                socket = 'fixture-r3-competition'
+                state = Path(tempfile.mkdtemp(dir=self.temp.name))
+                saved = state / 'sessions.json'
+                saved.write_text(json.dumps([
+                    {'id': uid, 'name': 'sb-' + uid, 'key': 'fixture-' + uid, 'socket': socket, 'metadata': meta}
+                    for uid, meta in records
+                ]), encoding='utf-8')
+                manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                names = {'sb-' + a_id, 'sb-' + b_id}
+                try:
+                    self.flow.terminals = manager
+                    self.rows['remote']['codex'] = [b_session, a_session] if reverse_sessions else [a_session, b_session]
+                    with patch.dict(self.board.hosts[1], platform='windows' if windows else 'macos'), \
+                            patch.object(manager, '_live_names', return_value=names):
+                        self.board.poll(REMOTE)
+                        rows = {row['id']: row for row in self.flow.linked_terminals()}
+                        self.assertNotIn('nativeSource', rows[a_id])
+                        self.assertNotIn('nativeSource', rows[b_id])
+                        self.assertTrue(all(row.get('linkHold') is True for row in rows.values()))
+                        if competitor_closes:
+                            names.remove('sb-' + b_id)
+                        self.assertTrue(all('nativeSource' not in row for row in self.flow.linked_terminals()))
+                        stored = [row['metadata'] for row in json.loads(saved.read_text())]
+                        self.assertTrue(all('nativeSource' not in meta and meta.get('linkHold') is True for meta in stored))
+                finally:
+                    manager.close()
 
     def test_the_first_interactive_session_after_the_terminal_opened_on_its_host_is_its_own(self):
         self.rows['remote']['codex'] = [codex_row('1', 900), codex_row('2', 1060, source='exec'),

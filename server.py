@@ -2550,6 +2550,7 @@ class Workflow:
         changed = False
         pending = []
         unresolved_ssh = []
+        deferred = set()
         for terminal in terminals:
             if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
                 continue
@@ -2557,26 +2558,29 @@ class Workflow:
             origin = terminal.get("host")
             program = terminal.get("program")
             native = terminal.get("nativeSource")
-            if not native:
-                # Unobserved launchers and Windows menus still compete for sessions
-                # on their own host, even when they cannot claim one themselves.
-                candidate_host = host or (origin if program is None else None)
-                if type(terminal.get("createdAt")) is int:
-                    if candidate_host:
-                        pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
-                    elif program == "ssh":
-                        unresolved_ssh.append(terminal)
-                continue
-            if unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
-                continue
-            wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
-            wrong_agent = program in ("codex", "claude") and native["agent"] != program
-            if wrong_host or wrong_agent:
+            if native:
+                if unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
+                    continue
+                wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
+                wrong_agent = program in ("codex", "claude") and native["agent"] != program
+                if not (wrong_host or wrong_agent):
+                    continue
+                # A mismatched estimate does not remove this terminal from the
+                # competition, but we never replace it in the same observation.
+                deferred.add(terminal["id"])
                 try:
                     if unlink(terminal["id"], native):
                         changed = True
                 except (KeyError, ValueError, RuntimeError, OSError):
-                    continue
+                    pass
+            # Unobserved launchers and Windows menus still compete for sessions
+            # on their own host, even when they cannot claim one themselves.
+            candidate_host = host or (origin if program is None else None)
+            if type(terminal.get("createdAt")) is int:
+                if candidate_host:
+                    pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
+                elif program == "ssh":
+                    unresolved_ssh.append(terminal)
         claimable_hosts = {host for _, host, can_link in pending if can_link}
         if not claimable_hosts:
             return changed
@@ -2623,13 +2627,14 @@ class Workflow:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]
             key = json.dumps(self.identity(native), sort_keys=True)
+            terminal_id = terminal["id"]
             try:
                 # Neither a later candidate nor a later observation resolves this ambiguity.
                 if shared[key] > 1:
-                    if hold is not None and hold(terminal["id"]):
+                    if hold is not None and hold(terminal_id):
                         changed = True
                     continue
-                if record(terminal["id"], native, confidence="estimated"):
+                if terminal_id not in deferred and record(terminal_id, native, confidence="estimated"):
                     taken.add(key)
                     changed = True
             except (KeyError, ValueError, RuntimeError, OSError):
