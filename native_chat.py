@@ -707,6 +707,10 @@ def _claude(identity, action, home, deadline, args):
             raise ValueError("원본 Claude 대화 ID를 확인하지 못했습니다.")
         transcript = transcript or _transcript(home, sid)
         if transcript is None:
+            if row.get("kind") == "interactive" and args.get("allowMissingTranscript") is True:
+                # A new interactive process can accept its first prompt before it has a transcript.
+                # This option is for chat state. Delivery verification still requires a transcript.
+                return {**result, "messages": [], "conversationUnavailable": True}
             raise ValueError("정확한 원본 Claude 대화 기록을 확인하지 못했습니다.")
         entries, result["messages"], result["olderOmitted"] = collector.claude_conversation(transcript)
         result["queuedPrompts"] = collector.claude_queued_prompts(entries)

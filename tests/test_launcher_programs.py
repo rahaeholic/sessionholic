@@ -265,6 +265,49 @@ class ProgramTest(unittest.TestCase):
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_claude_link_uses_the_unique_interactive_pid_on_the_launcher_host(self):
+        import collector
+        import server
+        from unittest.mock import Mock
+
+        sid = "019a0000-0000-7000-8000-000000000001"
+        raw = {"kind": "interactive", "sessionId": sid, "pid": 42, "cwd": "/work/project"}
+        host = {"name": "remote-mac", "local": False}
+        other = {"name": "laptop", "local": True}
+        rows = [{"id": FIRST, "createdAt": 100}]
+        board = Mock(hosts=[other, host])
+        terminals = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            flow = server.Workflow(board, terminals, directory)
+            for name, listed, info, fresh, linked in (
+                ("match", [raw], {"program": "claude", "pid": 42}, True, True),
+                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42}, True, True),
+                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "pid": 42}, True, False),
+                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "pid": 42}, True, False),
+                ("background", [{**raw, "kind": "background"}], {"program": "claude", "pid": 42}, True, False),
+                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "pid": 42}, True, False),
+                ("missing pid", [raw], {"program": "claude"}, True, False),
+                ("failed collection", [raw], {"program": "claude", "pid": 42}, False, False),
+            ):
+                with self.subTest(name=name):
+                    board.state = {
+                        host["name"]: {"ok": True, "data": {
+                            "claude": [collector.claude_row(item, {}, []) for item in listed],
+                            "sourceStatus": {"claude": {"ok": fresh}}}},
+                        other["name"]: {"ok": True, "data": {"claude": [collector.claude_row(raw, {}, [])]}},
+                    }
+                    terminals.reset_mock()
+                    with patch.object(flow.transfers, "rpc", return_value={"terminals": {FIRST: info}}):
+                        flow._describe_host(host, rows)
+                    terminals.set_program.assert_called_once_with(FIRST, info)
+                    if linked:
+                        terminals.link_native.assert_called_once_with(FIRST, {
+                            "host": host["name"], "agent": "claude", "id": sid, "home": None,
+                            "cwd": raw["cwd"], "kind": "interactive", "sessionId": sid,
+                        }, confidence="exact")
+                    else:
+                        terminals.link_native.assert_not_called()
+
     def test_host_owned_exact_evidence_is_recorded_and_unconfirmed_holds_are_read_after_a_minute(self):
         import server
         from unittest.mock import Mock

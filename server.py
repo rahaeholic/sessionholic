@@ -1176,7 +1176,7 @@ class Board:
             if failed:
                 self.runtime_observations.reject_scope(name, agent, request_seq)
             for row in data.get(agent, []):
-                source = {**row, 'host': name, 'agent': agent}
+                source = {**row, 'host': name, 'agent': agent, 'id': self._listed_id(row, agent)}
                 key = self.runtime_observations.key(source)
                 token = row.get('runtimeReadToken')
                 if live and (not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{16}:\d{1,12}', token)):
@@ -1538,6 +1538,15 @@ class Board:
             return {"serverTime": int(time.time()), "interval": self.interval, "version": self.version,
                     "hosts": copy.deepcopy(list(self.state.values()))}
 
+    @staticmethod
+    def _listed_id(row, agent):
+        identifier = row.get("id")
+        sid = row.get("sessionId")
+        if (not identifier and agent == "claude" and row.get("kind") == "interactive"
+                and isinstance(sid, str) and SESSION_ID.fullmatch(sid)):
+            return sid
+        return identifier
+
     def source(self, ref):
         if not isinstance(ref, dict):
             raise ValueError("작업을 선택해 주세요.")
@@ -1549,9 +1558,7 @@ class Board:
             raise ValueError("지원하지 않는 에이전트입니다.")
         with self.lock:
             for row in (host.get("data") or {}).get(agent, []):
-                identifier = row.get("id")
-                if not identifier and agent == "claude" and row.get("kind") == "interactive" and SESSION_ID.fullmatch(row.get("sessionId") or ""):
-                    identifier = row["sessionId"]
+                identifier = self._listed_id(row, agent)
                 if identifier and identifier == ref.get("id") and (agent != "codex" or row.get("home") == ref.get("home")):
                     return {**copy.deepcopy(row), "id": identifier, "host": host["name"], "hostLabel": host["label"],
                             "online": host["ok"], "fetchedAt": host["fetchedAt"]}
@@ -1984,7 +1991,9 @@ class Workflow:
             live.setdefault(terminal.get("host"), []).append({"id": terminal["id"], "createdAt": terminal["createdAt"],
                 **({"holdName": terminal["holdName"]} if terminal.get("holdName") else {})})
             seen = terminal.get("programAt")
-            confirming = terminal.get("holdName") and terminal.get("program") == "codex" and terminal.get("linkConfidence") != "exact"
+            program = terminal.get("program")
+            confirming = terminal.get("linkConfidence") != "exact" and (
+                program == "claude" or program == "codex" and terminal.get("holdName"))
             if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") and not confirming else self.PROGRAM_REFRESH):
                 continue
             due.setdefault(terminal.get("host"), set()).add(terminal["id"])
@@ -2014,12 +2023,17 @@ class Workflow:
             for identifier, info in (result.get("terminals") or {}).items():
                 if identifier in asked and isinstance(info, dict):
                     try:
-                        self.terminals.set_program(identifier, info)
+                        if not self.terminals.set_program(identifier, info):
+                            continue
                         native = info.get("nativeSource")
                         if isinstance(native, dict) and native.get("agent") == "codex":
                             native = self._native_of(host["name"], "codex", native)
-                            if native is not None:
-                                self.terminals.link_native(identifier, native, confidence="exact")
+                        elif info.get("program") == "claude":
+                            native = self._launcher_claude_source(host["name"], info.get("pid"))
+                        else:
+                            native = None
+                        if native is not None:
+                            self.terminals.link_native(identifier, native, confidence="exact")
                     except (RuntimeError, OSError, ValueError, KeyError):
                         continue
         except (RuntimeError, OSError, ValueError, KeyError, AttributeError):
@@ -2027,6 +2041,22 @@ class Workflow:
         finally:
             with self.program_lock:
                 self.program_busy.discard(host["name"])
+
+    def _launcher_claude_source(self, host, pid):
+        if type(pid) is not int or pid <= 0:
+            return None
+        status = self.board.state.get(host) or {}
+        data = status.get("data") or {}
+        # A failed collection retains old rows for display. They cannot prove process ownership.
+        if not status.get("ok") or ((data.get("sourceStatus") or {}).get("claude") or {}).get("ok") is False:
+            return None
+        matches = [row for row in data.get("claude") or [] if row.get("kind") == "interactive"
+                   and type(row.get("pid")) is int and row["pid"] == pid
+                   and isinstance(row.get("sessionId"), str) and SESSION_ID.fullmatch(row["sessionId"])]
+        if len(matches) == 1:
+            row = matches[0]
+            return self._native_of(host, "claude", {**row, "id": row["sessionId"]})
+        return None
 
     def profiles(self):
         from launch import discover_profiles

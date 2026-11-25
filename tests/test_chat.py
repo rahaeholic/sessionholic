@@ -1212,6 +1212,31 @@ class ChatClaudeTest(unittest.TestCase):
     def control(self, command, value=None, request='control-0001'):
         return self.chat.command({'source': CLAUDE_REF, 'command': command, 'value': value, 'requestId': request})
 
+    def test_workerless_interactive_chat_requires_an_exact_terminal(self):
+        self.row.update(id='', kind='interactive', status='idle', runtimeReadToken='a' * 16 + ':1')
+        stream = SimpleNamespace(name=HOST['name'], stopping=False)
+        self.board.streams[stream.name] = stream
+        self.board.apply_live(stream, {'claude': [self.row], 'codex': []})
+        ref = {'host': HOST['name'], 'agent': 'claude', 'id': CLAUDE_SID, 'sessionId': CLAUDE_SID}
+        terminal = self.terminal(id=CLAUDE_SID, kind='interactive', home=None)
+        terminal['linkConfidence'] = 'estimated'
+        state = self.state(source=ref)
+        self.assertEqual(state['phase'], 'idle')
+        self.assertTrue(state['runtimeKnown'])
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+        self.assertEqual(self.rejected(source=ref), chat.CLAUDE_EXTERNAL)
+        self.assertEqual(self.terms.pastes, [])
+
+        terminal['linkConfidence'] = 'exact'
+        self.terms.screen = '──────────\n❯ \n──────────'
+        state = self.state(source=ref)
+        self.assertTrue(state['capability']['supported'])
+        self.assertEqual(state['terminalConnection'], {'connected': True, 'id': TERMINAL_ID})
+        self.messages = [{'role': 'user', 'text': '안녕하세요', 'ts': time.time()}]
+        result = self.send(source=ref)
+        self.assertTrue(result['receipt']['deliveryVerified'])
+        self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '안녕하세요', True)])
+
     def test_delivery_readback_and_recovery_scenarios(self):
         empty = '─' * 20 + '\n❯ \n' + '─' * 20
         typed = '─' * 20 + '\n❯ 안녕하세요\n' + '─' * 20

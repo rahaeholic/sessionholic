@@ -594,7 +594,9 @@ class MessageTest(unittest.TestCase):
                 {"id": "agent123", "sessionId": "s" * 8, "pid": 7, "kind": "background", "state": "idle", "cwd": "/w"}]
         out = collector.claude_session_rows(rows, [], [], transcripts={})
         self.assertEqual((out[0]["id"], out[0]["pid"]), ("", 4242))
+        self.assertFalse(out[0].get("resume"))
         self.assertNotIn("pid", out[1])
+        self.assertEqual(out[1]["resume"], "claude attach agent123")
 
     def test_tail_entries_drops_cut_first_line(self):
         with tempfile.NamedTemporaryFile("wb", suffix=".jsonl", delete=False) as f:

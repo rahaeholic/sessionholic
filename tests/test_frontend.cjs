@@ -9307,15 +9307,48 @@ test('B10: a Claude row listed without an id gets its own key, one notice and no
   assert.doesNotMatch(textOf(list), /저장된 대화를 아직|올바르지 않습니다/);
   assert.match(list.children.at(-1).className, /msg-working/, 'the listed phase still shows it works');
   assert.match(c.get('chat-status').textContent, /세션 ID가 없어 여기서 보낼 수 없습니다/);
-  // With a session id the transcript is read directly, still without chat state.
-  const named = { ...s, sessionId: 'session-1234', key: 'workstation|claude||~named' };
-  rows.push({ ...rows[0], sessionId: 'session-1234', pid: 13 });
-  const withSession = c.allSessions().find((session) => session.sessionId === 'session-1234');
-  c.state.selected = withSession.key;
-  await c.loadDetail(withSession, true);
-  assert.deepEqual(requests.map((url) => url.split('?')[0]), ['/api/read']);
-  assert.match(requests[0], /id=session-1234/);
-  assert.ok(named);
+});
+
+test('a Claude interactive row without a worker id uses its sessionId for chat, events, suggestions and removal', async () => {
+  const sid = '019a0000-0000-7000-8000-000000000001';
+  const source = { host: 'workstation', agent: 'claude', id: sid, sessionId: sid };
+  const requests = [], { FakeEventSource, sources } = fakeEventSource();
+  let supported = false;
+  const c = client(async (url, options) => {
+    requests.push({ url, body: options?.body && JSON.parse(options.body) });
+    const data = url === '/api/chat/state' ? { route: source, phase: 'idle',
+      messages: [{ role: 'user', text: '테스트 고쳐 줘' }, { role: 'assistant', text: '고쳤습니다. 확인할까요?' }],
+      capability: { supported, reason: supported ? null : '보드 밖 터미널에서 실행 중입니다.' } }
+      : url === '/api/chat/suggestions' ? { status: 'ready', replies: ['네'] } : {};
+    return { ok: true, status: 200, json: async () => data };
+  }, noChatTimers);
+  c.context.EventSource = FakeEventSource;
+  const row = { agent: 'claude', id: '', sessionId: sid, pid: 42, cwd: '/w', phase: 'idle', kind: 'interactive' };
+  c.state.snapshot = { hosts: [{ name: source.host, ok: true, data: { claude: [row] } }],
+    recoverySessions: [{ ...row, ...source, home: '.claude', retained: true }] };
+  c.state.authenticated = true;
+  c.state.capabilities = { suggestedReplies: true };
+  const [s, duplicate] = c.allSessions();
+  assert.equal(duplicate, undefined, 'the retained record is the same conversation');
+  c.state.selected = s.key;
+  c.get('chat-composer').dataset.source = c.chatKey(c.sourceOf(s));
+  await c.loadDetail(s, true);
+  assert.deepEqual(requests.find(({ url }) => url === '/api/chat/state')?.body.source, source);
+  assert.equal(requests.some(({ url }) => url.startsWith('/api/read?')), false);
+  assert.match(c.get('chat-status').textContent, /보드 밖 터미널/);
+  c.syncEvents();
+  assert.deepEqual(Object.fromEntries(new URL(sources.at(-1).url, 'https://fixture.test').searchParams), source);
+
+  supported = true;
+  const terminal = { id: 'a'.repeat(32), alive: true, mode: 'new-session', linkConfidence: 'exact',
+    nativeSource: { ...source, home: null, cwd: row.cwd, kind: row.kind } };
+  c.state.terminals = [terminal];
+  assert.equal(c.terminalForSession(s), terminal);
+  await c.loadChatState(s, true);
+  await settle();
+  assert.deepEqual(requests.find(({ url }) => url === '/api/chat/suggestions')?.body.source, source);
+  await c.removeSession(s, true, { quiet: true });
+  assert.deepEqual(requests.find(({ url }) => url === '/api/session/remove')?.body.source, { ...source, home: '.claude' });
 });
 
 test('a long press on a tool group line (a button) opens the group menu and its tap then does not toggle the group', () => {
