@@ -2519,10 +2519,10 @@ class Workflow:
 
     def _link_observed_sessions(self, terminals):
         """Estimate a "새 세션" link after observing Codex, Claude, or SSH to a known board host.
-        Match the earliest unambiguous, unclaimed interactive session for that agent or SSH
-        destination. Only hosts other than the board's local host allow 30 seconds of clock
-        difference. If a confirmed program contradicts an estimate, discard it so the next
-        observation can link again."""
+        Match the earliest unclaimed interactive session for that agent or SSH destination,
+        or defer if another terminal shares that candidate. Only other hosts allow 30 seconds
+        of clock difference. If a confirmed program contradicts an estimate, discard it so
+        the next observation can link again."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2617,14 +2617,17 @@ class Workflow:
             if not can_link:
                 continue
             candidates = [item for item in candidates
-                          if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
-                          and json.dumps(self.identity(item[1]), sort_keys=True) not in taken]
+                          if json.dumps(self.identity(item[1]), sort_keys=True) not in taken]
             if not candidates:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]
+            key = json.dumps(self.identity(native), sort_keys=True)
+            # If the earliest candidate is ambiguous, a later session may be unrelated.
+            if shared[key] > 1:
+                continue
             try:
                 if record(terminal["id"], native, confidence="estimated"):
-                    taken.add(json.dumps(self.identity(native), sort_keys=True))
+                    taken.add(key)
                     changed = True
             except (KeyError, ValueError, RuntimeError, OSError):
                 continue

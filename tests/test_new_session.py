@@ -613,6 +613,55 @@ class LinkNewSessionTest(unittest.TestCase):
                 self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', earlier)])
                 self.assertNotIn('nativeSource', second)
 
+    def test_earliest_shared_session_does_not_fall_through_to_a_later_session(self):
+        first_id, second_id = 'a' * 32, 'b' * 32
+        shared, independent = codex_row('1', 2795), codex_row('2', 2801)
+        self.rows['remote']['codex'] = [independent, shared]
+        a_program = launcher_programs.program_of('ssh -t -o BatchMode=yes remote codex')
+        for windows in (False, True):
+            with patch.dict(self.board.hosts[1], platform='windows' if windows else 'macos'):
+                self.board.poll(REMOTE)
+                for b_command in ('ssh -N remote', 'ssh -t -o LogLevel=ERROR remote', None):
+                    for reverse in (False, True):
+                        with self.subTest(windows=windows, b_command=b_command, reverse=reverse):
+                            socket = 'fixture-earliest'
+                            first = {'mode': 'new-session', 'createdAt': 2790, 'host': 'local'}
+                            if windows:
+                                first.update(host='remote', windowsSingleChoice=True)
+                            fixtures = [(first_id, first)]
+                            if b_command:
+                                fixtures.append((second_id, {'mode': 'new-session', 'createdAt': 1000, 'host': 'local'}))
+                            if reverse:
+                                fixtures.reverse()
+                            state = Path(tempfile.mkdtemp(dir=self.temp.name))
+                            saved = state / 'sessions.json'
+                            saved.write_text(json.dumps([
+                                {'id': uid, 'name': 'sb-' + uid, 'key': 'fixture-' + uid,
+                                 'socket': socket, 'metadata': metadata}
+                                for uid, metadata in fixtures
+                            ]), encoding='utf-8')
+                            manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                            self.addCleanup(manager.close)
+                            self.flow.terminals = manager
+                            if not windows:
+                                self.assertTrue(manager.set_program(first_id, a_program))
+                            if b_command:
+                                self.assertTrue(manager.set_program(second_id, launcher_programs.program_of(b_command)))
+                            with patch.object(manager, '_live_names', return_value={'sb-' + uid for uid, _ in fixtures}):
+                                if b_command:
+                                    self.assertTrue(all('nativeSource' not in row for row in self.flow.linked_terminals()))
+                                    self.assertTrue(all('nativeSource' not in row['metadata']
+                                                        for row in json.loads(saved.read_text())))
+                                    self.assertTrue(manager.set_program(second_id, {'program': 'claude'}))
+                                rows = {row['id']: row for row in self.flow.linked_terminals()}
+                                expected = server.Workflow._native_of('remote', 'codex', shared)
+                                self.assertEqual(rows[first_id]['nativeSource'], expected)
+                                self.assertEqual(rows[first_id]['linkConfidence'], 'estimated')
+                                stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
+                                self.assertEqual(stored[first_id]['nativeSource'], expected)
+                                if b_command:
+                                    self.assertNotIn('nativeSource', stored[second_id])
+
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
