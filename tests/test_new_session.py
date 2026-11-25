@@ -553,6 +553,28 @@ class LinkNewSessionTest(unittest.TestCase):
                         self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
                         self.assertIn('nativeSource', other)
 
+    def test_ssh_destination_override_does_not_claim_the_configured_alias(self):
+        candidate = codex_row('1', 1008)
+        self.rows['remote']['codex'] = [candidate]
+        self.terminal.update(host='local', program=None)
+        for options in ('-oHostName=unlisted.example', '-o HOSTNAME=unlisted.example',
+                        '-o HostName unlisted.example', '-F /fixture/ssh.conf', '-F/fixture/ssh.conf'):
+            for command in (f'/usr/bin/ssh {options} remote', f'/usr/bin/ssh remote {options}'):
+                with self.subTest(command=command):
+                    for launcher, rows in (
+                        (command.split(), [(20, 1, 1001, command)]),
+                        (['/bin/zsh', '-lic', 'menu'], [(20, 1, 1001, '/bin/zsh -lic menu'), (21, 20, 1002, command)]),
+                    ):
+                        observed = launcher_programs.describe([self.terminal], launcher, rows)[self.terminal['id']]
+                        self.assertEqual(observed['program'], 'ssh')
+                        self.assertNotIn('sshHost', observed)
+                        self.terminal.update(program='ssh', programHost=observed.get('sshHost'))
+                        self.assertEqual(self.link(), [])
+        command = '/usr/bin/ssh -oBatchMode=yes remote codex -oHostName=unlisted.example'
+        observed = launcher_programs.describe([self.terminal], command.split(), [(20, 1, 1001, command)])
+        self.terminal.update(program='ssh', programHost=observed[self.terminal['id']]['sshHost'])
+        self.assertEqual(self.link(), [server.Workflow._native_of('remote', 'codex', candidate)])
+
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))

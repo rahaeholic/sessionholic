@@ -108,12 +108,16 @@ def program_of(command):
                 destination = word
                 continue
             for end, option in enumerate(word[1:], 2):
-                if option in SSH_NO_SHELL_OPTIONS:
+                # An alternate config or HostName override can change where the
+                # alias connects, independently of the board's normal resolver.
+                if option in SSH_NO_SHELL_OPTIONS or option == "F":
                     return found
                 if option in SSH_VALUE_OPTIONS:
                     value = word[end:] or next(words, "")
                     if option == "o":
                         key, _, session_type = value.lower().partition("=")
+                        if key == "hostname":
+                            return found
                         if key == "sessiontype":
                             session_type = session_type or next(words, "").lower()
                             if session_type == "=":
