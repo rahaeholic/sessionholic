@@ -1058,6 +1058,22 @@ class TerminalManager:
         self._changed()
         return True
 
+    def hold_native_link(self, terminal_id):
+        """Persist a new launcher's decision to stop attempting automatic links."""
+        with self.lock:
+            terminal = self._get(terminal_id)
+            previous = terminal.record["metadata"]
+            if previous.get("mode") != "new-session" or previous.get("nativeSource") or previous.get("linkHold"):
+                return False
+            terminal.record["metadata"] = _metadata({**previous, "linkHold": True})
+            try:
+                self._save()
+            except BaseException:
+                terminal.record["metadata"] = previous
+                raise
+        self._changed()
+        return True
+
     def list(self):
         with self.lock, self._listing():
             result = []

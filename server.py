@@ -2520,13 +2520,14 @@ class Workflow:
     def _link_observed_sessions(self, terminals):
         """Estimate a "새 세션" link after observing Codex, Claude, or SSH to a known board host.
         Match the earliest unclaimed interactive session for that agent or SSH destination,
-        or defer if another terminal shares that candidate. Only other hosts allow 30 seconds
-        of clock difference. If a confirmed program contradicts an estimate, discard it so
-        the next observation can link again."""
+        or persist a hold on further estimates if another terminal shares that candidate.
+        Only other hosts allow 30 seconds of clock difference. If a confirmed program
+        contradicts an estimate, discard it so the next observation can link again."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
         unlink = getattr(self.terminals, "unlink_estimated_native", None)
+        hold = getattr(self.terminals, "hold_native_link", None)
         windows_hosts = {h["name"] for h in self.board.hosts if not h.get("local") and h.get("platform") == "windows"}
 
         def session_host(terminal):
@@ -2562,7 +2563,7 @@ class Workflow:
                 candidate_host = host or (origin if program is None else None)
                 if type(terminal.get("createdAt")) is int:
                     if candidate_host:
-                        pending.append((terminal, candidate_host, bool(host)))
+                        pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
                     elif program == "ssh":
                         unresolved_ssh.append(terminal)
                 continue
@@ -2622,10 +2623,12 @@ class Workflow:
                 continue
             native = min(candidates, key=lambda item: item[0])[1]
             key = json.dumps(self.identity(native), sort_keys=True)
-            # If the earliest candidate is ambiguous, a later session may be unrelated.
-            if shared[key] > 1:
-                continue
             try:
+                # Neither a later candidate nor a later observation resolves this ambiguity.
+                if shared[key] > 1:
+                    if hold is not None and hold(terminal["id"]):
+                        changed = True
+                    continue
                 if record(terminal["id"], native, confidence="estimated"):
                     taken.add(key)
                     changed = True

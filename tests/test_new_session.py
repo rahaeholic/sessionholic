@@ -6,6 +6,7 @@ os.execve is replaced, SSH is never started and no agent or model is involved.
 from contextlib import contextmanager, redirect_stderr
 import http.client
 import io
+from itertools import product
 import json
 import os
 from pathlib import Path
@@ -654,13 +655,89 @@ class LinkNewSessionTest(unittest.TestCase):
                                                         for row in json.loads(saved.read_text())))
                                     self.assertTrue(manager.set_program(second_id, {'program': 'claude'}))
                                 rows = {row['id']: row for row in self.flow.linked_terminals()}
-                                expected = server.Workflow._native_of('remote', 'codex', shared)
-                                self.assertEqual(rows[first_id]['nativeSource'], expected)
-                                self.assertEqual(rows[first_id]['linkConfidence'], 'estimated')
                                 stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
-                                self.assertEqual(stored[first_id]['nativeSource'], expected)
                                 if b_command:
+                                    self.assertNotIn('nativeSource', rows[first_id])
+                                    self.assertNotIn('nativeSource', stored[first_id])
                                     self.assertNotIn('nativeSource', stored[second_id])
+                                else:
+                                    expected = server.Workflow._native_of('remote', 'codex', shared)
+                                    self.assertEqual(rows[first_id]['nativeSource'], expected)
+                                    self.assertEqual(rows[first_id]['linkConfidence'], 'estimated')
+                                    self.assertEqual(stored[first_id]['nativeSource'], expected)
+
+    def test_shared_candidate_hold_survives_competitor_departure_and_restart(self):
+        a_id, b_id = 'a' * 32, 'b' * 32
+        a_session, b_session = codex_row('1', 2801), codex_row('2', 2789)
+        a_native = server.Workflow._native_of('remote', 'codex', a_session)
+        cases = product((False, True), ('ssh -N remote', 'ssh -t -o LogLevel=ERROR remote'),
+                        (False, True), (False, True), ('claude', 'closed'))
+        for windows, b_command, reverse_terminals, reverse_sessions, departure in cases:
+            with self.subTest(windows=windows, command=b_command, reverse_terminals=reverse_terminals,
+                              reverse_sessions=reverse_sessions, departure=departure):
+                state = Path(tempfile.mkdtemp(dir=self.temp.name))
+                saved = state / 'sessions.json'
+                socket = 'fixture-sticky'
+                first = {'mode': 'new-session', 'host': 'local', 'createdAt': 2790}
+                if windows:
+                    first.update(host='remote', windowsSingleChoice=True)
+                records = [(a_id, first), (b_id, {'mode': 'new-session', 'host': 'local', 'createdAt': 1000})]
+                if reverse_terminals:
+                    records.reverse()
+                saved.write_text(json.dumps([
+                    {'id': uid, 'name': 'sb-' + uid, 'key': 'fixture-' + uid, 'socket': socket, 'metadata': meta}
+                    for uid, meta in records
+                ]), encoding='utf-8')
+                names = {'sb-' + a_id, 'sb-' + b_id}
+                self.rows['remote']['codex'] = [b_session, a_session] if reverse_sessions else [a_session, b_session]
+                with patch.dict(self.board.hosts[1], platform='windows' if windows else 'macos'):
+                    self.board.poll(REMOTE)
+                    manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                    try:
+                        self.flow.terminals = manager
+                        if not windows:
+                            self.assertTrue(manager.set_program(a_id, launcher_programs.program_of(
+                                'ssh -t -o BatchMode=yes remote codex')))
+                        self.assertTrue(manager.set_program(b_id, launcher_programs.program_of(b_command)))
+                        with patch.object(manager, '_live_names', return_value=names):
+                            with patch.object(manager, '_save', side_effect=OSError('fixture disk failure')):
+                                with self.assertRaises(OSError):
+                                    manager.hold_native_link(a_id)
+                            self.assertNotIn('linkHold', next(row for row in manager.list() if row['id'] == a_id))
+                            rows = {row['id']: row for row in self.flow.linked_terminals()}
+                            self.assertTrue(all('nativeSource' not in row for row in rows.values()))
+                            hold = rows[a_id].get('linkHold')
+                            stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
+                            if departure == 'claude':
+                                self.assertTrue(manager.set_program(b_id, {'program': 'claude'}))
+                            else:
+                                names.remove('sb-' + b_id)
+                            rows = {row['id']: row for row in self.flow.linked_terminals()}
+                            self.assertNotIn('nativeSource', rows[a_id])
+                            self.assertIs(hold, True)
+                            self.assertIs(stored[a_id].get('linkHold'), True)
+                            self.assertNotIn('linkHold', stored[b_id])
+                            self.assertFalse(manager.hold_native_link(a_id))
+                            self.assertNotIn('nativeSource', {row['id']: row['metadata']
+                                                             for row in json.loads(saved.read_text())}[a_id])
+                    finally:
+                        manager.close()
+
+                    restored = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                    try:
+                        self.flow.terminals = restored
+                        with patch.object(restored, '_live_names', return_value={'sb-' + a_id}):
+                            rows = {row['id']: row for row in self.flow.linked_terminals()}
+                            self.assertNotIn('nativeSource', rows[a_id])
+                            self.assertIs(rows[a_id].get('linkHold'), True)
+                            manual = server.Workflow._native_of(first['host'], 'codex', a_session)
+                            self.assertEqual(restored.link_chat(a_id, manual)['chatSource'], manual)
+                            self.assertTrue(restored.link_native(a_id, a_native, confidence='exact'))
+                            stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
+                            self.assertEqual(stored[a_id]['nativeSource'], a_native)
+                            self.assertEqual(stored[a_id]['linkConfidence'], 'exact')
+                    finally:
+                        restored.close()
 
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
@@ -690,6 +767,7 @@ class LinkNewSessionTest(unittest.TestCase):
         self.rows['remote']['codex'] = [actual]
         self.board.poll(REMOTE)
 
+        self.assertFalse(manager.hold_native_link('b' * 32))
         self.assertFalse(manager.unlink_estimated_native('a' * 32, remote_match))
         self.assertFalse(manager.unlink_estimated_native('b' * 32, old))
         with patch.object(manager, '_save', side_effect=OSError('fixture disk failure')):
@@ -711,8 +789,7 @@ class LinkNewSessionTest(unittest.TestCase):
             for letter in 'bcf':
                 self.assertEqual(cleared[letter], fixtures[letter])
             self.assertEqual({row['id'][0]: row['metadata'] for row in json.loads(saved.read_text())}, cleared)
-            ambiguous = {row['id'][0]: row for row in self.flow.linked_terminals()}
-            self.assertNotIn('nativeSource', ambiguous['a'])
+            # Resolve the competitor before the first attempt to relink.
             self.assertTrue(manager.set_program('9' * 32, {'program': 'claude'}))
             relinked = {row['id'][0]: row for row in self.flow.linked_terminals()}
         self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
@@ -746,6 +823,12 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual(self.terms.linked[-1][0], self.terminal['id'])
 
     def test_unobserved_launcher_blocks_only_ambiguous_candidates_without_taking_them(self):
+        def hold(terminal_id):
+            row = next(row for row in self.terms.rows if row['id'] == terminal_id)
+            row['linkHold'] = True
+            return True
+
+        self.terms.hold_native_link = hold
         for first_observed in (0, 1):
             with self.subTest(first_observed=first_observed):
                 launchers = [{**self.terminal, 'host': 'local', 'program': None},
@@ -759,8 +842,12 @@ class LinkNewSessionTest(unittest.TestCase):
                 self.rows['local']['codex'].append(codex_row('2', 1102))
                 self.assertEqual(self.link(), [])
                 self.rows['local']['codex'].append(codex_row('3', 1099))
-                self.assertEqual([native['id'] for native in self.link()], [codex_row('3', 0)['id']])
-                self.assertEqual(self.terms.linked[0][0], launchers[0]['id'])
+                self.assertEqual(self.link(), [])
+                self.assertTrue(all(row.get('linkHold') for row in launchers))
+                newcomer = {**self.terminal, 'host': 'local', 'id': 'd' * 32, 'createdAt': 1100}
+                self.terms.rows.append(newcomer)
+                self.assertEqual(self.link(), [])
+                self.assertIs(newcomer.get('linkHold'), True, 'already held terminals still compete')
 
     def test_ssh_and_agent_view_launchers_neither_take_nor_block_and_an_agent_takes_only_its_own(self):
         # Waiting beside it since before: one went to another host over SSH, one is Claude's agent view.
