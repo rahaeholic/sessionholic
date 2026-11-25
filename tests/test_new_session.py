@@ -793,20 +793,26 @@ class LinkNewSessionTest(unittest.TestCase):
         self.assertEqual(relinked['a']['nativeSource'], server.Workflow._native_of('remote', 'codex', actual))
         self.assertEqual(relinked['a']['linkConfidence'], 'estimated')
 
-    def test_cleared_estimate_still_competes_on_the_next_list(self):
+    def test_cleared_estimate_preserves_holds_if_either_competitor_closes(self):
         a_id, b_id = 'a' * 32, 'b' * 32
         ssh = {'mode': 'new-session', 'host': 'local', 'program': 'ssh', 'programHost': 'remote'}
         old = server.Workflow._native_of('local', 'codex', codex_row('1', 990))
         a_session, b_session = codex_row('2', 1035), codex_row('3', 1040)
-        cases = product((False, True), (False, True), (False, True), (False, True))
-        for windows, reverse_terminals, reverse_sessions, competitor_closes in cases:
+        cases = product((False, True), (False, True), (False, True), (a_id, b_id), (False, True))
+        for windows, reverse_terminals, reverse_sessions, closing_id, unrelated_release in cases:
             with self.subTest(windows=windows, reverse_terminals=reverse_terminals,
-                              reverse_sessions=reverse_sessions, competitor_closes=competitor_closes):
-                first = {**ssh, 'createdAt': 1000, 'nativeSource': old, 'linkConfidence': 'estimated'}
+                              reverse_sessions=reverse_sessions, closing_id=closing_id,
+                              unrelated_release=unrelated_release):
+                first = {**ssh, 'createdAt': 1000}
                 second = {**ssh, 'createdAt': 1030}
                 if windows:
                     second = {'mode': 'new-session', 'host': 'remote', 'createdAt': 1030, 'windowsSingleChoice': True}
                 records = [(a_id, first), (b_id, second)]
+                if unrelated_release:
+                    records.append(('c' * 32, {'mode': 'new-session', 'host': 'local', 'program': 'claude',
+                                               'createdAt': 1000, 'nativeSource': old, 'linkConfidence': 'estimated'}))
+                else:
+                    first.update(nativeSource=old, linkConfidence='estimated')
                 if reverse_terminals:
                     records.reverse()
                 socket = 'fixture-r3-competition'
@@ -817,7 +823,7 @@ class LinkNewSessionTest(unittest.TestCase):
                     for uid, meta in records
                 ]), encoding='utf-8')
                 manager = terminal.TerminalManager(state_dir=state, socket_name=socket)
-                names = {'sb-' + a_id, 'sb-' + b_id}
+                names = {'sb-' + uid for uid, _ in records}
                 try:
                     self.flow.terminals = manager
                     self.rows['remote']['codex'] = [b_session, a_session] if reverse_sessions else [a_session, b_session]
@@ -827,16 +833,24 @@ class LinkNewSessionTest(unittest.TestCase):
                         rows = {row['id']: row for row in self.flow.linked_terminals()}
                         self.assertNotIn('nativeSource', rows[a_id])
                         self.assertNotIn('nativeSource', rows[b_id])
-                        self.assertTrue(all('linkHold' not in row for row in rows.values()))
-                        rows = {row['id']: row for row in self.flow.linked_terminals()}
-                        self.assertTrue(all(row.get('linkHold') is True for row in rows.values()))
-                        if competitor_closes:
-                            names.remove('sb-' + b_id)
+                        first_holds = [rows[uid].get('linkHold') for uid in (a_id, b_id)]
+                        names.remove('sb-' + closing_id)
                         self.assertTrue(all('nativeSource' not in row for row in self.flow.linked_terminals()))
-                        stored = [row['metadata'] for row in json.loads(saved.read_text())]
-                        self.assertTrue(all('nativeSource' not in meta and meta.get('linkHold') is True for meta in stored))
+                        self.assertEqual(first_holds, [True, True])
+                        stored = {row['id']: row['metadata'] for row in json.loads(saved.read_text())}
+                        for uid in (a_id, b_id):
+                            self.assertNotIn('nativeSource', stored[uid])
+                            self.assertIs(stored[uid].get('linkHold'), True)
                 finally:
                     manager.close()
+                restored = terminal.TerminalManager(state_dir=state, socket_name=socket)
+                try:
+                    self.flow.terminals = restored
+                    with patch.dict(self.board.hosts[1], platform='windows' if windows else 'macos'), \
+                            patch.object(restored, '_live_names', return_value=names):
+                        self.assertTrue(all('nativeSource' not in row for row in self.flow.linked_terminals()))
+                finally:
+                    restored.close()
 
     def test_released_estimate_becomes_available_on_the_next_list(self):
         a_id, b_id = 'a' * 32, 'b' * 32

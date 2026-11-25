@@ -2522,8 +2522,8 @@ class Workflow:
         Match the earliest unclaimed interactive session for that agent or SSH destination,
         or persist a hold on further estimates if another terminal shares that candidate.
         Only other hosts allow 30 seconds of clock difference. If a confirmed program
-        contradicts an estimate, discard it. Defer new estimates and holds to the next
-        observation after any successful removal."""
+        contradicts an estimate, discard it. After a removal, recompute holds from a
+        fresh list and leave new estimates for the next observation."""
         record = getattr(self.terminals, "link_native", None)
         if record is None:
             return
@@ -2548,9 +2548,7 @@ class Workflow:
             return next((h["name"] for h in self.board.hosts if target and h["name"] != origin
                          and target in (h["name"], h.get("ssh"))), None)
 
-        changed = False
-        pending = []
-        unresolved_ssh = []
+        released = False
         deferred = set()
         for terminal in terminals:
             if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
@@ -2559,21 +2557,32 @@ class Workflow:
             origin = terminal.get("host")
             program = terminal.get("program")
             native = terminal.get("nativeSource")
-            if native:
-                if unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
-                    continue
-                wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
-                wrong_agent = program in ("codex", "claude") and native["agent"] != program
-                if not (wrong_host or wrong_agent):
-                    continue
-                # A mismatched estimate does not remove this terminal from the
-                # competition, but we never replace it in the same observation.
-                deferred.add(terminal["id"])
-                try:
-                    if unlink(terminal["id"], native):
-                        changed = True
-                except (KeyError, ValueError, RuntimeError, OSError):
-                    pass
+            if not native or unlink is None or program is None or terminal.get("linkConfidence") != "estimated":
+                continue
+            wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
+            wrong_agent = program in ("codex", "claude") and native["agent"] != program
+            if not (wrong_host or wrong_agent):
+                continue
+            deferred.add(terminal["id"])
+            try:
+                if unlink(terminal["id"], native):
+                    released = True
+            except (KeyError, ValueError, RuntimeError, OSError):
+                pass
+        if released:
+            # A released claim must be visible when deciding which candidates overlap.
+            terminals = self.terminals.list()
+        changed = released
+        pending = []
+        unresolved_ssh = []
+        for terminal in terminals:
+            if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
+                continue
+            if terminal.get("nativeSource") and terminal["id"] not in deferred:
+                continue
+            host = session_host(terminal)
+            origin = terminal.get("host")
+            program = terminal.get("program")
             # Unobserved launchers and Windows menus still compete for sessions
             # on their own host, even when they cannot claim one themselves.
             candidate_host = host or (origin if program is None else None)
@@ -2582,9 +2591,6 @@ class Workflow:
                     pending.append((terminal, candidate_host, bool(host) and not terminal.get("linkHold")))
                 elif program == "ssh":
                     unresolved_ssh.append(terminal)
-        if changed:
-            # Re-evaluate candidates from a fresh list after releasing a claim.
-            return changed
         claimable_hosts = {host for _, host, can_link in pending if can_link}
         if not claimable_hosts:
             return changed
@@ -2638,7 +2644,7 @@ class Workflow:
                     if hold is not None and hold(terminal_id):
                         changed = True
                     continue
-                if terminal_id not in deferred and record(terminal_id, native, confidence="estimated"):
+                if not released and terminal_id not in deferred and record(terminal_id, native, confidence="estimated"):
                     taken.add(key)
                     changed = True
             except (KeyError, ValueError, RuntimeError, OSError):
