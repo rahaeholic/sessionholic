@@ -2525,15 +2525,20 @@ class Workflow:
         if record is None:
             return
         unlink = getattr(self.terminals, "unlink_estimated_native", None)
+        windows_hosts = {h["name"] for h in self.board.hosts if not h.get("local") and h.get("platform") == "windows"}
 
         def session_host(terminal):
             program = terminal.get("program")
+            origin = terminal.get("host")
             if program in ("codex", "claude"):
-                return terminal.get("host")
+                return origin
+            # A Windows new-session terminal is itself launched over SSH by the board.
+            if program is None and origin in windows_hosts:
+                return origin
             if program != "ssh":
                 return None
             target = terminal.get("programHost")
-            return next((h["name"] for h in self.board.hosts if target and h["name"] != terminal.get("host")
+            return next((h["name"] for h in self.board.hosts if target and h["name"] != origin
                          and target in (h["name"], h.get("ssh"))), None)
 
         changed = False
@@ -2542,15 +2547,21 @@ class Workflow:
             if terminal.get("mode") != "new-session" or not terminal.get("alive") or terminal.get("closed"):
                 continue
             host = session_host(terminal)
-            if not host:
-                continue
-            native = terminal.get("nativeSource")
+            origin = terminal.get("host")
             program = terminal.get("program")
+            native = terminal.get("nativeSource")
             if not native:
-                if type(terminal.get("createdAt")) is int:
-                    pending.append((terminal, host))
-            elif (unlink is not None and terminal.get("linkConfidence") == "estimated"
-                  and (native["host"] != host or program in ("codex", "claude") and native["agent"] != program)):
+                # Unobserved launchers can make an own-host candidate ambiguous before
+                # they are eligible to claim it.
+                candidate_host = host or (origin if program is None else None)
+                if candidate_host and type(terminal.get("createdAt")) is int:
+                    pending.append((terminal, candidate_host, bool(host)))
+                continue
+            if unlink is None or terminal.get("linkConfidence") != "estimated":
+                continue
+            wrong_host = native["host"] != host if host else program == "ssh" and native["host"] == origin
+            wrong_agent = program in ("codex", "claude") and native["agent"] != program
+            if wrong_host or wrong_agent:
                 try:
                     if unlink(terminal["id"], native):
                         changed = True
@@ -2562,7 +2573,7 @@ class Workflow:
                  if isinstance(t.get("nativeSource"), dict)}
         local_hosts = {h["name"] for h in self.board.hosts if h.get("local")}
         found = []
-        for terminal, host in sorted(pending, key=lambda item: item[0]["createdAt"]):
+        for terminal, host, can_link in sorted(pending, key=lambda item: item[0]["createdAt"]):
             data = (self.board.state.get(host) or {}).get("data") or {}
             opened = terminal["createdAt"]
             earliest = opened if host in local_hosts else opened - 30
@@ -2579,16 +2590,18 @@ class Workflow:
                             or json.dumps(self.identity(native), sort_keys=True) in taken):
                         continue
                     candidates.append((started, native))
-            found.append((terminal, candidates))
+            found.append((terminal, candidates, can_link))
         # A session that could be either of two terminals still waiting on its host (both opened
         # before it started) is neither's: start times cannot tell them apart, and a wrong link
         # shows another conversation beside the terminal and opens the wrong one from its card.
         shared = {}
-        for _terminal, candidates in found:
+        for _terminal, candidates, _can_link in found:
             for _started, native in candidates:
                 key = json.dumps(self.identity(native), sort_keys=True)
                 shared[key] = shared.get(key, 0) + 1
-        for terminal, candidates in found:
+        for terminal, candidates, can_link in found:
+            if not can_link:
+                continue
             candidates = [item for item in candidates
                           if shared[json.dumps(self.identity(item[1]), sort_keys=True)] == 1
                           and json.dumps(self.identity(item[1]), sort_keys=True) not in taken]

@@ -490,7 +490,8 @@ class LinkNewSessionTest(unittest.TestCase):
                     'c': {**launcher, 'nativeSource': remote_match},
                     'd': {**launcher, 'program': 'claude'},
                     'e': {**launcher, 'program': 'codex', 'nativeSource': remote_match},
-                    'f': {**launcher, 'program': 'codex'}}
+                    'f': {**launcher, 'program': 'codex'},
+                    '9': {**launcher, 'program': None, 'programHost': None}}
         state = Path(self.temp.name) / 'terminals'
         state.mkdir(mode=0o700)
         saved = state / 'sessions.json'
@@ -511,9 +512,13 @@ class LinkNewSessionTest(unittest.TestCase):
             with self.assertRaises(OSError):
                 manager.unlink_estimated_native('a' * 32, old)
         with patch.object(manager, '_live_names', return_value={'sb-' + letter * 32 for letter in fixtures}):
-            self.assertEqual(manager.list()[0]['metadata'], launcher)
+            before = {row['id'][0]: row['metadata'] for row in manager.list()}
+            self.assertEqual(before['a'], launcher)
+            self.assertEqual(before['9'], fixtures['9'])
+            self.assertTrue(manager.set_program('9' * 32, {'program': 'ssh'}))
+            fixtures['9'] = {row['id'][0]: row['metadata'] for row in manager.list()}['9']
             cleared = {row['id'][0]: row['metadata'] for row in self.flow.linked_terminals()}
-            for letter in 'ade':
+            for letter in 'ade9':
                 self.assertEqual(cleared[letter], {key: value for key, value in fixtures[letter].items()
                                                   if key not in ('nativeSource', 'linkConfidence')})
             for letter in 'bcf':
@@ -549,6 +554,23 @@ class LinkNewSessionTest(unittest.TestCase):
         self.rows['remote']['codex'].append(codex_row('2', 1004))
         self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
         self.assertEqual(self.terms.linked[-1][0], self.terminal['id'])
+
+    def test_unobserved_launcher_blocks_only_ambiguous_candidates_without_taking_them(self):
+        for first_observed in (0, 1):
+            with self.subTest(first_observed=first_observed):
+                launchers = [{**self.terminal, 'host': 'local', 'program': None},
+                             {**self.terminal, 'host': 'local', 'id': 'e' * 32, 'createdAt': 1100, 'program': None}]
+                self.terms.rows = launchers
+                self.terms.linked.clear()
+                self.rows['local']['codex'] = [codex_row('1', 1101)]
+                launchers[first_observed]['program'] = 'codex'
+                self.assertEqual(self.link(), [])
+                launchers[1 - first_observed]['program'] = 'codex'
+                self.rows['local']['codex'].append(codex_row('2', 1102))
+                self.assertEqual(self.link(), [])
+                self.rows['local']['codex'].append(codex_row('3', 1099))
+                self.assertEqual([native['id'] for native in self.link()], [codex_row('3', 0)['id']])
+                self.assertEqual(self.terms.linked[0][0], launchers[0]['id'])
 
     def test_ssh_and_agent_view_launchers_neither_take_nor_block_and_an_agent_takes_only_its_own(self):
         # Waiting beside it since before: one went to another host over SSH, one is Claude's agent view.

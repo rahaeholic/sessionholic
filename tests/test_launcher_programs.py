@@ -170,6 +170,20 @@ class ExactCodexTest(unittest.TestCase):
 
 
 class ProgramTest(unittest.TestCase):
+    def test_the_paired_launcher_itself_can_be_the_program(self):
+        terminal = {"id": FIRST, "createdAt": 1000}
+        for command, program in (("/opt/example/codex", "codex"),
+                                 ("node /opt/example/codex", "codex"),
+                                 ("/opt/example/claude", "claude"),
+                                 ("/usr/bin/ssh pc", "ssh")):
+            with self.subTest(command=command):
+                args = command.split()
+                launcher = args[1:] if args[0] == "node" else args
+                rows = [(20, 1, 1001, command)]
+                result = lp.describe([terminal], launcher, rows)[FIRST]
+                self.assertEqual((result["program"], result.get("pid")), (program, 20))
+                self.assertEqual(result.get("sshHost"), "pc" if program == "ssh" else None)
+
     def test_agent_clis_are_named_and_claude_helpers_are_not(self):
         cases = {
             "/Users/example/.local/bin/claude agents --cwd /Users/example/project": {"program": "claude-agents", "cwd": "/Users/example/project"},

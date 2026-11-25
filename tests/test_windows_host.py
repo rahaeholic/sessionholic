@@ -256,6 +256,14 @@ class WindowsRoutingTest(unittest.TestCase):
             {'choices': LAUNCHER['choices'][:1]})))
         self.assertNotIn('Read-Host', one)
         self.assertIn("& $c.Exe @($c.Args)", one)
+        # The board itself launched the SSH transport to this PC. No Mac observer RPC is needed.
+        self.terms.list = lambda: [{**meta, 'id': 'f' * 32, 'alive': True}]
+        self.terms.link_native = Mock(return_value=True)
+        self.board.state[HOST['name']]['data']['codex'] = [{**ROW, 'startedAt': meta['createdAt'] + 1}]
+        self.board.state[HOST['name']]['data']['claude'] = []
+        with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('no PC observer RPC')):
+            self.flow.linked_terminals()
+        self.terms.link_native.assert_called_once_with('f' * 32, {**REF, 'cwd': ROW['cwd']}, confidence='estimated')
         self.board.state[HOST['name']]['ok'] = False
         self.assertFalse(self.flow.new_session_status(host, online=False)['available'])
         with self.assertRaisesRegex(RuntimeError, '연결할 수 없어'):

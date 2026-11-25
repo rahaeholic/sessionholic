@@ -2,7 +2,7 @@
 
 A 새 세션 terminal runs this host's launcher (the host settings' `launcher`). Its launcher
 process starts when the terminal opens, so the board's creation time names it; the first
-agent CLI below it is the program: Claude's agent view (`claude agents`, with its --cwd),
+agent CLI at or below it is the program: Claude's agent view (`claude agents`, with its --cwd),
 Claude, or Codex. Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
@@ -23,7 +23,7 @@ PAIRING_LIMIT = 6  # terminals weighed together at most; more name none
 PS = "/bin/ps"
 LSTART = "%a %b %d %H:%M:%S %Y"
 # Claude's own helpers under the agent view, never a program a person runs.
-INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python"}
+INTERPRETERS = {"zsh", "bash", "sh", "env", "python3", "python", "node"}
 CLAUDE_HELPERS = {"daemon", "bg-pty-host", "bg-spare", "--chrome-native-host", "mcp", "doctor"}
 # ssh(1) options that take a value: `-o BatchMode=yes beaulink` names beaulink, not BatchMode.
 SSH_VALUE_OPTIONS = set("BbcDEeFIiJLlmOoPpQRSWw")
@@ -195,11 +195,10 @@ def describe(terminals, launcher, rows):
             if pid in seen:
                 continue
             seen.add(pid)
-            if pid != matches[0]:
-                found = program_of(by_pid[pid][2])
-                if found is not None:
-                    found = {**found, "pid": pid}
-                    break
+            found = program_of(by_pid[pid][2])
+            if found is not None:
+                found["pid"] = pid
+                break
             queue.extend(sorted(children.get(pid, [])))
         # Its own launcher, with nothing chosen below it yet: the menu still waits.
         result[identifier] = found or {"program": None, "launcher": True}
