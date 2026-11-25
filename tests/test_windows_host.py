@@ -251,19 +251,30 @@ class WindowsRoutingTest(unittest.TestCase):
         self.assertIn("@{Label='Claude · it''s'; Exe='C:\\Tools\\claude.exe'; Args=@(); Cwd=''}", script)
         self.assertIn("Read-Host '선택'", script)
         self.assertNotIn(HOST['label'], script)
-        # One choice runs straight away, with no menu.
-        one = decoded(self.flow.transfers.windows_launcher(HOST, server.windows_launcher_setting(
-            {'choices': LAUNCHER['choices'][:1]})))
-        self.assertNotIn('Read-Host', one)
-        self.assertIn("& $c.Exe @($c.Args)", one)
         # The board itself launched the SSH transport to this PC. No Mac observer RPC is needed.
-        self.terms.list = lambda: [{**meta, 'id': 'f' * 32, 'alive': True}]
+        row = {**meta, 'id': 'f' * 32, 'alive': True, 'typed': False}
+        self.terms.list = lambda: [row]
         self.terms.link_native = Mock(return_value=True)
         self.board.state[HOST['name']]['data']['codex'] = [{**ROW, 'startedAt': meta['createdAt'] + 1}]
         self.board.state[HOST['name']]['data']['claude'] = []
         with patch.object(self.flow.transfers, 'rpc', side_effect=AssertionError('no PC observer RPC')):
             self.flow.linked_terminals()
+            self.terms.link_native.assert_not_called()
+            row['typed'] = True
+            self.flow.linked_terminals()
         self.terms.link_native.assert_called_once_with('f' * 32, {**REF, 'cwd': ROW['cwd']}, confidence='estimated')
+
+        host['launcher'] = server.windows_launcher_setting({'choices': LAUNCHER['choices'][:1]})
+        self.flow.new_session({'host': HOST['name'], 'requestId': 'fixture-launch-one'})
+        _, one_argv, one_meta = created[-1]
+        one = decoded(one_argv)
+        self.assertNotIn('Read-Host', one)
+        self.assertIn("& $c.Exe @($c.Args)", one)
+        row = {**one_meta, 'id': 'e' * 32, 'alive': True, 'typed': False}
+        self.board.state[HOST['name']]['data']['codex'] = [{**ROW, 'startedAt': one_meta['createdAt'] + 1}]
+        self.terms.link_native.reset_mock()
+        self.flow.linked_terminals()
+        self.terms.link_native.assert_called_once_with('e' * 32, {**REF, 'cwd': ROW['cwd']}, confidence='estimated')
         self.board.state[HOST['name']]['ok'] = False
         self.assertFalse(self.flow.new_session_status(host, online=False)['available'])
         with self.assertRaisesRegex(RuntimeError, '연결할 수 없어'):

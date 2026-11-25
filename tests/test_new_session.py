@@ -20,6 +20,7 @@ import unittest
 from unittest.mock import patch
 
 import launch
+import launcher_programs
 import server
 import settings
 import terminal
@@ -477,6 +478,30 @@ class LinkNewSessionTest(unittest.TestCase):
         self.terminal['host'] = 'local'
         self.rows['local']['codex'] = [codex_row('1', 990), codex_row('2', 1000)]
         self.assertEqual([native['id'] for native in self.link()], [codex_row('2', 0)['id']])
+
+    def test_codex_named_launchers_route_by_child_program_unless_ssh_is_a_shell_tool(self):
+        local, remote = codex_row('1', 1003), codex_row('2', 1004)
+        self.rows['local']['codex'] = [local]
+        self.rows['remote']['codex'] = [remote]
+        ssh = (21, 20, 1002, '/usr/bin/ssh remote')
+        tool_ssh = [(21, 20, 1002, '/bin/zsh -c tool'), (22, 21, 1003, '/usr/bin/ssh remote')]
+        codex = '/opt/example/codex'
+        node = '/opt/example/node /opt/example/codex.js'
+        cases = [(codex, [ssh], 'ssh', 21, 'remote', remote),
+                 (node, [ssh], 'ssh', 21, 'remote', remote),
+                 (codex, [], 'codex', 20, 'local', local),
+                 (codex, tool_ssh, 'codex', 20, 'local', local),
+                 (node, tool_ssh + [(23, 20, 1002, '/vendor/codex')], 'codex', 23, 'local', local)]
+        for command, children, program, pid, host, candidate in cases:
+            with self.subTest(command=command, children=children):
+                self.terminal.pop('nativeSource', None)
+                self.terms.linked.clear()
+                self.terminal.update(host='local', program=None)
+                rows = [(20, 1, 1001, command), *children]
+                observed = launcher_programs.describe([self.terminal], command.split(), rows)[self.terminal['id']]
+                self.assertEqual((observed['program'], observed['pid']), (program, pid))
+                self.terminal.update(program=observed['program'], programHost=observed.get('sshHost'))
+                self.assertEqual(self.link(), [server.Workflow._native_of(host, 'codex', candidate)])
 
     def test_confirmed_program_clears_only_conflicting_estimates_and_relinks_on_next_list(self):
         socket = 'fixture-link-correction'
