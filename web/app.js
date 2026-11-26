@@ -1519,34 +1519,10 @@ function sessionRuntime(s, key, fetchedAt, following) {
     runtimeReadReason: live?.runtimeReadReason || null,
     listedPhase: s.phase, listedRuntimeKnown: s.runtimeKnown, listedRuntimeReason: s.runtimeReason };
 }
-// Visible Claude cards of one listing that share a worker id but are different
-// conversations (sessionId): once per listing array, which a new snapshot replaces.
-const sharedClaudeIds = new WeakMap();
-function claudeSharedIds(rows) {
-  let shared = sharedClaudeIds.get(rows);
-  if (shared) return shared;
-  const first = new Map();
-  shared = new Set();
-  for (const row of rows) {
-    if (row.boardDuplicateOf || !row.id || !row.sessionId) continue;
-    const id = (row.home || "") + "\0" + row.id;
-    if (!first.has(id)) first.set(id, row.sessionId);
-    else if (first.get(id) !== row.sessionId) shared.add(id);
-  }
-  sharedClaudeIds.set(rows, shared);
-  return shared;
-}
 function listedSessionKey(host, s) {
   // A Claude row listed without an id is told apart by its process (or folder and start).
-  let id = s.id || (s.agent === "claude"
-    ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "");
-  // Two cards reusing one worker id stay two cards (11/26: reopening the background
-  // one picked the other card by their common key).
-  const rows = host.data?.claude;
-  if (s.agent === "claude" && s.id && s.sessionId && !s.boardDuplicateOf && Array.isArray(rows) &&
-      claudeSharedIds(rows).has((s.home || "") + "\0" + s.id))
-    id += "#" + s.sessionId;
-  return [host.name, s.agent, s.home || "", id].join("|");
+  return [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
+    ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
 }
 function claudeDetailKey(key, row) {
   const transcript = row.sessionId || row.id;
@@ -13325,7 +13301,17 @@ function terminalMatchesDetail(terminal, s) {
 function sessionForTerminalDetail(terminal) {
   const source = terminalInfo(terminal).nativeSource;
   const background = source?.agent === "claude" && source.kind === "background";
-  const exact = allSessions().find((s) => (!background || s.kind === "background") && terminalMatchesDetail(terminal, s));
+  const sessions = allSessions();
+  const exact = sessions.find((s) => (!background || s.kind === "background") && terminalMatchesDetail(terminal, s));
+  // Two conversations reusing one worker id share a card key; the selection would land on
+  // the first of them, so the matched one opens by its own conversation (detail) key.
+  if (exact?.agent === "claude" && Number.isInteger(exact.listedIndex) &&
+      sessions.some((s) => s !== exact && s.key === exact.key && s.sessionId !== exact.sessionId)) {
+    const host = state.snapshot?.hosts?.find((item) => item.name === exact.host);
+    const row = host?.data?.claude?.[exact.listedIndex];
+    if (row && (row.kind === "interactive" || row.kind === "background"))
+      return listedSession(host, row, claudeDetailKey(exact.key, row), state.selected);
+  }
   if (exact || !background) return exact;
   // A merged background row can share the visible interactive card's key.
   for (const { host, row } of listedClaudeAliases()) {
