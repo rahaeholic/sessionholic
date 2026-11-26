@@ -10065,7 +10065,7 @@ async function suggestionAnswer(s, message, authEpoch) {
   let scan = Number.isInteger(message.recordOffset) ? message.recordOffset : 0, recent = !Number.isInteger(message.recordOffset);
   try {
     for (let page = 0; page < 8; page++) {
-      const params = new URLSearchParams({ ...sourceOf(s), bodyHash: message.bodyHash, offset: String(scan),
+      const params = new URLSearchParams({ ...questionSource(s), bodyHash: message.bodyHash, offset: String(scan),
         textOffset: String(Math.max(0, message.fullLength - SUGGESTION_TAIL)), recent: recent ? "1" : "0" });
       const data = await api(`/api/history/message?${params}`, { authEpoch });
       if (data?.readOnly !== true || data.error) break;
@@ -10964,7 +10964,7 @@ async function loadLongMessage(s, item) {
   longMessageControls(s, entry, item);
   try {
     for (let page = 0; page < 32 && current(); page++) {
-      const params = new URLSearchParams({ ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}), bodyHash: hash,
+      const params = new URLSearchParams({ ...questionSource(s), bodyHash: hash,
         offset: String(full.recordOffset ?? full.scanOffset), textOffset: String(full.textOffset), recent: full.recent ? "1" : "0" });
       const data = await api(`/api/history/message?${params}`, { authEpoch, signal: full.controller.signal });
       if (!current()) return;
@@ -11064,8 +11064,11 @@ function conversationWindowText(s, entry) {
   return `최근 질문·답변 ${CONVERSATION_MESSAGES}개까지 보입니다.` +
     (count ? ` 그보다 앞의 질문은 위의 '${count}'에서 찾을 수 있습니다.` : "");
 }
+// The saved-record reads (내 질문·전체 보기) take only host/agent/id/home/sessionId: the
+// execution kind and cwd sourceOf adds for a listed Claude conversation were refused (400).
 function questionSource(s) {
-  return { ...sourceOf(s), ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}) };
+  const { kind, cwd, ...source } = sourceOf(s);
+  return { ...source, ...(s.agent === "claude" && s.sessionId ? { sessionId: s.sessionId } : {}) };
 }
 const questionKey = (item) => `${item.recordOffset}:${item.bodyHash}`;
 const questionText = (text) => String(text || "").replace(/\s+/g, " ").trim();

@@ -15306,6 +15306,37 @@ function questionsConversation(answer = () => questionsReply(), { session = {}, 
   return { c, s, entry, calls, q, pin: c.get('question-pin'), count: c.get('question-pin-count'), text: c.get('question-pin-text') };
 }
 
+test('kind가 붙은 Claude 대화도 내 질문·전체 보기 요청에 서버가 받는 키만 보낸다', async () => {
+  // 11/26: listedKind Claude rows sent kind·cwd and the server answered 400.
+  const allowed = { questions: ['host', 'agent', 'id', 'home', 'sessionId', 'before'],
+    message: ['host', 'agent', 'id', 'home', 'sessionId', 'bodyHash', 'offset', 'textOffset', 'recent'] };
+  const calls = [];
+  const c = client(async (url) => { calls.push(url);
+    return url.startsWith('/api/history/questions?') ? questionsReply({ questions: [askedQuestion(3)] })
+      : { ok: true, status: 200, json: async () => ({}) }; }, noChatTimers);
+  const s = { host: 'workstation', agent: 'claude', home: '.claude', id: 'native-session', sessionId: 'abcdef12-3456',
+    listedKind: 'interactive', cwd: '/fixture/cwd', key: 'workstation|claude|.claude|native-session' };
+  c.state.snapshot = { hosts: [{ name: 'workstation', label: 'Workstation', ok: true, data: { claude: [s] } }] };
+  c.state.selected = s.key; c.state.authenticated = true;
+  const entry = c.chatEntry(s);
+  entry.data = { capability: { supported: true }, phase: 'idle', route: c.sourceOf(s) };
+  c.get('chat-composer').dataset.source = c.chatKey(entry.source);
+  c.drawDetail(s);
+  assert.equal(c.sourceOf(s).kind, 'interactive', 'the chat route itself still carries the kind');
+  await vm.runInContext('loadQuestions', c.context)(s);
+  const source = vm.runInContext('questionSource', c.context)(s);
+  assert.equal(source.kind, undefined); assert.equal(source.cwd, undefined);
+  assert.equal(source.sessionId, 'abcdef12-3456');
+  const reads = questionReads(calls);
+  assert.ok(reads.length);
+  for (const url of reads) {
+    const keys = [...new URL(url, 'https://fixture.invalid').searchParams.keys()];
+    assert.deepEqual(keys.filter((key) => !allowed.questions.includes(key)), [], url);
+  }
+  const message = new URLSearchParams({ ...source, bodyHash: 'a'.repeat(64), offset: '0', textOffset: '0', recent: '1' });
+  assert.deepEqual([...message.keys()].filter((key) => !allowed.message.includes(key)), []);
+});
+
 test('내 질문 줄은 질문을 알기 전엔 숨고, 읽은 뒤 마지막 질문·시각·개수(더 있으면 +)를 보인다', async () => {
   const { c, s, calls, q, pin, count, text } = questionsConversation(() =>
     questionsReply({ questions: [askedQuestion(3), askedQuestion(2)], complete: false, before: 200 }));
