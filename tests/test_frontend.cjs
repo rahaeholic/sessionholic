@@ -10989,6 +10989,43 @@ test('열린 터미널 목록에서 대화형 대표에 합쳐진 기존 Claude 
   assert.deepEqual(warnings, []);
 });
 
+test('같은 작업자 ID를 쓰는 서로 다른 Claude 대화 두 카드는 각자 자기 백그라운드 연결을 다시 연다', async () => {
+  // 11/26 후속: the interactive card listed first took the background terminal by the shared key.
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const shared = { host: 'workstation', agent: 'claude', id: 'fixture-worker', cwd: '/fixture/work', boardDuplicateOf: null };
+  const interactive = { ...shared, sessionId: '11111111-1111-4111-8111-111111111112', kind: 'interactive', phase: 'idle' };
+  const background = { ...shared, sessionId: '22222222-2222-4222-8222-222222222223', kind: 'background', phase: 'working' };
+  const terminal = { id: 'b'.repeat(32), host: shared.host, agent: 'claude', title: '기존 연결',
+    alive: true, mode: 'attach', nativeSource: { ...shared, sessionId: background.sessionId, kind: 'background' } };
+  c.state.authenticated = true;
+  c.state.snapshot = { version: 5, bootId: 'fixture-boot', hosts: [
+    { name: shared.host, label: 'Fixture', ok: true, data: { claude: [interactive, background], codex: [] } },
+  ] };
+  c.state.terminals = [terminal];
+  const warnings = [];
+  c.context.toast = (message) => warnings.push(message);
+  const cards = Array.from(c.allSessions());
+  assert.deepEqual(cards.map((s) => s.kind), ['interactive', 'background']);
+  assert.equal(new Set(cards.map((s) => s.key)).size, 2, 'two conversations, two keys');
+  c.renderTerminals();
+  c.get('running-terminals').events.click();
+  const list = c.get('running-list');
+  byClass(list, 'running-connections')[0].events.click();
+  byClass(list, 'running-terminal')[0].events.click();
+  await settle();
+  assert.equal(c.state.terminal?.id, terminal.id);
+  assert.equal(c.context.selectedSession().sessionId, background.sessionId);
+  assert.equal(c.state.selected, cards[1].key);
+  assert.deepEqual(warnings, []);
+  // A single card with that worker id keeps its plain key.
+  c.state.snapshot = { version: 6, bootId: 'fixture-boot', hosts: [
+    { name: shared.host, label: 'Fixture', ok: true, data: { claude: [{ ...interactive }], codex: [] } },
+  ] };
+  assert.equal(Array.from(c.allSessions())[0].key, 'workstation|claude||fixture-worker');
+});
+
 test('원이 알림 경로를 원이 화면으로 전달한다', () => {
   const c = client();
   const opened = [];

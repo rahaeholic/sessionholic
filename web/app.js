@@ -1519,10 +1519,34 @@ function sessionRuntime(s, key, fetchedAt, following) {
     runtimeReadReason: live?.runtimeReadReason || null,
     listedPhase: s.phase, listedRuntimeKnown: s.runtimeKnown, listedRuntimeReason: s.runtimeReason };
 }
+// Visible Claude cards of one listing that share a worker id but are different
+// conversations (sessionId): once per listing array, which a new snapshot replaces.
+const sharedClaudeIds = new WeakMap();
+function claudeSharedIds(rows) {
+  let shared = sharedClaudeIds.get(rows);
+  if (shared) return shared;
+  const first = new Map();
+  shared = new Set();
+  for (const row of rows) {
+    if (row.boardDuplicateOf || !row.id || !row.sessionId) continue;
+    const id = (row.home || "") + "\0" + row.id;
+    if (!first.has(id)) first.set(id, row.sessionId);
+    else if (first.get(id) !== row.sessionId) shared.add(id);
+  }
+  sharedClaudeIds.set(rows, shared);
+  return shared;
+}
 function listedSessionKey(host, s) {
   // A Claude row listed without an id is told apart by its process (or folder and start).
-  return [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
-    ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
+  let id = s.id || (s.agent === "claude"
+    ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "");
+  // Two cards reusing one worker id stay two cards (11/26: reopening the background
+  // one picked the other card by their common key).
+  const rows = host.data?.claude;
+  if (s.agent === "claude" && s.id && s.sessionId && !s.boardDuplicateOf && Array.isArray(rows) &&
+      claudeSharedIds(rows).has((s.home || "") + "\0" + s.id))
+    id += "#" + s.sessionId;
+  return [host.name, s.agent, s.home || "", id].join("|");
 }
 function claudeDetailKey(key, row) {
   const transcript = row.sessionId || row.id;
