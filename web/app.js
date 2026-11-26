@@ -1528,16 +1528,19 @@ function allSessions() {
   // The open conversation is read again every few seconds; its own read stands until then.
   const following = chatVisible() ? state.selected : null;
   for (const host of state.snapshot?.hosts || []) {
-    for (const s of [
-      ...(host.data?.claude || []),
-      ...(host.data?.codex || []),
-    ]) {
-      out.push(listedSession(host, s, listedSessionKey(host, s), following));
+    for (const agent of ["claude", "codex"]) {
+      for (const [index, s] of (host.data?.[agent] || []).entries()) {
+        if (agent === "claude" && s.boardDuplicateOf) continue;
+        const session = listedSession(host, s, listedSessionKey(host, s), following);
+        session.listedIndex = index;
+        out.push(session);
+      }
     }
   }
-  const listedByRecovery = new Map();
+  const listedByRecovery = new Map(), listedByPosition = new Map();
   for (const session of out) {
-    const identity = recoveryIdentity(session);
+    listedByPosition.set(JSON.stringify([session.host, session.agent, session.listedIndex]), session);
+    const identity = recoveryIdentity(session.boardSource || session);
     if (!identity) continue;
     const matches = listedByRecovery.get(identity) || [];
     matches.push(session);
@@ -1556,17 +1559,32 @@ function allSessions() {
   }
   for (const [identity, row] of retainedByKey) {
     if (!row) continue; // An ambiguous saved selector cannot become an actionable card.
-    const listed = listedByRecovery.get(identity);
-    if (listed) {
-      if (listed.length === 1 && sameRecoverySource(row, listed[0]) && sameRecoverySource(listed[0], row) &&
-          (row.cwd === listed[0].cwd || sameClaudeConversation(row, listed[0]))) {
-        listed[0].retained = true;
-        listed[0].closedReason = row.closedReason;
+    const decision = row.boardRecovery;
+    if (decision) {
+      if (decision.retainedAction === "merge") {
+        const listed = listedByPosition.get(JSON.stringify(decision.listedRow));
+        if (listed) {
+          listed.retained = true;
+          listed.closedReason = row.closedReason;
+        }
       }
-      continue;
+      if (decision.retainedAction !== "add") continue;
+      // Other recovery rows may already have supplied the card, including an older page.
+      if (row.kind === "interactive" && out.some((s) => s.listedIndex === undefined &&
+          s.kind === "interactive" && sameClaudeConversation(row, s))) continue;
+    } else {
+      const listed = listedByRecovery.get(identity);
+      if (listed) {
+        if (listed.length === 1 && sameRecoverySource(row, listed[0]) && sameRecoverySource(listed[0], row) &&
+            (row.cwd === listed[0].cwd || sameClaudeConversation(row, listed[0]))) {
+          listed[0].retained = true;
+          listed[0].closedReason = row.closedReason;
+        }
+        continue;
+      }
+      if (row.kind === "interactive" && out.some((s) => s.kind === "interactive" && sameClaudeConversation(row, s)))
+        continue;
     }
-    if (row.kind === "interactive" && out.some((s) => s.kind === "interactive" && sameClaudeConversation(row, s)))
-      continue;
     const host = (state.snapshot?.hosts || []).find((item) => item.name === row.host);
     if (!host) continue;
     // The default Claude account used an empty home in listed keys and draft storage.
@@ -1678,7 +1696,7 @@ function selectedSession() {
   if (!state.nativeSessions.size) for (const host of state.snapshot?.hosts || []) {
     if (!key.startsWith(host.name + "|")) continue;
     const matches = (row) => listedSessionKey(host, row) === key;
-    const row = host.data?.claude?.find(matches) || host.data?.codex?.find(matches);
+    const row = host.data?.claude?.find((row) => !row.boardDuplicateOf && matches(row)) || host.data?.codex?.find(matches);
     if (row) return listedSession(host, row, key, chatVisible() ? key : null);
   }
   return allSessions().find((s) => s.key === key) || heldSelectedSession();
@@ -13259,9 +13277,21 @@ function isInteractiveClaudeLauncher(info) {
 }
 function listedLauncherClaude(terminal) {
   // The terminal carries the transcript ID. Requests must use the collector's listed selector.
-  const rows = allSessions().filter((row) => row.kind === "interactive" && !row.recoverySource && !row.nativeSource &&
-    terminalMatchesDetail(terminal, row));
-  return rows.length === 1 ? rows[0] : null;
+  const candidate = (row) => row.kind === "interactive" && !row.recoverySource && !row.nativeSource &&
+    terminalMatchesDetail(terminal, row);
+  const decision = terminal?.boardLauncher, snapshot = state.snapshot;
+  if (decision && decision.bootId === snapshot?.bootId && decision.snapshotVersion === snapshot?.version) {
+    if (!decision.listedRow) return null;
+    const [host, agent, index] = decision.listedRow;
+    return allSessions().find((row) => row.host === host && row.agent === agent &&
+      row.listedIndex === index && candidate(row)) || null;
+  }
+  const rows = allSessions().filter(candidate);
+  if (rows.length !== 1) return null;
+  // A hidden duplicate can still make a launcher selector ambiguous.
+  const host = snapshot?.hosts?.find((item) => item.name === rows[0].host);
+  if (host?.data?.claude?.some((row) => row.boardDuplicateOf && candidate({ ...row, host: host.name }))) return null;
+  return rows[0];
 }
 function launcherConversation(terminal) {
   const info = terminalInfo(terminal), source = info.nativeSource;

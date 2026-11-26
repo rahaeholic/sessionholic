@@ -73,6 +73,7 @@
   "terminal_input.py",
   "termination_jobs.py",
   "tests/chat_preview_fixture.py",
+  "tests/parity/claude-board.json",
   "tests/preview_fixture.py",
   "tests/test_agent_router.py",
   "tests/test_attachments.py",

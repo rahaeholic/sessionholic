@@ -125,6 +125,40 @@ class RecoveryHttpTest(unittest.TestCase):
         self.assertEqual(self.terms.inputs, 0)
         self.assertTrue(all(call[1] == 'recover_session' for call in self.calls))
 
+    def test_claude_board_display_contract_matches_shared_fixtures(self):
+        for path in sorted(Path(__file__).with_name('parity').glob('*.json')):
+            for case in json.loads(path.read_text(encoding='utf-8')):
+                with self.subTest(case=case['name']):
+                    snapshot = case['snapshot']
+                    recoveries = snapshot['recoverySessions']
+                    expected = case['expected']
+                    self.terms.records = copy.deepcopy(case['terminals'])
+                    with patch.object(self.board, 'snapshot', side_effect=lambda: copy.deepcopy(snapshot)), \
+                            patch.object(self.board, 'version', snapshot['version']), \
+                            patch.object(self.httpd, 'boot_id', snapshot['bootId']), \
+                            patch.object(server.Handler, 'recovery_sessions',
+                                         side_effect=lambda: (copy.deepcopy(recoveries), None)):
+                        result = self.snapshot()
+                        status, terminals = self.request('GET', '/api/terminals')
+                    self.assertEqual(status, 200)
+                    self.assertEqual(len(result['hosts']), len(snapshot['hosts']))
+                    for actual_host, input_host, fields in zip(result['hosts'], snapshot['hosts'], expected['claude']):
+                        rows = actual_host['data']['claude']
+                        self.assertEqual([{key: row[key] for key in ('boardSource', 'boardDuplicateOf')}
+                                          for row in rows], fields)
+                        self.assertEqual([{key: row[key] for key in original}
+                                          for row, original in zip(rows, input_host['data']['claude'])],
+                                         input_host['data']['claude'])
+                    self.assertEqual([row['boardRecovery'] for row in result['recoverySessions']], expected['recoveries'])
+                    self.assertEqual([{key: row[key] for key in original}
+                                      for row, original in zip(result['recoverySessions'], recoveries)], recoveries)
+                    self.assertEqual({row['id']: row.get('boardLauncher') for row in terminals['terminals']},
+                                     expected['launchers'])
+                    self.assertEqual([{key: val for key, val in row.items() if key != 'boardLauncher'}
+                                      for row in terminals['terminals']], case['terminals'])
+                    self.assertEqual(self.terms.records, case['terminals'])
+                    self.assert_no_execution()
+
     def test_recover_authentication_and_untrusted_browser_references_never_reach_native(self):
         self.assertEqual(self.recover(authorized=False)[0], 401)
         for change in ({'id': '019aaaaa-0000-7000-8000-000000000099'}, {'home': '.codex-other'},

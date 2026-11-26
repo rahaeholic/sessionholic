@@ -3364,6 +3364,130 @@ STORE_FIELDS = ("sessionLabels", "sessionSeen", "sessionTidied", "sessionRemoved
                 "sessionPinned", "quickReplyPreferences", "savedPrompts")
 
 
+CLAUDE_TRANSCRIPT_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def board_display_source(row):
+    agent = row.get("agent")
+    source = {"host": row.get("host"), "agent": agent, "id": Board._listed_id(row, agent),
+              "home": row.get("home") or (".claude" if agent == "claude" else None)}
+    if agent == "claude" and row.get("sessionId"):
+        source["sessionId"] = row["sessionId"]
+    return source
+
+
+def claude_display_conversation(source):
+    transcript = source.get("sessionId") or source["id"]
+    if (source["agent"] == "claude" and source["host"] and isinstance(source["home"], str)
+            and isinstance(transcript, str)
+            and CLAUDE_TRANSCRIPT_UUID.fullmatch(transcript)):
+        return source["host"], source["home"], transcript
+    return None
+
+
+def board_recovery_identity(source):
+    host, agent, home, identifier = (source[key] for key in ("host", "agent", "home", "id"))
+    if (not isinstance(host, str) or not host or not isinstance(identifier, str) or not identifier
+            or not isinstance(home, str) or not home or agent not in ("codex", "claude")
+            or agent == "claude" and home != ".claude"):
+        return None
+    return host, agent, home, identifier
+
+
+def board_listed_rows(snapshot, agents):
+    first_by_conversation = {}
+    for host in snapshot["hosts"]:
+        for agent in agents:
+            for index, row in enumerate((host.get("data") or {}).get(agent, [])):
+                position = (host["name"], agent, index)
+                source = board_display_source({**row, "host": host["name"], "agent": agent})
+                conversation = claude_display_conversation(source)
+                first = first_by_conversation.setdefault(conversation, position) if conversation else position
+                yield position, row, source, first if first != position else None
+
+
+def annotate_board_snapshot(snapshot, recoveries):
+    """Add display decisions to the HTTP snapshot's own copy."""
+    listed_by_identity, interactive = {}, {}
+    for position, row, source, duplicate_of in board_listed_rows(snapshot, ("claude", "codex")):
+        if source["agent"] == "claude":
+            row["boardSource"] = source
+            row["boardDuplicateOf"] = duplicate_of
+            conversation = claude_display_conversation(source)
+            if conversation and row.get("kind") == "interactive":
+                interactive[conversation] = duplicate_of or position
+            if duplicate_of is not None:
+                continue
+        identity = board_recovery_identity(source)
+        if identity:
+            listed_by_identity.setdefault(identity, []).append((position, row, source))
+
+    missing = object()
+    for row in recoveries:
+        source = board_display_source(row)
+        identity = board_recovery_identity(source)
+        conversation = claude_display_conversation(source)
+        matches = listed_by_identity.get(identity, [])
+        position, action = None, "add"
+        if matches:
+            action = "hide"
+            compatible = []
+            for listed_position, listed, listed_source in matches:
+                same_transcript = source.get("sessionId") == listed_source.get("sessionId")
+                same_place = (row.get("cwd", missing) == listed.get("cwd", missing)
+                              or conversation and conversation == claude_display_conversation(listed_source))
+                if (same_transcript or not source.get("sessionId")) and (same_place or not row.get("cwd")):
+                    compatible.append(listed_position)
+                if len(matches) == 1 and same_transcript and same_place:
+                    action = "merge"
+            if len(compatible) == 1:
+                position = compatible[0]
+        elif identity and row.get("kind") == "interactive" and conversation in interactive:
+            position, action = interactive[conversation], "hide"
+        row["boardRecovery"] = {"listedRow": position, "retainedAction": action}
+
+
+def board_launcher_matches(source, native, row, listed):
+    conversation = claude_display_conversation(source)
+    if conversation and conversation == claude_display_conversation(listed):
+        return True
+    identity = board_recovery_identity(source)
+    return (bool(identity) and identity == board_recovery_identity(listed)
+            and (native.get("cwd") or None) == (row.get("cwd") or None)
+            and source.get("sessionId") == listed.get("sessionId"))
+
+
+def annotate_board_launchers(board, records, boot_id):
+    launchers = []
+    for index, record in enumerate(records):
+        info = {**(record.get("metadata") or {}), **record}
+        native = info.get("nativeSource")
+        if (info.get("mode") == "new-session" and isinstance(native, dict)
+                and native.get("agent") == "claude" and native.get("kind") == "interactive"):
+            launchers.append((index, native, info.get("linkConfidence")))
+    if not launchers:
+        return records
+
+    snapshot = board.snapshot()
+    listed_by_host = {}
+    for position, row, source, duplicate_of in board_listed_rows(snapshot, ("claude",)):
+        if row.get("kind") == "interactive" and not row.get("recoverySource") and not row.get("nativeSource"):
+            listed_by_host.setdefault(source["host"], []).append((position, row, source, duplicate_of))
+    result = list(records)
+    for index, native, confidence in launchers:
+        source = board_display_source(native)
+        host = source["host"]
+        rows = listed_by_host.get(host, ()) if confidence == "exact" and isinstance(host, str) else ()
+        # A hidden duplicate still counts toward ambiguity but cannot be a card target.
+        matches = [position if duplicate_of is None else None for position, row, listed, duplicate_of in rows
+                   if board_launcher_matches(source, native, row, listed)]
+        result[index] = {**records[index], "boardLauncher": {
+            "bootId": boot_id, "snapshotVersion": snapshot["version"],
+            "listedRow": matches[0] if len(matches) == 1 else None,
+        }}
+    return result
+
+
 class SnapshotResponses:
     """The /api/snapshot body, kept while nothing it is made of changed: each open page asks
     every few seconds, and a body was a copy of every host's list per store, six store reads
@@ -4038,6 +4162,7 @@ class Handler(BaseHTTPRequestHandler):
                                 self.server.terminals.restore_forgotten(forgotten)
                             result["inputCleanupPending"] = True
                     workflow.describe_launchers(records)
+                    result["terminals"] = annotate_board_launchers(self.server.board, records, self.server.boot_id)
                     return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)
                 if match:
@@ -4246,6 +4371,7 @@ class Handler(BaseHTTPRequestHandler):
             kept, kept_status = [], {"ok": False}
         # Keep the cursor anchored to the ordinary indexed page for existing clients.
         recoveries.extend(kept)
+        annotate_board_snapshot(snapshot, recoveries)
         return {**snapshot, "bootId": self.server.boot_id, "quickReplyPreferences": preferences,
                 "savedPrompts": prompts, "recoverySessions": recoveries, "retainedNextCursor": next_cursor,
                 "retainedUserCatalog": kept_status,

@@ -2046,6 +2046,43 @@ test('a linked Claude launcher opens only its listed conversation and uses the l
   }
 });
 
+for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) => file.endsWith('.json'))) {
+  const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'parity', file), 'utf8'));
+  for (const { name, snapshot, terminals, expected } of cases) {
+    test(`Claude board parity: ${name}`, () => {
+      const c = client(undefined, noChatTimers);
+      const { isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo } =
+        vm.runInContext('({ isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo })', c.context);
+      const launcherCards = (records) => Object.fromEntries(records.map((terminal) =>
+        [terminal.id, isInteractiveClaudeLauncher(terminalInfo(terminal)) ? listedLauncherClaude(terminal)?.key || null : null]));
+      const cardKeys = () => Array.from(c.allSessions(), (row) => row.key);
+      const annotatedTerminals = terminals.map((terminal) => expected.launchers[terminal.id]
+        ? { ...terminal, boardLauncher: expected.launchers[terminal.id] } : terminal);
+      c.state.snapshot = snapshot;
+      assert.deepEqual(cardKeys(), expected.legacyCardKeys || expected.cardKeys);
+      assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys);
+
+      c.state.snapshot = { ...snapshot,
+        hosts: snapshot.hosts.map((host, h) => ({ ...host, data: { ...host.data,
+          claude: host.data.claude.map((row, i) => ({ ...row, ...expected.claude[h][i] })) } })),
+        recoverySessions: snapshot.recoverySessions.map((row, i) => ({ ...row, boardRecovery: expected.recoveries[i] })) };
+      assert.deepEqual(cardKeys(), expected.cardKeys);
+      assert.deepEqual(Array.from(c.allSessions().filter((row) => row.retained), (row) => row.key), expected.retainedCardKeys);
+      assert.deepEqual(launcherCards(annotatedTerminals), expected.launcherCardKeys);
+      assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys, 'a terminal response without hints keeps legacy matching');
+
+      const confirmed = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow);
+      if (confirmed) {
+        const unlinked = { ...confirmed, boardLauncher: { ...confirmed.boardLauncher, listedRow: null } };
+        assert.equal(listedLauncherClaude(unlinked), null, 'a current no-match decision is authoritative');
+        c.state.snapshot.version++;
+        assert.equal(listedLauncherClaude(unlinked)?.key, expected.launcherCardKeys[confirmed.id],
+          'a hint from an older snapshot falls back to the current listed rows');
+      }
+    });
+  }
+}
+
 test('environment changes live in a native disclosure that starts closed and retains the existing controls', () => {
   const c = client(undefined, noChatTimers);
   const details = c.buildContinuePanel({ host: 'workstation', agent: 'codex', home: '.codex-example', id: 'session', key: 'source-key' });
