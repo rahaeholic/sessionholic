@@ -9413,7 +9413,7 @@ test('a Claude interactive row without a worker id uses its sessionId for chat, 
   c.context.EventSource = FakeEventSource;
   const row = { agent: 'claude', id: '', sessionId: sid, pid: 42, cwd: '/w', phase: 'working', kind: 'interactive' };
   c.state.snapshot = { hosts: [{ name: source.host, ok: true, data: { claude: [row] } }],
-    recoverySessions: [{ ...row, ...source, home: '.claude', retained: true }] };
+    recoverySessions: [{ ...row, ...source, home: '.claude', phase: 'idle', retained: true }] };
   c.state.authenticated = true;
   c.state.capabilities = { suggestedReplies: true };
   const [s, duplicate] = c.allSessions();
