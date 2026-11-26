@@ -3632,6 +3632,19 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/api/chat/send", "/api/chat/state"):
             sys.stderr.write(f"{self.log_date_time_string()} {self.command} {path} disconnected {phase}\n")
 
+    def note_chat_refusal(self, code, data):
+        """Why a chat read/send was refused: 11/26 a run of /api/chat/state 409s left only
+        the status, so the cause could not be found afterwards."""
+        path = urlparse(getattr(self, "path", "") or "").path
+        if path not in ("/api/chat/send", "/api/chat/state"):
+            return
+        from launch import scrub_text
+        exc = sys.exc_info()[1]
+        reason = " ".join(scrub_text(str(data.get("error") or "")).split())[:160]
+        sys.stderr.write("%s %s %s refused %s code=%s type=%s reason=%s\n" % (
+            self.log_date_time_string(), self.command, path, code, data.get("code") or "-",
+            type(exc).__name__ if exc is not None else "-", reason or "-"))
+
     def parse_request(self):
         self.started = time.monotonic()
         return super().parse_request()
@@ -3674,6 +3687,8 @@ class Handler(BaseHTTPRequestHandler):
             raise
 
     def send_json(self, code, data, extra=None):
+        if code >= 400 and isinstance(data, dict):
+            self.note_chat_refusal(code, data)
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_body(code, body, "application/json; charset=utf-8", {"Cache-Control": "no-store", **(extra or {})},
                        compress=True)
