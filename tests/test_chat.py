@@ -1295,6 +1295,38 @@ class ChatClaudeTest(unittest.TestCase):
             state = self.state(source=ref)
         self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
 
+    def test_interactive_new_session_menu_before_program_refresh_shows_connecting(self):
+        self.row.update(id='', kind='interactive', status='idle', startedAt=1000,
+                        runtimeReadToken='a' * 16 + ':1')
+        stream = SimpleNamespace(name=HOST['name'], stopping=False)
+        self.board.streams[stream.name] = stream
+        self.board.apply_live(stream, {'claude': [self.row], 'codex': []})
+        ref = {'host': HOST['name'], 'agent': 'claude', 'id': CLAUDE_SID, 'sessionId': CLAUDE_SID}
+        launcher = {'id': TERMINAL_ID, 'host': HOST['name'], 'mode': 'new-session', 'program': None,
+                    'programMenu': True, 'typed': True, 'createdAt': 999, 'alive': True, 'closed': False}
+        self.terms.rows = [launcher]
+
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertFalse(state['capability']['supported'])
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_CONNECTING)
+        self.assertTrue(state['capability']['connecting'])
+        self.assertEqual(self.rejected(source=ref), chat.CLAUDE_EXTERNAL)
+        self.assertEqual(self.terms.pastes, [])
+
+        # An unrelated launcher program does not claim the new Claude session.
+        self.terms.rows = [{**launcher, 'program': 'codex'}]
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertFalse(state['capability'].get('connecting', False))
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+
+        # Exact linkage restores normal input capability.
+        self.terminal(id=CLAUDE_SID, kind='interactive', home=None)
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertTrue(state['capability']['supported'])
+
     def test_new_launcher_proves_its_pane_before_claude_chat_can_paste(self):
         import launcher_programs as lp
 

@@ -999,9 +999,13 @@ class Chat:
             metadata = row.get('metadata') or {}
             native = row.get('nativeSource') or metadata.get('nativeSource')
             created = row.get('createdAt')
+            program = row.get('program', metadata.get('program'))
+            waiting_for_program = (program is None
+                                   and row.get('programMenu', metadata.get('programMenu')) is True
+                                   and row.get('typed', metadata.get('typed')) is True)
             if (row.get('mode', metadata.get('mode')) == 'new-session'
                     and row.get('alive') and not row.get('closed') and not native
-                    and row.get('program', metadata.get('program')) == 'claude'
+                    and (program == 'claude' or waiting_for_program)
                     and row.get('host', metadata.get('host')) == source.get('host')
                     and isinstance(created, int) and not isinstance(created, bool)
                     and 0 <= started - created <= CLAUDE_LINK_WINDOW_SECONDS):
