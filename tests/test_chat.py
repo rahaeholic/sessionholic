@@ -1260,6 +1260,23 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(result['receipt']['deliveryVerified'])
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '안녕하세요', True)])
 
+    def test_first_prompt_attachment_matches_advertised_support(self):
+        self.row.update(kind='interactive', status='idle')
+        self.board.poll(HOST)
+        self.terminal(id=CLAUDE_SID, kind='interactive', home=None)
+        self.terms.screen = '──────────\n❯ \n──────────'
+
+        with patch.object(self.chat, 'rpc', wraps=self.chat.rpc) as rpc:
+            state = self.chat.state({'source': CLAUDE_REF})
+            self.assertTrue(state['capability']['attachments'])
+            uploaded = self.chat.upload(CLAUDE_REF, '첫 파일.txt', b'fixture')
+
+        self.assertEqual(uploaded['attachment']['name'], '첫 파일.txt')
+        read_calls = [call for call in rpc.call_args_list if call.args[1] == 'read']
+        self.assertEqual(len(read_calls), 2)
+        self.assertTrue(read_calls[0].kwargs.get('allowMissingTranscript'))
+        self.assertTrue(read_calls[1].kwargs.get('allowMissingTranscript'))
+
     def test_interactive_new_session_shows_connecting_only_during_exact_link_window(self):
         self.row.update(id='', kind='interactive', status='idle', startedAt=1000,
                         runtimeReadToken='a' * 16 + ':1')
