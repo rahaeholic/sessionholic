@@ -569,9 +569,15 @@ class Chat:
         """The conversation view. A watcher read (watching=True) also carries the receipts
         clients recently asked for, so their next read is answered from the cache; a read
         still in progress is shared by readers asking for a subset of its receipts."""
-        source, host = self.source(data.get('source'), sending=False)
+        ref = data.get('source')
+        source, host = self.source(ref, sending=False)
         identity = self.identity(source)
         key = self.state_key(source)
+        def client_view(view):
+            # Legacy clients still receive their original route shape even when
+            # the representative was resolved with an exact execution kind.
+            return {**view, 'route': identity} if source.get('listedKind') and not ref.get('kind') else view
+
         request_id = data.get('requestId')
         if request_id is not None and (not isinstance(request_id, str) or not STATE_REQUEST.fullmatch(request_id)):
             raise ValueError('메시지 요청 식별자가 올바르지 않습니다.')
@@ -611,9 +617,9 @@ class Chat:
                     sequence, epoch = self.read_sequence, self.cache_epoch
                     read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'), source.get('sessionId'))
         if cached:
-            return self._cached_view(cached[1], request_ids, recheck_pane=True)
+            return client_view(self._cached_view(cached[1], request_ids, recheck_pane=True))
         if shared is not None:
-            return self._shared_view(shared, request_ids)
+            return client_view(self._shared_view(shared, request_ids))
         if watching:
             kwargs = {'requestIds': carried} if carried else {}
         else:
@@ -633,7 +639,7 @@ class Chat:
                 if self.reads.get(key) is read:
                     del self.reads[key]
             read.done.set()
-        return self._cached_view(response, request_ids)
+        return client_view(self._cached_view(response, request_ids))
 
     def _shared_view(self, shared, request_ids):
         """The asked receipts from another reader's read; its failure is this reader's too."""

@@ -1421,5 +1421,96 @@
       },
       "launcherCwd": "/fixture/right"
     }
+  },
+  {
+    "name": "다른 UUID가 옛 Claude 식별자를 재사용해도 복구는 현재 UUID를 가리킴",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 112,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "11111111-1111-4111-8111-111111111113",
+                "kind": "interactive",
+                "cwd": "/fixture/right",
+                "phase": "idle"
+              },
+              {
+                "agent": "claude",
+                "id": "fixture-current-worker",
+                "sessionId": "11111111-1111-4111-8111-111111111112",
+                "kind": "interactive",
+                "cwd": "/fixture/right",
+                "phase": "idle"
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": [
+        {
+          "agent": "claude",
+          "id": "fixture-worker",
+          "sessionId": "11111111-1111-4111-8111-111111111112",
+          "kind": "interactive",
+          "cwd": "/fixture/right",
+          "phase": "idle",
+          "host": "fixture-host",
+          "home": ".claude",
+          "retained": true,
+          "closedReason": "released"
+        }
+      ]
+    },
+    "terminals": [],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "fixture-worker",
+              "sessionId": "11111111-1111-4111-8111-111111111113"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "fixture-current-worker",
+              "sessionId": "11111111-1111-4111-8111-111111111112"
+            },
+            "boardDuplicateOf": null
+          }
+        ]
+      ],
+      "recoveries": [
+        {
+          "listedRow": ["fixture-host", "claude", 1],
+          "retainedAction": "hide"
+        }
+      ],
+      "launchers": {},
+      "launcherCardKeys": {},
+      "cardKeys": [
+        "fixture-host|claude||fixture-worker",
+        "fixture-host|claude||fixture-current-worker"
+      ],
+      "retainedCardKeys": [],
+      "reusedRecoveryTarget": "fixture-host|claude||fixture-current-worker"
+    }
   }
 ]

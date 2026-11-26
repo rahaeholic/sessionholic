@@ -1570,21 +1570,25 @@ class Board:
                 matches = [row for row in matches if row.get("kind") == kind]
                 if ref.get("cwd"):
                     matches = [row for row in matches if row.get("cwd") == ref["cwd"]]
+            shared_conversation = False
             if agent == "claude" and len(matches) > 1:
                 # Multiple processes may publish the same route for one conversation.
-                # Different execution kinds or folders need an exact selector.
+                # A legacy selector opens the first row of that conversation.
                 first = matches[0]
                 transcript = first.get("sessionId") or identifier
                 if (not isinstance(transcript, str) or not CLAUDE_TRANSCRIPT_UUID.fullmatch(transcript)
                         or any((row.get("sessionId") or identifier) != transcript
-                               or row.get("kind") != first.get("kind") or row.get("cwd") != first.get("cwd")
+                               or row.get("cwd") != first.get("cwd")
                                for row in matches[1:])):
                     raise ValueError("같은 식별자의 작업이 여러 개입니다. 목록에서 다시 선택해 주세요.")
+                shared_conversation = any(row.get("kind") != first.get("kind") for row in matches[1:])
             if matches:
                 result = {**copy.deepcopy(matches[0]), "id": identifier, "host": host["name"],
                           "hostLabel": host["label"], "online": host["ok"], "fetchedAt": host["fetchedAt"]}
                 if kind:
                     result["listedKind"] = kind
+                elif shared_conversation and result.get("kind"):
+                    result["listedKind"] = result["kind"]
                 return result
         raise ValueError("목록에서 작업을 다시 선택해 주세요.")
 
@@ -3477,7 +3481,7 @@ def annotate_board_snapshot(snapshot, recoveries):
                         and source.get("sessionId") == listed_source.get("sessionId")
                         and same_place(row, representative, conversation, listed_source)):
                     action = "merge"
-        elif identity and conversation in listed_by_conversation:
+        if position is None and identity and conversation in listed_by_conversation:
             position, action = listed_by_conversation[conversation], "hide"
         row["boardRecovery"] = {"listedRow": position, "retainedAction": action}
 

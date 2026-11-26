@@ -3656,7 +3656,7 @@ function renderDetailTerminal(s) {
   if (!s || $("detail").dataset?.key !== s.key) return;
   const box = $("detail-terminal");
   if (!box) return;
-  const terminal = terminalForSession(s);
+  const terminal = terminalForOpenDetail(s);
   box.hidden = !terminal;
   const mark = box.querySelector?.(".terminal-mark-label");
   if (mark) mark.textContent = terminalEstimated(terminal) ? "터미널 연결 추정" : "터미널 열림";
@@ -13399,8 +13399,12 @@ function terminalMatchesOpenDetail(terminal, session) {
   if (!session || !terminalMatchesDetail(terminal, session)) return false;
   const info = terminalInfo(terminal);
   if (isInteractiveClaudeLauncher(info)) {
-    const listed = launcherDetailSession(terminal);
-    if (session.listedKind || listed?.listedKind) return listed?.key === session.key;
+    const listed = listedLauncherClaude(terminal);
+    if (session.listedKind || listed?.listedKind) {
+      if (!listed || session.kind !== "interactive" || !session.key) return false;
+      const detailKey = session.key.startsWith("claude-detail:") ? session.key : claudeDetailKey(session.key, session);
+      return claudeDetailKey(listed.key, listed) === detailKey;
+    }
   }
   const kind = info.nativeSource?.kind;
   return !session.listedKind || !kind || session.listedKind === kind;

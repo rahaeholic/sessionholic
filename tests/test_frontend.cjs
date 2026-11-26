@@ -2156,6 +2156,19 @@ for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) 
         await settle();
         const older = { ...annotatedTerminals[0], boardLauncher: { ...annotatedTerminals[0].boardLauncher, snapshotVersion: -1 } };
         for (const terminal of [annotatedTerminals[0], terminals[0], older]) {
+          if (expected.representativeKind === 'interactive') {
+            const open = c.context.openTerminal;
+            const prepare = c.context.preparePlan;
+            const calls = [];
+            c.context.openTerminal = (opened, options) => calls.push([opened.id, options.inline.key]);
+            c.context.preparePlan = () => assert.fail('the existing launcher must be reused');
+            c.state.terminals = [terminal];
+            c.goToSessionTerminal(rawKey);
+            vm.runInContext('openChatTerminal', c.context)(selectedSession());
+            assert.deepEqual(calls, [[terminal.id, rawKey], [terminal.id, rawKey]]);
+            c.context.openTerminal = open;
+            c.context.preparePlan = prepare;
+          }
           reads.length = 0;
           c.openNativeChat(terminal);
           assert.equal(selectedSession().kind, 'interactive');
@@ -2166,6 +2179,15 @@ for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) 
           assert.ok(reads.some((source) => source.kind === 'interactive'), 'the detail API requests the interactive kind');
           assert.equal(selectedSession().phase, expected.runtimePhases.interactive);
           assert.equal(selectedSession().runtimeObservation.phase, expected.runtimePhases.interactive);
+          const annotated = c.state.snapshot;
+          const reduced = { ...annotated, version: annotated.version + 1,
+            hosts: annotated.hosts.map((host) => ({ ...host, data: { ...host.data,
+              claude: host.data.claude.filter((row) => row.kind === 'interactive').map((row) => ({ ...row, boardDuplicateOf: null })) } })) };
+          c.state.snapshot = reduced;
+          c.state.terminals = [terminal];
+          assert.equal(vm.runInContext('terminalForOpenDetail', c.context)(selectedSession()).id, terminal.id,
+            'the same runtime remains attached after its sibling leaves the snapshot');
+          c.state.snapshot = annotated;
           c.requestSessionOpen(url);
           assert.equal(c.state.selected, rawKey, 'the original notification still opens the representative');
           assert.equal(selectedSession().kind, expected.representativeKind);
@@ -2221,6 +2243,15 @@ for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) 
           await settle();
           assert.ok(reads.some((source) => source.cwd === expected.launcherCwd && source.kind === 'interactive'));
         }
+      }
+      if (expected.reusedRecoveryTarget) {
+        c.state.authenticated = true;
+        renderRecoveries();
+        assert.equal(c.get('session-recoveries').hidden, true);
+        await openRecovery(c.state.snapshot.recoverySessions[0]);
+        assert.equal(c.state.selected, expected.reusedRecoveryTarget);
+        assert.equal(c.state.nativeSessions.size, 0);
+        assert.deepEqual(cardKeys(), expected.cardKeys);
       }
 
       const confirmed = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow);

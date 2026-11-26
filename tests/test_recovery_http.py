@@ -224,8 +224,8 @@ class RecoveryHttpTest(unittest.TestCase):
                 self.assertEqual({row['kind']: row['runtimeObservation']['phase']
                                   for row in snapshot['hosts'][0]['data']['claude']}, phases)
                 ref = {'host': HOST['name'], 'agent': 'claude', 'id': sid, 'sessionId': sid}
-                with self.assertRaisesRegex(ValueError, '여러 개'):
-                    self.board.source(ref)
+                representative = rows[0]['kind']
+                self.assertEqual(self.board.source(ref)['kind'], representative)
                 kinds = ('background', 'interactive')
                 resolved = [self.board.source({**ref, 'kind': kind}) for kind in kinds]
                 self.assertEqual(tuple(row['kind'] for row in resolved), kinds)
@@ -253,6 +253,23 @@ class RecoveryHttpTest(unittest.TestCase):
                     rpc_kinds.append(kind)
                     return {'phase': phases[kind], 'runtimeKnown': True, 'messages': [], 'capabilities': {}}
 
+                self.terms.records = []
+                legacy_ref = {key: value for key, value in ref.items() if key != 'sessionId'}
+                for recovery_present in (True, False):
+                    with self.subTest(recovery_present=recovery_present), \
+                            patch.object(self.flow.recoveries, 'get', wraps=self.flow.recoveries.get) as recover, \
+                            patch.object(self.flow.transfers, 'rpc', side_effect=read_state):
+                        if not recovery_present:
+                            recover.return_value = None
+                        for source in (legacy_ref, ref):
+                            code, state = self.request('POST', '/api/chat/state', {'source': source})
+                            self.assertEqual(code, 200)
+                            self.assertEqual(state['phase'], phases[representative])
+                            self.assertEqual(state['route'], {**legacy_ref, 'home': None})
+                        recover.assert_not_called()
+                        self.assertEqual(rpc_kinds.pop(), representative)
+                        self.httpd.chat._forget_state(resolved[1])
+
                 for terminals in ([attach, launcher], [launcher, attach]):
                     self.terms.records = terminals
                     with patch.object(self.flow.transfers, 'rpc', side_effect=read_state), \
@@ -275,6 +292,26 @@ class RecoveryHttpTest(unittest.TestCase):
                     self.assertTrue(all(key not in self.httpd.chat.cache for key in keys))
                 self.assertEqual(tuple(rpc_kinds), kinds * 2)
                 self.assert_no_execution()
+
+    def test_recovery_tracks_claude_uuid_when_an_old_worker_id_is_reused(self):
+        sid = '11111111-1111-4111-8111-111111111112'
+        row = {'agent': 'claude', 'id': 'fixture-current-worker', 'sessionId': sid,
+               'kind': 'interactive', 'cwd': '/fixture/right'}
+        saved = {**row, 'host': HOST['name'], 'id': 'fixture-worker'}
+        reused = {**row, 'id': saved['id'], 'sessionId': '11111111-1111-4111-8111-111111111113'}
+        self.flow.recoveries.remember(saved, closed_reason='released')
+        for index, rows in ((0, [row]), (1, [reused, row]), (0, [row, reused])):
+            with self.subTest(index=index, count=len(rows)):
+                collected = collector.claude_session_rows(rows, [], {}, transcripts={})
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': collected}):
+                    self.assertTrue(self.board.poll(HOST))
+                result = self.snapshot()
+                recovery = next(item for item in result['recoverySessions']
+                                if item['id'] == saved['id'] and item.get('sessionId') == sid)
+                self.assertEqual(recovery['closedReason'], 'released')
+                self.assertEqual(recovery['boardRecovery'], {'listedRow': [HOST['name'], 'claude', index],
+                                                            'retainedAction': 'hide'})
+        self.assert_no_execution()
 
     def test_launcher_preserves_folder_when_non_uuid_worker_is_reused(self):
         row = {'agent': 'claude', 'id': 'fixture-worker', 'sessionId': 'fixture-transcript',
