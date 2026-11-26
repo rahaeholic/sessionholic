@@ -1237,6 +1237,40 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(result['receipt']['deliveryVerified'])
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '안녕하세요', True)])
 
+    def test_interactive_new_session_shows_connecting_only_during_exact_link_window(self):
+        self.row.update(id='', kind='interactive', status='idle', startedAt=1000,
+                        runtimeReadToken='a' * 16 + ':1')
+        stream = SimpleNamespace(name=HOST['name'], stopping=False)
+        self.board.streams[stream.name] = stream
+        self.board.apply_live(stream, {'claude': [self.row], 'codex': []})
+        ref = {'host': HOST['name'], 'agent': 'claude', 'id': CLAUDE_SID, 'sessionId': CLAUDE_SID}
+        launcher = {'id': TERMINAL_ID, 'host': HOST['name'], 'mode': 'new-session', 'program': 'claude',
+                    'createdAt': 999, 'alive': True, 'closed': False}
+        self.terms.rows = [launcher]
+
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertFalse(state['capability']['supported'])
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_CONNECTING)
+        self.assertEqual(self.rejected(source=ref), chat.CLAUDE_EXTERNAL)
+        self.assertEqual(self.terms.pastes, [])
+
+        # Exact linkage immediately restores normal input capability.
+        self.terminal(id=CLAUDE_SID, kind='interactive', home=None)
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertTrue(state['capability']['supported'])
+
+        self.terms.rows = [launcher]
+        with patch.object(chat.time, 'time', return_value=1121):
+            state = self.state(source=ref)
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+
+        self.terms.rows = [{**launcher, 'host': 'another-host'}]
+        with patch.object(chat.time, 'time', return_value=1010):
+            state = self.state(source=ref)
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+
     def test_new_launcher_proves_its_pane_before_claude_chat_can_paste(self):
         import launcher_programs as lp
 
