@@ -9066,6 +9066,32 @@ test('a disconnected Claude chat connects on send, stays in chat, and sends its 
   assert.equal(c.get('chat-send').disabled, true, 'unsupported external sessions keep their policy');
 });
 
+test('a Claude submit refusal keeps the pasted draft reserved and blocks a second paste', async () => {
+  let sends = 0;
+  const reason = '본문은 붙여넣었지만 제출 Enter는 보내지 않았습니다.';
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/send') {
+      sends++;
+      return { ok: false, status: 409, json: async () => ({ error: reason, dispatchState: 'not_started',
+        code: 'claude_submit_not_started', phase: 'submit', draftPasted: true }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body || '{}').source,
+      phase: 'idle', messages: [], capability: { supported: true } }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: true } };
+  entry.text = '보낼 내용';
+  await c.sendChat(entry);
+  await c.sendChat(entry);
+  assert.equal(sends, 1);
+  assert.equal(entry.text, '보낼 내용');
+  assert.ok(entry.pending);
+  assert.equal(entry.receipt.submitBlocked, true);
+  assert.equal(c.chatReceiptCopy(entry.receipt), reason);
+});
+
 test('a send refused because the terminal closed keeps the draft and makes the next send reconnect', async () => {
   let reads = 0;
   let c;
@@ -16653,6 +16679,60 @@ test('터미널 파일 paste는 올린 뒤 미리보기만 표시하고 보내�
   assert.match(inputs[0], /검토해 줘\n첨부 파일: "\/fixture\/work\/file-1.png"/);
   assert.equal(inputs[1], '\r');
   assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
+});
+
+test('Claude 새 세션의 터미널 초안은 첨부 유무와 관계없이 서버에서 검증한 창으로만 보낸다', async () => {
+  for (const [submit, attach, bracketed] of [[true, true, false], [false, true, true], [true, false, true], [false, false, false]]) {
+    const inputs = [];
+    let refused = true;
+    const c = terminalFilesClient(async (url, options) => {
+      if (url === '/api/chat/upload') return fileReply();
+      inputs.push(JSON.parse(options.body));
+      return refused
+        ? { ok: false, status: 409, json: async () => ({ code: 'claude_pane_unavailable', error: '연결된 Claude 창을 확인하지 못했습니다.' }) }
+        : { ok: true, status: 200, json: async () => ({ ok: true }) };
+    });
+    Object.assign(c.state.terminal, { mode: 'new-session', linkConfidence: 'exact',
+      nativeSource: { host: 'fixture', agent: 'claude', id: 'native-fixture', kind: 'interactive' } });
+    c.state.term.modes.bracketedPasteMode = bracketed;
+    c.get('terminal-draft').value = '검토해 줘';
+    if (attach) await c.uploadTerminalFiles([{ name: 'shot.png', size: 9, type: 'image/png' }]);
+    await c.pasteDraft(submit);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0].claudePasteSubmit, submit);
+    assert.equal(inputs[0].text, attach ? '검토해 줘 첨부 파일: "/fixture/work/file-1.png"' : '검토해 줘');
+    assert.match(c.get('draft-note').textContent, /Claude 창을 확인하지 못했습니다/);
+    assert.equal(c.terminalAttachmentEntry().attachments.length, Number(attach));
+    assert.equal(c.get('terminal-draft').value, '검토해 줘');
+    assert.equal(c.state.connected, true);
+    refused = false;
+    await c.pasteDraft(submit);
+    assert.equal(inputs.length, 2);
+    assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
+  }
+});
+
+test('연결 갱신 전 Claude 초안 거절 뒤에도 직접 터미널 키는 구분해서 보낸다', async () => {
+  const inputs = [];
+  const c = terminalFilesClient(async (url, options) => {
+    inputs.push(JSON.parse(options.body));
+    return inputs.at(-1).directKeys
+      ? { ok: true, status: 200, json: async () => ({ ok: true }) }
+      : { ok: false, status: 409, json: async () => ({ code: 'claude_pane_unavailable', error: '화면을 새로고침해 주세요.' }) };
+  });
+  Object.assign(c.state.terminal, { mode: 'new-session', nativeSource: null });
+  c.get('terminal-draft').value = 'stale draft';
+  await c.pasteDraft(true);
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].directKeys, undefined);
+  assert.equal(inputs[0].claudePasteSubmit, undefined);
+  assert.equal(c.get('terminal-draft').value, 'stale draft');
+  assert.match(c.get('draft-note').textContent, /새로고침/);
+  c.pressTerminalKey('enter');
+  await c.state.inputQueue;
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[1].directKeys, true);
+  assert.equal(inputs[1].text, '\r');
 });
 
 test('터미널의 일반 텍스트 paste는 가로채지 않고 혼합 paste는 커서 위치에 초안으로 삽입한다', async () => {

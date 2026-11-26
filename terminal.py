@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import base64
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import json
 import math
@@ -17,6 +17,7 @@ import pty
 import re
 import secrets
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -86,6 +87,17 @@ SCROLL_LIMIT = 200
 WHEEL_LIMIT = 40
 KEY_NAMES = frozenset(("Up", "Down", "Enter"))
 KEY_LIMIT = 40
+# Evaluated by tmux immediately before dispatch. A launcher's own pane PID can
+# stay alive after its foreground Claude child has exited or left the tty.
+CLAUDE_FOREGROUND = """
+kill -0 "$1" 2>/dev/null || exit 1
+fields=$(/bin/ps -p "$1" -o tty=,pgid=,tpgid=,stat=) || exit 1
+tty=${2#/dev/}
+set -f
+set -- $fields
+[ "$#" -eq 4 ] && [ "$1" = "$tty" ] && [ "$2" -gt 0 ] && [ "$2" = "$3" ] || exit 1
+case "$4" in [TtZ]*) exit 1;; esac
+"""
 # One display-message call; scroll_position is empty outside copy-mode, so the
 # fields are split on an explicit separator rather than on whitespace.
 PANE_FORMAT = ("#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}|#{pane_width}|#{pane_height}"
@@ -119,6 +131,25 @@ LOG_PREFIX = instance.current()["brand"]["logPrefix"] if instance is not None el
 
 class InputNotSent(RuntimeError):
     """tmux refused the paste before any byte reached the CLI."""
+
+
+class ClaudePaneUnavailable(InputNotSent):
+    def __init__(self, message="연결된 Claude 창을 확인하지 못해 보내지 않았습니다. 터미널에서 직접 입력해 주세요."):
+        super().__init__(message)
+
+
+class ClaudeSubmitNotStarted(RuntimeError):
+    """The body was pasted, and the guarded submit Enter was refused."""
+    def __init__(self):
+        super().__init__("Claude 창에 본문은 붙여넣었지만 제출 Enter는 보내지 않았습니다. 다시 붙여넣기 전에 터미널을 확인해 주세요.")
+
+
+CLAUDE_SYNC_UNAVAILABLE = "tmux 창의 pane 동기화를 끈 뒤 웹 입력을 다시 시도해 주세요."
+
+
+def launcher_claude(metadata):
+    return (metadata.get("mode") == "new-session"
+            and (metadata.get("nativeSource") or {}).get("agent") == "claude")
 
 
 def _metadata(value):
@@ -335,12 +366,12 @@ class TerminalManager:
             raise RuntimeError("tmux가 설치되어 있지 않습니다.")
         return [self.tmux, "-L", self.socket_name, "-f", "/dev/null"] + list(args)
 
-    def _run(self, *args, **kwargs):
+    def _run(self, *args, stdout=subprocess.DEVNULL, **kwargs):
         if "input" not in kwargs:
             kwargs["stdin"] = subprocess.DEVNULL
         try:
             return subprocess.run(self._command(*args),
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  stdout=stdout, stderr=subprocess.DEVNULL,
                                   timeout=10, **kwargs)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 실행기에 연결하지 못했습니다.") from None
@@ -786,7 +817,7 @@ class TerminalManager:
             result["redrawn"] = True
         return result
 
-    def write(self, terminal_id, text):
+    def write(self, terminal_id, text, *, direct=True):
         if not isinstance(text, str):
             raise ValueError("입력 형식이 올바르지 않습니다.")
         data = text.encode("utf-8")
@@ -794,10 +825,20 @@ class TerminalManager:
             raise ValueError("입력은 32KiB 이하여야 합니다.")
         with self.lock:
             terminal = self._use(terminal_id)
+            metadata = terminal.record["metadata"]
+            # Only the explicit terminal key stream follows the attached client's
+            # active pane. Older clients used the same route for keys and drafts.
+            if not direct and launcher_claude(metadata) and metadata.get("linkConfidence") == "exact":
+                raise ClaudePaneUnavailable("Claude 창 연결을 확인했습니다. 화면을 새로고침한 뒤 다시 입력해 주세요.")
             self._attach(terminal)
             self._typed(terminal)
         self._leave_scroll(terminal)
-        with terminal.io_lock:
+        # Keep exact publication and the legacy write ordered even if the
+        # launcher is identified while the client is attaching.
+        with (self.lock if not direct and metadata.get("mode") == "new-session" else nullcontext()), terminal.io_lock:
+            current = terminal.record["metadata"]
+            if not direct and launcher_claude(current) and current.get("linkConfidence") == "exact":
+                raise ClaudePaneUnavailable("Claude 창 연결을 확인했습니다. 화면을 새로고침한 뒤 다시 입력해 주세요.")
             if (terminal.record.get("closed", False) or terminal.fd is None
                     or terminal.process.poll() is not None):
                 raise RuntimeError("터미널 연결이 종료되었습니다.")
@@ -821,10 +862,10 @@ class TerminalManager:
         # The colon forces tmux to resolve the name as a session, even if a window shares it.
         return "=" + terminal.record["name"] + ":"
 
-    def _cancel_mode(self, terminal):
+    def _cancel_mode(self, terminal, target=None):
         # Outside a mode tmux answers "not in a mode" and sends nothing to the CLI.
         try:
-            self._run("send-keys", "-t", self._pane_target(terminal), "-X", "cancel")
+            self._run("send-keys", "-t", target or self._pane_target(terminal), "-X", "cancel")
         except RuntimeError:
             pass
 
@@ -906,7 +947,75 @@ class TerminalManager:
             raise RuntimeError("터미널 화면을 스크롤하지 못했습니다.")
         return {"ok": True, "mode": "app", "position": None}
 
-    def capture(self, terminal_id, styled=False, touch=True):
+    def _claude_pane(self, terminal):
+        from launcher_programs import PANE_ID, pane_program, session_pane, table
+
+        metadata = terminal.record["metadata"]
+        identifier, pid = metadata.get("claudePaneId"), metadata.get("claudePanePid")
+        if (not launcher_claude(metadata) or terminal.record.get("closed") or not terminal.alive or self._foreign(terminal)
+                or metadata.get("holdName") or metadata.get("linkConfidence") != "exact"
+                or not isinstance(identifier, str) or not PANE_ID.fullmatch(identifier)
+                or type(pid) is not int or pid <= 0):
+            raise ClaudePaneUnavailable()
+        try:
+            pane = session_pane(self._command(), terminal.record["name"], identifier)
+            if pane and pane[3] != "0":
+                raise ClaudePaneUnavailable(CLAUDE_SYNC_UNAVAILABLE)
+            program = pane_program(pane[1], table()) if pane else None
+            if program and program["program"] == "claude" and program["pid"] == pid:
+                check = subprocess.run(["/bin/sh", "-c", CLAUDE_FOREGROUND, "sh", str(pid), pane[2]],
+                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
+                if check.returncode == 0:
+                    return pane[:2]
+        except ClaudePaneUnavailable:
+            raise
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
+            pass
+        raise ClaudePaneUnavailable()
+
+    def _prepare_claude_pane(self, terminal):
+        target, _ = self._claude_pane(terminal)
+        self._cancel_mode(terminal, target)
+        return self._claude_pane(terminal)
+
+    def _run_for_claude_pane(self, terminal, pane, command, *, multiline=False):
+        target, root_pid = pane
+        owner = "#{==:#{session_name}," + terminal.record["name"] + "}"
+        process = "#{&&:#{==:#{pane_pid}," + str(root_pid) + "},#{==:#{pane_dead},0}}"
+        condition = "#{&&:" + owner + "," + process + "}"
+        body = shlex.join(command)
+        # send-keys may fan out even with an explicit %pane_id. Read the
+        # effective pane option in tmux's queue immediately before dispatch.
+        body = shlex.join(("if-shell", "-F", "-t", target, "#{==:#{synchronize-panes},0}", body,
+                           "display-message -p synchronized-panes"))
+        if multiline:
+            body = shlex.join(("if-shell", "-F", "-t", target, "#{bracket_paste_flag}", body,
+                               "display-message -p unsafe-paste"))
+        changed = "display-message -p changed-pane"
+        body = shlex.join(("if-shell", "-F", "-t", target, condition, body, changed))
+        check = shlex.join(("/bin/sh", "-c", CLAUDE_FOREGROUND, "sh",
+                            str(terminal.record["metadata"]["claudePanePid"]), "#{pane_tty}"))
+        # Wait for the foreground check and then resolve pane membership/root
+        # again, since the shell check itself gives tmux time to process a respawn.
+        done = self._run("if-shell", "-t", target, check, body, changed,
+                         stdout=subprocess.PIPE)
+        if done.returncode != 0 or done.stdout.strip() == b"changed-pane":
+            raise ClaudePaneUnavailable()
+        if done.stdout.strip() == b"unsafe-paste":
+            raise ClaudePaneUnavailable("Claude 창의 여러 줄 붙여넣기 모드를 확인하지 못해 초안을 보내지 않았습니다.")
+        if done.stdout.strip() == b"synchronized-panes":
+            raise ClaudePaneUnavailable(CLAUDE_SYNC_UNAVAILABLE)
+
+    def claude_pane_available(self, terminal_id):
+        try:
+            with self.lock:
+                terminal = self._get(terminal_id)
+            self._claude_pane(terminal)
+            return True
+        except (RuntimeError, ValueError, KeyError):
+            return False
+
+    def capture(self, terminal_id, styled=False, touch=True, claude_input=False):
         """Visible screen text of the live pane (no history). `styled` keeps its colour and
         attribute codes (SGR), which tell a prompt's grey placeholder from typed text. A look by
         the board's own sweep (`touch` False) does not count as the terminal being used."""
@@ -914,9 +1023,10 @@ class TerminalManager:
             terminal = self._use(terminal_id) if touch else self._get(terminal_id)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
+        target = self._claude_pane(terminal)[0] if claude_input else self._pane_target(terminal)
         try:
             done = subprocess.run(self._command("capture-pane", "-p", *(["-e"] if styled else []),
-                                                "-t", self._pane_target(terminal)),
+                                                "-t", target),
                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 화면을 확인하지 못했습니다.") from None
@@ -934,11 +1044,15 @@ class TerminalManager:
             self._typed(terminal)
         if terminal.record.get("closed", False) or not terminal.alive:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
-        self._leave_scroll(terminal)
         with terminal.io_lock:
-            done = self._run("send-keys", "-t", self._pane_target(terminal), *keys)
-            if done.returncode != 0:
-                raise InputNotSent("터미널에 키를 보내지 못했습니다.")
+            if launcher_claude(terminal.record["metadata"]):
+                pane = self._prepare_claude_pane(terminal)
+                self._run_for_claude_pane(terminal, pane, ("send-keys", "-t", pane[0], *keys))
+            else:
+                self._leave_scroll(terminal)
+                done = self._run("send-keys", "-t", self._pane_target(terminal), *keys)
+                if done.returncode != 0:
+                    raise InputNotSent("터미널에 키를 보내지 못했습니다.")
         return {"ok": True}
 
     def scroll_end(self, terminal_id):
@@ -947,7 +1061,7 @@ class TerminalManager:
         self._leave_scroll(terminal)
         return {"ok": True}
 
-    def paste(self, terminal_id, text, submit=True):
+    def paste(self, terminal_id, text, submit=True, *, require_claude_pane=False):
         """Paste text as one bracketed paste (when the CLI asked for it), then Enter."""
         if not isinstance(text, str) or not text or "\0" in text:
             raise ValueError("입력 형식이 올바르지 않습니다.")
@@ -955,27 +1069,58 @@ class TerminalManager:
         if len(data) > INPUT_LIMIT:
             raise ValueError("입력은 32KiB 이하여야 합니다.")
         with self.lock:
-            terminal = self._use(terminal_id)
-            self._attach(terminal)
+            try:
+                terminal = self._use(terminal_id)
+            except (KeyError, RuntimeError):
+                if require_claude_pane:
+                    raise ClaudePaneUnavailable() from None
+                raise
+            pinned = require_claude_pane or launcher_claude(terminal.record["metadata"])
+            if not pinned:
+                self._attach(terminal)
             self._typed(terminal)
-        if terminal.record.get("closed", False) or not terminal.alive:
+        if not pinned and (terminal.record.get("closed", False) or not terminal.alive):
             raise InputNotSent("터미널 연결이 종료되었습니다.")
-        self._leave_scroll(terminal)
-        target, buffer = self._pane_target(terminal), "sh-" + secrets.token_hex(8)
+        buffer = "sh-" + secrets.token_hex(8)
         with terminal.io_lock:
-            done = self._run("load-buffer", "-b", buffer, "-", ";",
-                             "paste-buffer", "-p", "-d", "-b", buffer, "-t", target, input=data)
-            if done.returncode != 0:
-                # load-buffer may have succeeded; never leave the message text in tmux.
-                self._run("delete-buffer", "-b", buffer)
-                raise InputNotSent("터미널에 붙여넣지 못했습니다.")
+            if pinned:
+                try:
+                    done = self._run("load-buffer", "-b", buffer, "-", input=data)
+                    if done.returncode != 0:
+                        raise InputNotSent("터미널에 붙여넣지 못했습니다.")
+                    pane = self._prepare_claude_pane(terminal)
+                    self._run_for_claude_pane(terminal, pane, ("paste-buffer", "-p", "-r", "-d", "-b", buffer,
+                                                             "-t", pane[0]),
+                                              multiline=b"\n" in data or b"\r" in data)
+                except (RuntimeError, ValueError):
+                    try:
+                        self._run("delete-buffer", "-b", buffer)
+                    except RuntimeError:
+                        pass
+                    raise
+            else:
+                self._leave_scroll(terminal)
+                target = self._pane_target(terminal)
+                done = self._run("load-buffer", "-b", buffer, "-", ";",
+                                 "paste-buffer", "-p", "-d", "-b", buffer, "-t", target, input=data)
+                if done.returncode != 0:
+                    # load-buffer may have succeeded; never leave the message text in tmux.
+                    self._run("delete-buffer", "-b", buffer)
+                    raise InputNotSent("터미널에 붙여넣지 못했습니다.")
             if submit:
                 # Let the TUI finish its paste handling before the separate Enter key (sooner, a
                 # TUI may take the Enter as part of the paste: a newline).
                 time.sleep(0.3)
-                done = self._run("send-keys", "-t", target, "Enter")
-                if done.returncode != 0:
-                    raise RuntimeError("붙여넣은 뒤 Enter를 보내지 못했습니다.")
+                if pinned:
+                    try:
+                        pane = self._claude_pane(terminal)
+                        self._run_for_claude_pane(terminal, pane, ("send-keys", "-t", pane[0], "Enter"))
+                    except ClaudePaneUnavailable as exc:
+                        raise ClaudeSubmitNotStarted() from exc
+                else:
+                    done = self._run("send-keys", "-t", target, "Enter")
+                    if done.returncode != 0:
+                        raise RuntimeError("붙여넣은 뒤 Enter를 보내지 못했습니다.")
         return {"ok": True}
 
     def resize(self, terminal_id, cols, rows):
@@ -1020,7 +1165,7 @@ class TerminalManager:
         self._changed()
         return result
 
-    def link_native(self, terminal_id, native, confidence="exact"):
+    def link_native(self, terminal_id, native, confidence="exact", claude_pane=None):
         """Exact host-owned evidence can correct a new launcher's estimate, never an exact binding."""
         with self.lock:
             if confidence not in ("exact", "estimated"):
@@ -1030,9 +1175,26 @@ class TerminalManager:
             correction = (confidence == "exact" and previous.get("linkConfidence") == "estimated"
                           and (previous.get("nativeSource") == native or previous.get("mode") == "new-session"
                                and isinstance(native, dict) and native.get("host") == previous.get("host")))
-            if previous.get("nativeSource") and not correction:
+            if claude_pane is not None:
+                from launcher_programs import PANE_ID
+                from session_recovery import same_claude_conversation
+                pane_id, pid = claude_pane
+                if (confidence != "exact" or previous.get("mode") != "new-session" or native.get("agent") != "claude"
+                        or not isinstance(pane_id, str) or not PANE_ID.fullmatch(pane_id)
+                        or type(pid) is not int or pid <= 0):
+                    raise ValueError("Claude 창 연결 근거를 확인해 주세요.")
+                backfill = (previous.get("linkConfidence") == "exact" and not previous.get("claudePaneId")
+                            and same_claude_conversation(previous.get("nativeSource"), native))
+                if backfill:
+                    native = previous["nativeSource"]
+            else:
+                backfill = False
+            if previous.get("nativeSource") and not correction and not backfill:
                 return False
-            metadata = _metadata({**terminal.record["metadata"], "nativeSource": native, "linkConfidence": confidence})
+            metadata = {**previous, "nativeSource": native, "linkConfidence": confidence}
+            if claude_pane is not None:
+                metadata.update(claudePaneId=pane_id, claudePanePid=pid)
+            metadata = _metadata(metadata)
             terminal.record["metadata"] = metadata
             try:
                 self._save()
@@ -1181,8 +1343,8 @@ class TerminalManager:
         self._changed()
         return {"ok": True}
 
-    def launcher_pane_pid(self, terminal_id):
-        from launcher_programs import single_pane_pid
+    def launcher_pane(self, terminal_id):
+        from launcher_programs import session_pane
 
         with self.lock:
             terminal = self._get(terminal_id)
@@ -1190,7 +1352,8 @@ class TerminalManager:
                     or terminal.record["metadata"].get("mode") != "new-session"):
                 return None
             name = terminal.record["name"]
-        return single_pane_pid(self._command(), name)
+        pane = session_pane(self._command(), name)
+        return pane[:2] if pane else None
 
     def set_program(self, terminal_id, info):
         """Record what a 새 세션 terminal runs (read from its host); never its identity or command."""

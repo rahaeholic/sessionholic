@@ -14,6 +14,7 @@ import uuid
 
 import instance
 from attachments import MAX_ATTACHMENTS
+from terminal import ClaudePaneUnavailable, ClaudeSubmitNotStarted, launcher_claude
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -544,6 +545,7 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
+                **({'submitBlocked': True} if result.get('submitBlocked') is True else {}),
                 **({'deliveryVerified': result['deliveryVerified']} if 'deliveryVerified' in result else {}),
                 **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
                    and result.get('failureCode') == 'server_overloaded' else {}),
@@ -581,22 +583,24 @@ class Chat:
                 carried = list(dict.fromkeys(request_ids + self._waiting_ids(key, now)))
             cached = self.cache.get(key)
             fresh = WATCH_CACHE_SECONDS if watching else STATE_CACHE_SECONDS
-            if (cached and self.board.state[host['name']]['ok']
+            if not (cached and self.board.state[host['name']]['ok']
                     and cached[3] == source.get('cwd') and cached[5] == source.get('sessionId') and now - cached[0] < fresh
                     and cached[4].issuperset(request_ids)):
-                return self._cached_view(cached[1], request_ids)
-            shared = self.reads.get(key)
-            # Shared only when it started after the latest send or terminal input (the same
-            # epoch) and carries every id asked for here.
-            if (shared is not None and shared.epoch == self.cache_epoch and shared.cwd == source.get('cwd')
-                    and shared.session_id == source.get('sessionId')
-                    and shared.ids.issuperset(request_ids)):
-                shared.joined += 1
-            else:
-                shared = None
-                self.read_sequence += 1
-                sequence, epoch = self.read_sequence, self.cache_epoch
-                read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'), source.get('sessionId'))
+                cached = None
+                shared = self.reads.get(key)
+                # Shared only when it started after the latest send or terminal input (the same
+                # epoch) and carries every id asked for here.
+                if (shared is not None and shared.epoch == self.cache_epoch and shared.cwd == source.get('cwd')
+                        and shared.session_id == source.get('sessionId')
+                        and shared.ids.issuperset(request_ids)):
+                    shared.joined += 1
+                else:
+                    shared = None
+                    self.read_sequence += 1
+                    sequence, epoch = self.read_sequence, self.cache_epoch
+                    read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'), source.get('sessionId'))
+        if cached:
+            return self._cached_view(cached[1], request_ids, recheck_pane=True)
         if shared is not None:
             return self._shared_view(shared, request_ids)
         if watching:
@@ -620,8 +624,7 @@ class Chat:
             read.done.set()
         return self._cached_view(response, request_ids)
 
-    @staticmethod
-    def _shared_view(shared, request_ids):
+    def _shared_view(self, shared, request_ids):
         """The asked receipts from another reader's read; its failure is this reader's too."""
         if not shared.done.wait(STATE_SHARE_SECONDS):
             raise RuntimeError(STATE_UNAVAILABLE)
@@ -630,7 +633,7 @@ class Chat:
         if shared.response is None:
             raise RuntimeError(STATE_UNAVAILABLE)
         # A send after this reader joined keeps the result out of the cache, not from this reader.
-        return Chat._cached_view(shared.response, request_ids)
+        return self._cached_view(shared.response, request_ids, recheck_pane=True)
 
     def _read_state(self, source, host, identity, key, request_ids, kwargs, sequence, epoch):
         """One remote read with the receipts of `request_ids`, cached unless a send or a newer
@@ -704,7 +707,7 @@ class Chat:
             terminal, terminal_failed = None, True
         if claude and terminal:
             try:
-                live = terminal_model_settings(self.workflow.terminals.capture(terminal['id']))
+                live = terminal_model_settings(self._capture_terminal(terminal))
                 read = result.get('modelSettings') or {}
                 # The screen's "opus" does not replace the "claude-opus-5-5" a response recorded.
                 if live.get('model') and live['model'] in str(read.get('model') or '').lower():
@@ -802,6 +805,8 @@ class Chat:
         connected_input = bool(claude and terminal and not terminal_failed and response['capability']['supported'])
         if connected_input:
             response['terminalConnection'] = {'connected': True, 'id': terminal['id']}
+            if launcher_claude(terminal):
+                response['_launcherClaudeTerminal'] = terminal['id']
         if observation_request is not None:
             observed = {**result, 'phase': phase, 'runtimeReason': response.get('runtimeReason')}
             if host.get('platform') != 'windows':
@@ -877,11 +882,17 @@ class Chat:
                 'runtimeKnown': False, 'runtimeReason': capability['reason'],
                 'readOnly': True, 'prompt': None, 'promptOpenable': False}
 
-    @staticmethod
-    def _cached_view(response, request_ids):
+    def _cached_view(self, response, request_ids, recheck_pane=False):
         """A cached view with only the requested receipts, in the requested order."""
         receipts = {receipt['requestId']: receipt for receipt in response['receipts']}
-        return {**response, 'receipts': [receipts[request_id] for request_id in request_ids]}
+        view = {**response, 'receipts': [receipts[request_id] for request_id in request_ids]}
+        launcher = view.pop('_launcherClaudeTerminal', None)
+        if (recheck_pane and launcher and view['capability']['supported']
+                and not self.workflow.terminals.claude_pane_available(launcher)):
+            view['capability'] = {**view['capability'], 'supported': False, 'reason': CLAUDE_EXTERNAL}
+            view['prompt'] = None
+            view.pop('terminalConnection', None)
+        return view
 
     def _remember(self, key, request_ids, now):
         """Note ids a client is waiting on (already validated); caller holds self.lock."""
@@ -942,8 +953,16 @@ class Chat:
                 continue
             native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
             if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
+                if (launcher_claude(terminal)
+                        and not self.workflow.terminals.claude_pane_available(terminal['id'])):
+                    continue
                 return terminal
         return None
+
+    def _capture_terminal(self, terminal, **kwargs):
+        if launcher_claude(terminal):
+            kwargs['claude_input'] = True
+        return self.workflow.terminals.capture(terminal['id'], **kwargs)
 
     def _claude_capability(self, source, terminal, failed, windows=False):
         """(supported, reason, action). Input goes through a live board terminal; for a background
@@ -1001,7 +1020,7 @@ class Chat:
 
     def _screen_prompt(self, terminal, source):
         try:
-            menu = parse_menu(self.workflow.terminals.capture(terminal['id']))
+            menu = parse_menu(self._capture_terminal(terminal))
         except (RuntimeError, ValueError, KeyError, OSError):
             return None
         return None if menu is None else self._present(menu, terminal, source)
@@ -1102,7 +1121,7 @@ class Chat:
             if terminal is None:
                 raise PromptRejected(PROMPT_NO_TERMINAL, code='terminal_required')
             try:
-                menu = parse_menu(self.workflow.terminals.capture(terminal['id']))
+                menu = parse_menu(self._capture_terminal(terminal))
             except (RuntimeError, ValueError, KeyError, OSError):
                 raise PromptRejected('터미널 화면을 확인하지 못해 선택을 보내지 않았습니다. 다시 시도해 주세요.',
                                      code='terminal_unavailable') from None
@@ -1120,14 +1139,15 @@ class Chat:
                 sent = True
             except InputNotSent as exc:
                 self._prompt_receipt_call('cancel_not_sent', source, request_id, fingerprint, number, terminal)
-                raise PromptRejected(str(exc), code='terminal_unavailable') from None
+                code = 'claude_pane_unavailable' if isinstance(exc, ClaudePaneUnavailable) else 'terminal_unavailable'
+                raise PromptRejected(str(exc), code=code) from None
             except (RuntimeError, OSError, ValueError, KeyError):
                 sent = False  # the keys may or may not have arrived; never press them again
             after = None
             if sent:
                 time.sleep(PROMPT_SETTLE)
                 try:
-                    after = parse_menu(self.workflow.terminals.capture(terminal['id']))
+                    after = parse_menu(self._capture_terminal(terminal))
                 except (RuntimeError, ValueError, KeyError, OSError):
                     sent = False
             answered = sent and (after is None or after['fingerprint'] != fingerprint)
@@ -1395,6 +1415,8 @@ class Chat:
             return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         receipt = dict(record.get('receipt') or {})
         evidence = self._claude_evidence(record, messages, queued)
+        if evidence:
+            receipt.pop('submitBlocked', None)
         if evidence == 'message':
             receipt.update(delivery='accepted', confirmed=True, readbackConfirmed=True,
                            currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
@@ -1437,7 +1459,7 @@ class Chat:
             found = self._claude_readback(host, source, record, CLAUDE_READ_SECONDS)
             if found is False:
                 outcome = 'missing'
-                screen = self.workflow.terminals.capture(terminal['id'])
+                screen = self._capture_terminal(terminal)
                 if parse_menu(screen):
                     outcome += '→menu'
                 elif still_typed(screen, body):
@@ -1452,7 +1474,7 @@ class Chat:
                     else:
                         self.workflow.terminals.paste(terminal['id'], body, submit=True)
                         repasted = True
-                        if self._confirm_submit(terminal['id'], body):
+                        if self._confirm_submit(terminal, body):
                             resubmitted = True
                         found = self._claude_readback(host, source, record, CLAUDE_READ_SECONDS)
                         outcome += '→repaste'
@@ -1475,16 +1497,16 @@ class Chat:
         receipt.update(resubmitted=resubmitted, verificationSeconds=round(elapsed, 2))
         sys.stderr.write('%s: Claude 전달 확인 %s %.1f초\n' % (instance.current()['brand']['logPrefix'], outcome, elapsed))
 
-    def _confirm_submit(self, terminal_id, body):
+    def _confirm_submit(self, terminal, body):
         """The message still in Claude Code's input box a moment after its Enter (taken as a
         newline): Enter once more. An empty input ignores Enter, so a message the first Enter
         sent is not sent twice. Returns whether it pressed again."""
         self.sleep(SUBMIT_CHECK_SECONDS)
         try:
-            screen = self.workflow.terminals.capture(terminal_id)
+            screen = self._capture_terminal(terminal)
             if parse_menu(screen) or not still_typed(screen, body):
                 return False
-            self.workflow.terminals.send_keys(terminal_id, ['Enter'])
+            self.workflow.terminals.send_keys(terminal['id'], ['Enter'])
         except (RuntimeError, ValueError, KeyError, OSError):
             return False
         return True
@@ -1503,6 +1525,8 @@ class Chat:
         try:
             previous = self._claude_read_record(source, request_id)
             if previous:
+                if (previous.get('receipt') or {}).get('submitBlocked') is True:
+                    raise ClaudeSubmitNotStarted()
                 return {**(previous.get('receipt') or {}), 'attachments': manifest}
             try:
                 current = self.rpc(host, 'capabilities', source)
@@ -1539,7 +1563,9 @@ class Chat:
                 timing.mark('settle')
             self.unsettled.discard(terminal['id'])
             try:
-                screen = self.workflow.terminals.capture(terminal['id'])
+                screen = self._capture_terminal(terminal)
+            except ClaudePaneUnavailable:
+                raise SendRejected(CLAUDE_EXTERNAL, 409) from None
             except (RuntimeError, ValueError, KeyError, OSError):
                 raise SendRejected('Claude 터미널 화면을 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
             # Enter would confirm the highlighted choice of an open menu.
@@ -1575,6 +1601,8 @@ class Chat:
                 fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except FileExistsError:
                 saved = self._claude_read_record(source, request_id) or {}
+                if (saved.get('receipt') or {}).get('submitBlocked') is True:
+                    raise ClaudeSubmitNotStarted()
                 return {**(saved.get('receipt') or unknown), 'attachments': manifest}
             words = claude_words(body)[:CLAUDE_PROBE]
             record = {'requestId': request_id, 'sentAt': time.time(), 'probe': digest,
@@ -1591,13 +1619,15 @@ class Chat:
                 receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
                            'readbackConfirmed': False, 'deliveryVerified': None,
                            'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
-                if self._confirm_submit(terminal['id'], body):
+                if self._confirm_submit(terminal, body):
                     receipt['resubmitted'] = True
                 timing.mark('submit')
                 self._verify_claude_delivery(host, source, terminal, body, record, receipt)
             except InputNotSent as exc:
                 path.unlink(missing_ok=True)
                 raise SendRejected(str(exc), 409) from None
+            except ClaudeSubmitNotStarted as exc:
+                receipt = {**unknown, 'submitBlocked': True, 'reason': str(exc)}
             except (RuntimeError, ValueError, OSError):
                 receipt = unknown
             from server import private_json
@@ -1606,6 +1636,9 @@ class Chat:
             except (OSError, ValueError):
                 receipt = {**receipt, 'ledgerPending': True}
             timing.mark('save')
+            if receipt.get('submitBlocked'):
+                self._forget_state(source)
+                raise ClaudeSubmitNotStarted()
             return {**receipt, 'attachments': manifest}
         finally:
             turn.release()
@@ -1939,7 +1972,7 @@ class Chat:
             if terminal is None and source.get('kind') == 'background':
                 terminal = self._open_claude_terminal(ref, source, request_id)
             if terminal is None: raise ValueError(CLAUDE_EXTERNAL)
-            styled = self.workflow.terminals.capture(terminal['id'], styled=True)
+            styled = self._capture_terminal(terminal, styled=True)
             screen = SGR.sub('', styled)
             if parse_menu(screen): raise ValueError(CLAUDE_BLOCKED)
             # Refuse a loading, reconnecting or nonempty editor; no keys clear existing input.
@@ -1955,8 +1988,10 @@ class Chat:
             from terminal import InputNotSent
             try:
                 self.workflow.terminals.paste(terminal['id'], body, submit=True)
-            except InputNotSent:
+            except InputNotSent as exc:
                 path.unlink(missing_ok=True)
+                if isinstance(exc, ClaudePaneUnavailable):
+                    raise ValueError(CLAUDE_EXTERNAL) from None
                 raise ValueError('명령을 전달하지 못했습니다. 입력창 상태를 다시 확인해 주세요.') from None
             except (RuntimeError, ValueError, OSError):
                 return unknown
@@ -1966,7 +2001,7 @@ class Chat:
             for attempt in range(8 if command != 'compact' else 1):
                 try:
                     time.sleep(SUBMIT_CHECK_SECONDS if attempt == 0 else .2)
-                    after = self.workflow.terminals.capture(terminal['id'])
+                    after = self._capture_terminal(terminal)
                     if parse_menu(after): break
                     if attempt == 0 and still_typed(after, body):
                         # Claude sometimes takes the first Enter as a newline. A second

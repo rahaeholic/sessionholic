@@ -7677,6 +7677,7 @@ function renderKeyboardHint() {
   if (hint) hint.hidden = !keyboardPresent();
 }
 function chatReceiptCopy(receipt) {
+  if (receipt?.submitBlocked) return receipt.reason;
   if (receipt?.dispatchState === "not_started")
     return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
   if (receipt?.status === "failed" && receipt.confirmed === true)
@@ -9311,7 +9312,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
       haptic("error");
-      if (!recovering && (!dispatched || err.dispatchState === "not_started")) {
+      const submitBlocked = err.code === "claude_submit_not_started";
+      if (!submitBlocked && !recovering && (!dispatched || err.dispatchState === "not_started")) {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -9337,7 +9339,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
         sent = true;
-        const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
+        const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails,
+          ...(submitBlocked ? { submitBlocked: true, reason: err.message } : {}) };
         // A status read may already have settled this same send before its
         // HTTP response was lost. Keep that evidence and the next draft.
         if (unconfirmedChatRequests(entry).some((request) => request.requestId === pending.requestId)) {
@@ -14020,7 +14023,8 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
       if (!state.connected || state.term !== sender || state.terminal?.id !== terminalId) return;
       state.terminalScrollLines = 0;
       renderTerminalScroll();
-      sendInput(text).catch(() => {});
+      // xterm's direct key stream follows the pane visible in the terminal.
+      sendInput(text, { directKeys: true }).catch(() => {});
     });
     state.term.onBinary((data) => {
       if (state.connected)
@@ -14176,7 +14180,7 @@ async function startTerminalReader({ manual = false } = {}) {
 // After an input a restarted board refused, keys go nowhere until typing pauses this long:
 // the rest of a fast-typed line (and its Enter) must not arrive without its start.
 const INPUT_REFUSED_PAUSE_MS = 1000;
-function sendInput(text) {
+function sendInput(text, { claudePasteSubmit, directKeys } = {}) {
   if (networkOffline() || !state.connected || state.inputFailed || !state.terminal)
     return Promise.reject(new Error("터미널에 연결되어 있지 않습니다."));
   if (state.inputRefused && Date.now() - state.inputRefusedAt < INPUT_REFUSED_PAUSE_MS) {
@@ -14196,7 +14200,7 @@ function sendInput(text) {
     try {
       await api(`/api/terminal/${encodeURIComponent(id)}/input`, {
         method: "POST",
-        body: { text, requestId: req },
+        body: { text, requestId: req, claudePasteSubmit, directKeys },
       });
       if (state.inputRefused) {
         state.inputRefused = false;
@@ -14218,7 +14222,7 @@ function sendInput(text) {
         }
         throw err;
       }
-      if (!err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
+      if (err.code !== "claude_pane_unavailable" && !err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         state.inputFailed = true;
         state.inputEpoch++;
         stopTerminalReader();
@@ -14649,7 +14653,7 @@ function sendTerminalBytes(bytes) {
   if (!bytes || state.composing || state.draftPaste) return;
   state.terminalScrollLines = 0;
   renderTerminalScroll();
-  sendInput(bytes).catch(() => {});
+  sendInput(bytes, { directKeys: true }).catch(() => {});
 }
 // The bar's slash commands, typed into the CLI's own input and run there.
 const TERMINAL_BAR_COMMANDS = { model: "/model", effort: "/effort" };
@@ -14661,6 +14665,10 @@ async function sendTerminalCommand(text) {
   state.terminalScrollLines = 0;
   renderTerminalScroll();
   try {
+    if (isInteractiveClaudeLauncher(terminalInfo(state.terminal))) {
+      await sendInput(text, { claudePasteSubmit: true });
+      return;
+    }
     await sendInput(text);
     await new Promise((resolve) => setTimeout(resolve, 120));
     if (state.terminal?.id !== id || state.inputEpoch !== epoch) return;
@@ -14833,13 +14841,14 @@ async function pasteDraft(submit = false) {
         "초안에 제어 문자가 포함되어 있습니다. 일반 텍스트만 붙여넣을 수 있습니다.";
       return;
     }
+    const pinned = isInteractiveClaudeLauncher(terminalInfo(state.terminal));
     const bracketed = !!state.term?.modes?.bracketedPasteMode;
-    if (/[\r\n]/.test(text) && !bracketed) {
+    if (/[\r\n]/.test(text) && !pinned && !bracketed) {
       $("draft-note").textContent =
         "터미널의 붙여넣기 모드를 확인하지 못했습니다. 다시 연결한 뒤 보내 주세요. 여러 줄 초안은 유지됩니다.";
       return;
     }
-    const separator = bracketed ? "\n" : " ";
+    const separator = bracketed && !pinned ? "\n" : " ";
     const payload = [text, ...attached.map((file) => `첨부 파일: ${JSON.stringify(file.path)}`)].filter(Boolean).join(separator);
     if (new TextEncoder().encode(payload).length > 32750) {
       $("draft-note").textContent =
@@ -14850,9 +14859,10 @@ async function pasteDraft(submit = false) {
     pending.dispatched = true;
     if (attachmentEntry) attachmentEntry.sending = true;
     saveDraft();
-    await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
+    if (pinned) await sendInput(normalized, { claudePasteSubmit: submit });
+    else await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
-    if (submit) {
+    if (submit && !pinned) {
       // A separate Enter after the TUI has handled the paste, as a person would type it.
       await new Promise((resolve) => setTimeout(resolve, 120));
       if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
@@ -14874,10 +14884,11 @@ async function pasteDraft(submit = false) {
     state.terminalScrollLines = 0;
     renderTerminalScroll();
     state.term.scrollToBottom();
-  } catch {
+  } catch (err) {
     if (state.terminal?.id === pending.id) {
       $("draft-note").textContent =
-        "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
+        ["claude_pane_unavailable", "claude_submit_not_started"].includes(err.code) ? err.message
+          : "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
       haptic("error");
     }
   } finally {

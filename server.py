@@ -1992,8 +1992,9 @@ class Workflow:
                 **({"holdName": terminal["holdName"]} if terminal.get("holdName") else {})})
             seen = terminal.get("programAt")
             program = terminal.get("program")
-            confirming = terminal.get("linkConfidence") != "exact" and (
-                program == "claude" or program == "codex" and terminal.get("holdName"))
+            confirming = (program == "claude" and not terminal.get("claudePaneId")
+                          or program == "codex" and terminal.get("linkConfidence") != "exact"
+                          and terminal.get("holdName"))
             if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") and not confirming else self.PROGRAM_REFRESH):
                 continue
             due.setdefault(terminal.get("host"), set()).add(terminal["id"])
@@ -2018,19 +2019,19 @@ class Workflow:
         try:
             asked = {row["id"] for row in rows} if wanted is None else set(wanted)
             if host.get("local"):
-                pane_pid = getattr(self.terminals, "launcher_pane_pid", None)
-                if pane_pid is not None:
+                launcher_pane = getattr(self.terminals, "launcher_pane", None)
+                if launcher_pane is not None:
                     rows = [dict(row) for row in rows]
                     for row in rows:
                         if row["id"] not in asked:
                             continue
                         try:
-                            pid = pane_pid(row["id"])
+                            pane = launcher_pane(row["id"])
                         except (RuntimeError, OSError, ValueError, KeyError):
                             continue
-                        if type(pid) is int and pid > 0:
-                            row["panePid"] = pid
-            pane_targets = {row["id"] for row in rows if row.get("holdName") or row.get("panePid")}
+                        if pane is not None:
+                            row["paneId"], row["panePid"] = pane
+            pane_targets = {row["id"]: row for row in rows if row.get("holdName") or row.get("panePid")}
             # The board's SSH aliases are matched on that host, whose own SSH settings name the machines.
             ssh_hosts = {h["name"]: h["ssh"] for h in self.board.hosts if isinstance(h.get("ssh"), str)}
             result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows, "sshHosts": ssh_hosts}, timeout=15)
@@ -2042,13 +2043,19 @@ class Workflow:
                         native = info.get("nativeSource")
                         if isinstance(native, dict) and native.get("agent") == "codex":
                             native = self._native_of(host["name"], "codex", native)
+                            if native is not None:
+                                self.terminals.link_native(identifier, native, confidence="exact")
                         elif (info.get("program") == "claude" and info.get("paneVerified") is True
                               and identifier in pane_targets):
-                            native = self._launcher_claude_source(host["name"], info.get("pid"))
-                        else:
-                            native = None
-                        if native is not None:
-                            self.terminals.link_native(identifier, native, confidence="exact")
+                            from launcher_programs import PANE_ID
+                            pane_id, pid = info.get("paneId"), info.get("pid")
+                            target = pane_targets[identifier]
+                            if (isinstance(pane_id, str) and PANE_ID.fullmatch(pane_id)
+                                    and (target.get("holdName") or target.get("paneId") == pane_id)):
+                                native = self._launcher_claude_source(host["name"], pid)
+                                if native is not None:
+                                    self.terminals.link_native(identifier, native, confidence="exact",
+                                                               claude_pane=(pane_id, pid))
                     except (RuntimeError, OSError, ValueError, KeyError):
                         continue
         except (RuntimeError, OSError, ValueError, KeyError, AttributeError):
@@ -4427,6 +4434,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self):
         from chat import PromptRejected, SendRejected
+        from terminal import ClaudeSubmitNotStarted
         path = urlparse(self.path).path
         not_started = {"dispatchState": "not_started"} if path in ("/api/chat/send", "/api/session/action") else {}
         if not host_allowed(self.headers.get("Host")):
@@ -4667,7 +4675,32 @@ class Handler(BaseHTTPRequestHandler):
                     text = data.get("text")
                     if not isinstance(text, str) or len(text.encode()) > 32768:
                         raise ValueError("입력이 비었거나 너무 깁니다.")
-                    self.server.terminal_inputs.submit(tid, request_id, text, self.server.terminals.write)
+                    terminals = self.server.terminals
+                    from terminal import InputNotSent
+                    if "claudePasteSubmit" in data:
+                        from chat import CONTROL
+                        submit = data["claudePasteSubmit"]
+                        if type(submit) is not bool or not text or CONTROL.search(text):
+                            raise ValueError("Claude 붙여넣기에는 일반 텍스트만 보낼 수 있습니다.")
+                        try:
+                            receipt = self.server.terminal_inputs.submit(
+                                tid, request_id, text,
+                                lambda identifier, body: terminals.paste(identifier, body, submit=submit,
+                                                                         require_claude_pane=True),
+                                operation="claude-submit" if submit else "claude-paste")
+                        except InputNotSent as exc:
+                            raise SendRejected(str(exc), 409, code="claude_pane_unavailable") from None
+                        return self.send_json(200, receipt)
+                    try:
+                        # The explicit key stream is the only route that follows the
+                        # active pane of a terminal already linked to Claude.
+                        direct = data.get("directKeys") is True
+                        self.server.terminal_inputs.submit(
+                            tid, request_id, text,
+                            lambda identifier, body: terminals.write(identifier, body, direct=direct),
+                            operation="direct-keys" if direct else None)
+                    except InputNotSent as exc:
+                        raise SendRejected(str(exc), 409, code="claude_pane_unavailable") from None
                 elif action == "resize":
                     self.server.terminals.resize(tid, data.get("cols"), data.get("rows"))
                 elif action == "scroll":
@@ -4697,6 +4730,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
         except GoalError as exc:
             return self.send_json(exc.status, exc.payload)
+        except ClaudeSubmitNotStarted as exc:
+            # Only the submit phase was stopped. The pasted body stays reserved.
+            return self.send_json(409, {"error": str(exc), "code": "claude_submit_not_started",
+                                        "dispatchState": "not_started", "phase": "submit", "draftPasted": True})
         except SendRejected as exc:
             # A refusal with a code (e.g. "terminal_required") lets the composer act on it at once.
             payload = {"error": str(exc), "dispatchState": "not_started"}
@@ -4705,7 +4742,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(exc.status, payload)
         except PromptRejected as exc:
             # No key reached the terminal; "prompt_changed" means read the screen again.
-            return self.send_json(exc.status, {"error": str(exc), "code": exc.code})
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.code == "claude_pane_unavailable":
+                payload["dispatchState"] = "not_started"
+            return self.send_json(exc.status, payload)
         except LaunchFailure as exc:
             return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:
