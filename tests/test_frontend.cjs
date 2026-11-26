@@ -16634,6 +16634,36 @@ test('터미널 파일 paste는 올린 뒤 미리보기만 표시하고 보내�
   assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
 });
 
+test('Claude 새 세션의 터미널 첨부는 서버에 붙여넣기와 Enter를 함께 요청한다', async () => {
+  for (const submit of [true, false]) {
+    const inputs = [];
+    let refused = true;
+    const c = terminalFilesClient(async (url, options) => {
+      if (url === '/api/chat/upload') return fileReply();
+      inputs.push(JSON.parse(options.body));
+      return refused
+        ? { ok: false, status: 409, json: async () => ({ code: 'claude_pane_unavailable', error: '연결된 Claude 창을 확인하지 못했습니다.' }) }
+        : { ok: true, status: 200, json: async () => ({ ok: true }) };
+    });
+    Object.assign(c.state.terminal, { mode: 'new-session', linkConfidence: 'exact',
+      nativeSource: { host: 'fixture', agent: 'claude', id: 'native-fixture', kind: 'interactive' } });
+    c.get('terminal-draft').value = '검토해 줘';
+    await c.uploadTerminalFiles([{ name: 'shot.png', size: 9, type: 'image/png' }]);
+    await c.pasteDraft(submit);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0].claudePasteSubmit, submit);
+    assert.equal(inputs[0].text, '검토해 줘\n첨부 파일: "/fixture/work/file-1.png"');
+    assert.match(c.get('draft-note').textContent, /Claude 창을 확인하지 못했습니다/);
+    assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+    assert.equal(c.get('terminal-draft').value, '검토해 줘');
+    assert.equal(c.state.connected, true);
+    refused = false;
+    await c.pasteDraft(submit);
+    assert.equal(inputs.length, 2);
+    assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
+  }
+});
+
 test('터미널의 일반 텍스트 paste는 가로채지 않고 혼합 paste는 커서 위치에 초안으로 삽입한다', async () => {
   const c = terminalFilesClient(async () => fileReply());
   const plain = { clipboardData: { files: [], getData: () => 'plain' }, preventDefault() { throw Error('native text must stay native'); } };

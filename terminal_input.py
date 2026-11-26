@@ -98,13 +98,15 @@ class TerminalInputs:
             raise ValueError('터미널 ID가 올바르지 않습니다.')
         return hashlib.sha256(terminal_id.encode()).hexdigest()
 
-    def submit(self, terminal_id, request_id, text, writer):
+    def submit(self, terminal_id, request_id, text, writer, *, operation=None):
         terminal_hash = self._terminal(terminal_id)
         if not isinstance(request_id, str) or not REQUEST.fullmatch(request_id):
             raise ValueError('입력 요청 식별자가 필요합니다.')
         if not isinstance(text, str) or len(text.encode()) > 32768:
             raise ValueError('입력은 32KiB 이하여야 합니다.')
         digest = hashlib.sha256(text.encode()).hexdigest()
+        if operation is not None:
+            digest = hashlib.sha256((operation + ':' + digest).encode()).hexdigest()
         request_hash = hashlib.sha256((terminal_id + ':' + request_id).encode()).hexdigest()
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')

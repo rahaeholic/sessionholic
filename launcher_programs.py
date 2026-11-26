@@ -34,6 +34,7 @@ SSH_CONFIG_KEYS = {"batchmode", "connecttimeout", "serveraliveinterval", "server
 SSH_CONFIG_VALUE = re.compile(r"[A-Za-z0-9._-]+")
 # A host name or alias, never an option (`ssh -G` is asked about it).
 SSH_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
+PANE_ID = re.compile(r"%[0-9]+")
 
 
 def table(runner=None, uid=None):
@@ -243,6 +244,8 @@ def launcher_programs(args):
         # A time-derived Claude PID describes the program but cannot authorize terminal input.
         hold = terminal.get("holdName")
         exact = held_program(hold, rows) if hold else pane_program(terminal.get("panePid"), rows)
+        if not hold and exact and exact["program"] == "claude":
+            exact["paneId"] = terminal.get("paneId")
         if exact and exact.get("program") != "claude" and not exact.get("nativeSource"):
             exact = None
         resumed = result[identifier].get("sessionId") if result[identifier].get("program") == "codex" else None
@@ -260,17 +263,23 @@ def launcher_programs(args):
     return {"terminals": result}
 
 
-def single_pane_pid(command, name):
-    """Read the PID only when this named tmux session has one pane."""
+def session_pane(command, name, pane_id=None):
+    """Read a live pane's (ID, PID) in this exact session. Initial proof requires one pane."""
     try:
         done = subprocess.run(command + ["list-panes", "-s", "-t", "=" + name + ":",
-                                         "-F", "#{session_name} #{pane_pid}"],
+                                         "-F", "#{session_name} #{pane_id} #{pane_pid} #{pane_dead}"],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, text=True)
         panes = done.stdout.splitlines()
-        if not done.returncode and len(panes) == 1:
-            owner, _, pid = panes[0].partition(" ")
-            if owner == name and re.fullmatch(r"[1-9][0-9]{0,9}", pid):
-                return int(pid)
+        if done.returncode or (pane_id is None and len(panes) != 1):
+            return None
+        for line in panes:
+            fields = line.split()
+            if len(fields) != 4:
+                continue
+            owner, identifier, pid, dead = fields
+            if (owner == name and PANE_ID.fullmatch(identifier) and dead == "0"
+                    and (pane_id is None or identifier == pane_id) and re.fullmatch(r"[1-9][0-9]{0,9}", pid)):
+                return identifier, int(pid)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return None
@@ -309,7 +318,10 @@ def held_program(hold, rows):
     tmux = which("tmux")
     if not tmux:
         return None
-    program = pane_program(single_pane_pid([tmux, "-L", HOLD_SOCKET, "-f", "/dev/null"], hold), rows)
+    pane = session_pane([tmux, "-L", HOLD_SOCKET, "-f", "/dev/null"], hold)
+    program = pane_program(pane[1], rows) if pane else None
+    if program and program["program"] == "claude":
+        return {**program, "paneId": pane[0]}
     if not program or program["program"] != "codex":
         return program
     try:

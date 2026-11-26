@@ -14172,7 +14172,7 @@ async function startTerminalReader({ manual = false } = {}) {
 // After an input a restarted board refused, keys go nowhere until typing pauses this long:
 // the rest of a fast-typed line (and its Enter) must not arrive without its start.
 const INPUT_REFUSED_PAUSE_MS = 1000;
-function sendInput(text) {
+function sendInput(text, claudePasteSubmit) {
   if (networkOffline() || !state.connected || state.inputFailed || !state.terminal)
     return Promise.reject(new Error("터미널에 연결되어 있지 않습니다."));
   if (state.inputRefused && Date.now() - state.inputRefusedAt < INPUT_REFUSED_PAUSE_MS) {
@@ -14192,7 +14192,7 @@ function sendInput(text) {
     try {
       await api(`/api/terminal/${encodeURIComponent(id)}/input`, {
         method: "POST",
-        body: { text, requestId: req },
+        body: { text, requestId: req, claudePasteSubmit },
       });
       if (state.inputRefused) {
         state.inputRefused = false;
@@ -14214,7 +14214,7 @@ function sendInput(text) {
         }
         throw err;
       }
-      if (!err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
+      if (err.code !== "claude_pane_unavailable" && !err.unauthorized && !err.staleAuth && epoch === state.inputEpoch) {
         state.inputFailed = true;
         state.inputEpoch++;
         stopTerminalReader();
@@ -14829,7 +14829,8 @@ async function pasteDraft(submit = false) {
         "초안에 제어 문자가 포함되어 있습니다. 일반 텍스트만 붙여넣을 수 있습니다.";
       return;
     }
-    const bracketed = !!state.term?.modes?.bracketedPasteMode;
+    const pinnedAttachment = attached.length && isInteractiveClaudeLauncher(terminalInfo(state.terminal));
+    const bracketed = pinnedAttachment || !!state.term?.modes?.bracketedPasteMode;
     if (/[\r\n]/.test(text) && !bracketed) {
       $("draft-note").textContent =
         "터미널의 붙여넣기 모드를 확인하지 못했습니다. 다시 연결한 뒤 보내 주세요. 여러 줄 초안은 유지됩니다.";
@@ -14846,9 +14847,10 @@ async function pasteDraft(submit = false) {
     pending.dispatched = true;
     if (attachmentEntry) attachmentEntry.sending = true;
     saveDraft();
-    await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
+    if (pinnedAttachment) await sendInput(normalized, submit);
+    else await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
-    if (submit) {
+    if (submit && !pinnedAttachment) {
       // A separate Enter after the TUI has handled the paste, as a person would type it.
       await new Promise((resolve) => setTimeout(resolve, 120));
       if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
@@ -14870,10 +14872,11 @@ async function pasteDraft(submit = false) {
     state.terminalScrollLines = 0;
     renderTerminalScroll();
     state.term.scrollToBottom();
-  } catch {
+  } catch (err) {
     if (state.terminal?.id === pending.id) {
       $("draft-note").textContent =
-        "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
+        err.code === "claude_pane_unavailable" ? err.message
+          : "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
       haptic("error");
     }
   } finally {

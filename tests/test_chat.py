@@ -1101,6 +1101,24 @@ class ChatHttpTest(ChatTest):
         c.request('POST',path,json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer synthetic',
                                                  'X-CSRF-Token':self.httpd.csrf})
         r=c.getresponse(); data=json.loads(r.read()); c.close(); return r.status,data
+    def test_terminal_attachment_input_requires_a_verified_claude_pane_and_deduplicates_submit(self):
+        path = '/api/terminal/' + TERMINAL_ID + '/input'
+        body = {'requestId': 'attachment-paste-01', 'text': '첨부 파일: "/fixture/file.txt"',
+                'claudePasteSubmit': True}
+        terms = self.httpd.terminals
+        with patch.object(terms, 'claude_pane_available', create=True, return_value=False) as owned, \
+                patch.object(terms, 'paste', create=True, return_value={'ok': True}) as paste, \
+                patch.object(terms, 'write', create=True) as raw:
+            status, data = self.post(path, body)
+            self.assertEqual((status, data['code'], data['dispatchState']),
+                             (409, 'claude_pane_unavailable', 'not_started'))
+            paste.assert_not_called()
+            owned.return_value = True
+            self.assertEqual(self.post(path, body)[0], 200)
+            self.assertEqual(self.post(path, body)[0], 200)
+            self.assertEqual(self.post(path, {**body, 'claudePasteSubmit': False})[0], 400)
+            paste.assert_called_once_with(TERMINAL_ID, body['text'], submit=True, require_claude_pane=True)
+            raw.assert_not_called()
     def test_prompt_route_answers_and_reports_refusals_with_a_code(self):
         terms=self.codex_terminal()
         fingerprint=chat.parse_menu(CODEX_APPROVAL)['fingerprint']
@@ -1276,12 +1294,18 @@ class ChatClaudeTest(unittest.TestCase):
                     rows = [{'id': TERMINAL_ID, 'createdAt': 100, **({'holdName': hold} if hold else {})}]
                     def transfer(host, op, args, timeout):
                         return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
+                    def tmux_run(command, **kwargs):
+                        if command[0] == lp.PS:
+                            return subprocess.CompletedProcess(command, 0, '32 32 S+')
+                        output = ''.join(f"{hold or record['name']} %{i} {pid} 0\n"
+                                         for i, pid in enumerate(panes.splitlines()))
+                        return subprocess.CompletedProcess(command, 0, output)
+
                     with patch.object(self.flow.transfers, 'rpc', side_effect=transfer), \
                             patch('launch.new_session', return_value={'argv': argv.split()}), \
                             patch('collector.which', return_value='/fixture/tmux'), \
                             patch.object(lp, 'table', return_value=tree), \
-                            patch.object(lp.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, ''.join(
-                                (hold or record['name']) + ' ' + pid + '\n' for pid in panes.splitlines()))) as tmux, \
+                            patch.object(lp.subprocess, 'run', side_effect=tmux_run) as tmux, \
                             patch.object(manager, 'list', side_effect=lambda: [manager._public(item)]), \
                             patch.object(manager, 'capture', return_value='──────────\n❯ \n──────────'), \
                             patch.object(manager, 'paste', return_value={'ok': True}) as paste:
@@ -1292,19 +1316,128 @@ class ChatClaudeTest(unittest.TestCase):
                         self.assertFalse(self.state(source=ref(outside))['capability']['supported'])
                         self.assertEqual(self.rejected(source=ref(outside)), chat.CLAUDE_EXTERNAL)
                         paste.assert_not_called()
-                        self.assertEqual(self.state(source=ref(own))['capability']['supported'], exact)
-                        if exact:
+                        self.assertEqual(saved.get('claudePaneId'), '%0' if exact else None)
+                        self.assertEqual(saved.get('claudePanePid'), 32 if exact else None)
+                        self.assertEqual(self.state(source=ref(own))['capability']['supported'], exact and not remote)
+                        if exact and not remote:
                             self.messages = [{'role': 'user', 'text': '안녕하세요', 'ts': time.time()}]
                             result = self.send(source=ref(own), rid=f'pane-{name.split()[0]}-fixture')
                             self.assertTrue(result['receipt']['deliveryVerified'])
                             paste.assert_called_once_with(TERMINAL_ID, '안녕하세요', submit=True)
+                        if remote:
+                            self.assertEqual(self.rejected(source=ref(own)), chat.CLAUDE_EXTERNAL)
+                            paste.assert_not_called()
                         if remote and not hold:
                             tmux.assert_not_called()
                         else:
                             target = hold if remote else record['name']
-                            self.assertIn('=' + target + ':', tmux.call_args.args[0])
+                            self.assertTrue(any('=' + target + ':' in call.args[0] for call in tmux.call_args_list))
                 finally:
                     manager.close()
+
+    @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')
+    def test_claude_chat_and_menu_stay_in_the_verified_pane(self):
+        import launcher_programs as lp
+
+        folder = self.root
+        socket = 'sb-test-' + secrets.token_hex(5)
+        manager = terminal.TerminalManager(state_dir=folder / 'pane-records', socket_name=socket)
+        self.addCleanup(manager.close)
+        self.flow.terminals = manager
+        command = [shutil.which('tmux'), '-L', socket, '-f', '/dev/null']
+
+        def tmux(*args):
+            return subprocess.run(command + list(args), capture_output=True, text=True, timeout=5, check=True).stdout
+
+        fixture = folder / 'pane-fixture.py'
+        fixture.write_text(
+            "import os, sys, tty\n"
+            "tty.setraw(0)\n"
+            "with open(sys.argv[1], 'wb', buffering=0) as log:\n"
+            "    while True:\n"
+            "        data = os.read(0, 4096)\n"
+            "        log.write(data)\n"
+            "        if b'!' in data:\n"
+            "            print(" + repr(CLAUDE_PERMISSION.replace('\n', '\r\n')) + ", end='', flush=True)\n"
+        )
+        target = '=sb-' + TERMINAL_ID + ':'
+        own_log, decoy_log, replacement_log = (folder / name for name in ('own', 'decoy', 'replacement'))
+        own, pid = tmux('new-session', '-dP', '-x', '120', '-y', '30', '-F', '#{pane_id} #{pane_pid}',
+                        '-s', 'sb-' + TERMINAL_ID, sys.executable, '-u', str(fixture), str(own_log)).split()
+        self.addCleanup(tmux, 'kill-server')
+        record = {'id': TERMINAL_ID, 'name': 'sb-' + TERMINAL_ID, 'key': 'fixture',
+                  'socket': socket, 'metadata': {'host': HOST['name'], 'mode': 'new-session'}}
+        manager.terminals[TERMINAL_ID] = terminal._Terminal(record, 1024)
+        self.row.update(kind='interactive', pid=int(pid))
+        self.board.poll(HOST)
+        # Simulate the exact metadata written by the previous version.
+        manager.link_native(TERMINAL_ID, self.flow._native_of(HOST['name'], 'claude', self.row))
+        self.assertFalse(self.state()['capability']['supported'])
+        self.assertEqual(self.rejected(rid='pane-unverified-01'), chat.CLAUDE_EXTERNAL)
+        rpc, program_of = self.flow.transfers.rpc, lp.program_of
+
+        def transfer(host, op, args, timeout):
+            return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
+
+        def program(argv):
+            return {'program': 'claude', 'cwd': None} if str(fixture) in argv else program_of(argv)
+
+        def wait_for(ready):
+            for _ in range(100):
+                if ready():
+                    return
+                time.sleep(.02)
+            self.fail('tmux fixture did not reach the expected state')
+
+        with patch.object(lp, 'program_of', side_effect=program), \
+                patch('launch.new_session', return_value={'argv': ['/bin/zsh', '-lic', 'zz']}), \
+                patch.object(self.flow.transfers, 'rpc', side_effect=transfer):
+            self.flow._describe_host(HOST, [{'id': TERMINAL_ID, 'createdAt': int(time.time())}])
+            saved = json.loads(manager.state_path.read_text())[0]['metadata']
+            self.assertEqual((saved['linkConfidence'], saved['claudePaneId'], saved['claudePanePid']),
+                             ('exact', own, int(pid)))
+            decoy = tmux('split-window', '-hP', '-F', '#{pane_id}', '-t', target,
+                         sys.executable, '-u', str(fixture), str(decoy_log)).strip()
+            wait_for(lambda: decoy_log.exists() and own_log.exists())
+            self.assertEqual(tmux('display-message', '-p', '-t', target, '#{pane_id}').strip(), decoy)
+            self.assertTrue(self.state()['capability']['supported'])
+            self.messages = [{'role': 'user', 'text': 'pane fixture', 'ts': time.time()}]
+            attachment = self.chat.upload(CLAUDE_REF, 'memo.txt', b'fixture')['attachment']
+            self.assertTrue(self.send(text='pane fixture', attachments=[attachment['id']])['receipt']['deliveryVerified'])
+            sent = ('pane fixture\r첨부 파일: ' + attachment['path'] + '\r').encode()
+            wait_for(lambda: own_log.read_bytes().endswith(sent))
+            self.assertEqual(decoy_log.read_bytes(), b'')
+            self.assertEqual(own_log.read_bytes(), sent)
+            tmux('send-keys', '-t', own, '-l', '!')
+            wait_for(lambda: 'Do you want to proceed?' in tmux('capture-pane', '-p', '-t', own))
+            fingerprint = chat.parse_menu(tmux('capture-pane', '-p', '-t', own))['fingerprint']
+            self.chat.prompt({'action': 'answer', 'source': CLAUDE_REF, 'requestId': 'pane-answer-01',
+                              'fingerprint': fingerprint, 'number': 2})
+            self.assertRegex(own_log.read_bytes(), rb'!\x1b[\[O]B\r$')
+            self.assertEqual(decoy_log.read_bytes(), b'')
+            self.assertTrue(self.state()['capability']['supported'])
+
+            run_tmux = manager._run
+
+            def replace_before_enter(*args, **kwargs):
+                result = run_tmux(*args, **kwargs)
+                if args[0] == 'load-buffer':
+                    wait_for(lambda: own_log.read_bytes().endswith(b'paste with no submit'))
+                    tmux('respawn-pane', '-k', '-t', own, sys.executable, '-u', str(fixture), str(replacement_log))
+                return result
+
+            with patch.object(manager, '_run', side_effect=replace_before_enter), \
+                    self.assertRaisesRegex(RuntimeError, '붙여넣은 뒤 연결된 Claude 창'):
+                manager.paste(TERMINAL_ID, 'paste with no submit')
+            wait_for(replacement_log.exists)
+            # A warm conversation cache must also report the missing pane.
+            self.assertFalse(self.chat.state({'source': CLAUDE_REF})['capability']['supported'])
+            self.assertFalse(self.state()['capability']['supported'])
+            self.assertEqual(self.rejected(rid='pane-replaced-01'), chat.CLAUDE_EXTERNAL)
+            with self.assertRaises(chat.PromptRejected):
+                self.answer(2, fingerprint, rid='pane-replaced-02')
+            self.assertEqual(decoy_log.read_bytes(), b'')
+            self.assertEqual(replacement_log.read_bytes(), b'')
 
     @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')
     def test_hold_window_name_collision_cannot_authorize_foreign_claude_input(self):
@@ -1318,10 +1451,11 @@ class ChatClaudeTest(unittest.TestCase):
             def tmux(*args):
                 return subprocess.run(command + list(args), capture_output=True, text=True, timeout=5, check=True)
 
-            pane = tmux('new-session', '-dP', '-F', '#{pane_pid}', '-s', hold, '-n', 'own', '/bin/cat')
+            pane = tmux('new-session', '-dP', '-F', '#{pane_id} #{pane_pid}', '-s', hold, '-n', 'own', '/bin/cat')
             try:
                 decoy = tmux('new-session', '-dP', '-F', '#{pane_pid}', '-s', other, '-n', hold, '/bin/cat')
-                own_pid, outside_pid = int(pane.stdout), int(decoy.stdout)
+                pane_id, pid = pane.stdout.split()
+                own_pid, outside_pid = int(pid), int(decoy.stdout)
                 own = {**self.row, 'kind': 'interactive', 'id': '', 'pid': own_pid}
                 outside = {**own, 'id': 'external-worker', 'pid': outside_pid,
                            'sessionId': '019bbbbb-0000-7000-8000-000000000003'}
@@ -1349,16 +1483,19 @@ class ChatClaudeTest(unittest.TestCase):
                             if not present:
                                 tmux('kill-session', '-t', '=' + hold)
                             record = {'id': TERMINAL_ID, 'name': 'sb-' + TERMINAL_ID, 'key': 'fixture',
-                                      'socket': manager.socket_name, 'metadata': {'host': HOST['name'], 'mode': 'new-session'}}
+                                      'socket': manager.socket_name, 'metadata': {
+                                          'host': HOST['name'], 'mode': 'new-session', 'holdName': hold}}
                             item = manager.terminals[TERMINAL_ID] = terminal._Terminal(record, 1024)
                             held = lp.held_program(hold, tree)
                             self.assertEqual(held, {'program': 'claude', 'cwd': None, 'pid': own_pid,
-                                                    'paneVerified': True} if present else None)
+                                                    'paneVerified': True, 'paneId': pane_id} if present else None)
                             self.flow._describe_host(host, [{'id': TERMINAL_ID, 'createdAt': 100, 'holdName': hold}])
                             saved = item.record['metadata']
                             self.assertEqual(saved.get('linkConfidence'), 'exact' if present else None)
                             self.assertEqual((saved.get('nativeSource') or {}).get('id'), CLAUDE_SID if present else None)
-                            self.assertEqual(self.state(source=owned_ref)['capability']['supported'], present)
+                            self.assertEqual(saved.get('claudePaneId'), pane_id if present else None)
+                            self.assertFalse(self.state(source=owned_ref)['capability']['supported'])
+                            self.assertEqual(self.rejected(source=owned_ref), chat.CLAUDE_EXTERNAL)
                             self.assertFalse(self.state(source=other_ref)['capability']['supported'])
                             self.assertEqual(self.rejected(source=other_ref), chat.CLAUDE_EXTERNAL)
                             paste.assert_not_called()

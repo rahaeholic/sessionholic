@@ -39,25 +39,30 @@ not a process line
 
 
 class TableTest(unittest.TestCase):
-    def test_single_pane_requires_an_exact_session_name_and_valid_pid(self):
+    def test_session_pane_requires_the_exact_session_and_a_live_pane(self):
         name = "sh-0123456789abcdef"
         command = ["/fixture/tmux"]
-        for code, output, expected in (
-            (0, name + " 52\n", 52),
-            (0, "sh-1123456789abcdef 32\n", None),
-            (0, name + " 52\nsh-1123456789abcdef 32\n", None),
-            (0, name + " 52\n" + name + " 53\n", None),
-            (0, name + " x\n", None),
-            (0, "52\n", None),
-            (0, "", None),
-            (1, name + " 52\n", None),
+        valid = name + " %7 52 0\n"
+        split = valid + name + " %8 53 0\n"
+        for code, output, pane_id, expected in (
+            (0, valid, None, ("%7", 52)),
+            (0, split, "%7", ("%7", 52)),
+            (0, split, "%8", ("%8", 53)),
+            (0, split, "%9", None),
+            (0, "sh-1123456789abcdef %7 52 0\n", "%7", None),
+            (0, split, None, None),
+            (0, name + " %7 x 0\n", None, None),
+            (0, name + " invalid 52 0\n", None, None),
+            (0, name + " %7 52 1\n", "%7", None),
+            (0, "", None, None),
+            (1, valid, None, None),
         ):
-            with self.subTest(code=code, output=output), patch.object(lp.subprocess, "run",
+            with self.subTest(code=code, output=output, pane_id=pane_id), patch.object(lp.subprocess, "run",
                     return_value=subprocess.CompletedProcess([], code, output)) as run:
-                self.assertEqual(lp.single_pane_pid(command, name), expected)
+                self.assertEqual(lp.session_pane(command, name, pane_id), expected)
                 self.assertEqual(run.call_args.args[0],
                                  command + ["list-panes", "-s", "-t", "=" + name + ":",
-                                            "-F", "#{session_name} #{pane_pid}"])
+                                            "-F", "#{session_name} #{pane_id} #{pane_pid} #{pane_dead}"])
 
     def test_ps_rows_are_parsed_in_the_c_locale_and_bad_lines_are_skipped(self):
         commands = []
@@ -141,14 +146,14 @@ class ExactCodexTest(unittest.TestCase):
                 (21, 20, 2, "/vendor/codex"), (22, 21, 2, "/vendor/codex app-server"),
                 (23, 21, 2, "/vendor/codex app-server daemon"), (30, 21, 3, "bash -c tool"),
                 (31, 30, 3, "/vendor/codex"), (40, 1, 2, "/vendor/codex")]
-        done = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\n")
+        done = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef %7 10 0\n")
         with patch("collector.which", return_value="/fixture/tmux"), patch.object(lp.subprocess, "run", return_value=done) as run, \
                 patch.object(lp, "writable_codex_source", return_value=self.native) as read:
             self.assertEqual(lp.held_program("sh-0123456789abcdef", rows),
                              {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native})
             read.assert_called_once_with({20, 21, 22})
             self.assertIn("list-panes", run.call_args.args[0])
-            run.return_value = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\nsh-0123456789abcdef 40\n")
+            run.return_value = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef %7 10 0\nsh-0123456789abcdef %8 40 0\n")
             self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
             run.side_effect = subprocess.TimeoutExpired("tmux", 3)
             self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
@@ -332,16 +337,17 @@ class WorkflowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             flow = server.Workflow(board, terminals, directory)
             for name, listed, info, fresh, linked in (
-                ("match", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
-                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
-                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
-                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
-                ("background", [{**raw, "kind": "background"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
-                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
-                ("missing pid", [raw], {"program": "claude", "paneVerified": True}, True, False),
+                ("match", [raw], {"program": "claude", "pid": 42, "paneVerified": True, "paneId": "%7"}, True, True),
+                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42, "paneVerified": True, "paneId": "%7"}, True, True),
+                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "paneVerified": True, "pid": 42, "paneId": "%7"}, True, False),
+                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "paneVerified": True, "pid": 42, "paneId": "%7"}, True, False),
+                ("background", [{**raw, "kind": "background"}], {"program": "claude", "paneVerified": True, "pid": 42, "paneId": "%7"}, True, False),
+                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "paneVerified": True, "pid": 42, "paneId": "%7"}, True, False),
+                ("missing pane", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, False),
+                ("missing pid", [raw], {"program": "claude", "paneVerified": True, "paneId": "%7"}, True, False),
                 ("unverified pid", [raw], {"program": "claude", "pid": 42}, True, False),
-                ("no pane target", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, False),
-                ("failed collection", [raw], {"program": "claude", "paneVerified": True, "pid": 42}, False, False),
+                ("no pane target", [raw], {"program": "claude", "pid": 42, "paneVerified": True, "paneId": "%7"}, True, False),
+                ("failed collection", [raw], {"program": "claude", "paneVerified": True, "pid": 42, "paneId": "%7"}, False, False),
             ):
                 with self.subTest(name=name):
                     board.state = {
@@ -358,7 +364,7 @@ class WorkflowTest(unittest.TestCase):
                         terminals.link_native.assert_called_once_with(FIRST, {
                             "host": host["name"], "agent": "claude", "id": sid, "home": None,
                             "cwd": raw["cwd"], "kind": "interactive", "sessionId": sid,
-                        }, confidence="exact")
+                        }, confidence="exact", claude_pane=("%7", 42))
                     else:
                         terminals.link_native.assert_not_called()
 
