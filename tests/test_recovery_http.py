@@ -208,11 +208,21 @@ class RecoveryHttpTest(unittest.TestCase):
         for interactive_index in (0, 1):
             with self.subTest(interactive_index=interactive_index):
                 sid = '22222222-2222-4222-8222-%012d' % interactive_index
-                active = {'agent': 'claude', 'id': sid, 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work'}
-                background = {**active, 'kind': 'background'}
+                active = {'agent': 'claude', 'id': sid, 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work',
+                          'state': 'idle'}
+                background = {**active, 'kind': 'background', 'state': 'working'}
                 rows = [active, background] if interactive_index == 0 else [background, active]
-                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
-                    self.assertTrue(self.board.poll(HOST))
+                collected = collector.claude_session_rows(rows, [], {}, transcripts={})
+                for row in collected:
+                    row['runtimeReadToken'] = 'a' * 16 + ':%d' % (interactive_index + 1)
+                stream = SimpleNamespace(name=HOST['name'], stopping=False, delivered=False)
+                with patch.dict(self.board.streams, {HOST['name']: stream}):
+                    self.assertTrue(self.board.apply_live(stream, {'claude': collected, 'codex': []}))
+                snapshot = self.snapshot()
+                phases = {'background': 'working', 'interactive': 'idle'}
+                self.assertEqual({row['kind']: row['phase'] for row in snapshot['hosts'][0]['data']['claude']}, phases)
+                self.assertEqual({row['kind']: row['runtimeObservation']['phase']
+                                  for row in snapshot['hosts'][0]['data']['claude']}, phases)
                 ref = {'host': HOST['name'], 'agent': 'claude', 'id': sid, 'sessionId': sid}
                 with self.assertRaisesRegex(ValueError, '여러 개'):
                     self.board.source(ref)
@@ -226,27 +236,70 @@ class RecoveryHttpTest(unittest.TestCase):
                         patch.object(native_chat.native, '_claude_run', return_value=json.dumps(rows)):
                     self.assertEqual(native_chat._agents_row(ref, self.home, 0, resolved[1]), active)
                     self.assertEqual(native_chat._agents_row(ref, self.home, 0, resolved[0]), background)
-                self.terms.records = [{'id': 'b' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact',
-                                       'nativeSource': {**active, 'host': HOST['name']}}]
+                launcher = {'id': 'b' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact',
+                            'nativeSource': {**active, 'host': HOST['name']}}
+                attach = {'id': 'c' * 32, 'alive': True, 'mode': 'attach', 'linkConfidence': 'exact',
+                          'nativeSource': {**background, 'host': HOST['name']}}
+                self.terms.records = [launcher]
                 status, body = self.request('GET', '/api/terminals')
                 self.assertEqual(status, 200)
                 self.assertEqual(body['terminals'][0]['boardLauncher']['listedRow'],
                                  [HOST['name'], 'claude', interactive_index])
-                self.terms.records = []
                 rpc_kinds = []
 
                 def read_state(host, operation, args, timeout):
                     self.assertEqual((operation, args['action']), ('chat', 'read'))
-                    rpc_kinds.append(args['source']['kind'])
-                    return {'phase': 'idle', 'runtimeKnown': True, 'messages': [], 'capabilities': {}}
-                with patch.object(self.flow.transfers, 'rpc', side_effect=read_state):
-                    for kind in kinds:
-                        self.assertEqual(self.request('POST', '/api/chat/state', {'source': {**ref, 'kind': kind}})[0], 200)
-                self.assertEqual(tuple(rpc_kinds), kinds, 'a cached background read cannot answer the interactive route')
-                self.assertTrue(all(key in self.httpd.chat.cache for key in keys))
-                self.httpd.chat._forget_state(resolved[1])
-                self.assertTrue(all(key not in self.httpd.chat.cache for key in keys))
+                    kind = args['source']['kind']
+                    rpc_kinds.append(kind)
+                    return {'phase': phases[kind], 'runtimeKnown': True, 'messages': [], 'capabilities': {}}
+
+                for terminals in ([attach, launcher], [launcher, attach]):
+                    self.terms.records = terminals
+                    with patch.object(self.flow.transfers, 'rpc', side_effect=read_state), \
+                            patch.object(self.terms, 'claude_pane_available', create=True, return_value=True), \
+                            patch.object(self.terms, 'capture', create=True, return_value='') as capture:
+                        for terminal in (attach, launcher):
+                            kind = terminal['nativeSource']['kind']
+                            capture.reset_mock()
+                            code, state = self.request('POST', '/api/chat/state', {'source': {**ref, 'kind': kind}})
+                            self.assertEqual(code, 200)
+                            self.assertEqual(state['phase'], phases[kind])
+                            self.assertEqual(state['route']['kind'], kind)
+                            self.assertEqual(state['route']['sessionId'], sid)
+                            self.assertEqual(state['runtimeObservation']['phase'], phases[kind])
+                            self.assertEqual(state['terminalConnection']['id'], terminal['id'])
+                            self.assertTrue(capture.call_args_list)
+                            self.assertTrue(all(call.args[0] == terminal['id'] for call in capture.call_args_list))
+                    self.assertTrue(all(key in self.httpd.chat.cache for key in keys))
+                    self.httpd.chat._forget_state(resolved[1])
+                    self.assertTrue(all(key not in self.httpd.chat.cache for key in keys))
+                self.assertEqual(tuple(rpc_kinds), kinds * 2)
                 self.assert_no_execution()
+
+    def test_launcher_preserves_folder_when_non_uuid_worker_is_reused(self):
+        row = {'agent': 'claude', 'id': 'fixture-worker', 'sessionId': 'fixture-transcript',
+               'kind': 'interactive', 'cwd': '/fixture/right'}
+        wrong = {**row, 'cwd': '/fixture/wrong'}
+        background = {**row, 'kind': 'background'}
+        ref = {**row, 'host': HOST['name']}
+        self.terms.records = [{'id': 'd' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact', 'nativeSource': ref}]
+        for index, rows in ((2, [wrong, background, row]), (0, [row, background, wrong])):
+            with self.subTest(index=index):
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
+                    self.assertTrue(self.board.poll(HOST))
+                for lookup in (self.board.source, self.httpd.chat.resolve):
+                    self.assertEqual(lookup(ref)['cwd'], '/fixture/right')
+                    self.assertEqual(lookup({**ref, 'cwd': wrong['cwd']})['cwd'], '/fixture/wrong')
+                right = self.board.source(ref)
+                wrong_row = self.board.source({**ref, 'cwd': wrong['cwd']})
+                self.assertNotEqual(self.httpd.chat.state_key(right), self.httpd.chat.state_key(wrong_row))
+                with patch.object(native_chat.native, '_claude_binary', return_value='fixture-claude'), \
+                        patch.object(native_chat.native, '_claude_run', return_value=json.dumps(rows)):
+                    self.assertEqual(native_chat._agents_row(ref, self.home, 0, right), row)
+                status, body = self.request('GET', '/api/terminals')
+                self.assertEqual(status, 200)
+                self.assertEqual(body['terminals'][0]['boardLauncher']['listedRow'], [HOST['name'], 'claude', index])
+        self.assert_no_execution()
 
     def test_duplicate_interactive_pids_share_retained_mark(self):
         sid = '33333333-3333-4333-8333-333333333333'

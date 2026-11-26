@@ -482,6 +482,8 @@ class Chat:
                 identity['sessionId'] = source['sessionId']
             if source.get('listedKind'):
                 identity['kind'] = source['listedKind']
+                if source.get('cwd'):
+                    identity['cwd'] = source['cwd']
         return identity
 
     @classmethod
@@ -507,12 +509,14 @@ class Chat:
                 native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
                 if (isinstance(native, dict) and self.identity(native) == self.identity(ref or {})
                         and (not kind or native.get('kind') == kind)
+                        and (not kind or not ref.get('cwd') or native.get('cwd') == ref['cwd'])
                         and (not ref.get('sessionId') or native.get('sessionId') == ref['sessionId'])):
                     return {**native, 'title': terminal.get('title', '이어가는 작업'),
                             **({'listedKind': kind} if kind else {})}
                 selected = terminal.get('chatSource') or terminal.get('metadata', {}).get('chatSource')
                 if (allow_chat_source and isinstance(selected, dict) and self.identity(selected) == self.identity(ref)
                         and (not kind or selected.get('kind') == kind)
+                        and (not kind or not ref.get('cwd') or selected.get('cwd') == ref['cwd'])
                         and (not ref.get('sessionId') or selected.get('sessionId') == ref['sessionId'])):
                     return {**selected, 'readOnly': True, **({'listedKind': kind} if kind else {})}
             raise
@@ -752,7 +756,8 @@ class Chat:
                 capability['reason'] = '연결이 끝난 세션입니다. 같은 대화를 다시 열어 이어갈 수 있습니다.'
             elif recovery.get('reason'):
                 capability['reason'] = recovery['reason']
-        response = {'route': identity, 'phase': phase,
+        route = self.watch_identity(source) if source.get('listedKind') else identity
+        response = {'route': route, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
                     # Rows before these were left out (collector.recent_window, the read's range).
@@ -939,9 +944,13 @@ class Chat:
             if source.get('agent') == 'claude':
                 identity = self.watch_identity(source)
                 identity.pop('kind', None)
+                identity.pop('cwd', None)
                 self.cache.pop(json.dumps(identity, sort_keys=True), None)
                 for kind in ('interactive', 'background', 'bg'):
-                    self.cache.pop(json.dumps({**identity, 'kind': kind}, sort_keys=True), None)
+                    route = {**identity, 'kind': kind}
+                    self.cache.pop(json.dumps(route, sort_keys=True), None)
+                    if source.get('cwd'):
+                        self.cache.pop(json.dumps({**route, 'cwd': source['cwd']}, sort_keys=True), None)
             else:
                 self.cache.pop(self.state_key(source), None)
 
@@ -960,18 +969,28 @@ class Chat:
         return False
 
     def _board_terminal(self, source):
+        fallback = None
+        interactive = source.get('agent') == 'claude' and source.get('kind') == 'interactive'
+        kind = source.get('listedKind') or ('interactive' if interactive else None)
         for terminal in self.workflow.terminals.list():
             # A 새 세션 link guessed from start times may name another terminal's session:
             # it is shown as estimated and never receives a paste or a menu answer.
-            if terminal.get('linkConfidence') == 'estimated':
+            info = {**(terminal.get('metadata') or {}), **terminal}
+            if info.get('linkConfidence') == 'estimated':
                 continue
-            native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
+            native = info.get('nativeSource')
             if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
-                if (launcher_claude(terminal)
-                        and not self.workflow.terminals.claude_pane_available(terminal['id'])):
+                if kind and native.get('kind') and native['kind'] != kind:
                     continue
-                return terminal
-        return None
+                if launcher_claude(info):
+                    if not self.workflow.terminals.claude_pane_available(terminal['id']):
+                        continue
+                    return info
+                if not interactive:
+                    return info
+                if fallback is None:
+                    fallback = info
+        return fallback
 
     def _capture_terminal(self, terminal, **kwargs):
         if launcher_claude(terminal):
@@ -1694,6 +1713,7 @@ class Chat:
             from server import private_json
             attachment_source = self.watch_identity(source)
             attachment_source.pop('kind', None)
+            attachment_source.pop('cwd', None)
             record = {'source': attachment_source, 'cwd': cwd, 'attachment': attachment}
             private_json(self.root / 'attachments' / (attachment['id'] + '.json'), record)
             return {'attachment': {**attachment, 'type': attachment.get('mime', 'application/octet-stream')}}

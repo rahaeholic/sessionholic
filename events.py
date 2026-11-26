@@ -75,7 +75,7 @@ def chat_ref(query):
     if query.get("home"):
         ref["home"] = query["home"]
     if query.get('agent') == 'claude':
-        for field in ('sessionId', 'kind'):
+        for field in ('sessionId', 'kind', 'cwd'):
             if query.get(field):
                 ref[field] = query[field]
     return ref
@@ -87,7 +87,7 @@ def watch_key(ref):
     one conversation however the client spelled it."""
     identity = {key: ref.get(key) for key in CHAT_KEYS}
     if ref.get('agent') == 'claude':
-        for field in ('sessionId', 'kind'):
+        for field in ('sessionId', 'kind', 'cwd'):
             if ref.get(field):
                 identity[field] = ref[field]
     return json.dumps(identity, sort_keys=True)

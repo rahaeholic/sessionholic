@@ -747,6 +747,9 @@ def _agents_row(identity, home, deadline, source):
     if isinstance(rows, list) and source.get("listedKind"):
         rows = [row for row in rows if isinstance(row, dict) and row.get("kind") == source["listedKind"]]
     matches = [r for r in rows if isinstance(r, dict) and r.get("id") == identity["id"]] if isinstance(rows, list) else []
+    if len(matches) > 1 and source.get("listedKind"):
+        matches = [row for row in matches if row.get("cwd") == source.get("cwd")
+                   and (not source.get("sessionId") or row.get("sessionId") == source["sessionId"])]
     if not matches and source.get("kind") == "interactive" and source.get("sessionId") == identity["id"]:
         # Board-created --session-id UUID differs from agents' terminal row ID.
         # The server supplies this binding; cwd and native sessionId must agree.

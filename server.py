@@ -1568,6 +1568,8 @@ class Board:
                            and (not ref.get("sessionId") or row.get("sessionId") == ref["sessionId"])]
             if kind:
                 matches = [row for row in matches if row.get("kind") == kind]
+                if ref.get("cwd"):
+                    matches = [row for row in matches if row.get("cwd") == ref["cwd"]]
             if agent == "claude" and len(matches) > 1:
                 # Multiple processes may publish the same route for one conversation.
                 # Different execution kinds or folders need an exact selector.
@@ -1868,7 +1870,7 @@ class Workflow:
                 raise original
         source = dict(record["source"])
         if ref.get("agent") == "claude" and ref.get("kind"):
-            if source.get("kind") != ref["kind"]:
+            if source.get("kind") != ref["kind"] or ref.get("cwd") and source.get("cwd") != ref["cwd"]:
                 raise ValueError("원래 대화의 실행 방식이 변경되었습니다.")
             source["listedKind"] = ref["kind"]
         if record.get("provenance", {}).get("closure") in ("explicit_termination", "legacy_user_close"):

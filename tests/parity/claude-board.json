@@ -983,7 +983,7 @@
                 "cwd": "/fixture/work",
                 "pid": 9,
                 "startedAt": 1,
-                "phase": "working",
+                "phase": "idle",
                 "updatedAt": 1
               },
               {
@@ -994,7 +994,7 @@
                 "cwd": "/fixture/work",
                 "pid": 9,
                 "startedAt": 1,
-                "phase": "idle",
+                "phase": "working",
                 "updatedAt": 1
               }
             ],
@@ -1069,6 +1069,10 @@
       "notificationAlias": {
         "key": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
         "target": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      },
+      "runtimePhases": {
+        "background": "working",
+        "interactive": "idle"
       }
     }
   },
@@ -1093,7 +1097,7 @@
                 "cwd": "/fixture/work",
                 "pid": 9,
                 "startedAt": 1,
-                "phase": "idle",
+                "phase": "working",
                 "updatedAt": 1
               },
               {
@@ -1104,7 +1108,7 @@
                 "cwd": "/fixture/work",
                 "pid": 9,
                 "startedAt": 1,
-                "phase": "working",
+                "phase": "idle",
                 "updatedAt": 1
               }
             ],
@@ -1179,7 +1183,243 @@
       "notificationAlias": {
         "key": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
         "target": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      },
+      "runtimePhases": {
+        "background": "working",
+        "interactive": "idle"
       }
+    }
+  },
+  {
+    "name": "비UUID 식별자를 공유하는 작업 폴더에서 대화형 행 선택 (후보 2)",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 111,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "interactive",
+                "phase": "idle",
+                "cwd": "/fixture/wrong"
+              },
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "background",
+                "phase": "working",
+                "cwd": "/fixture/right"
+              },
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "interactive",
+                "phase": "idle",
+                "cwd": "/fixture/right"
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": []
+    },
+    "terminals": [
+      {
+        "id": "exact",
+        "mode": "new-session",
+        "alive": true,
+        "linkConfidence": "exact",
+        "nativeSource": {
+          "agent": "claude",
+          "id": "fixture-worker",
+          "sessionId": "fixture-transcript",
+          "kind": "interactive",
+          "phase": "idle",
+          "cwd": "/fixture/right",
+          "host": "fixture-host"
+        }
+      }
+    ],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          }
+        ]
+      ],
+      "recoveries": [],
+      "launchers": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 111,
+          "listedRow": ["fixture-host", "claude", 2]
+        }
+      },
+      "cardKeys": [
+        "fixture-host|claude||fixture-worker",
+        "fixture-host|claude||fixture-worker",
+        "fixture-host|claude||fixture-worker"
+      ],
+      "retainedCardKeys": [],
+      "launcherCardKeys": {
+        "exact": "fixture-host|claude||fixture-worker"
+      },
+      "launcherCwd": "/fixture/right"
+    }
+  },
+  {
+    "name": "비UUID 식별자를 공유하는 작업 폴더에서 대화형 행 선택 (후보 0)",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 109,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "interactive",
+                "phase": "idle",
+                "cwd": "/fixture/right"
+              },
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "background",
+                "phase": "working",
+                "cwd": "/fixture/right"
+              },
+              {
+                "agent": "claude",
+                "id": "fixture-worker",
+                "sessionId": "fixture-transcript",
+                "kind": "interactive",
+                "phase": "idle",
+                "cwd": "/fixture/wrong"
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": []
+    },
+    "terminals": [
+      {
+        "id": "exact",
+        "mode": "new-session",
+        "alive": true,
+        "linkConfidence": "exact",
+        "nativeSource": {
+          "agent": "claude",
+          "id": "fixture-worker",
+          "sessionId": "fixture-transcript",
+          "kind": "interactive",
+          "phase": "idle",
+          "cwd": "/fixture/right",
+          "host": "fixture-host"
+        }
+      }
+    ],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "fixture-worker",
+              "sessionId": "fixture-transcript",
+              "home": ".claude"
+            },
+            "boardDuplicateOf": null
+          }
+        ]
+      ],
+      "recoveries": [],
+      "launchers": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 109,
+          "listedRow": ["fixture-host", "claude", 0]
+        }
+      },
+      "cardKeys": [
+        "fixture-host|claude||fixture-worker",
+        "fixture-host|claude||fixture-worker",
+        "fixture-host|claude||fixture-worker"
+      ],
+      "retainedCardKeys": [],
+      "launcherCardKeys": {
+        "exact": "fixture-host|claude||fixture-worker"
+      },
+      "launcherCwd": "/fixture/right"
     }
   }
 ]

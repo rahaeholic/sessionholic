@@ -1436,9 +1436,14 @@ function validRuntimeObservation(value) {
     Number.isFinite(value.observedAt) && Number.isFinite(value.expiresAt) && value.observedAt <= runtimeNow() + 30 &&
     (value.known ? ["working", "needs_input", "idle", "done", "closed"].includes(value.phase) && value.expiresAt > value.observedAt : value.phase === "unknown");
 }
+function runtimeIdentity(s) {
+  if (s.agent !== "claude") return conversationIdentity(s);
+  return JSON.stringify([s.host, s.agent, s.home || ".claude", sourceOf(s).id,
+    s.cwd || null, s.sessionId || null, s.kind || null]);
+}
 function rememberRuntimeObservation(s, data, authEpoch = state.authEpoch) {
   if (authEpoch !== state.authEpoch || data?.stale === true || !validRuntimeObservation(data?.runtimeObservation)) return false;
-  const observation = data.runtimeObservation, identity = conversationIdentity(s);
+  const observation = data.runtimeObservation, identity = runtimeIdentity(s);
   const previous = state.runtimeObservations.get(identity);
   if (previous && (previous.observation.bootId !== observation.bootId ||
       previous.observation.acceptedSeq >= observation.acceptedSeq || previous.observation.requestSeq > observation.requestSeq)) return false;
@@ -1479,7 +1484,7 @@ function runtimeMetadataChanged({ refreshMessages = false } = {}) {
 function observedSessionRuntime(s) {
   const hasAnnotation = Object.hasOwn(s, "runtimeObservation");
   if (hasAnnotation) rememberRuntimeObservation(s, s);
-  const record = state.runtimeObservations.get(conversationIdentity(s));
+  const record = state.runtimeObservations.get(runtimeIdentity(s));
   if (!hasAnnotation && !record) return null;
   const observation = record?.authEpoch === state.authEpoch && validRuntimeObservation(record.observation) ? record.observation : null;
   const confirmed = !!observation?.known && observation.expiresAt > runtimeNow() && !s.stale;
@@ -1520,14 +1525,16 @@ function listedSessionKey(host, s) {
     ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
 }
 function claudeDetailKey(key, row) {
-  return "claude-detail:" + JSON.stringify([key, row.sessionId || row.id]);
+  const transcript = row.sessionId || row.id;
+  return "claude-detail:" + JSON.stringify([key, transcript, conversationUUID(transcript) ? null : row.cwd || null]);
 }
 function listedSession(host, s, key, following) {
   const row = { ...s, host: host.name, stale: !host.ok };
   if (s.agent === "claude" && s.kind) {
     const identifier = sourceOf(s).id;
     if (key.startsWith("claude-detail:") || identifier && host.data?.claude?.some((other) =>
-      other.kind !== s.kind && (other.home || ".claude") === (s.home || ".claude") && sourceOf(other).id === identifier))
+      (other.kind !== s.kind || other.cwd !== s.cwd || other.sessionId !== s.sessionId) &&
+      (other.home || ".claude") === (s.home || ".claude") && sourceOf(other).id === identifier))
       row.listedKind = s.kind;
   }
   // The list's own phase stands again once it changed since the conversation was read,
@@ -1727,7 +1734,10 @@ function sourceOf(s) {
     id: s.id,
   };
   if (s.home) source.home = s.home;
-  if (s.agent === "claude" && s.listedKind) source.kind = s.listedKind;
+  if (s.agent === "claude" && s.listedKind) {
+    source.kind = s.listedKind;
+    if (s.cwd) source.cwd = s.cwd;
+  }
   if (s.agent === "claude" && s.sessionId) {
     source.sessionId = s.sessionId;
     if (!source.id && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId))
@@ -3659,20 +3669,20 @@ function renderDetailTerminal(s) {
 function goToSessionTerminal(key) {
   const s = selectedSession();
   if (!s || s.key !== key || state.launchBusy || !state.authenticated) return;
-  const terminal = terminalForSession(s);
+  const terminal = terminalForOpenDetail(s);
   if (!terminal) {
     renderDetailTerminal(s);
     return;
   }
-  if (terminalMatchesDetail(terminal, s)) openTerminal(terminal, { inline: inlineTerminalRef(s) });
+  if (terminalMatchesOpenDetail(terminal, s)) openTerminal(terminal, { inline: inlineTerminalRef(s) });
   else openChatTerminal(s);
 }
 function openSessionTerminal(s) {
   if (window.SessionholicWorkspace?.routeSessionTerminal(s)) return;
   if (!s || state.launchBusy || !state.authenticated) return;
   if (sessionOneShot(s)) { select(s.key); toast(ONE_SHOT_NO_INPUT); return; }
-  const terminal = terminalForSession(s);
-  if (terminal && terminalMatchesDetail(terminal, s)) {
+  const terminal = terminalForOpenDetail(s);
+  if (terminal && terminalMatchesOpenDetail(terminal, s)) {
     if (state.selected !== s.key) select(s.key);
     openTerminal(terminal, { inline: inlineTerminalRef(s) });
     return;
@@ -5355,7 +5365,7 @@ function conversationIdentity(s) {
   if (!s) return null;
   const transcript = s.agent === "claude" ? s.sessionId || s.id : s.id;
   const folder = s.agent === "claude" && conversationUUID(transcript) ? null : s.cwd || null;
-  return JSON.stringify([chatKey(sourceOf(s)), folder, transcript, ...(s.listedKind ? [s.listedKind] : [])]);
+  return JSON.stringify([chatKey(sourceOf(s)), folder, transcript, ...(s.listedKind ? [s.listedKind, s.cwd || null] : [])]);
 }
 function conversationUUID(value) {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
@@ -5478,6 +5488,7 @@ function chatEntry(s) {
   // recovered transport selector must not give the same conversation a different draft.
   const draftSource = { ...source }; delete draftSource.sessionId;
   delete draftSource.kind; // Both listed execution kinds share the transcript's draft.
+  delete draftSource.cwd;
   const draftIdentity = JSON.stringify([draftSource, s.agent === "claude" ? s.sessionId || s.id : s.id]);
   const previous = state.chats.get(key);
   if (previous && previous.draftIdentity !== draftIdentity) {
@@ -5507,11 +5518,12 @@ function chatEntry(s) {
     restoreChatDraft(entry);
   }
   const entry = state.chats.get(key);
-  if (source.kind !== entry.source.kind) {
+  const routeChanged = source.kind !== entry.source.kind || source.cwd !== entry.source.cwd;
+  if (routeChanged) {
     entry.data = null;
     entry.stateEpoch++;
   }
-  if (source.kind !== entry.source.kind || source.sessionId && entry.source.sessionId !== source.sessionId)
+  if (routeChanged || source.sessionId && entry.source.sessionId !== source.sessionId)
     entry.source = Object.freeze({ ...source });
   return entry;
 }
@@ -10564,14 +10576,14 @@ function openChatTerminal(s) {
   if (chatOneShot(chatEntry(s))) { toast(ONE_SHOT_NO_INPUT); return; }
   state.detailModes.set(conversationIdentity(s), "terminal");
   renderDetailMode();
-  if (state.terminalAlive && terminalMatchesDetail(state.terminal, s)) {
+  if (state.terminalAlive && terminalMatchesOpenDetail(state.terminal, s)) {
     openTerminal(state.terminal, { inline: inlineTerminalRef(s) });
     return;
   }
   // The session already has a live board terminal (its "터미널 열림" mark): that one opens,
   // never a second connection to the same session.
-  const open = terminalForSession(s);
-  if (open && terminalMatchesDetail(open, s)) {
+  const open = terminalForOpenDetail(s);
+  if (open && terminalMatchesOpenDetail(open, s)) {
     openTerminal(open, { inline: inlineTerminalRef(s) });
     return;
   }
@@ -10587,10 +10599,9 @@ function openNativeChat(terminal) {
   const source = info.nativeSource;
   if (!source?.host || !source.agent || !source.id || !state.authenticated) return;
   const isClaudeLauncher = isInteractiveClaudeLauncher(info);
-  const listed = isClaudeLauncher && listedLauncherClaude(terminal);
+  const listed = isClaudeLauncher && launcherDetailSession(terminal);
   if (isClaudeLauncher && !listed) return;
-  const key = listed?.listedKind === "interactive" ? claudeDetailKey(listed.key, listed) :
-    listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
+  const key = listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
   // This identity comes only from the server-owned launched terminal metadata.
   // The user explicitly selects it; the original source never changes underneath a draft.
   if (!isClaudeLauncher && !allSessions().some((s) => s.key === key)) {
@@ -10600,7 +10611,7 @@ function openNativeChat(terminal) {
       phase: "idle", project: "이어가는 실제 세션", updatedAt: Date.now() / 1000 });
   }
   if (boardCovered()) returnToBoard({ selectLaunchedSource: false });
-  select(key);
+  return select(key);
 }
 // --- Tool records: consecutive tool rows fold into one line -----------------
 // "도구 실행 7개 · 명령 4 · 파일 수정 2" opens to one line per record, and a
@@ -13273,18 +13284,18 @@ function sessionDetailMode(s = selectedSession()) {
 function sessionComposerTerminal(s = selectedSession()) {
   return s && !sessionRecordOnly(s) && state.terminalVisible && state.inlineTerminal?.key === s.key &&
     state.inlineTerminal.identity === conversationIdentity(s) && state.terminalRawComposerId !== state.terminal?.id &&
-    terminalMatchesDetail(state.terminal, s) ? state.terminal : null;
+    terminalMatchesOpenDetail(state.terminal, s) ? state.terminal : null;
 }
 function syncSessionTerminal(s = selectedSession()) {
   if (!s || !state.authenticated || state.selected !== s.key ||
       conversationIdentity(selectedSession()) !== conversationIdentity(s) || sessionDetailMode(s) !== "terminal" || !state.detailShown ||
       window.SessionholicWorkspace?.visible() === false) return;
   if (state.terminalVisible && state.inlineTerminal?.key === s.key &&
-      state.inlineTerminal.identity === conversationIdentity(s) && terminalMatchesDetail(state.terminal, s)) {
+      state.inlineTerminal.identity === conversationIdentity(s) && terminalMatchesOpenDetail(state.terminal, s)) {
     renderDetailMode(); return;
   }
-  const terminal = terminalForSession(s);
-  if (terminal && terminalMatchesDetail(terminal, s))
+  const terminal = terminalForOpenDetail(s);
+  if (terminal && terminalMatchesOpenDetail(terminal, s))
     return openTerminal(terminal, { inline: inlineTerminalRef(s), recordHistory: false, passive: true });
   renderDetailMode();
 }
@@ -13379,6 +13390,26 @@ function listedLauncherClaude(terminal) {
       rows.push(listedSession(host, row, listedSessionKey(host, row), state.selected));
   }
   return rows.length === 1 ? rows[0] : null;
+}
+function launcherDetailSession(terminal) {
+  const listed = listedLauncherClaude(terminal);
+  return listed?.listedKind ? { ...listed, key: claudeDetailKey(listed.key, listed) } : listed;
+}
+function terminalMatchesOpenDetail(terminal, session) {
+  if (!session || !terminalMatchesDetail(terminal, session)) return false;
+  const info = terminalInfo(terminal);
+  if (isInteractiveClaudeLauncher(info)) {
+    const listed = launcherDetailSession(terminal);
+    if (session.listedKind || listed?.listedKind) return listed?.key === session.key;
+  }
+  const kind = info.nativeSource?.kind;
+  return !session.listedKind || !kind || session.listedKind === kind;
+}
+function terminalForOpenDetail(session) {
+  if (!session?.listedKind) return terminalForSession(session);
+  const exact = state.terminals.filter((terminal) => terminal && terminal.alive !== false && !terminal.closed &&
+    terminalMatchesOpenDetail(terminal, session));
+  return exact.find((terminal) => isInteractiveClaudeLauncher(terminalInfo(terminal))) || exact[0] || null;
 }
 function launcherConversation(terminal) {
   const info = terminalInfo(terminal), source = info.nativeSource;
@@ -13596,22 +13627,31 @@ function useSessionComposer({ mergeDrafts = false, expectedIdentity = null } = {
       files.source?.cwd !== source.cwd || source.agent === "claude" && files.source?.sessionId !== source.sessionId)) {
     toast("첨부를 올린 세션의 연결이 바뀌었습니다. 원래 터미널에서 첨부를 확인해 주세요."); return;
   }
-  const entry = chatEntry(source), text = $("terminal-draft").value;
+  const listed = isInteractiveClaudeLauncher(terminalInfo(terminal)) ? launcherDetailSession(terminal) : null;
+  const entry = chatEntry(listed || source), text = $("terminal-draft").value;
   if (entry.pending || entry.sending || entry.uploads) {
     toast("전송과 업로드를 마친 뒤 통합 입력으로 이동해 주세요. 초안은 유지됩니다."); return;
   }
   const identity = `${terminal.id}:${conversationIdentity(source)}`;
+  const openComposer = () => {
+    const inline = () => {
+      const selected = selectedSession();
+      if (state.terminal?.id !== terminal.id || !terminalMatchesOpenDetail(terminal, selected)) return;
+      state.detailModes.set(conversationIdentity(selected), "terminal");
+      openTerminal(terminal, { inline: inlineTerminalRef(selected), recordHistory: false });
+      state.terminalRawComposerId = null;
+      renderDetailMode();
+    };
+    if (terminalMatchesOpenDetail(terminal, selectedSession())) return inline();
+    const opening = openNativeChat(terminal);
+    return opening?.then ? opening.then(inline) : inline();
+  };
   if (!mergeDrafts && (entry.text && text || entry.attachments.length && files?.attachments.length)) {
     openActionSheet({ title: "두 초안을 어떻게 볼까요?", preview: "같은 세션에 메시지 초안과 터미널 초안이 남아 있습니다. 합쳐도 자동 전송하지 않습니다.",
       actions: [{ label: "초안 합쳐서 이동", run: () => useSessionComposer({ mergeDrafts: true, expectedIdentity: identity }) },
         { label: "메시지 초안 보기", run: () => {
           if (`${state.terminal?.id}:${conversationIdentity(launcherConversation(state.terminal))}` !== identity) return;
-          const current = selectedSession();
-          if (!current || !terminalMatchesDetail(terminal, current)) openNativeChat(terminal);
-          const selected = selectedSession();
-          if (selected && terminalMatchesDetail(terminal, selected))
-            openTerminal(terminal, { inline: inlineTerminalRef(selected), recordHistory: false });
-          state.terminalRawComposerId = null; renderDetailMode();
+          return openComposer();
         } }, { label: "터미널 초안 보기", run: () => {
           if (`${state.terminal?.id}:${conversationIdentity(launcherConversation(state.terminal))}` !== identity) return;
           state.terminalRawComposerId = terminal.id; renderDetailMode();
@@ -13629,12 +13669,7 @@ function useSessionComposer({ mergeDrafts = false, expectedIdentity = null } = {
   }
   state.terminalRawComposerId = null;
   saveDraft(); persistChatDraft(entry);
-  openNativeChat(terminal);
-  const s = selectedSession();
-  if (s && terminalMatchesDetail(terminal, s)) {
-    state.detailModes.set(conversationIdentity(s), "terminal");
-    openTerminal(terminal, { inline: inlineTerminalRef(s), recordHistory: false });
-  }
+  return openComposer();
 }
 async function openNewSessionTerminal(terminal, { recordHistory = true, restoreChat = false } = {}) {
   if (window.SessionholicWorkspace?.routeTerminal(terminal)) return;
@@ -13643,7 +13678,7 @@ async function openNewSessionTerminal(terminal, { recordHistory = true, restoreC
     openNativeChat(terminal);
     if (restoreChat) return;
     const selected = selectedSession();
-    if (selected && terminalMatchesDetail(terminal, selected))
+    if (terminalMatchesOpenDetail(terminal, selected))
       return openTerminal(terminal, { inline: inlineTerminalRef(selected), recordHistory: false });
     return;
   }
@@ -13986,7 +14021,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
   }
   if (inline && (!inlineTerminalCurrent(inline) || (inline.terminalId
       ? inline.terminalId !== terminal.id || terminalInfo(terminal).mode !== "new-session"
-      : !terminalMatchesDetail(terminal, selectedSession())))) {
+      : !terminalMatchesOpenDetail(terminal, selectedSession())))) {
     toast("선택한 대화와 터미널의 연결을 확인하지 못했습니다. 열린 터미널 목록에서 확인해 주세요."); return;
   }
   if (inline?.key) state.detailModes.set(inline.identity, "terminal");
@@ -15798,7 +15833,7 @@ function syncEvents() {
   if (state.events?.key === key && state.events?.identity === identity) return;
   closeEvents();
   const params = new URLSearchParams();
-  for (const name of ["host", "agent", "home", "id", "sessionId", "kind"]) if (chat?.[name]) params.set(name, chat[name]);
+  for (const name of ["host", "agent", "home", "id", "sessionId", "kind", "cwd"]) if (chat?.[name]) params.set(name, chat[name]);
   const query = params.toString();
   let source;
   try {
@@ -16978,7 +17013,7 @@ function workspaceHooks() {
       if (!terminal) return !ref.terminalId;
       if (state.terminalVisible && state.terminal?.id === terminal.id) return true;
       if (s) {
-        if (!terminalMatchesDetail(terminal, s)) return true;
+        if (!terminalMatchesOpenDetail(terminal, s)) return true;
         openTerminal(terminal, { recordHistory: false, inline: { key: s.key, identity: conversationIdentity(s) } });
       } else if (terminalInfo(terminal).mode === "new-session") {
         openNewSessionTerminal(terminal, { recordHistory: false, restoreChat: ref.mode === "chat" });
