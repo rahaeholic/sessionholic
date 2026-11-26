@@ -866,8 +866,9 @@ class NativeChatTests(unittest.TestCase):
                   'kind': 'interactive', 'cwd': str(self.cwd)}
         folder = self.home / '.claude/projects/p'
         folder.mkdir(parents=True)
-        (folder / (sid + '.jsonl')).write_text(json.dumps({'type': 'user', 'message': {'content': 'fixture'}}) + '\n')
-        row = {'id': 'tty-other123', 'sessionId': sid, 'kind': 'interactive',
+        transcript = folder / (sid + '.jsonl')
+        transcript.write_text(json.dumps({'type': 'user', 'message': {'content': 'fixture'}}) + '\n')
+        row = {'sessionId': sid, 'kind': 'interactive',
                'state': 'idle', 'status': 'idle', 'cwd': str(self.cwd)}
         with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
                 patch.object(chat.native, '_claude_run', return_value=json.dumps([row]).encode()):
@@ -877,6 +878,12 @@ class NativeChatTests(unittest.TestCase):
             for changed in ({'sessionId': 'other'}, {'cwd': str(self.home)}, {'kind': 'background'}):
                 with self.assertRaises(ValueError):
                     chat.handle({'action': 'read', 'source': {**source, **changed}}, home=self.home)
+            transcript.unlink()
+            with self.assertRaisesRegex(ValueError, '대화 기록을 확인하지 못했습니다'):
+                chat.handle({'action': 'read', 'source': source}, home=self.home)
+            result = chat.handle({'action': 'read', 'source': source, 'allowMissingTranscript': True}, home=self.home)
+            self.assertEqual(result['messages'], [])
+            self.assertTrue(result['conversationUnavailable'])
         with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
                 patch.object(chat.native, '_claude_run', return_value=json.dumps([row, {**row, 'id': 'duplicate'}]).encode()):
             with self.assertRaises(ValueError):

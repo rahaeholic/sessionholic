@@ -1565,6 +1565,8 @@ function allSessions() {
       }
       continue;
     }
+    if (row.kind === "interactive" && out.some((s) => s.kind === "interactive" && sameClaudeConversation(row, s)))
+      continue;
     const host = (state.snapshot?.hosts || []).find((item) => item.name === row.host);
     if (!host) continue;
     // The default Claude account used an empty home in listed keys and draft storage.
@@ -1648,7 +1650,11 @@ function sourceOf(s) {
     id: s.id,
   };
   if (s.home) source.home = s.home;
-  if (s.agent === "claude" && s.sessionId) source.sessionId = s.sessionId;
+  if (s.agent === "claude" && s.sessionId) {
+    source.sessionId = s.sessionId;
+    if (!source.id && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId))
+      source.id = s.sessionId;
+  }
   return source;
 }
 function accountOf(s) {
@@ -1680,9 +1686,11 @@ function selectedSession() {
 // Recovery references are navigation hints from the server, never launch instructions.
 // Claude's sole default account historically omitted home; Codex always names its account.
 function recoveryIdentity(source) {
-  if (!source || !["codex", "claude"].includes(source.agent) || typeof source.host !== "string" || !source.host || typeof source.id !== "string" || !source.id ||
-      source.agent === "codex" && !source.home || source.agent === "claude" && source.home && source.home !== ".claude") return null;
-  return JSON.stringify([source.host, source.agent, source.home || ".claude", source.id]);
+  if (!source) return null;
+  const { host, agent, home, id } = sourceOf(source);
+  if (!["codex", "claude"].includes(agent) || typeof host !== "string" || !host || typeof id !== "string" || !id ||
+      agent === "codex" && !home || agent === "claude" && home && home !== ".claude") return null;
+  return JSON.stringify([host, agent, home || ".claude", id]);
 }
 function sameRecoverySource(a, b) {
   const key = recoveryIdentity(a);
@@ -3313,15 +3321,10 @@ function sessionUnread(s, now = state.snapshot?.serverTime || Date.now() / 1000)
 }
 // A refused or failed mark brings the dot back and is not tried again for this long.
 const SEEN_RETRY_MS = 60000;
-// The session as the board's read marks name it: a Claude conversation without a worker id
-// by its sessionId (as session_labels.js names it for 제목 수정).
+// Board labels and read marks use Claude's default account name.
 function seenSource(s) {
-  const source = { ...sourceOf(s) };
-  if (s.agent === "claude") {
-    source.home ||= ".claude";
-    if (!source.id && s.kind === "interactive") source.id = s.sessionId;
-    if (s.sessionId) source.sessionId = s.sessionId;
-  }
+  const source = sourceOf(s);
+  if (s.agent === "claude") source.home ||= ".claude";
   return source;
 }
 // Opening a conversation is kept by the board (the list orders 이전 by it); once a minute at most.
@@ -3500,7 +3503,8 @@ function terminalForSession(s) {
   // One launched from it that runs another session (a handoff, a transfer) is that session's.
   const linked = alive.filter((terminal) => {
     const native = terminalInfo(terminal).nativeSource;
-    return native?.host && chatKey(native) === key;
+    return native?.host && (chatKey(native) === key ||
+      (native.kind === "interactive" && terminalMatchesDetail(terminal, s)));
   });
   // A formerly guessed launcher can remain alive beside a later exact attach.
   // Prefer the proven native identity, including cwd, regardless of list order.
@@ -4006,7 +4010,6 @@ async function manageSession(s, trigger = null) {
     document.body.append(dialog);
   }
   const source = sourceOf(s);
-  if (!source.id && s.agent === "claude" && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId || "")) source.id = s.sessionId;
   const context = { source, s, trigger, authEpoch: state.authEpoch, busy: false, preview: null, used: false };
   sessionControl = context;
   const top = el("div", "dialog-top");
@@ -7802,7 +7805,8 @@ function updateChatComposer(entry, selected = selectedSession() || null, { defer
     ? "첨부는 이 작업 폴더에 저장됐습니다. 첨부의 ‘경로’를 복사해 터미널에 붙여넣으세요."
     : entry.data?.capability?.reason || "직접 입력을 지원하지 않습니다. 터미널을 사용해 주세요.";
   const dictating = state.dictation?.field === input;
-  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.connecting ? "같은 대화에 연결하고 있습니다…" : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (claudeWithoutId(selected) ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported && connectable ? receiptNotice(entry) || "보내면 이 대화를 다시 연결합니다." : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
+  const missingClaudeId = claudeWithoutId(selected) && !selected.sessionId;
+  const statusCopy = offline ? "오프라인입니다. 초안은 유지됩니다. 연결 후 상태를 확인하고 보내 주세요." : entry.connecting ? "같은 대화에 연결하고 있습니다…" : (dictating && entry.dictationNotice) || entry.error || (oneShot ? ONE_SHOT_NO_INPUT : entry.dictationNotice || entry.notice || (entry.uploads ? `첨부 ${entry.uploads}개를 올리고 있습니다…` : !entry.data ? (missingClaudeId ? CLAUDE_NO_SEND : "메시지 전송 환경을 확인하고 있습니다…") : !supported && connectable ? receiptNotice(entry) || "보내면 이 대화를 다시 연결합니다." : !supported ? unsupportedCopy : receiptNotice(entry) || phaseCopy));
   // The paused-check note adds only what the line does not say yet ("상태 다시 확인" twice was).
   const statusText = statusCopy + (budgetNote && !statusCopy.includes("상태 다시 확인") ? budgetNote : budgetNote ? CHAT_CHECKS_PAUSED_SHORT : "");
   if ($("chat-status").textContent !== statusText) $("chat-status").textContent = statusText;
@@ -9706,14 +9710,12 @@ function tickWorking() {
   if (!text || !chatVisible()) return;
   state.workingTimer = setTimeout(tickWorking, 1000 - (Date.now() % 1000) + 20);
 }
-// `claude agents` can list a working interactive session without an id (and
-// then often without its transcript's session id too): the board can neither
-// send to it nor, without a session id, read it.
+// An interactive Claude row can lack both a worker id and a transcript id.
 const CLAUDE_UNREADABLE = "이 Claude 세션은 아직 대화 기록 ID를 알 수 없어 여기서 읽을 수 없습니다. " +
   "잠시 뒤 다시 열거나 터미널에서 확인해 주세요.";
 const CLAUDE_NO_SEND = "이 Claude 세션은 세션 ID가 없어 여기서 보낼 수 없습니다. 터미널에서 이어가 주세요.";
 function claudeWithoutId(s) {
-  return s?.agent === "claude" && !s.nativeSource && !s.id;
+  return s?.agent === "claude" && !s.nativeSource && !sourceOf(s).id;
 }
 // Re-renders the open conversation from what is already on screen (new
 // bubble states, the working indicator), optionally scrolling to the end.
@@ -10478,7 +10480,10 @@ function openNativeChat(terminal) {
   const info = terminalInfo(terminal);
   const source = info.nativeSource;
   if (!source?.host || !source.agent || !source.id || !state.authenticated) return;
-  const key = [source.host, source.agent, source.home || "", source.id].join("|");
+  const isClaudeLauncher = isInteractiveClaudeLauncher(info);
+  const listed = isClaudeLauncher && listedLauncherClaude(terminal);
+  if (isClaudeLauncher && !listed) return;
+  const key = listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
   // This identity comes only from the server-owned launched terminal metadata.
   // The user explicitly selects it; the original source never changes underneath a draft.
   if (!allSessions().some((s) => s.key === key)) {
@@ -12558,7 +12563,8 @@ function terminalTitle(terminal, fallback = "열어 둔 터미널") {
   const info = terminalInfo(terminal);
   if (info.nativeSource?.host) {
     const key = chatKey(info.nativeSource);
-    const session = allSessions().find((s) => chatKey(sourceOf(s)) === key);
+    const session = (isInteractiveClaudeLauncher(info) && listedLauncherClaude(terminal)) ||
+      allSessions().find((s) => chatKey(sourceOf(s)) === key);
     if (session?.title) return terminalEstimated(terminal) ? `${session.title} · 연결 추정` : session.title;
   }
   const title = info.title || fallback;
@@ -12675,6 +12681,8 @@ function currentTerminalLaunchFailure() {
 function sessionForTerminal(terminal) {
   if (!terminal) return null;
   const info = terminalInfo(terminal);
+  const listed = isInteractiveClaudeLauncher(info) && listedLauncherClaude(terminal);
+  if (listed) return listed;
   const keys = [];
   if (info.nativeSource?.host) keys.push(chatKey(info.nativeSource));
   try {
@@ -13238,8 +13246,22 @@ function launcherWorkspaceCurrent(terminalId) {
   return !!terminalId && state.launcherWorkspace?.terminalId === terminalId &&
     state.launcherWorkspace.authEpoch === state.authEpoch && !state.selected && !state.selectedBotRequest;
 }
+function isInteractiveClaudeLauncher(info) {
+  const source = info.nativeSource;
+  return info.mode === "new-session" && source?.agent === "claude" && source.kind === "interactive";
+}
+function listedLauncherClaude(terminal) {
+  // The terminal carries the transcript ID. Requests must use the collector's listed selector.
+  const rows = allSessions().filter((row) => row.kind === "interactive" && !row.recoverySource && !row.nativeSource &&
+    terminalMatchesDetail(terminal, row));
+  return rows.length === 1 ? rows[0] : null;
+}
 function launcherConversation(terminal) {
-  const source = terminalInfo(terminal).nativeSource;
+  const info = terminalInfo(terminal), source = info.nativeSource;
+  if (isInteractiveClaudeLauncher(info)) {
+    const listed = listedLauncherClaude(terminal);
+    return listed ? { ...sourceOf(listed), cwd: listed.cwd, kind: listed.kind } : null;
+  }
   return source && terminalMatchesDetail(terminal, source) ? source : null;
 }
 function launcherWorkspaceTerminal() {
@@ -13446,7 +13468,7 @@ function useSessionComposer({ mergeDrafts = false, expectedIdentity = null } = {
   const files = terminalAttachmentDrafts.get(terminal.id);
   if (files?.uploads || files?.uploadQueue.length) { toast("첨부 업로드를 마친 뒤 통합 입력으로 이동해 주세요."); return; }
   if (files?.attachments.length && (!terminalAttachmentMatches(files, terminal) ||
-      files.attachments.some((file) => !validTerminalAttachment(file) || file.terminalSourceKey !== chatKey(source)) ||
+      files.attachments.some((file) => !validTerminalAttachment(file) || file.terminalSourceKey !== chatKey(files.source)) ||
       files.source?.cwd !== source.cwd || source.agent === "claude" && files.source?.sessionId !== source.sessionId)) {
     toast("첨부를 올린 세션의 연결이 바뀌었습니다. 원래 터미널에서 첨부를 확인해 주세요."); return;
   }
