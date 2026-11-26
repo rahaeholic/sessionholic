@@ -1237,6 +1237,74 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(result['receipt']['deliveryVerified'])
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '안녕하세요', True)])
 
+    def test_new_launcher_proves_its_pane_before_claude_chat_can_paste(self):
+        import launcher_programs as lp
+
+        own = {**self.row, 'id': '', 'kind': 'interactive', 'pid': 32}
+        outside = {**own, 'id': 'external-worker', 'pid': 52,
+                   'sessionId': '019bbbbb-0000-7000-8000-000000000003'}
+        self.board.runner = lambda *_: {'claude': [outside, own], 'codex': []}
+        self.board.poll(HOST)
+        def ref(row):
+            return {'host': HOST['name'], 'agent': 'claude', 'id': row['id'] or row['sessionId'],
+                    'sessionId': row['sessionId']}
+
+        argv = '/bin/zsh -lic zz'
+        outside_tree = [(50, 1, 102, argv), (52, 50, 103, 'claude')]
+        owned_tree = [(30, 1, 116, argv), (31, 30, 117, 'python3 router'), (32, 31, 118, 'claude')]
+        rpc = self.flow.transfers.rpc
+        for name, remote, hold, tree, panes, exact in (
+            ('local delayed', False, None, outside_tree + owned_tree, '30\n', True),
+            ('remote held', True, 'sh-0123456789abcdef', owned_tree + outside_tree, '30\n', True),
+            ('external only', False, None, outside_tree + owned_tree[:2], '30\n', False),
+            ('remote no hold', True, None, outside_tree + owned_tree, '30\n', False),
+            ('multiple panes', False, None, outside_tree + owned_tree, '30\n50\n', False),
+            ('multiple first CLIs', True, 'sh-0123456789abcdef', outside_tree + owned_tree + [
+                (33, 31, 118, 'codex')], '30\n', False),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(dir=self.root) as folder:
+                host = {**HOST, 'local': not remote}
+                meta = {'host': HOST['name'], 'mode': 'new-session', 'createdAt': 100,
+                        'linkConfidence': 'estimated',
+                        'nativeSource': {**ref(outside), 'home': None, 'kind': 'interactive', 'cwd': str(self.project)}}
+                manager = terminal.TerminalManager(state_dir=folder, socket_name='sb-fixture-proof', tmux='/fixture/tmux')
+                try:
+                    record = {'id': TERMINAL_ID, 'name': 'sb-' + TERMINAL_ID, 'key': 'fixture',
+                              'socket': manager.socket_name, 'metadata': meta}
+                    item = manager.terminals[TERMINAL_ID] = terminal._Terminal(record, 1024)
+                    self.flow.terminals = manager
+                    rows = [{'id': TERMINAL_ID, 'createdAt': 100, **({'holdName': hold} if hold else {})}]
+                    def transfer(host, op, args, timeout):
+                        return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
+                    with patch.object(self.flow.transfers, 'rpc', side_effect=transfer), \
+                            patch('launch.new_session', return_value={'argv': argv.split()}), \
+                            patch('collector.which', return_value='/fixture/tmux'), \
+                            patch.object(lp, 'table', return_value=tree), \
+                            patch.object(lp.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, panes)) as tmux, \
+                            patch.object(manager, 'list', side_effect=lambda: [manager._public(item)]), \
+                            patch.object(manager, 'capture', return_value='──────────\n❯ \n──────────'), \
+                            patch.object(manager, 'paste', return_value={'ok': True}) as paste:
+                        self.flow._describe_host(host, rows)
+                        saved = item.record['metadata']
+                        self.assertEqual(saved['linkConfidence'], 'exact' if exact else 'estimated')
+                        self.assertEqual(saved['nativeSource']['sessionId'], (own if exact else outside)['sessionId'])
+                        self.assertFalse(self.state(source=ref(outside))['capability']['supported'])
+                        self.assertEqual(self.rejected(source=ref(outside)), chat.CLAUDE_EXTERNAL)
+                        paste.assert_not_called()
+                        self.assertEqual(self.state(source=ref(own))['capability']['supported'], exact)
+                        if exact:
+                            self.messages = [{'role': 'user', 'text': '안녕하세요', 'ts': time.time()}]
+                            result = self.send(source=ref(own), rid=f'pane-{name.split()[0]}-fixture')
+                            self.assertTrue(result['receipt']['deliveryVerified'])
+                            paste.assert_called_once_with(TERMINAL_ID, '안녕하세요', submit=True)
+                        if remote and not hold:
+                            tmux.assert_not_called()
+                        else:
+                            target = hold if remote else record['name']
+                            self.assertIn('=' + target, tmux.call_args.args[0])
+                finally:
+                    manager.close()
+
     def test_delivery_readback_and_recovery_scenarios(self):
         empty = '─' * 20 + '\n❯ \n' + '─' * 20
         typed = '─' * 20 + '\n❯ 안녕하세요\n' + '─' * 20

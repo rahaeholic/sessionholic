@@ -84,7 +84,7 @@ class ExactCodexTest(unittest.TestCase):
         terminal = {"id": FIRST, "createdAt": opened}
         seen = {FIRST: {"program": "codex", "cwd": None, "sessionId": identifier, "pid": 31}}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
-                patch.object(lp, "describe", return_value=seen), patch.object(lp, "held_codex", return_value=None), \
+                patch.object(lp, "describe", return_value=seen), patch.object(lp, "held_program", return_value=None), \
                 patch.object(lp, "resumed_codex_source", wraps=lambda sid, at: lp.rollout_source(
                     self.home / ".codex-work/sessions/2026/10/21" / ("rollout-now-" + sid + ".jsonl"), self.home)):
             reply = lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST]
@@ -124,15 +124,15 @@ class ExactCodexTest(unittest.TestCase):
         done = subprocess.CompletedProcess([], 0, "10\n")
         with patch("collector.which", return_value="/fixture/tmux"), patch.object(lp.subprocess, "run", return_value=done) as run, \
                 patch.object(lp, "writable_codex_source", return_value=self.native) as read:
-            self.assertEqual(lp.held_codex("sh-0123456789abcdef", rows),
+            self.assertEqual(lp.held_program("sh-0123456789abcdef", rows),
                              {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native})
             read.assert_called_once_with({20, 21, 22})
             self.assertIn("list-panes", run.call_args.args[0])
             run.return_value = subprocess.CompletedProcess([], 0, "10\n40\n")
-            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
+            self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
             run.side_effect = subprocess.TimeoutExpired("tmux", 3)
-            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
-            self.assertIsNone(lp.held_codex("../other", rows))
+            self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
+            self.assertIsNone(lp.held_program("../other", rows))
 
     def test_an_ssh_destination_is_named_by_the_board_host_its_alias_reaches_here(self):
         machines = {"bk": "pc.example.ts.net", "beaulink": "pc.example.ts.net", "air15": "air15", "elsewhere": "elsewhere"}
@@ -154,7 +154,7 @@ class ExactCodexTest(unittest.TestCase):
         seen = {FIRST: {"program": "ssh", "cwd": None, "sshHost": "bk", "pid": 12}}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
                 patch.object(lp, "describe", side_effect=lambda *a: {k: dict(v) for k, v in seen.items()}), \
-                patch.object(lp, "held_codex", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get), \
+                patch.object(lp, "held_program", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get), \
                 patch("subprocess.run", side_effect=AssertionError("this host's real ssh settings were read")):
             reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"beaulink": "beaulink"}})
             self.assertEqual(reply["terminals"][FIRST]["sshHost"], "beaulink")
@@ -165,7 +165,7 @@ class ExactCodexTest(unittest.TestCase):
         terminal = {"id": FIRST, "createdAt": 1, "holdName": "sh-0123456789abcdef"}
         evidence = {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), \
-                patch.object(lp, "table", return_value=[]), patch.object(lp, "held_codex", return_value=evidence):
+                patch.object(lp, "table", return_value=[]), patch.object(lp, "held_program", return_value=evidence):
             self.assertEqual(lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST], evidence)
 
 
@@ -274,20 +274,22 @@ class WorkflowTest(unittest.TestCase):
         raw = {"kind": "interactive", "sessionId": sid, "pid": 42, "cwd": "/work/project"}
         host = {"name": "remote-mac", "local": False}
         other = {"name": "laptop", "local": True}
-        rows = [{"id": FIRST, "createdAt": 100}]
+        rows = [{"id": FIRST, "createdAt": 100, "holdName": "sh-0123456789abcdef"}]
         board = Mock(hosts=[other, host])
         terminals = Mock()
         with tempfile.TemporaryDirectory() as directory:
             flow = server.Workflow(board, terminals, directory)
             for name, listed, info, fresh, linked in (
-                ("match", [raw], {"program": "claude", "pid": 42}, True, True),
-                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42}, True, True),
-                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "pid": 42}, True, False),
-                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "pid": 42}, True, False),
-                ("background", [{**raw, "kind": "background"}], {"program": "claude", "pid": 42}, True, False),
-                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "pid": 42}, True, False),
-                ("missing pid", [raw], {"program": "claude"}, True, False),
-                ("failed collection", [raw], {"program": "claude", "pid": 42}, False, False),
+                ("match", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
+                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
+                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("background", [{**raw, "kind": "background"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("missing pid", [raw], {"program": "claude", "paneVerified": True}, True, False),
+                ("unverified pid", [raw], {"program": "claude", "pid": 42}, True, False),
+                ("no pane target", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, False),
+                ("failed collection", [raw], {"program": "claude", "paneVerified": True, "pid": 42}, False, False),
             ):
                 with self.subTest(name=name):
                     board.state = {
@@ -298,7 +300,7 @@ class WorkflowTest(unittest.TestCase):
                     }
                     terminals.reset_mock()
                     with patch.object(flow.transfers, "rpc", return_value={"terminals": {FIRST: info}}):
-                        flow._describe_host(host, rows)
+                        flow._describe_host(host, [{"id": FIRST, "createdAt": 100}] if name == "no pane target" else rows)
                     terminals.set_program.assert_called_once_with(FIRST, info)
                     if linked:
                         terminals.link_native.assert_called_once_with(FIRST, {

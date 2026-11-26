@@ -1565,6 +1565,8 @@ function allSessions() {
       }
       continue;
     }
+    if (row.kind === "interactive" && out.some((s) => s.kind === "interactive" && sameClaudeConversation(row, s)))
+      continue;
     const host = (state.snapshot?.hosts || []).find((item) => item.name === row.host);
     if (!host) continue;
     // The default Claude account used an empty home in listed keys and draft storage.
@@ -10478,7 +10480,10 @@ function openNativeChat(terminal) {
   const info = terminalInfo(terminal);
   const source = info.nativeSource;
   if (!source?.host || !source.agent || !source.id || !state.authenticated) return;
-  const key = [source.host, source.agent, source.home || "", source.id].join("|");
+  const isClaudeLauncher = isInteractiveClaudeLauncher(info);
+  const listed = isClaudeLauncher && listedLauncherClaude(terminal);
+  if (isClaudeLauncher && !listed) return;
+  const key = listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
   // This identity comes only from the server-owned launched terminal metadata.
   // The user explicitly selects it; the original source never changes underneath a draft.
   if (!allSessions().some((s) => s.key === key)) {
@@ -12558,7 +12563,8 @@ function terminalTitle(terminal, fallback = "열어 둔 터미널") {
   const info = terminalInfo(terminal);
   if (info.nativeSource?.host) {
     const key = chatKey(info.nativeSource);
-    const session = allSessions().find((s) => chatKey(sourceOf(s)) === key);
+    const session = (isInteractiveClaudeLauncher(info) && listedLauncherClaude(terminal)) ||
+      allSessions().find((s) => chatKey(sourceOf(s)) === key);
     if (session?.title) return terminalEstimated(terminal) ? `${session.title} · 연결 추정` : session.title;
   }
   const title = info.title || fallback;
@@ -12675,6 +12681,8 @@ function currentTerminalLaunchFailure() {
 function sessionForTerminal(terminal) {
   if (!terminal) return null;
   const info = terminalInfo(terminal);
+  const listed = isInteractiveClaudeLauncher(info) && listedLauncherClaude(terminal);
+  if (listed) return listed;
   const keys = [];
   if (info.nativeSource?.host) keys.push(chatKey(info.nativeSource));
   try {
@@ -13238,8 +13246,22 @@ function launcherWorkspaceCurrent(terminalId) {
   return !!terminalId && state.launcherWorkspace?.terminalId === terminalId &&
     state.launcherWorkspace.authEpoch === state.authEpoch && !state.selected && !state.selectedBotRequest;
 }
+function isInteractiveClaudeLauncher(info) {
+  const source = info.nativeSource;
+  return info.mode === "new-session" && source?.agent === "claude" && source.kind === "interactive";
+}
+function listedLauncherClaude(terminal) {
+  // The terminal carries the transcript ID. Requests must use the collector's listed selector.
+  const rows = allSessions().filter((row) => row.kind === "interactive" && !row.recoverySource && !row.nativeSource &&
+    terminalMatchesDetail(terminal, row));
+  return rows.length === 1 ? rows[0] : null;
+}
 function launcherConversation(terminal) {
-  const source = terminalInfo(terminal).nativeSource;
+  const info = terminalInfo(terminal), source = info.nativeSource;
+  if (isInteractiveClaudeLauncher(info)) {
+    const listed = listedLauncherClaude(terminal);
+    return listed ? { ...sourceOf(listed), cwd: listed.cwd, kind: listed.kind } : null;
+  }
   return source && terminalMatchesDetail(terminal, source) ? source : null;
 }
 function launcherWorkspaceTerminal() {
@@ -13446,7 +13468,7 @@ function useSessionComposer({ mergeDrafts = false, expectedIdentity = null } = {
   const files = terminalAttachmentDrafts.get(terminal.id);
   if (files?.uploads || files?.uploadQueue.length) { toast("첨부 업로드를 마친 뒤 통합 입력으로 이동해 주세요."); return; }
   if (files?.attachments.length && (!terminalAttachmentMatches(files, terminal) ||
-      files.attachments.some((file) => !validTerminalAttachment(file) || file.terminalSourceKey !== chatKey(source)) ||
+      files.attachments.some((file) => !validTerminalAttachment(file) || file.terminalSourceKey !== chatKey(files.source)) ||
       files.source?.cwd !== source.cwd || source.agent === "claude" && files.source?.sessionId !== source.sessionId)) {
     toast("첨부를 올린 세션의 연결이 바뀌었습니다. 원래 터미널에서 첨부를 확인해 주세요."); return;
   }

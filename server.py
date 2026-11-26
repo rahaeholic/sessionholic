@@ -2016,10 +2016,24 @@ class Workflow:
 
     def _describe_host(self, host, rows, wanted=None):
         try:
+            asked = {row["id"] for row in rows} if wanted is None else set(wanted)
+            if host.get("local"):
+                pane_pid = getattr(self.terminals, "launcher_pane_pid", None)
+                if pane_pid is not None:
+                    rows = [dict(row) for row in rows]
+                    for row in rows:
+                        if row["id"] not in asked:
+                            continue
+                        try:
+                            pid = pane_pid(row["id"])
+                        except (RuntimeError, OSError, ValueError, KeyError):
+                            continue
+                        if type(pid) is int and pid > 0:
+                            row["panePid"] = pid
+            pane_targets = {row["id"] for row in rows if row.get("holdName") or row.get("panePid")}
             # The board's SSH aliases are matched on that host, whose own SSH settings name the machines.
             ssh_hosts = {h["name"]: h["ssh"] for h in self.board.hosts if isinstance(h.get("ssh"), str)}
             result = self.transfers.rpc(host, "launcher_programs", {"terminals": rows, "sshHosts": ssh_hosts}, timeout=15)
-            asked = {row["id"] for row in rows} if wanted is None else set(wanted)
             for identifier, info in (result.get("terminals") or {}).items():
                 if identifier in asked and isinstance(info, dict):
                     try:
@@ -2028,7 +2042,8 @@ class Workflow:
                         native = info.get("nativeSource")
                         if isinstance(native, dict) and native.get("agent") == "codex":
                             native = self._native_of(host["name"], "codex", native)
-                        elif info.get("program") == "claude":
+                        elif (info.get("program") == "claude" and info.get("paneVerified") is True
+                              and identifier in pane_targets):
                             native = self._launcher_claude_source(host["name"], info.get("pid"))
                         else:
                             native = None

@@ -1143,6 +1143,17 @@ class TerminalManager:
         self._changed()
         return {"ok": True}
 
+    def launcher_pane_pid(self, terminal_id):
+        from launcher_programs import single_pane_pid
+
+        with self.lock:
+            terminal = self._get(terminal_id)
+            if (terminal.record.get("closed") or self._foreign(terminal)
+                    or terminal.record["metadata"].get("mode") != "new-session"):
+                return None
+            name = terminal.record["name"]
+        return single_pane_pid(self._command(), name)
+
     def set_program(self, terminal_id, info):
         """Record what a 새 세션 terminal runs (read from its host); never its identity or command."""
         program = info.get("program") if isinstance(info, dict) else None

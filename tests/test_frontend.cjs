@@ -1984,6 +1984,47 @@ test('an explicit native destination opens a synthetic exact-source row without 
   assert.ok(!requests.some((url) => url.startsWith('/api/read')));
 });
 
+test('a linked Claude launcher opens only its listed conversation and uses the listed worker selector', async () => {
+  const sid = '019a0000-0000-7000-8000-000000000017';
+  for (const id of ['claude-worker-17', '']) {
+    const calls = [];
+    const c = client(async (url, options) => {
+      const body = options?.body && JSON.parse(options.body);
+      calls.push({ url, body });
+      if (url === '/api/session/preview')
+        return { ok: true, status: 200, json: async () => ({ capabilities: {} }) };
+      return { ok: true, status: 200, json: async () => ({ route: body?.source,
+        capability: { supported: true }, phase: 'idle', messages: [] }) };
+    }, noChatTimers);
+    const row = { agent: 'claude', id, sessionId: sid, kind: 'interactive', pid: 17, cwd: '/work', title: '기존 대화' };
+    const host = { name: 'workstation', ok: true, data: { claude: [] } };
+    const nativeSource = { ...row, host: host.name, id: sid, home: null };
+    const terminal = { id: 'linked-launcher', host: host.name, mode: 'new-session', alive: true,
+      linkConfidence: 'exact', nativeSource };
+    c.state.authenticated = true;
+    c.state.snapshot = { hosts: [host] };
+    host.data.claude = [row, { ...row, id: 'another-worker' }];
+    c.openNativeChat(terminal);
+    assert.equal(c.state.selected, null, 'ambiguous listings do not select a conversation');
+    host.data.claude = [];
+    c.openNativeChat(terminal);
+    assert.equal(c.allSessions().length, 0, 'terminal proof can arrive before the listed selector');
+    host.data.claude = [row];
+    c.state.snapshot.recoverySessions = [{ ...nativeSource, retained: true }];
+    c.openNativeChat(terminal);
+    await settle();
+    const [listed, duplicate] = c.allSessions();
+    assert.equal(duplicate, undefined);
+    assert.equal(c.state.selected, listed.key);
+    assert.equal(listed.id, id);
+    assert.equal(listed.nativeSource, undefined);
+    const selector = { host: host.name, agent: 'claude', id: id || sid, sessionId: sid };
+    assert.deepEqual(calls.find(({ url }) => url === '/api/chat/state')?.body.source, selector);
+    await vm.runInContext('manageSession', c.context)(listed);
+    assert.deepEqual(calls.find(({ url }) => url === '/api/session/preview')?.body.source, selector);
+  }
+});
+
 test('environment changes live in a native disclosure that starts closed and retains the existing controls', () => {
   const c = client(undefined, noChatTimers);
   const details = c.buildContinuePanel({ host: 'workstation', agent: 'codex', home: '.codex-example', id: 'session', key: 'source-key' });
