@@ -3612,8 +3612,34 @@ function sessionForRow(row) {
 }
 // The alive board terminal that belongs to a session: its attached runtime
 // (nativeSource) first, then the session it was launched from (sourceKey).
+// The board server's "터미널 열림" decision for a listed card (boardTerminalMark), used
+// only while every live terminal carries one for the snapshot shown; otherwise undefined.
+function decidedTerminalForSession(s, alive) {
+  const snapshot = state.snapshot;
+  if (!Number.isInteger(s.listedIndex) || s.recoverySource || s.nativeSource || !snapshot) return undefined;
+  if (!snapshot.bootId || !alive.every((terminal) => {
+    const mark = terminal.boardTerminalMark;
+    return !!mark && mark.bootId === snapshot.bootId && mark.snapshotVersion === snapshot.version && Array.isArray(mark.listedRows);
+  }))
+    return undefined;
+  const row = snapshot.hosts?.find((host) => host.name === s.host)?.data?.[s.agent]?.[s.listedIndex];
+  // A card merged with an opened session may carry another selector than its listed row.
+  if (!row || row.id !== s.id || (row.home || "") !== (s.home || "") || (row.sessionId || null) !== (s.sessionId || null) ||
+      (row.cwd || null) !== (s.cwd || null)) return undefined;
+  let best = null, bestRank = Infinity;
+  for (const terminal of alive)
+    for (const [host, agent, index, rank] of terminal.boardTerminalMark.listedRows)
+      if (host === s.host && agent === s.agent && index === s.listedIndex && rank < bestRank) { best = terminal; bestRank = rank; }
+  return best;
+}
 function terminalForSession(s) {
   if (!s) return null;
+  const decided = decidedTerminalForSession(s, state.terminals.filter((terminal) =>
+    terminal && terminal.alive !== false && !terminal.closed));
+  if (decided !== undefined) return decided;
+  return legacyTerminalForSession(s);
+}
+function legacyTerminalForSession(s) {
   const key = chatKey(sourceOf(s));
   const alive = state.terminals.filter((terminal) => terminal && terminal.alive !== false && !terminal.closed);
   const launchedFrom = (info) => {

@@ -3525,6 +3525,123 @@ def annotate_board_launchers(board, records, boot_id):
     return result
 
 
+WEB_SELECTOR_ID = re.compile(r"[0-9A-Za-z-]{8,64}")
+WEB_CONVERSATION_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def web_source_of(row):
+    """web/app.js sourceOf: the selector fields the card rules compare."""
+    source = {"host": row.get("host"), "agent": row.get("agent"), "id": row.get("id")}
+    if row.get("home"):
+        source["home"] = row["home"]
+    if row.get("agent") == "claude" and row.get("sessionId"):
+        source["sessionId"] = row["sessionId"]
+        if (not source["id"] and row.get("kind") == "interactive" and isinstance(row["sessionId"], str)
+                and WEB_SELECTOR_ID.fullmatch(row["sessionId"])):
+            source["id"] = row["sessionId"]
+    return source
+
+
+def web_chat_key(source):
+    return (source.get("host"), source.get("agent"), source.get("home") or "", source.get("id"))
+
+
+def web_recovery_identity(row):
+    source = web_source_of(row)
+    host, agent, home, identifier = source["host"], source["agent"], source.get("home"), source["id"]
+    if (agent not in ("codex", "claude") or not isinstance(host, str) or not host
+            or not isinstance(identifier, str) or not identifier
+            or agent == "codex" and not home or agent == "claude" and home and home != ".claude"):
+        return None
+    return host, agent, home or ".claude", identifier
+
+
+def web_same_recovery_source(a, b):
+    key = web_recovery_identity(a)
+    return (bool(key) and key == web_recovery_identity(b)
+            and (a.get("agent") != "claude" or not a.get("sessionId") or a.get("sessionId") == b.get("sessionId")))
+
+
+def web_same_claude_conversation(a, b):
+    transcript = a.get("sessionId") or a.get("id")
+    return (a.get("agent") == "claude" and b.get("agent") == "claude" and bool(a.get("host"))
+            and a.get("host") == b.get("host") and (a.get("home") or ".claude") == (b.get("home") or ".claude")
+            and isinstance(transcript, str) and bool(WEB_CONVERSATION_UUID.fullmatch(transcript))
+            and transcript == (b.get("sessionId") or b.get("id")))
+
+
+def web_terminal_estimated(info):
+    return (info.get("linkConfidence") == "estimated"
+            or info.get("mode") == "new-session" and bool(info.get("nativeSource")) and info.get("linkConfidence") != "exact")
+
+
+def web_parsed_source_key(info):
+    try:
+        source = json.loads(info.get("sourceKey") or "null")
+    except (TypeError, ValueError):
+        return None
+    return source if isinstance(source, dict) else None
+
+
+def web_terminal_matches_detail(info, card):
+    """web/app.js terminalMatchesDetail."""
+    if web_terminal_estimated(info):
+        return False
+    source = info.get("nativeSource")
+    if not source:
+        source = web_parsed_source_key(info)
+        if not source or not isinstance(source.get("cwd"), str) or not source["cwd"]:
+            return False
+    if not isinstance(source, dict):
+        return False
+    if web_same_claude_conversation(source, card):
+        return True
+    if (source.get("cwd") or None) != (card.get("cwd") or None):
+        return False
+    return (web_same_recovery_source(source, card)
+            and (card.get("agent") != "claude" or not card.get("sessionId") or source.get("sessionId") == card.get("sessionId")))
+
+
+def web_terminal_card_rank(info, card):
+    """The order web/app.js terminalForSession prefers a live terminal for a card in:
+    0 its proven runtime, 1 its runtime by selector only, 2 launched from it; None: not its terminal."""
+    key = web_chat_key(web_source_of(card))
+    native = info.get("nativeSource")
+    if isinstance(native, dict) and native.get("host") and (
+            web_chat_key(native) == key
+            or native.get("kind") == "interactive" and web_terminal_matches_detail(info, card)):
+        return 0 if web_terminal_matches_detail(info, card) else 1
+    launched = web_parsed_source_key(info)
+    if launched is not None and web_chat_key(launched) == key and not (isinstance(native, dict) and native.get("host")):
+        return 2
+    return None
+
+
+def annotate_board_terminal_marks(board, records, boot_id):
+    """Which listed cards show each live terminal as "터미널 열림" (web terminalForSession
+    moved here, as the launcher decision was): a client of this snapshot version uses it."""
+    alive = [index for index, record in enumerate(records)
+             if isinstance(record, dict) and record.get("alive") is not False and not record.get("closed")]
+    if not alive:
+        return records
+    snapshot = board.snapshot()
+    cards = [(position, {**row, "host": position[0], "agent": position[1]})
+             for position, row, _, duplicate_of in board_listed_rows(snapshot, ("claude", "codex"))
+             if not (position[1] == "claude" and duplicate_of is not None)]
+    result = list(records)
+    for index in alive:
+        record = records[index]
+        info = {**(record.get("metadata") or {}), **record}
+        rows = []
+        for position, card in cards:
+            rank = web_terminal_card_rank(info, card)
+            if rank is not None:
+                rows.append([*position, rank])
+        result[index] = {**record, "boardTerminalMark": {
+            "bootId": boot_id, "snapshotVersion": snapshot["version"], "listedRows": rows}}
+    return result
+
+
 class SnapshotResponses:
     """The /api/snapshot body, kept while nothing it is made of changed: each open page asks
     every few seconds, and a body was a copy of every host's list per store, six store reads
@@ -4214,7 +4331,9 @@ class Handler(BaseHTTPRequestHandler):
                                 self.server.terminals.restore_forgotten(forgotten)
                             result["inputCleanupPending"] = True
                     workflow.describe_launchers(records)
-                    result["terminals"] = annotate_board_launchers(self.server.board, records, self.server.boot_id)
+                    result["terminals"] = annotate_board_terminal_marks(
+                        self.server.board, annotate_board_launchers(self.server.board, records, self.server.boot_id),
+                        self.server.boot_id)
                     return self.send_json(200, result)
                 match = re.fullmatch(r"/api/terminal/([a-f0-9]{32})/events", url.path)
                 if match:
