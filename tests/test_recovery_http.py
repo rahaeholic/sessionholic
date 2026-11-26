@@ -134,6 +134,7 @@ class RecoveryHttpTest(unittest.TestCase):
         for path in sorted(Path(__file__).with_name('parity').glob('*.json')):
             for case in json.loads(path.read_text(encoding='utf-8')):
                 with self.subTest(case=case['name']):
+                    server.TERMINAL_MARK_CACHE.clear()
                     snapshot = case['snapshot']
                     recoveries = snapshot['recoverySessions']
                     expected = case['expected']
@@ -173,6 +174,25 @@ class RecoveryHttpTest(unittest.TestCase):
                         notice = PushService.notice(SimpleNamespace(clock=lambda: 100),
                             {'row': row, 'host': host, 'key': key, 'kind': 'needs_input'})
                         self.assertEqual(parse_qs(urlsplit(notice['url']).query), {'session': [alias['key']]})
+
+    def test_terminal_marks_reuse_the_last_decision_until_the_board_or_a_terminal_changes(self):
+        server.TERMINAL_MARK_CACHE.clear()
+        row = {'agent': 'codex', 'id': 'codex-1', 'home': '.codex-fixture', 'cwd': '/fixture/c'}
+        state = {'version': 7, 'hosts': [{'name': 'fixture-host', 'data': {'codex': [row], 'claude': []}}]}
+        calls = []
+        board = SimpleNamespace(version=7, snapshot=lambda: calls.append(1) or copy.deepcopy(state))
+        terminal = {'id': 'a' * 32, 'alive': True, 'mode': 'attach',
+                    'nativeSource': {'host': 'fixture-host', 'agent': 'codex', 'home': '.codex-fixture', 'id': 'codex-1', 'cwd': '/fixture/c'}}
+        first = server.annotate_board_terminal_marks(board, [terminal], 'boot')
+        self.assertEqual(first[0]['boardTerminalMark']['listedRows'], [['fixture-host', 'codex', 0, 0]])
+        server.annotate_board_terminal_marks(board, [dict(terminal)], 'boot')
+        self.assertEqual(len(calls), 1, 'same board version and terminal fields: no new snapshot')
+        board.version = 8
+        state['hosts'][0]['data']['codex'] = []
+        self.assertEqual(server.annotate_board_terminal_marks(board, [terminal], 'boot')[0]['boardTerminalMark']['listedRows'], [])
+        moved = {**terminal, 'nativeSource': {**terminal['nativeSource'], 'id': 'codex-2'}}
+        server.annotate_board_terminal_marks(board, [moved], 'boot')
+        self.assertEqual(len(calls), 3)
 
     def test_mixed_claude_rows_preserve_recovery_and_exact_launcher_in_both_orders(self):
         position = [HOST['name'], 'claude', 0]
