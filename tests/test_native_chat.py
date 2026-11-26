@@ -889,6 +889,23 @@ class NativeChatTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 chat.handle({'action': 'read', 'source': source}, home=self.home)
 
+    def test_claude_read_rejects_reused_worker_id_for_another_transcript(self):
+        requested_sid, current_sid = str(uuid.uuid4()), str(uuid.uuid4())
+        source = {'agent': 'claude', 'id': 'fixture-worker', 'kind': 'interactive',
+                  'listedKind': 'interactive', 'cwd': str(self.cwd), 'sessionId': requested_sid}
+        row = {key: source[key] for key in ('id', 'kind', 'cwd', 'sessionId')}
+        rows = [{**row, 'kind': 'background'}, {**row, 'sessionId': current_sid}]
+        folder = self.home / '.claude/projects/p'
+        folder.mkdir(parents=True)
+        (folder / (current_sid + '.jsonl')).write_text(json.dumps(
+            {'type': 'user', 'message': {'content': 'different conversation'}}) + '\n')
+        with patch.object(chat.native, '_claude_binary', return_value='/fixture/claude'), \
+                patch.object(chat.native, '_claude_run', return_value=json.dumps(rows).encode()):
+            with self.assertRaisesRegex(ValueError, '정확한 원본 Claude 세션을 확인하지 못했습니다'):
+                chat.handle({'action': 'read', 'source': source}, home=self.home)
+            result = chat.handle({'action': 'read', 'source': {**source, 'sessionId': current_sid}}, home=self.home)
+            self.assertEqual(result['messages'][0]['text'], 'different conversation')
+
     def test_claude_exact_background_read_maps_id_to_session_not_resume(self):
         source = {'agent': 'claude', 'home': '.claude', 'id': 'back1234'}
         sid = 'session-12345'
