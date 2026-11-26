@@ -16665,6 +16665,29 @@ test('Claude 새 세션의 터미널 초안은 첨부 유무와 관계없이 서
   }
 });
 
+test('연결 갱신 전 Claude 초안 거절 뒤에도 직접 터미널 키는 구분해서 보낸다', async () => {
+  const inputs = [];
+  const c = terminalFilesClient(async (url, options) => {
+    inputs.push(JSON.parse(options.body));
+    return inputs.at(-1).directKeys
+      ? { ok: true, status: 200, json: async () => ({ ok: true }) }
+      : { ok: false, status: 409, json: async () => ({ code: 'claude_pane_unavailable', error: '화면을 새로고침해 주세요.' }) };
+  });
+  Object.assign(c.state.terminal, { mode: 'new-session', nativeSource: null });
+  c.get('terminal-draft').value = 'stale draft';
+  await c.pasteDraft(true);
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].directKeys, undefined);
+  assert.equal(inputs[0].claudePasteSubmit, undefined);
+  assert.equal(c.get('terminal-draft').value, 'stale draft');
+  assert.match(c.get('draft-note').textContent, /새로고침/);
+  c.pressTerminalKey('enter');
+  await c.state.inputQueue;
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[1].directKeys, true);
+  assert.equal(inputs[1].text, '\r');
+});
+
 test('터미널의 일반 텍스트 paste는 가로채지 않고 혼합 paste는 커서 위치에 초안으로 삽입한다', async () => {
   const c = terminalFilesClient(async () => fileReply());
   const plain = { clipboardData: { files: [], getData: () => 'plain' }, preventDefault() { throw Error('native text must stay native'); } };

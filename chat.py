@@ -1107,7 +1107,8 @@ class Chat:
                 sent = True
             except InputNotSent as exc:
                 self._prompt_receipt_call('cancel_not_sent', source, request_id, fingerprint, number, terminal)
-                raise PromptRejected(str(exc), code='terminal_unavailable') from None
+                code = 'claude_pane_unavailable' if isinstance(exc, ClaudePaneUnavailable) else 'terminal_unavailable'
+                raise PromptRejected(str(exc), code=code) from None
             except (RuntimeError, OSError, ValueError, KeyError):
                 sent = False  # the keys may or may not have arrived; never press them again
             after = None

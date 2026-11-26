@@ -58,7 +58,7 @@ class FakeTerminals:
         record['alive'] = False
         record['closed'] = True
         return {'ok': True}
-    def write(self, tid, text):
+    def write(self, tid, text, *, direct=True):
         self.calls.append(('write', tid, text))
     def resize(self, tid, cols, rows):
         self.calls.append(('resize', tid, cols, rows))
@@ -366,7 +366,7 @@ class SecurityTest(unittest.TestCase):
         path = '/api/terminal/' + 'a'*32 + '/input'
         payload = {'text': 'x'*2048, 'requestId': 'partial-input-0001'}
         received = []
-        def partial(tid, text):
+        def partial(tid, text, *, direct=True):
             received.append(text[:1024])
             raise RuntimeError('fixture partial write timeout')
         self.terms.write = partial
@@ -504,7 +504,7 @@ class SecurityTest(unittest.TestCase):
                 db.set_trace_callback(trace)
                 yield db
 
-        def write_live(tid, text):
+        def write_live(tid, text, *, direct=True):
             if self.terms.records[0]['closed'] and tid == ending:
                 raise RuntimeError('fixture terminal closed')
             write(tid, text)

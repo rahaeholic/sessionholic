@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1382,19 +1384,25 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.rejected(rid='pane-unverified-01'), chat.CLAUDE_EXTERNAL)
         httpd = server.make_server('127.0.0.1', 0, self.board, 'synthetic', terminals=manager,
                                    workflow=self.flow, state_dir=self.root)
+        httpd.chat = self.chat
         self.addCleanup(httpd.server_close)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         self.addCleanup(httpd.shutdown)
         rpc, program_of = self.flow.transfers.rpc, lp.program_of
 
-        def post_draft(identifier, request, draft, submit):
+        def post_json(path, payload):
             with closing(http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=5)) as client:
-                client.request('POST', '/api/terminal/' + identifier + '/input',
-                               json.dumps({'requestId': request, 'text': draft, 'claudePasteSubmit': submit}),
+                client.request('POST', path, json.dumps(payload),
                                {'Content-Type': 'application/json', 'Authorization': 'Bearer synthetic',
                                 'X-CSRF-Token': httpd.csrf})
                 response = client.getresponse()
                 return response.status, json.loads(response.read())
+
+        def post_terminal(identifier, payload):
+            return post_json('/api/terminal/' + identifier + '/input', payload)
+
+        def post_draft(identifier, request, draft, submit):
+            return post_terminal(identifier, {'requestId': request, 'text': draft, 'claudePasteSubmit': submit})
 
         def transfer(host, op, args, timeout):
             return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
@@ -1421,6 +1429,11 @@ class ChatClaudeTest(unittest.TestCase):
             wait_for(lambda: decoy_log.exists() and own_log.exists())
             self.assertEqual(tmux('display-message', '-p', '-t', target, '#{pane_id}').strip(), decoy)
             self.assertTrue(self.state()['capability']['supported'])
+            for index, raw in enumerate(('stale draft', '\r', '\x1b[200~stale attachment\x1b[201~')):
+                status, rejected = post_terminal(TERMINAL_ID, {'requestId': f'stale-draft-{index}', 'text': raw})
+                self.assertEqual((status, rejected['code'], rejected['dispatchState']),
+                                 (409, 'claude_pane_unavailable', 'not_started'))
+            self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (b'', b''))
             self.messages = [{'role': 'user', 'text': 'pane fixture', 'ts': time.time()}]
             attachment = self.chat.upload(CLAUDE_REF, 'memo.txt', b'fixture')['attachment']
             self.assertTrue(self.send(text='pane fixture', attachments=[attachment['id']])['receipt']['deliveryVerified'])
@@ -1454,7 +1467,7 @@ class ChatClaudeTest(unittest.TestCase):
             run_tmux = manager._run
 
             def replace_before_enter(*args, **kwargs):
-                if args[0] == 'if-shell' and 'send-keys' in args[5]:
+                if args[0] == 'if-shell' and 'send-keys' in args[-2]:
                     wait_for(lambda: own_log.read_bytes().endswith(b'paste with no submit'))
                     tmux('respawn-pane', '-k', '-t', own, sys.executable, '-u', str(fixture), str(replacement_log))
                 return run_tmux(*args, **kwargs)
@@ -1474,6 +1487,10 @@ class ChatClaudeTest(unittest.TestCase):
             status, receipt = post_draft(TERMINAL_ID, 'draft-True', 'plain draft', True)
             self.assertEqual((status, receipt['delivery'], receipt['deduplicated']), (200, 'accepted', True))
             self.assertEqual(replacement_log.read_bytes(), b'')
+            status, _ = post_terminal(TERMINAL_ID, {'requestId': 'manual-keys', 'text': 'manual', 'directKeys': True})
+            self.assertEqual(status, 200)
+            wait_for(lambda: decoy_log.read_bytes() == b'manual')
+            self.assertEqual(replacement_log.read_bytes(), b'')
 
             # Replace the process after the last Python check, at each guarded tmux dispatch.
             for action in ('paste-buffer', 'send-keys'):
@@ -1490,7 +1507,7 @@ class ChatClaudeTest(unittest.TestCase):
                     wait_for(original.exists)
 
                     def replace_before_dispatch(*args, **kwargs):
-                        if args[0] == 'if-shell' and action in args[5]:
+                        if args[0] == 'if-shell' and action in args[-2]:
                             tmux('respawn-pane', '-k', '-t', pane, sys.executable, '-u', str(fixture), str(replacement))
                         return run_tmux(*args, **kwargs)
 
@@ -1505,6 +1522,78 @@ class ChatClaudeTest(unittest.TestCase):
                     wait_for(replacement.exists)
                     self.assertEqual(original.read_bytes(), b'')
                     self.assertEqual(replacement.read_bytes(), b'')
+
+            launcher = folder / 'launcher-fixture.py'
+            launcher.write_text(
+                "import os, signal, subprocess, sys\n"
+                "from pathlib import Path\n"
+                "os.setpgid(0, 0)\n"
+                "signal.signal(signal.SIGTTOU, signal.SIG_IGN)\n"
+                "os.tcsetpgrp(0, os.getpgrp())\n"
+                "prefix = sys.argv[1]\n"
+                "child = subprocess.Popen([sys.executable, '-u', " + repr(str(fixture)) + ", prefix + '.child'])\n"
+                "Path(prefix + '.pid').write_text(str(child.pid))\n"
+                "child.wait()\n"
+                "with open(prefix + '.launcher', 'wb', buffering=0) as log:\n"
+                "    while True:\n"
+                "        log.write(os.read(0, 4096))\n"
+            )
+            for phase in ('paste', 'menu', 'submit'):
+                with self.subTest(phase=phase):
+                    identifier = secrets.token_hex(16)
+                    name = 'sb-' + identifier
+                    prefix = folder / phase
+                    child_pid, child_log, parent_log = (prefix.with_suffix(suffix) for suffix in ('.pid', '.child', '.launcher'))
+                    argv = shlex.join([sys.executable, '-u', str(launcher), str(prefix)]) + '; exit $?'
+                    pane, root_pid = tmux('new-session', '-dP', '-F', '#{pane_id} #{pane_pid}',
+                                          '-s', name, '/bin/sh', '-c', argv).split()
+                    wait_for(lambda: child_log.exists() and child_pid.exists() and child_pid.stat().st_size)
+                    pid = int(child_pid.read_text())
+                    self.assertNotEqual(pid, int(root_pid))
+                    meta = {'host': HOST['name'], 'mode': 'new-session'}
+                    manager.terminals[identifier] = terminal._Terminal(
+                        {'id': identifier, 'name': name, 'key': phase, 'socket': socket, 'metadata': meta}, 1024)
+                    manager.link_native(identifier, saved['nativeSource'], claude_pane=(pane, pid))
+                    self.assertTrue(manager.claude_pane_available(identifier))
+                    if phase == 'paste':
+                        self.assertEqual(post_draft(identifier, 'launcher-ready', 'ready', True)[0], 200)
+                        wait_for(lambda: child_log.read_bytes() == b'\x1b[200~ready\x1b[201~\r')
+                    if phase == 'menu':
+                        tmux('send-keys', '-t', pane, '-l', '!')
+                        wait_for(lambda: chat.parse_menu(tmux('capture-pane', '-p', '-t', pane)) is not None)
+                        menu = chat.parse_menu(tmux('capture-pane', '-p', '-t', pane))
+                    dispatch = 'paste-buffer' if phase == 'paste' else 'send-keys'
+                    fired = []
+
+                    def exit_child_before_dispatch(*args, **kwargs):
+                        if args[0] == 'if-shell' and dispatch in args[-2]:
+                            os.kill(pid, signal.SIGTERM)
+                            wait_for(parent_log.exists)
+                            fired.append(True)
+                            self.assertEqual(tmux('display-message', '-p', '-t', pane,
+                                                  '#{pane_id} #{pane_pid} #{pane_dead}').split(),
+                                             [pane, root_pid, '0'])
+                        return run_tmux(*args, **kwargs)
+
+                    with patch.object(manager, '_run', side_effect=exit_child_before_dispatch):
+                        if phase == 'menu':
+                            status, failed = post_json('/api/chat/prompt', {'action': 'answer', 'source': CLAUDE_REF,
+                                'requestId': 'launcher-menu', 'fingerprint': menu['fingerprint'], 'number': 2})
+                            self.assertEqual((status, failed['code'], failed['dispatchState']),
+                                             (409, 'claude_pane_unavailable', 'not_started'))
+                            self.assertEqual(child_log.read_bytes(), b'!')
+                        else:
+                            status, failed = post_draft(identifier, 'launcher-race', 'draft', phase == 'submit')
+                            self.assertEqual(status, 409)
+                            if phase == 'paste':
+                                self.assertEqual((failed['code'], failed['dispatchState']),
+                                                 ('claude_pane_unavailable', 'not_started'))
+                            else:
+                                self.assertNotIn('dispatchState', failed)
+                                self.assertEqual(child_log.read_bytes(), b'\x1b[200~draft\x1b[201~')
+                    self.assertEqual(fired, [True])
+                    self.assertFalse(manager.claude_pane_available(identifier))
+                    self.assertEqual(parent_log.read_bytes(), b'')
             self.assertEqual(tmux('list-buffers', '-F', '#{buffer_name}').strip(), '')
 
     @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')

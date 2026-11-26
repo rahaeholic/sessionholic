@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import base64
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import fcntl
 import json
 import math
@@ -87,6 +87,17 @@ SCROLL_LIMIT = 200
 WHEEL_LIMIT = 40
 KEY_NAMES = frozenset(("Up", "Down", "Enter"))
 KEY_LIMIT = 40
+# Evaluated by tmux immediately before dispatch. A launcher's own pane PID can
+# stay alive after its foreground Claude child has exited or left the tty.
+CLAUDE_FOREGROUND = """
+kill -0 "$1" 2>/dev/null || exit 1
+fields=$(/bin/ps -p "$1" -o tty=,pgid=,tpgid=,stat=) || exit 1
+tty=${2#/dev/}
+set -f
+set -- $fields
+[ "$#" -eq 4 ] && [ "$1" = "$tty" ] && [ "$2" -gt 0 ] && [ "$2" = "$3" ] || exit 1
+case "$4" in [TtZ]*) exit 1;; esac
+"""
 # One display-message call; scroll_position is empty outside copy-mode, so the
 # fields are split on an explicit separator rather than on whitespace.
 PANE_FORMAT = ("#{alternate_on}|#{mouse_any_flag}|#{mouse_sgr_flag}|#{pane_width}|#{pane_height}"
@@ -797,7 +808,7 @@ class TerminalManager:
             result["redrawn"] = True
         return result
 
-    def write(self, terminal_id, text):
+    def write(self, terminal_id, text, *, direct=True):
         if not isinstance(text, str):
             raise ValueError("입력 형식이 올바르지 않습니다.")
         data = text.encode("utf-8")
@@ -805,10 +816,20 @@ class TerminalManager:
             raise ValueError("입력은 32KiB 이하여야 합니다.")
         with self.lock:
             terminal = self._use(terminal_id)
+            metadata = terminal.record["metadata"]
+            # Only the explicit terminal key stream follows the attached client's
+            # active pane. Older clients used the same route for keys and drafts.
+            if not direct and launcher_claude(metadata) and metadata.get("linkConfidence") == "exact":
+                raise ClaudePaneUnavailable("Claude 창 연결을 확인했습니다. 화면을 새로고침한 뒤 다시 입력해 주세요.")
             self._attach(terminal)
             self._typed(terminal)
         self._leave_scroll(terminal)
-        with terminal.io_lock:
+        # Keep exact publication and the legacy write ordered even if the
+        # launcher is identified while the client is attaching.
+        with (self.lock if not direct and metadata.get("mode") == "new-session" else nullcontext()), terminal.io_lock:
+            current = terminal.record["metadata"]
+            if not direct and launcher_claude(current) and current.get("linkConfidence") == "exact":
+                raise ClaudePaneUnavailable("Claude 창 연결을 확인했습니다. 화면을 새로고침한 뒤 다시 입력해 주세요.")
             if (terminal.record.get("closed", False) or terminal.fd is None
                     or terminal.process.poll() is not None):
                 raise RuntimeError("터미널 연결이 종료되었습니다.")
@@ -958,9 +979,13 @@ class TerminalManager:
         if multiline:
             body = shlex.join(("if-shell", "-F", "-t", target, "#{bracket_paste_flag}", body,
                                "display-message -p unsafe-paste"))
-        # tmux evaluates the pane's current root PID in the same command queue as the input.
-        # A respawn keeps %pane_id while changing the process or PTY that would receive input.
-        done = self._run("if-shell", "-F", "-t", target, condition, body, "display-message -p changed-pane",
+        changed = "display-message -p changed-pane"
+        body = shlex.join(("if-shell", "-F", "-t", target, condition, body, changed))
+        check = shlex.join(("/bin/sh", "-c", CLAUDE_FOREGROUND, "sh",
+                            str(terminal.record["metadata"]["claudePanePid"]), "#{pane_tty}"))
+        # Wait for the foreground check and then resolve pane membership/root
+        # again, since the shell check itself gives tmux time to process a respawn.
+        done = self._run("if-shell", "-t", target, check, body, changed,
                          stdout=subprocess.PIPE)
         if done.returncode != 0 or done.stdout.strip() == b"changed-pane":
             raise ClaudePaneUnavailable()

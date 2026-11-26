@@ -4675,9 +4675,9 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(text, str) or len(text.encode()) > 32768:
                         raise ValueError("입력이 비었거나 너무 깁니다.")
                     terminals = self.server.terminals
+                    from terminal import InputNotSent
                     if "claudePasteSubmit" in data:
                         from chat import CONTROL
-                        from terminal import InputNotSent
                         submit = data["claudePasteSubmit"]
                         if type(submit) is not bool or not text or CONTROL.search(text):
                             raise ValueError("Claude 붙여넣기에는 일반 텍스트만 보낼 수 있습니다.")
@@ -4690,8 +4690,16 @@ class Handler(BaseHTTPRequestHandler):
                         except InputNotSent as exc:
                             raise SendRejected(str(exc), 409, code="claude_pane_unavailable") from None
                         return self.send_json(200, receipt)
-                    else:
-                        self.server.terminal_inputs.submit(tid, request_id, text, terminals.write)
+                    try:
+                        # The explicit key stream is the only route that follows the
+                        # active pane of a terminal already linked to Claude.
+                        direct = data.get("directKeys") is True
+                        self.server.terminal_inputs.submit(
+                            tid, request_id, text,
+                            lambda identifier, body: terminals.write(identifier, body, direct=direct),
+                            operation="direct-keys" if direct else None)
+                    except InputNotSent as exc:
+                        raise SendRejected(str(exc), 409, code="claude_pane_unavailable") from None
                 elif action == "resize":
                     self.server.terminals.resize(tid, data.get("cols"), data.get("rows"))
                 elif action == "scroll":
@@ -4729,7 +4737,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(exc.status, payload)
         except PromptRejected as exc:
             # No key reached the terminal; "prompt_changed" means read the screen again.
-            return self.send_json(exc.status, {"error": str(exc), "code": exc.code})
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.code == "claude_pane_unavailable":
+                payload["dispatchState"] = "not_started"
+            return self.send_json(exc.status, payload)
         except LaunchFailure as exc:
             return self.send_json(409, {"error": str(exc), "recovery": exc.recovery})
         except (ValueError, KeyError) as exc:

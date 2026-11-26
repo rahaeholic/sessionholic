@@ -14016,7 +14016,8 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
       if (!state.connected || state.term !== sender || state.terminal?.id !== terminalId) return;
       state.terminalScrollLines = 0;
       renderTerminalScroll();
-      sendInput(text).catch(() => {});
+      // xterm's direct key stream follows the pane visible in the terminal.
+      sendInput(text, { directKeys: true }).catch(() => {});
     });
     state.term.onBinary((data) => {
       if (state.connected)
@@ -14172,7 +14173,7 @@ async function startTerminalReader({ manual = false } = {}) {
 // After an input a restarted board refused, keys go nowhere until typing pauses this long:
 // the rest of a fast-typed line (and its Enter) must not arrive without its start.
 const INPUT_REFUSED_PAUSE_MS = 1000;
-function sendInput(text, claudePasteSubmit) {
+function sendInput(text, { claudePasteSubmit, directKeys } = {}) {
   if (networkOffline() || !state.connected || state.inputFailed || !state.terminal)
     return Promise.reject(new Error("터미널에 연결되어 있지 않습니다."));
   if (state.inputRefused && Date.now() - state.inputRefusedAt < INPUT_REFUSED_PAUSE_MS) {
@@ -14192,7 +14193,7 @@ function sendInput(text, claudePasteSubmit) {
     try {
       await api(`/api/terminal/${encodeURIComponent(id)}/input`, {
         method: "POST",
-        body: { text, requestId: req, claudePasteSubmit },
+        body: { text, requestId: req, claudePasteSubmit, directKeys },
       });
       if (state.inputRefused) {
         state.inputRefused = false;
@@ -14645,7 +14646,7 @@ function sendTerminalBytes(bytes) {
   if (!bytes || state.composing || state.draftPaste) return;
   state.terminalScrollLines = 0;
   renderTerminalScroll();
-  sendInput(bytes).catch(() => {});
+  sendInput(bytes, { directKeys: true }).catch(() => {});
 }
 // The bar's slash commands, typed into the CLI's own input and run there.
 const TERMINAL_BAR_COMMANDS = { model: "/model", effort: "/effort" };
@@ -14657,6 +14658,10 @@ async function sendTerminalCommand(text) {
   state.terminalScrollLines = 0;
   renderTerminalScroll();
   try {
+    if (isInteractiveClaudeLauncher(terminalInfo(state.terminal))) {
+      await sendInput(text, { claudePasteSubmit: true });
+      return;
+    }
     await sendInput(text);
     await new Promise((resolve) => setTimeout(resolve, 120));
     if (state.terminal?.id !== id || state.inputEpoch !== epoch) return;
@@ -14847,7 +14852,7 @@ async function pasteDraft(submit = false) {
     pending.dispatched = true;
     if (attachmentEntry) attachmentEntry.sending = true;
     saveDraft();
-    if (pinned) await sendInput(normalized, submit);
+    if (pinned) await sendInput(normalized, { claudePasteSubmit: submit });
     else await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
     if (submit && !pinned) {
