@@ -1302,7 +1302,7 @@ class ChatClaudeTest(unittest.TestCase):
                     def tmux_run(command, **kwargs):
                         if command[0] == '/bin/sh':
                             return subprocess.CompletedProcess(command, 0, '')
-                        output = ''.join(f"{hold or record['name']} %{i} {pid} 0 /dev/ttys001\n"
+                        output = ''.join(f"{hold or record['name']} %{i} {pid} 0 /dev/ttys001 0\n"
                                          for i, pid in enumerate(panes.splitlines()))
                         return subprocess.CompletedProcess(command, 0, output)
 
@@ -1434,6 +1434,31 @@ class ChatClaudeTest(unittest.TestCase):
                 self.assertEqual((status, rejected['code'], rejected['dispatchState']),
                                  (409, 'claude_pane_unavailable', 'not_started'))
             self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (b'', b''))
+            tmux('set-option', '-w', '-t', own, 'synchronize-panes', 'on')
+            status, refused = post_json('/api/chat/send', {
+                'source': CLAUDE_REF, 'requestId': 'sync-chat-01', 'text': 'synchronized chat'})
+            self.assertEqual((status, refused.get('dispatchState')), (409, 'not_started'))
+            for submit in (True, False):
+                status, refused = post_draft(TERMINAL_ID, f'sync-draft-{submit}', 'synchronized draft', submit)
+                self.assertEqual((status, refused.get('dispatchState')), (409, 'not_started'))
+            self.assertFalse(self.state()['capability']['supported'])
+            self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (b'', b''))
+            self.assertEqual(tmux('display-message', '-p', '-t', own, '#{synchronize-panes}').strip(), '1')
+            tmux('set-option', '-w', '-t', own, 'synchronize-panes', 'off')
+            run_tmux = manager._run
+
+            def synchronize_before_dispatch(command):
+                def run(*args, **kwargs):
+                    if args[0] == 'if-shell' and command in args[-2]:
+                        tmux('set-option', '-p', '-t', own, 'synchronize-panes', 'on')
+                    return run_tmux(*args, **kwargs)
+                return run
+
+            with patch.object(manager, '_run', side_effect=synchronize_before_dispatch('paste-buffer')):
+                status, refused = post_draft(TERMINAL_ID, 'sync-before-paste', 'no input', True)
+            self.assertEqual((status, refused['dispatchState']), (409, 'not_started'))
+            self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (b'', b''))
+            tmux('set-option', '-pu', '-t', own, 'synchronize-panes')
             self.messages = [{'role': 'user', 'text': 'pane fixture', 'ts': time.time()}]
             attachment = self.chat.upload(CLAUDE_REF, 'memo.txt', b'fixture')['attachment']
             self.assertTrue(self.send(text='pane fixture', attachments=[attachment['id']])['receipt']['deliveryVerified'])
@@ -1455,16 +1480,35 @@ class ChatClaudeTest(unittest.TestCase):
                 before += draft.encode() + (b'\r' if submit else b'')
                 wait_for(lambda: own_log.read_bytes() == before)
                 self.assertEqual(decoy_log.read_bytes(), b'')
+            with patch.object(manager, '_run', side_effect=synchronize_before_dispatch('send-keys')):
+                status, blocked_submit = post_draft(TERMINAL_ID, 'sync-after-paste', 'only body', True)
+            self.assertEqual((status, blocked_submit['dispatchState'], blocked_submit['phase'], blocked_submit['draftPasted']),
+                             (409, 'not_started', 'submit', True))
+            before += b'only body'
+            wait_for(lambda: own_log.read_bytes() == before)
+            self.assertEqual(decoy_log.read_bytes(), b'')
+            tmux('set-option', '-pu', '-t', own, 'synchronize-panes')
+            self.assertEqual(post_draft(TERMINAL_ID, 'sync-after-paste', 'only body', True), (409, blocked_submit))
             tmux('send-keys', '-t', own, '-l', '!')
             wait_for(lambda: 'Do you want to proceed?' in tmux('capture-pane', '-p', '-t', own))
             fingerprint = chat.parse_menu(tmux('capture-pane', '-p', '-t', own))['fingerprint']
-            self.chat.prompt({'action': 'answer', 'source': CLAUDE_REF, 'requestId': 'pane-answer-01',
-                              'fingerprint': fingerprint, 'number': 2})
+            before_menu = own_log.read_bytes()
+            tmux('set-option', '-w', '-t', own, 'synchronize-panes', 'on')
+            answer = {'action': 'answer', 'source': CLAUDE_REF, 'requestId': 'pane-answer-01',
+                      'fingerprint': fingerprint, 'number': 2}
+            status, _ = post_json('/api/chat/prompt', answer)
+            self.assertEqual(status, 409)
+            self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (before_menu, b''))
+            tmux('set-option', '-w', '-t', own, 'synchronize-panes', 'off')
+            with patch.object(manager, '_run', side_effect=synchronize_before_dispatch('send-keys')):
+                status, refused = post_json('/api/chat/prompt', answer)
+            self.assertEqual((status, refused['dispatchState']), (409, 'not_started'))
+            self.assertEqual((own_log.read_bytes(), decoy_log.read_bytes()), (before_menu, b''))
+            tmux('set-option', '-pu', '-t', own, 'synchronize-panes')
+            self.assertEqual(post_json('/api/chat/prompt', answer)[0], 200)
             self.assertRegex(own_log.read_bytes(), rb'!\x1b[\[O]B\r$')
             self.assertEqual(decoy_log.read_bytes(), b'')
             self.assertTrue(self.state()['capability']['supported'])
-
-            run_tmux = manager._run
 
             def replace_before_enter(*args, **kwargs):
                 if args[0] == 'if-shell' and 'send-keys' in args[-2]:

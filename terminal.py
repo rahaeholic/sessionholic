@@ -144,6 +144,9 @@ class ClaudeSubmitNotStarted(RuntimeError):
         super().__init__("Claude 창에 본문은 붙여넣었지만 제출 Enter는 보내지 않았습니다. 다시 붙여넣기 전에 터미널을 확인해 주세요.")
 
 
+CLAUDE_SYNC_UNAVAILABLE = "tmux 창의 pane 동기화를 끈 뒤 웹 입력을 다시 시도해 주세요."
+
+
 def launcher_claude(metadata):
     return (metadata.get("mode") == "new-session"
             and (metadata.get("nativeSource") or {}).get("agent") == "claude")
@@ -956,12 +959,16 @@ class TerminalManager:
             raise ClaudePaneUnavailable()
         try:
             pane = session_pane(self._command(), terminal.record["name"], identifier)
+            if pane and pane[3] != "0":
+                raise ClaudePaneUnavailable(CLAUDE_SYNC_UNAVAILABLE)
             program = pane_program(pane[1], table()) if pane else None
             if program and program["program"] == "claude" and program["pid"] == pid:
                 check = subprocess.run(["/bin/sh", "-c", CLAUDE_FOREGROUND, "sh", str(pid), pane[2]],
                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
                 if check.returncode == 0:
                     return pane[:2]
+        except ClaudePaneUnavailable:
+            raise
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             pass
         raise ClaudePaneUnavailable()
@@ -977,6 +984,10 @@ class TerminalManager:
         process = "#{&&:#{==:#{pane_pid}," + str(root_pid) + "},#{==:#{pane_dead},0}}"
         condition = "#{&&:" + owner + "," + process + "}"
         body = shlex.join(command)
+        # send-keys may fan out even with an explicit %pane_id. Read the
+        # effective pane option in tmux's queue immediately before dispatch.
+        body = shlex.join(("if-shell", "-F", "-t", target, "#{==:#{synchronize-panes},0}", body,
+                           "display-message -p synchronized-panes"))
         if multiline:
             body = shlex.join(("if-shell", "-F", "-t", target, "#{bracket_paste_flag}", body,
                                "display-message -p unsafe-paste"))
@@ -992,6 +1003,8 @@ class TerminalManager:
             raise ClaudePaneUnavailable()
         if done.stdout.strip() == b"unsafe-paste":
             raise ClaudePaneUnavailable("Claude 창의 여러 줄 붙여넣기 모드를 확인하지 못해 초안을 보내지 않았습니다.")
+        if done.stdout.strip() == b"synchronized-panes":
+            raise ClaudePaneUnavailable(CLAUDE_SYNC_UNAVAILABLE)
 
     def claude_pane_available(self, terminal_id):
         try:
