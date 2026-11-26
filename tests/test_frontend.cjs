@@ -1900,6 +1900,27 @@ test('selected native polling backs off during long turns, stays bounded and sto
   assert.equal(timers.length, count);
 });
 
+test('Claude 연결 중은 SSE가 없어도 빠르게 재조회하고 연결 뒤 정상 polling으로 돌아간다', () => {
+  const timers = [];
+  const c = client(undefined, { setTimeout: (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, clearTimeout() {} });
+  const { s, entry } = selectChat(c);
+  entry.data.phase = 'idle';
+  entry.data.capability = { supported: false, connecting: true };
+  c.state.chatPollCount = 240;
+  c.scheduleChatPoll(s, entry);
+  assert.equal(c.state.chatPollCount, 0, '연결 중 상태에 진입하면 이전 polling 상한을 초기화한다');
+  assert.equal(timers.at(-1).delay, 1000, '연결 중에는 SSE 상태와 무관하게 1초 뒤 상태를 다시 읽는다');
+  c.state.chatPollCount = 1;
+  c.scheduleChatPoll(s, entry);
+  assert.equal(timers.at(-1).delay, 1000, 'idle 상태여도 연결이 확인될 때까지 polling을 유지한다');
+  entry.data.capability = { supported: true };
+  c.scheduleChatPoll(s, entry);
+  assert.equal(timers.length, 2, '연결이 끝나면 연결 전용 타이머를 추가하지 않는다');
+  entry.data.phase = 'working';
+  c.scheduleChatPoll(s, entry);
+  assert.equal(timers.at(-1).delay, 3000, '이후에는 일반 작업 상태 polling으로 복귀한다');
+});
+
 test('PC 상태 읽기가 저장 대화로 대체돼도 자동 재확인을 계속하고 복구 뒤 초안을 유지한다', async () => {
   const timers = [], reads = [];
   const c = client(async (url, options) => {

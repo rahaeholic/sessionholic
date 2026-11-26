@@ -28,11 +28,13 @@ CLAUDE_WINDOWS_OPEN = ('보내면 같은 대화의 터미널을 연결합니다.
                        '그 PC의 터미널에서 입력해 주세요.')
 CLAUDE_EXTERNAL = ('이 Claude 세션은 보드 밖 터미널에서 실행 중이라 웹에서 입력할 수 없습니다. '
                    '그 터미널에서 입력하거나 백그라운드 세션(claude --bg)으로 실행해 주세요.')
+CLAUDE_CONNECTING = 'Claude 세션을 하던일 터미널과 연결하는 중이에요. 잠시 뒤 바로 입력할 수 있어요.'
 # A background session takes web input only through a board terminal the user opened.
 CLAUDE_OPEN_TERMINAL = '보내려면 먼저 터미널을 여세요.'
 CLAUDE_NOT_READY = 'Claude 터미널이 준비되지 않았습니다. 잠시 뒤 다시 보내거나 터미널을 열어 상태를 확인해 주세요.'
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 CLAUDE_READY_SECONDS = 12
+CLAUDE_LINK_WINDOW_SECONDS = 120
 CLAUDE_PROBE = 160
 # Claude Code records a pasted image path as "[Image #1]" in the prompt (before, after or
 # instead of the words) and may show a long paste as "[Pasted text #1 +12 lines]".
@@ -722,6 +724,8 @@ class Chat:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         capability = {'supported': supported, 'attachments': bool(source.get('cwd')),
                       'reason': None if supported else reason}
+        if claude and not supported and reason == CLAUDE_CONNECTING:
+            capability['connecting'] = True
         if action:
             # What the user can do to make sending possible ("open_terminal": the board's terminal button).
             capability['action'] = action
@@ -971,11 +975,38 @@ class Chat:
             return True, None, None
         if source.get('kind') == 'background':
             return True, None, None
+        if self._claude_connecting(source):
+            return False, CLAUDE_CONNECTING, None
         if windows:
             # Chat connects it on send (or reports why the PC cannot resume it).
             return False, CLAUDE_WINDOWS_OPEN, 'open_terminal'
         # An interactive session cannot be attached (launch.build_launch), so no button is offered.
         return False, CLAUDE_EXTERNAL, None
+
+    def _claude_connecting(self, source):
+        """A new-session launcher may take a short time to record its exact Claude link."""
+        started = source.get('startedAt')
+        if isinstance(started, bool) or not isinstance(started, (int, float)):
+            return False
+        now = time.time()
+        if not 0 <= now - started <= CLAUDE_LINK_WINDOW_SECONDS:
+            return False
+        try:
+            terminals = self.workflow.terminals.list()
+        except (RuntimeError, OSError, ValueError):
+            return False
+        for row in terminals:
+            metadata = row.get('metadata') or {}
+            native = row.get('nativeSource') or metadata.get('nativeSource')
+            created = row.get('createdAt')
+            if (row.get('mode', metadata.get('mode')) == 'new-session'
+                    and row.get('alive') and not row.get('closed') and not native
+                    and row.get('program', metadata.get('program')) == 'claude'
+                    and row.get('host', metadata.get('host')) == source.get('host')
+                    and isinstance(created, int) and not isinstance(created, bool)
+                    and 0 <= started - created <= CLAUDE_LINK_WINDOW_SECONDS):
+                return True
+        return False
 
     # ---------- approval / question menus answered from the web ----------
     @staticmethod
