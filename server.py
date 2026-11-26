@@ -3408,19 +3408,17 @@ def board_listed_rows(snapshot, agents):
 
 def annotate_board_snapshot(snapshot, recoveries):
     """Add display decisions to the HTTP snapshot's own copy."""
-    listed_by_identity, interactive = {}, {}
+    listed_by_identity, listed_by_conversation = {}, {}
     for position, row, source, duplicate_of in board_listed_rows(snapshot, ("claude", "codex")):
         if source["agent"] == "claude":
             row["boardSource"] = source
             row["boardDuplicateOf"] = duplicate_of
             conversation = claude_display_conversation(source)
-            if conversation and row.get("kind") == "interactive":
-                interactive[conversation] = duplicate_of or position
-            if duplicate_of is not None:
-                continue
+            if conversation:
+                listed_by_conversation[conversation] = duplicate_of or position
         identity = board_recovery_identity(source)
         if identity:
-            listed_by_identity.setdefault(identity, []).append((position, row, source))
+            listed_by_identity.setdefault(identity, []).append((position, row, source, duplicate_of))
 
     missing = object()
     for row in recoveries:
@@ -3432,18 +3430,18 @@ def annotate_board_snapshot(snapshot, recoveries):
         if matches:
             action = "hide"
             compatible = []
-            for listed_position, listed, listed_source in matches:
+            for listed_position, listed, listed_source, duplicate_of in matches:
                 same_transcript = source.get("sessionId") == listed_source.get("sessionId")
                 same_place = (row.get("cwd", missing) == listed.get("cwd", missing)
                               or conversation and conversation == claude_display_conversation(listed_source))
                 if (same_transcript or not source.get("sessionId")) and (same_place or not row.get("cwd")):
-                    compatible.append(listed_position)
-                if len(matches) == 1 and same_transcript and same_place:
+                    compatible.append(duplicate_of or listed_position)
+                if len(matches) == 1 and duplicate_of is None and same_transcript and same_place:
                     action = "merge"
-            if len(compatible) == 1:
+            if len(set(compatible)) == 1:
                 position = compatible[0]
-        elif identity and row.get("kind") == "interactive" and conversation in interactive:
-            position, action = interactive[conversation], "hide"
+        elif identity and conversation in listed_by_conversation:
+            position, action = listed_by_conversation[conversation], "hide"
         row["boardRecovery"] = {"listedRow": position, "retainedAction": action}
 
 
@@ -3470,17 +3468,15 @@ def annotate_board_launchers(board, records, boot_id):
 
     snapshot = board.snapshot()
     listed_by_host = {}
-    for position, row, source, duplicate_of in board_listed_rows(snapshot, ("claude",)):
+    for position, row, source, _ in board_listed_rows(snapshot, ("claude",)):
         if row.get("kind") == "interactive" and not row.get("recoverySource") and not row.get("nativeSource"):
-            listed_by_host.setdefault(source["host"], []).append((position, row, source, duplicate_of))
+            listed_by_host.setdefault(source["host"], []).append((position, row, source))
     result = list(records)
     for index, native, confidence in launchers:
         source = board_display_source(native)
         host = source["host"]
         rows = listed_by_host.get(host, ()) if confidence == "exact" and isinstance(host, str) else ()
-        # A hidden duplicate still counts toward ambiguity but cannot be a card target.
-        matches = [position if duplicate_of is None else None for position, row, listed, duplicate_of in rows
-                   if board_launcher_matches(source, native, row, listed)]
+        matches = [position for position, row, listed in rows if board_launcher_matches(source, native, row, listed)]
         result[index] = {**records[index], "boardLauncher": {
             "bootId": boot_id, "snapshotVersion": snapshot["version"],
             "listedRow": matches[0] if len(matches) == 1 else None,

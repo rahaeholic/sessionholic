@@ -7,12 +7,14 @@ import sqlite3
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
 import launch
 import server
+from push import PushService
 from session_recovery import RetainedSessions, RecoverySessions
 
 
@@ -158,6 +160,46 @@ class RecoveryHttpTest(unittest.TestCase):
                                       for row in terminals['terminals']], case['terminals'])
                     self.assertEqual(self.terms.records, case['terminals'])
                     self.assert_no_execution()
+                    alias = expected.get('notificationAlias')
+                    if alias:
+                        host = snapshot['hosts'][0]
+                        row = host['data']['claude'][1]
+                        key = PushService.row_key(host, 'claude', row)
+                        notice = PushService.notice(SimpleNamespace(clock=lambda: 100),
+                            {'row': row, 'host': host, 'key': key, 'kind': 'needs_input'})
+                        self.assertEqual(parse_qs(urlsplit(notice['url']).query), {'session': [alias['key']]})
+
+    def test_mixed_claude_rows_preserve_recovery_and_exact_launcher_in_both_orders(self):
+        position = [HOST['name'], 'claude', 0]
+        for interactive_index in (0, 1):
+            with self.subTest(interactive_index=interactive_index):
+                sid = '11111111-1111-4111-8111-%012d' % interactive_index
+                active = {'agent': 'claude', 'id': '', 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work'}
+                background = {**active, 'id': 'background-worker-%d' % interactive_index, 'kind': 'background'}
+                rows = [active, background] if interactive_index == 0 else [background, active]
+                hidden = {**rows[1], 'host': HOST['name'], 'id': rows[1]['id'] or sid}
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
+                    self.assertTrue(self.board.poll(HOST))
+                self.flow.recoveries.remember(hidden, closed_reason='released')
+                self.terms.records = [{'id': 'b' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact',
+                                       'nativeSource': {**active, 'host': HOST['name'], 'id': sid}}]
+                snapshot = self.snapshot()
+                self.assertEqual(snapshot['hosts'][0]['data']['claude'][1]['boardDuplicateOf'], position)
+                recovery = next(row for row in snapshot['recoverySessions']
+                                if row.get('sessionId') == sid and row['id'] == hidden['id'])
+                self.assertEqual(recovery['boardRecovery'], {'listedRow': position, 'retainedAction': 'hide'})
+                status, result = self.recover(hidden)
+                self.assertEqual((status, result['session']['id']), (200, hidden['id']))
+                status, result = self.request('GET', '/api/terminals')
+                self.assertEqual(status, 200)
+                # Listing a terminal can record its recovery, publishing a newer snapshot.
+                current = self.snapshot()
+                self.assertEqual(result['terminals'][0]['boardLauncher'], {
+                    'bootId': current['bootId'], 'snapshotVersion': current['version'],
+                    'listedRow': [HOST['name'], 'claude', interactive_index],
+                })
+                self.assertEqual(self.calls, [])
+                self.assert_no_execution()
 
     def test_recover_authentication_and_untrusted_browser_references_never_reach_native(self):
         self.assertEqual(self.recover(authorized=False)[0], 401)

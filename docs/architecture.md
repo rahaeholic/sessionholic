@@ -90,8 +90,10 @@ Codex RPC의 `source.subAgent`와 DB의 `source.subagent` 구조를 보존하고
 | --- | --- | --- |
 | `/api/snapshot`의 `hosts[].data.claude[]` | `boardSource` | `{host, agent, id, home, sessionId?}`. 대화형 행의 기존 `id`가 비고 `sessionId`가 영문자·숫자·하이픈 8~64자이면 그 값을 `id`에 사용합니다. 비어 있는 `home`은 `.claude`입니다. |
 | 같은 Claude 행 | `boardDuplicateOf` | 같은 기기·홈에서 `sessionId \|\| id`가 같은 소문자 UUID인 첫 행의 참조입니다. 첫 행과 단독 행에는 `null`을 보냅니다. |
-| `/api/snapshot`의 `recoverySessions[]` | `boardRecovery` | `{listedRow, retainedAction}`. `listedRow`는 대응하는 대표 행 참조 또는 `null`입니다. 보관 행에는 `merge`(원본 카드에 `retained`와 `closedReason` 적용), `hide`(별도 카드 생략), `add`(별도 카드 후보)를 적용합니다. 같은 복귀 식별자가 여럿이거나 작업 경로·대화가 어긋나면 `hide`를 사용합니다. 같은 대화형 Claude UUID가 이미 보이면 복귀 식별자가 달라도 별도 카드를 생략합니다. |
-| `/api/terminals`의 대화형 Claude 새 세션 터미널 | `boardLauncher` | `{bootId, snapshotVersion, listedRow}`. 정확한 연결이 가리키는 대화형 목록 행이 하나이고 카드로 표시될 때 그 행을 참조합니다. 후보가 없거나 여럿이거나 추정 연결이면 `listedRow`는 `null`입니다. 같은 Claude UUID가 있으면 작업 경로가 바뀌어도 일치하며, 그 외에는 복귀 식별자·대화 ID·작업 경로를 함께 확인합니다. |
+| `/api/snapshot`의 `recoverySessions[]` | `boardRecovery` | `{listedRow, retainedAction}`. `listedRow`는 대응하는 대표 행 참조 또는 `null`입니다. 보관 행에는 `merge`(원본 카드에 `retained`와 `closedReason` 적용), `hide`(별도 카드 생략), `add`(별도 카드 후보)를 적용합니다. 같은 복귀 식별자가 여럿이거나 작업 경로·대화가 어긋나면 `hide`를 사용합니다. 이미 목록에 있는 Claude 대화는 복귀 식별자나 실행 유형이 달라도 대표 행으로 연결합니다. |
+| `/api/terminals`의 대화형 Claude 새 세션 터미널 | `boardLauncher` | `{bootId, snapshotVersion, listedRow}`. 정확한 연결이 가리키는 대화형 목록 행이 하나이면 그 행을 참조합니다. 복수 후보, 후보 없음, 추정 연결에서는 `listedRow`가 `null`입니다. 같은 Claude UUID가 있으면 작업 경로가 바뀌어도 일치하며, 그 외에는 복귀 식별자·대화 ID·작업 경로를 함께 확인합니다. |
+
+기존 알림 링크와 복구 목록은 중복 행의 대표 카드를 엽니다. 새 세션 터미널은 대표 카드가 백그라운드 행이어도 대화형 행의 원래 식별자로 대화를 열 수 있습니다. 목록에는 대표 카드 한 장을 표시합니다.
 
 터미널의 행 참조는 `bootId`와 `snapshotVersion`이 현재 스냅샷의 `bootId`와 `version`에 일치할 때 사용합니다. 필드가 없거나 터미널과 스냅샷의 버전이 다르면 웹은 기존 계산을 사용합니다. 이 계약은 표시와 목록 탐색에 사용하며 터미널 입력과 세션 제어에는 기존 검증을 적용합니다. 공용 예제와 기대 출력은 `tests/parity/claude-board.json`에 있습니다.
 

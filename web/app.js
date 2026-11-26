@@ -1037,7 +1037,10 @@ function openRequestedSession() {
   if (!request) return;
   if (Date.now() > request.until) { state.openRequest = null; return; }
   if (!state.authenticated || state.launchBusy) return;
-  if (!allSessions().some((session) => session.key === request.key)) {
+  const sessions = allSessions();
+  const target = sessions.find((session) => session.key === request.key) ||
+    sessionAtListedPosition(sessions, listedAliasSession(request.key)?.boardDuplicateOf);
+  if (!target) {
     if (request.after && state.snapshot?.retainedDisplayVersion && !state.retainedLoading) {
       const after = request.after;
       delete request.after;
@@ -1048,13 +1051,12 @@ function openRequestedSession() {
   state.openRequest = null;
   // Over an open terminal too (or beside one of another session): the conversation
   // shows, and back returns to the terminal.
-  if (state.terminalVisible && (boardCovered() || sessionForTerminal(state.terminal)?.key !== request.key)) {
+  if (state.terminalVisible && (boardCovered() || sessionForTerminal(state.terminal)?.key !== target.key)) {
     returnToBoard({ selectLaunchedSource: false, animate: false });
-    navigateView("detail", false, { notice: request.key });
+    navigateView("detail", false, { notice: target.key });
   }
-  const target = allSessions().find((session) => session.key === request.key);
-  if (target && groupOf(target) === "needs_input" && !window.SessionholicWorkspace?.detached) answerOnOpen(target);
-  select(request.key);
+  if (groupOf(target) === "needs_input" && !window.SessionholicWorkspace?.detached) answerOnOpen(target);
+  select(target.key);
 }
 function openSessionWindow(s) {
   if (!state.authenticated || !allSessions().some((row) => row.key === s?.key)) return;
@@ -1523,6 +1525,25 @@ function listedSession(host, s, key, following) {
   return labeledSession({ ...row, ...sessionRuntime(row, key, host.fetchedAt, following),
     account: sessionAccountLabel(row), hostLabel: host.label, fetchedAt: host.fetchedAt, key });
 }
+function* listedClaudeAliases() {
+  for (const host of state.snapshot?.hosts || [])
+    for (const row of host.data?.claude || [])
+      if (row.boardDuplicateOf) yield { host, row };
+}
+function listedAliasSession(key) {
+  if (!key) return;
+  for (const { host, row } of listedClaudeAliases())
+    if (listedSessionKey(host, row) === key)
+      return listedSession(host, row, key, chatVisible() ? state.selected : null);
+}
+function sessionAtListedPosition(sessions, position) {
+  if (!position) return;
+  const [host, agent, index] = position;
+  return sessions.find((s) => s.host === host && s.agent === agent && s.listedIndex === index);
+}
+function listedRecoveryCard(sessions, ref) {
+  return sessionAtListedPosition(sessions, ref?.boardRecovery?.listedRow);
+}
 function allSessions() {
   const out = [];
   // The open conversation is read again every few seconds; its own read stands until then.
@@ -1582,7 +1603,8 @@ function allSessions() {
         }
         continue;
       }
-      if (row.kind === "interactive" && out.some((s) => s.kind === "interactive" && sameClaudeConversation(row, s)))
+      if (out.some((s) => (s.boardSource || row.kind === "interactive" && s.kind === "interactive") &&
+          sameClaudeConversation(row, s)))
         continue;
     }
     const host = (state.snapshot?.hosts || []).find((item) => item.name === row.host);
@@ -1608,6 +1630,7 @@ function allSessions() {
       out[index] = labeledSession({ ...merged, ...sessionRuntime(merged, session.key, value.fetchedAt, following) });
       continue;
     }
+    if (session.recoverySource && out.some((s) => s.boardSource && sameClaudeConversation(session, s))) continue;
     out.push(labeledSession({ ...session,
       ...sessionRuntime(session, session.key, session.fetchedAt, following), account: sessionAccountLabel(session) }));
   }
@@ -1699,7 +1722,7 @@ function selectedSession() {
     const row = host.data?.claude?.find((row) => !row.boardDuplicateOf && matches(row)) || host.data?.codex?.find(matches);
     if (row) return listedSession(host, row, key, chatVisible() ? key : null);
   }
-  return allSessions().find((s) => s.key === key) || heldSelectedSession();
+  return allSessions().find((s) => s.key === key) || listedAliasSession(key) || heldSelectedSession();
 }
 // Recovery references are navigation hints from the server, never launch instructions.
 // Claude's sole default account historically omitted home; Codex always names its account.
@@ -1720,7 +1743,7 @@ function recentRecoveries(sessions = allSessions()) {
     const key = recoveryIdentity(ref);
     if (!key || seen.has(key) || ref.closedReason === "user" || ref.removedAt || ref.terminatedAt || ref.closedByBoard) return false;
     seen.add(key);
-    const listed = sessions.find((s) => sameRecoverySource(ref, s));
+    const listed = listedRecoveryCard(sessions, ref) || sessions.find((s) => sameRecoverySource(ref, s));
     return !listed || !sessionRemoved(listed);
   });
 }
@@ -1728,7 +1751,8 @@ function renderRecoveries(sessions = allSessions()) {
   const section = $("session-recoveries"), list = $("session-recovery-list");
   if (!section || !list) return;
   const sameConversation = (ref, source) => sameRecoverySource(ref, source) && (!ref.cwd || ref.cwd === source.cwd || sameClaudeConversation(ref, source));
-  const refs = recentRecoveries(sessions).filter((ref) => !sessions.some((s) => sameConversation(ref, s)) &&
+  const refs = recentRecoveries(sessions).filter((ref) => !listedRecoveryCard(sessions, ref) &&
+    !sessions.some((s) => sameConversation(ref, s)) &&
     !state.terminals.some((terminal) => {
       const native = terminal.nativeSource || terminal.metadata?.nativeSource;
       return terminal.alive && terminal.linkConfidence !== "estimated" && terminal.metadata?.linkConfidence !== "estimated" &&
@@ -1764,8 +1788,14 @@ function renderRecoveries(sessions = allSessions()) {
   placeChildren(list, rows);
 }
 async function openRecovery(ref) {
-  if (!state.authenticated || state.launchBusy || !recentRecoveries().some((row) => sameRecoverySource(ref, row))) return;
-  const listed = allSessions().filter((s) => sameRecoverySource(ref, s));
+  if (!state.authenticated || state.launchBusy) return;
+  const sessions = allSessions();
+  const currentRef = () => recentRecoveries().find((row) => sameRecoverySource(ref, row));
+  const saved = currentRef();
+  if (!saved) return;
+  const card = listedRecoveryCard(sessions, saved);
+  if (card) { state.recoveryError = ""; select(card.key); return; }
+  const listed = sessions.filter((s) => sameRecoverySource(ref, s));
   if (listed.length === 1) { state.recoveryError = ""; select(listed[0].key); return; }
   if (listed.length > 1) { state.recoveryError = "같은 식별자의 대화가 여러 개입니다. 목록을 새로고침한 뒤 다시 확인해 주세요."; renderRecoveries(); return; }
   if (networkOffline()) { state.recoveryError = "오프라인입니다. 연결 후 원래 대화를 다시 확인해 주세요."; renderRecoveries(); return; }
@@ -1773,7 +1803,7 @@ async function openRecovery(ref) {
     selectedBot = state.selectedBotRequest, identity = conversationIdentity(selectedSession());
   const current = () => run === state.recoveryRun && authEpoch === state.authEpoch && state.authenticated &&
     state.selected === selected && state.selectedBotRequest === selectedBot && conversationIdentity(selectedSession()) === identity &&
-    recentRecoveries().some((row) => sameRecoverySource(ref, row));
+    currentRef();
   state.recoveryBusy = recoveryIdentity(ref); state.recoveryError = ""; renderRecoveries();
   try {
     const params = new URLSearchParams({ ...sourceOf(ref), ...(ref.agent === "claude" && ref.sessionId ? { sessionId: ref.sessionId } : {}) });
@@ -1781,6 +1811,10 @@ async function openRecovery(ref) {
     if (!current()) return;
     const resolved = result?.session;
     if (!sameRecoverySource(ref, resolved)) throw new Error("원래 대화의 기기·계정·식별자를 확인하지 못했습니다.");
+    const currentSessions = allSessions();
+    const representative = listedRecoveryCard(currentSessions, currentRef()) ||
+      currentSessions.find((s) => s.boardSource && sameClaudeConversation(resolved, s));
+    if (representative) { select(representative.key); return; }
     const key = [resolved.host, resolved.agent, resolved.home || "", resolved.id].join("|");
     state.nativeSessions.set(key, { ...resolved, key, recoverySource: true, nativeSource: false,
       title: resolved.title || ref.title || "이전에 연결한 대화", hostLabel: resolved.hostLabel || ref.hostLabel || ref.host });
@@ -1968,7 +2002,8 @@ function render() {
   syncLauncherWorkspace();
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  const selected = sessions.find((session) => session.key === state.selected) || heldSelectedSession();
+  const selected = sessions.find((session) => session.key === state.selected) ||
+    listedAliasSession(state.selected) || heldSelectedSession();
   const reading = state.detailShown && selected;
   if (reading && !sharedSessionSidebar() && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   const embedded = window.SessionholicWorkspace?.embedded;
@@ -3567,7 +3602,7 @@ function renderTerminalMarks() {
   for (const section of $("groups")?.children || [])
     for (const row of section.children || [])
       if (row.card?.cardParts) markCardTerminal(row.card, sessions.get(row.dataset?.sessionKey));
-  const selected = sessions.get(state.selected);
+  const selected = sessions.get(state.selected) || listedAliasSession(state.selected);
   if (selected) renderDetailTerminal(selected);
   if (selected && state.detailFor === selected.key && !state.terminalVisible) syncSessionTerminal(selected);
 }
@@ -4235,7 +4270,7 @@ function select(key) {
           conversationIdentity(selectedSession()) !== identity) return;
       state.selectionPending = null;
       if (!committed) { toast("입력 확정을 기다리고 있습니다. 입력창을 확인한 뒤 다시 이동해 주세요."); return; }
-      if (allSessions().some((session) => session.key === key)) return select(key);
+      if (allSessions().some((session) => session.key === key) || listedAliasSession(key)) return select(key);
     });
   }
   state.selectionPending = null;
@@ -4257,7 +4292,8 @@ function select(key) {
   if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
   if (state.selected !== key) closeQuickReplies();
-  const target = allSessions().find((session) => session.key === key) || (state.selected === key ? heldSelectedSession() : null);
+  const target = allSessions().find((session) => session.key === key) || listedAliasSession(key) ||
+    (state.selected === key ? heldSelectedSession() : null);
   // The window can advance while this conversation is open. Keep its exact
   // selector for the active pane without adding another row to the list.
   state.selectedHeld = target && recoveryIdentity(target) && (target.retained || conversationUUID(target.id) || target.sessionId)
@@ -10511,7 +10547,7 @@ function openNativeChat(terminal) {
   const key = listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
   // This identity comes only from the server-owned launched terminal metadata.
   // The user explicitly selects it; the original source never changes underneath a draft.
-  if (!allSessions().some((s) => s.key === key)) {
+  if (!isClaudeLauncher && !allSessions().some((s) => s.key === key)) {
     state.nativeSessions.set(key, { ...source, key, nativeSource: true,
       title: info.title || "이어가는 작업", hostLabel: hostLabel(source.host),
       account: sessionAccountLabel({ ...source, account: info.account }),
@@ -13283,15 +13319,20 @@ function listedLauncherClaude(terminal) {
   if (decision && decision.bootId === snapshot?.bootId && decision.snapshotVersion === snapshot?.version) {
     if (!decision.listedRow) return null;
     const [host, agent, index] = decision.listedRow;
-    return allSessions().find((row) => row.host === host && row.agent === agent &&
-      row.listedIndex === index && candidate(row)) || null;
+    const listed = sessionAtListedPosition(allSessions(), decision.listedRow);
+    if (listed) return candidate(listed) ? listed : null;
+    const group = snapshot.hosts?.find((item) => item.name === host);
+    const row = group?.data?.[agent]?.[index];
+    return row?.boardDuplicateOf && candidate({ ...row, host }) ?
+      listedSession(group, row, listedSessionKey(group, row), state.selected) : null;
   }
   const rows = allSessions().filter(candidate);
-  if (rows.length !== 1) return null;
-  // A hidden duplicate can still make a launcher selector ambiguous.
-  const host = snapshot?.hosts?.find((item) => item.name === rows[0].host);
-  if (host?.data?.claude?.some((row) => row.boardDuplicateOf && candidate({ ...row, host: host.name }))) return null;
-  return rows[0];
+  for (const { host, row } of listedClaudeAliases()) {
+    if (rows.length > 1) return null;
+    if (candidate({ ...row, host: host.name }))
+      rows.push(listedSession(host, row, listedSessionKey(host, row), state.selected));
+  }
+  return rows.length === 1 ? rows[0] : null;
 }
 function launcherConversation(terminal) {
   const info = terminalInfo(terminal), source = info.nativeSource;
@@ -16858,7 +16899,7 @@ function workspaceHooks() {
     },
     sessionKeyForTerminal: (terminal) => allSessions().find((s) => terminalMatchesDetail(terminal, s))?.key || null,
     listChanged: () => { if (state.snapshot) renderSessionList(allSessions(), state.snapshot.serverTime || Date.now() / 1000); },
-    sessionExists: (key) => allSessions().some((s) => s.key === key),
+    sessionExists: (key) => allSessions().some((s) => s.key === key) || !!listedAliasSession(key),
     // A PC or a Mac takes the pane's focus in its editor. On a phone or an iPad the on-screen
     // keyboard would cover the screen: a tap (a list selection, a pane's title) gives the
     // conversation the focus, only a hardware keyboard's move (→/Enter, Option+number) the editor.

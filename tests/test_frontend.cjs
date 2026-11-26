@@ -2049,10 +2049,11 @@ test('a linked Claude launcher opens only its listed conversation and uses the l
 for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) => file.endsWith('.json'))) {
   const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'parity', file), 'utf8'));
   for (const { name, snapshot, terminals, expected } of cases) {
-    test(`Claude board parity: ${name}`, () => {
+    test(`Claude board parity: ${name}`, async () => {
       const c = client(undefined, noChatTimers);
-      const { isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo } =
-        vm.runInContext('({ isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo })', c.context);
+      const { isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo, openRecovery, renderRecoveries,
+        selectedSession, launcherConversation } = vm.runInContext(
+        '({ isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo, openRecovery, renderRecoveries, selectedSession, launcherConversation })', c.context);
       const launcherCards = (records) => Object.fromEntries(records.map((terminal) =>
         [terminal.id, isInteractiveClaudeLauncher(terminalInfo(terminal)) ? listedLauncherClaude(terminal)?.key || null : null]));
       const cardKeys = () => Array.from(c.allSessions(), (row) => row.key);
@@ -2070,6 +2071,54 @@ for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) 
       assert.deepEqual(Array.from(c.allSessions().filter((row) => row.retained), (row) => row.key), expected.retainedCardKeys);
       assert.deepEqual(launcherCards(annotatedTerminals), expected.launcherCardKeys);
       assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys, 'a terminal response without hints keeps legacy matching');
+
+      const alias = expected.notificationAlias;
+      if (alias) {
+        c.state.authenticated = true;
+        const annotated = c.state.snapshot;
+        c.state.snapshot = { ...annotated, hosts: [] };
+        assert.equal(c.requestSessionOpen('/?session=' + encodeURIComponent(alias.key)), true);
+        assert.equal(c.state.openRequest?.key, alias.key, 'a cold link waits until the host is listed');
+        c.state.snapshot = annotated;
+        c.openRequestedSession();
+        assert.equal(c.state.openRequest, null);
+        assert.equal(c.state.selected, alias.target, 'the original link opens the representative');
+        for (const ref of annotated.recoverySessions) {
+          renderRecoveries();
+          assert.equal(c.get('session-recoveries').hidden, true, 'the recovery section omits a represented conversation');
+          await openRecovery(ref);
+          assert.equal(c.state.selected, alias.target, 'an existing recovery click also opens the representative');
+          assert.equal(c.state.nativeSessions.size, 0);
+          // A previously resolved alias must also disappear when its representative arrives.
+          c.state.nativeSessions.set(alias.key, { ...ref, key: alias.key, recoverySource: true });
+          assert.deepEqual(cardKeys(), expected.cardKeys);
+          c.state.nativeSessions.clear();
+
+          const api = vm.runInContext('api', c.context);
+          let finishRecovery;
+          c.context.api = (url, options) => url.startsWith('/api/session/recover?') ?
+            new Promise((resolve) => { finishRecovery = resolve; }) : api(url, options);
+          c.state.snapshot = { ...annotated, hosts: [], recoverySessions: [{ ...ref, boardRecovery: undefined }] };
+          const pending = openRecovery(ref);
+          assert.equal(typeof finishRecovery, 'function', 'a recovery starts before the representative arrives');
+          c.state.snapshot = annotated;
+          finishRecovery({ session: ref });
+          await pending;
+          c.context.api = api;
+          assert.equal(c.state.selected, alias.target, 'a representative arriving during recovery wins');
+          assert.equal(c.state.nativeSessions.size, 0);
+        }
+        const launcher = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow &&
+          expected.launcherCardKeys[terminal.id] === alias.key);
+        if (launcher) {
+          assert.equal(launcherConversation(launcher).kind, 'interactive');
+          c.openNativeChat(launcher);
+          assert.equal(c.state.selected, alias.key, 'the detail opens the unique interactive selector');
+          assert.equal(selectedSession().kind, 'interactive');
+          assert.equal(c.state.nativeSessions.size, 0);
+          assert.deepEqual(cardKeys(), expected.cardKeys, 'opening the hidden selector leaves one card');
+        }
+      }
 
       const confirmed = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow);
       if (confirmed) {
