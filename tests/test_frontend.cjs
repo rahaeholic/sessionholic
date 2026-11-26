@@ -2046,6 +2046,27 @@ test('a linked Claude launcher opens only its listed conversation and uses the l
   }
 });
 
+test('Claude native rows without ids merge with their recovery card and keep the working native state', () => {
+  const sid = '019a0000-0000-7000-8000-000000000018';
+  const c = client(undefined, noChatTimers);
+  const host = { name: 'workstation', ok: true, data: { claude: [
+    { agent: 'claude', id: '', sessionId: sid, kind: 'interactive', phase: 'working', cwd: '/work', title: '진행 중' },
+  ], codex: [] } };
+  c.state.snapshot = { serverTime: 1000, hosts: [host], recoverySessions: [
+    { host: host.name, agent: 'claude', id: sid, sessionId: sid, kind: 'interactive', phase: 'idle', cwd: '/work',
+      retained: true, title: '이전 대화' },
+  ] };
+
+  const [merged] = c.allSessions();
+  assert.equal(c.allSessions().length, 1);
+  assert.equal(merged.id, '');
+  assert.equal(merged.sessionId, sid);
+  assert.equal(merged.phase, 'working', 'the active native row keeps its working state');
+
+  host.data.claude[0].id = sid;
+  assert.equal(c.allSessions().length, 1, 'a native row with its id populated also merges');
+});
+
 test('environment changes live in a native disclosure that starts closed and retains the existing controls', () => {
   const c = client(undefined, noChatTimers);
   const details = c.buildContinuePanel({ host: 'workstation', agent: 'codex', home: '.codex-example', id: 'session', key: 'source-key' });
