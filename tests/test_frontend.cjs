@@ -2046,27 +2046,6 @@ test('a linked Claude launcher opens only its listed conversation and uses the l
   }
 });
 
-test('Claude native rows without ids merge with their recovery card and keep the working native state', () => {
-  const sid = '019a0000-0000-7000-8000-000000000018';
-  const c = client(undefined, noChatTimers);
-  const host = { name: 'workstation', ok: true, data: { claude: [
-    { agent: 'claude', id: '', sessionId: sid, kind: 'interactive', phase: 'working', cwd: '/work', title: '진행 중' },
-  ], codex: [] } };
-  c.state.snapshot = { serverTime: 1000, hosts: [host], recoverySessions: [
-    { host: host.name, agent: 'claude', id: sid, sessionId: sid, kind: 'interactive', phase: 'idle', cwd: '/work',
-      retained: true, title: '이전 대화' },
-  ] };
-
-  const [merged] = c.allSessions();
-  assert.equal(c.allSessions().length, 1);
-  assert.equal(merged.id, '');
-  assert.equal(merged.sessionId, sid);
-  assert.equal(merged.phase, 'working', 'the active native row keeps its working state');
-
-  host.data.claude[0].id = sid;
-  assert.equal(c.allSessions().length, 1, 'a native row with its id populated also merges');
-});
-
 test('environment changes live in a native disclosure that starts closed and retains the existing controls', () => {
   const c = client(undefined, noChatTimers);
   const details = c.buildContinuePanel({ host: 'workstation', agent: 'codex', home: '.codex-example', id: 'session', key: 'source-key' });
@@ -9432,13 +9411,17 @@ test('a Claude interactive row without a worker id uses its sessionId for chat, 
     return { ok: true, status: 200, json: async () => data };
   }, noChatTimers);
   c.context.EventSource = FakeEventSource;
-  const row = { agent: 'claude', id: '', sessionId: sid, pid: 42, cwd: '/w', phase: 'idle', kind: 'interactive' };
+  const row = { agent: 'claude', id: '', sessionId: sid, pid: 42, cwd: '/w', phase: 'working', kind: 'interactive' };
   c.state.snapshot = { hosts: [{ name: source.host, ok: true, data: { claude: [row] } }],
     recoverySessions: [{ ...row, ...source, home: '.claude', retained: true }] };
   c.state.authenticated = true;
   c.state.capabilities = { suggestedReplies: true };
   const [s, duplicate] = c.allSessions();
   assert.equal(duplicate, undefined, 'the retained record is the same conversation');
+  assert.equal(s.phase, 'working', 'the active native row keeps its working state');
+  row.id = sid;
+  assert.equal(c.allSessions().length, 1, 'a native row with its id populated also merges');
+  row.id = '';
   c.state.selected = s.key;
   c.get('chat-composer').dataset.source = c.chatKey(c.sourceOf(s));
   await c.loadDetail(s, true);
