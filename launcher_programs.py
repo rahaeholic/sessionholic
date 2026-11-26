@@ -246,11 +246,14 @@ def launcher_programs(args):
 def single_pane_pid(command, name):
     """Read the PID only when this named tmux session has one pane."""
     try:
-        done = subprocess.run(command + ["list-panes", "-s", "-t", "=" + name, "-F", "#{pane_pid}"],
+        done = subprocess.run(command + ["list-panes", "-s", "-t", "=" + name + ":",
+                                         "-F", "#{session_name} #{pane_pid}"],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, text=True)
         panes = done.stdout.splitlines()
-        if not done.returncode and len(panes) == 1 and re.fullmatch(r"[1-9][0-9]{0,9}", panes[0]):
-            return int(panes[0])
+        if not done.returncode and len(panes) == 1:
+            owner, _, pid = panes[0].partition(" ")
+            if owner == name and re.fullmatch(r"[1-9][0-9]{0,9}", pid):
+                return int(pid)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return None

@@ -696,14 +696,12 @@ class TerminalManager:
         self._changed()
 
     def _configure(self, terminal):
-        # Unlike has-session/attach-session, option targets interpret '=' as part
-        # of the name. These complete names are generated here, never by clients.
         # No prefix key: Ctrl+B (and every key after it) belongs to the CLI, never to this
         # board's own tmux client, which Ctrl+B d would otherwise detach.
-        name = terminal.record["name"]
-        done = self._run("set-option", "-t", name, "status", "off", ";",
-                         "set-option", "-t", name, "prefix", "None", ";",
-                         "set-option", "-t", name, "prefix2", "None")
+        target = self._pane_target(terminal)
+        done = self._run("set-option", "-t", target, "status", "off", ";",
+                         "set-option", "-t", target, "prefix", "None", ";",
+                         "set-option", "-t", target, "prefix2", "None")
         if done.returncode != 0:
             raise RuntimeError("터미널 화면 설정을 적용하지 못했습니다.")
 
@@ -818,10 +816,15 @@ class TerminalManager:
                     raise RuntimeError("터미널에 입력하지 못했습니다.") from None
         return {"ok": True}
 
+    @staticmethod
+    def _pane_target(terminal):
+        # The colon forces tmux to resolve the name as a session, even if a window shares it.
+        return "=" + terminal.record["name"] + ":"
+
     def _cancel_mode(self, terminal):
         # Outside a mode tmux answers "not in a mode" and sends nothing to the CLI.
         try:
-            self._run("send-keys", "-t", terminal.record["name"], "-X", "cancel")
+            self._run("send-keys", "-t", self._pane_target(terminal), "-X", "cancel")
         except RuntimeError:
             pass
 
@@ -834,7 +837,7 @@ class TerminalManager:
     def _pane(self, terminal):
         """Live pane flags; _run discards stdout, so this is its own bounded call."""
         try:
-            done = subprocess.run(self._command("display-message", "-p", "-t", terminal.record["name"], PANE_FORMAT),
+            done = subprocess.run(self._command("display-message", "-p", "-t", self._pane_target(terminal), PANE_FORMAT),
                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 상태를 확인하지 못했습니다.") from None
@@ -864,20 +867,20 @@ class TerminalManager:
         # alone say a full-screen app wants the wheel.
         if pane["mouse"] and (pane["alternate"] or terminal.record["metadata"].get("holdName")):
             return self._wheel(terminal, pane, lines)
-        name = terminal.record["name"]
+        target = self._pane_target(terminal)
         if lines < 0:
             if not pane["history"]:
                 # Nothing above the screen: an empty copy-mode would only trap input.
                 return {"ok": True, "mode": "history", "position": 0}
             # -e leaves history automatically once the view returns to the bottom.
-            done = self._run("copy-mode", "-e", "-t", name, ";",
-                             "send-keys", "-t", name, "-X", "-N", str(-lines), "scroll-up")
+            done = self._run("copy-mode", "-e", "-t", target, ";",
+                             "send-keys", "-t", target, "-X", "-N", str(-lines), "scroll-up")
             if done.returncode != 0:
                 raise RuntimeError("터미널 기록을 스크롤하지 못했습니다.")
             terminal.scrolled = True
         elif pane["inMode"]:
             # Outside history there is nothing below the live screen to scroll to.
-            self._run("send-keys", "-t", name, "-X", "-N", str(lines), "scroll-down")
+            self._run("send-keys", "-t", target, "-X", "-N", str(lines), "scroll-down")
         try:
             after = self._pane(terminal)
         except RuntimeError:
@@ -898,7 +901,7 @@ class TerminalManager:
             if pane["inMode"]:
                 self._cancel_mode(terminal)
             terminal.scrolled = False
-            done = self._run("send-keys", "-t", terminal.record["name"], "-l", event * count)
+            done = self._run("send-keys", "-t", self._pane_target(terminal), "-l", event * count)
         if done.returncode != 0:
             raise RuntimeError("터미널 화면을 스크롤하지 못했습니다.")
         return {"ok": True, "mode": "app", "position": None}
@@ -913,7 +916,7 @@ class TerminalManager:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         try:
             done = subprocess.run(self._command("capture-pane", "-p", *(["-e"] if styled else []),
-                                                "-t", terminal.record["name"]),
+                                                "-t", self._pane_target(terminal)),
                                   stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("터미널 화면을 확인하지 못했습니다.") from None
@@ -933,7 +936,7 @@ class TerminalManager:
             raise RuntimeError("터미널 연결이 종료되었습니다.")
         self._leave_scroll(terminal)
         with terminal.io_lock:
-            done = self._run("send-keys", "-t", terminal.record["name"], *keys)
+            done = self._run("send-keys", "-t", self._pane_target(terminal), *keys)
             if done.returncode != 0:
                 raise InputNotSent("터미널에 키를 보내지 못했습니다.")
         return {"ok": True}
@@ -958,10 +961,10 @@ class TerminalManager:
         if terminal.record.get("closed", False) or not terminal.alive:
             raise InputNotSent("터미널 연결이 종료되었습니다.")
         self._leave_scroll(terminal)
-        name, buffer = terminal.record["name"], "sh-" + secrets.token_hex(8)
+        target, buffer = self._pane_target(terminal), "sh-" + secrets.token_hex(8)
         with terminal.io_lock:
             done = self._run("load-buffer", "-b", buffer, "-", ";",
-                             "paste-buffer", "-p", "-d", "-b", buffer, "-t", name, input=data)
+                             "paste-buffer", "-p", "-d", "-b", buffer, "-t", target, input=data)
             if done.returncode != 0:
                 # load-buffer may have succeeded; never leave the message text in tmux.
                 self._run("delete-buffer", "-b", buffer)
@@ -970,7 +973,7 @@ class TerminalManager:
                 # Let the TUI finish its paste handling before the separate Enter key (sooner, a
                 # TUI may take the Enter as part of the paste: a newline).
                 time.sleep(0.3)
-                done = self._run("send-keys", "-t", name, "Enter")
+                done = self._run("send-keys", "-t", target, "Enter")
                 if done.returncode != 0:
                     raise RuntimeError("붙여넣은 뒤 Enter를 보내지 못했습니다.")
         return {"ok": True}

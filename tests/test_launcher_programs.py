@@ -39,6 +39,26 @@ not a process line
 
 
 class TableTest(unittest.TestCase):
+    def test_single_pane_requires_an_exact_session_name_and_valid_pid(self):
+        name = "sh-0123456789abcdef"
+        command = ["/fixture/tmux"]
+        for code, output, expected in (
+            (0, name + " 52\n", 52),
+            (0, "sh-1123456789abcdef 32\n", None),
+            (0, name + " 52\nsh-1123456789abcdef 32\n", None),
+            (0, name + " 52\n" + name + " 53\n", None),
+            (0, name + " x\n", None),
+            (0, "52\n", None),
+            (0, "", None),
+            (1, name + " 52\n", None),
+        ):
+            with self.subTest(code=code, output=output), patch.object(lp.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], code, output)) as run:
+                self.assertEqual(lp.single_pane_pid(command, name), expected)
+                self.assertEqual(run.call_args.args[0],
+                                 command + ["list-panes", "-s", "-t", "=" + name + ":",
+                                            "-F", "#{session_name} #{pane_pid}"])
+
     def test_ps_rows_are_parsed_in_the_c_locale_and_bad_lines_are_skipped(self):
         commands = []
         rows = lp.table(lambda command: commands.append(command) or PS, uid=501)
@@ -121,14 +141,14 @@ class ExactCodexTest(unittest.TestCase):
                 (21, 20, 2, "/vendor/codex"), (22, 21, 2, "/vendor/codex app-server"),
                 (23, 21, 2, "/vendor/codex app-server daemon"), (30, 21, 3, "bash -c tool"),
                 (31, 30, 3, "/vendor/codex"), (40, 1, 2, "/vendor/codex")]
-        done = subprocess.CompletedProcess([], 0, "10\n")
+        done = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\n")
         with patch("collector.which", return_value="/fixture/tmux"), patch.object(lp.subprocess, "run", return_value=done) as run, \
                 patch.object(lp, "writable_codex_source", return_value=self.native) as read:
             self.assertEqual(lp.held_program("sh-0123456789abcdef", rows),
                              {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native})
             read.assert_called_once_with({20, 21, 22})
             self.assertIn("list-panes", run.call_args.args[0])
-            run.return_value = subprocess.CompletedProcess([], 0, "10\n40\n")
+            run.return_value = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\nsh-0123456789abcdef 40\n")
             self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
             run.side_effect = subprocess.TimeoutExpired("tmux", 3)
             self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))

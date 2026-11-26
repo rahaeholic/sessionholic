@@ -1280,7 +1280,8 @@ class ChatClaudeTest(unittest.TestCase):
                             patch('launch.new_session', return_value={'argv': argv.split()}), \
                             patch('collector.which', return_value='/fixture/tmux'), \
                             patch.object(lp, 'table', return_value=tree), \
-                            patch.object(lp.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, panes)) as tmux, \
+                            patch.object(lp.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, ''.join(
+                                (hold or record['name']) + ' ' + pid + '\n' for pid in panes.splitlines()))) as tmux, \
                             patch.object(manager, 'list', side_effect=lambda: [manager._public(item)]), \
                             patch.object(manager, 'capture', return_value='──────────\n❯ \n──────────'), \
                             patch.object(manager, 'paste', return_value={'ok': True}) as paste:
@@ -1301,9 +1302,70 @@ class ChatClaudeTest(unittest.TestCase):
                             tmux.assert_not_called()
                         else:
                             target = hold if remote else record['name']
-                            self.assertIn('=' + target, tmux.call_args.args[0])
+                            self.assertIn('=' + target + ':', tmux.call_args.args[0])
                 finally:
                     manager.close()
+
+    @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')
+    def test_hold_window_name_collision_cannot_authorize_foreign_claude_input(self):
+        import launcher_programs as lp
+
+        hold, other = 'sh-0123456789abcdef', 'sh-1123456789abcdef'
+        socket_name = 'sb-test-' + secrets.token_hex(5)
+        command = [shutil.which('tmux'), '-L', socket_name, '-f', '/dev/null']
+        with tempfile.TemporaryDirectory(prefix='sh-hold-', dir='/tmp') as tmp, \
+                patch.dict(os.environ, {'TMUX_TMPDIR': tmp}):
+            def tmux(*args):
+                return subprocess.run(command + list(args), capture_output=True, text=True, timeout=5, check=True)
+
+            pane = tmux('new-session', '-dP', '-F', '#{pane_pid}', '-s', hold, '-n', 'own', '/bin/cat')
+            try:
+                decoy = tmux('new-session', '-dP', '-F', '#{pane_pid}', '-s', other, '-n', hold, '/bin/cat')
+                own_pid, outside_pid = int(pane.stdout), int(decoy.stdout)
+                own = {**self.row, 'kind': 'interactive', 'id': '', 'pid': own_pid}
+                outside = {**own, 'id': 'external-worker', 'pid': outside_pid,
+                           'sessionId': '019bbbbb-0000-7000-8000-000000000003'}
+                self.board.runner = lambda *_: {'claude': [outside, own], 'codex': []}
+                self.board.poll(HOST)
+                owned_ref = {'host': HOST['name'], 'agent': 'claude', 'id': CLAUDE_SID, 'sessionId': CLAUDE_SID}
+                other_ref = {**owned_ref, 'id': outside['id'], 'sessionId': outside['sessionId']}
+                tree = [(outside_pid, 1, 102, 'claude'), (own_pid, 1, 103, 'claude')]
+                host = {**HOST, 'local': False}
+                rpc = self.flow.transfers.rpc
+                manager = terminal.TerminalManager(state_dir=Path(tmp) / 'records',
+                                                   socket_name='sb-fixture-hold-collision')
+                try:
+                    self.flow.terminals = manager
+                    def transfer(host, op, args, timeout):
+                        return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
+                    with patch('transfer_worker.HOLD_SOCKET', socket_name), \
+                            patch('launch.new_session', return_value={'argv': ['/bin/zsh', '-lic', 'zz']}), \
+                            patch.object(lp, 'table', return_value=tree), \
+                            patch.object(self.flow.transfers, 'rpc', side_effect=transfer), \
+                            patch.object(manager, 'list', side_effect=lambda: [manager._public(item)]), \
+                            patch.object(manager, 'capture', return_value='──────────\n❯ \n──────────'), \
+                            patch.object(manager, 'paste') as paste:
+                        for present in (True, False):
+                            if not present:
+                                tmux('kill-session', '-t', '=' + hold)
+                            record = {'id': TERMINAL_ID, 'name': 'sb-' + TERMINAL_ID, 'key': 'fixture',
+                                      'socket': manager.socket_name, 'metadata': {'host': HOST['name'], 'mode': 'new-session'}}
+                            item = manager.terminals[TERMINAL_ID] = terminal._Terminal(record, 1024)
+                            held = lp.held_program(hold, tree)
+                            self.assertEqual(held, {'program': 'claude', 'cwd': None, 'pid': own_pid,
+                                                    'paneVerified': True} if present else None)
+                            self.flow._describe_host(host, [{'id': TERMINAL_ID, 'createdAt': 100, 'holdName': hold}])
+                            saved = item.record['metadata']
+                            self.assertEqual(saved.get('linkConfidence'), 'exact' if present else None)
+                            self.assertEqual((saved.get('nativeSource') or {}).get('id'), CLAUDE_SID if present else None)
+                            self.assertEqual(self.state(source=owned_ref)['capability']['supported'], present)
+                            self.assertFalse(self.state(source=other_ref)['capability']['supported'])
+                            self.assertEqual(self.rejected(source=other_ref), chat.CLAUDE_EXTERNAL)
+                            paste.assert_not_called()
+                finally:
+                    manager.close()
+            finally:
+                tmux('kill-server')
 
     def test_delivery_readback_and_recovery_scenarios(self):
         empty = '─' * 20 + '\n❯ \n' + '─' * 20
