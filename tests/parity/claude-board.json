@@ -223,14 +223,8 @@
           "listedRow": null
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
-        "fixture-host|claude||fixture-saved"
-      ],
-      "retainedCardKeys": [
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
-        "fixture-host|claude||fixture-saved"
-      ],
+      "cardKeys": ["fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100", "fixture-host|claude||fixture-saved"],
+      "retainedCardKeys": ["fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100", "fixture-host|claude||fixture-saved"],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "none": null,
@@ -238,7 +232,52 @@
         "attach": null,
         "metadata": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "unconfirmed": null
-      }
+      },
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "none": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": []
+        },
+        "estimated": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        },
+        "attach": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "metadata": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "unconfirmed": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 101,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"]
+      ]
     }
   },
   {
@@ -391,26 +430,38 @@
           "listedRow": ["fixture-other", "claude", 0]
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude|.claude-other|fixture-alt",
-        "fixture-other|claude||fixture-other-worker"
-      ],
+      "cardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude|.claude-other|fixture-alt", "fixture-other|claude||fixture-other-worker"],
       "retainedCardKeys": [],
       "launcherCardKeys": {
         "ambiguous": null,
         "other-host": "fixture-other|claude||fixture-other-worker"
       },
-      "legacyCardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude|.claude|fixture-alias",
-        "fixture-host|claude|.claude-other|fixture-alt",
-        "fixture-other|claude||fixture-other-worker"
-      ],
+      "legacyCardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude|.claude|fixture-alias", "fixture-host|claude|.claude-other|fixture-alt", "fixture-other|claude||fixture-other-worker"],
       "notificationAlias": {
         "key": "fixture-host|claude|.claude|fixture-alias",
         "target": "fixture-host|claude||fixture-worker"
-      }
+      },
+      "terminalMarks": {
+        "ambiguous": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 102,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "other-host": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 102,
+          "listedRows": [
+            ["fixture-other", "claude", 0, 0]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "ambiguous"],
+        ["fixture-host", "claude", 2, null],
+        ["fixture-other", "claude", 0, "other-host"]
+      ]
     }
   },
   {
@@ -546,15 +597,32 @@
           "listedRow": null
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||~:short:/fixture/work:"
-      ],
+      "cardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude||~:short:/fixture/work:"],
       "retainedCardKeys": [],
       "launcherCardKeys": {
         "same-folder": "fixture-host|claude||fixture-worker",
         "other-folder": null
-      }
+      },
+      "terminalMarks": {
+        "same-folder": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 103,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "other-folder": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 103,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "same-folder"],
+        ["fixture-host", "claude", 1, null]
+      ]
     }
   },
   {
@@ -686,16 +754,9 @@
           "listedRow": null
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
-      ],
-      "legacyCardKeys": [
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
-        "fixture-host|claude|.claude|background-worker"
-      ],
-      "retainedCardKeys": [
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
-      ],
+      "cardKeys": ["fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"],
+      "legacyCardKeys": ["fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100", "fixture-host|claude|.claude|background-worker"],
+      "retainedCardKeys": ["fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "estimated-mixed": null
@@ -703,7 +764,26 @@
       "notificationAlias": {
         "key": "fixture-host|claude|.claude|background-worker",
         "target": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
-      }
+      },
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 104,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "estimated-mixed": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 104,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"]
+      ]
     }
   },
   {
@@ -835,16 +915,9 @@
           "listedRow": null
         }
       },
-      "cardKeys": [
-        "fixture-host|claude|.claude|background-worker"
-      ],
-      "legacyCardKeys": [
-        "fixture-host|claude|.claude|background-worker",
-        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
-      ],
-      "retainedCardKeys": [
-        "fixture-host|claude|.claude|background-worker"
-      ],
+      "cardKeys": ["fixture-host|claude|.claude|background-worker"],
+      "legacyCardKeys": ["fixture-host|claude|.claude|background-worker", "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"],
+      "retainedCardKeys": ["fixture-host|claude|.claude|background-worker"],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "estimated-mixed": null
@@ -852,7 +925,24 @@
       "notificationAlias": {
         "key": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "target": "fixture-host|claude|.claude|background-worker"
-      }
+      },
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 105,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "estimated-mixed": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 105,
+          "listedRows": []
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"]
+      ]
     }
   },
   {
@@ -949,17 +1039,14 @@
       ],
       "launchers": {},
       "launcherCardKeys": {},
-      "cardKeys": [
-        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
-      ],
-      "legacyCardKeys": [
-        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1",
-        "fixture-host|claude||~10:11111111-1111-4111-8111-111111111111:/fixture/work:1"
-      ],
-      "retainedCardKeys": [
-        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
-      ],
-      "retainedReleasedVisible": "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
+      "cardKeys": ["fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"],
+      "legacyCardKeys": ["fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1", "fixture-host|claude||~10:11111111-1111-4111-8111-111111111111:/fixture/work:1"],
+      "retainedCardKeys": ["fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"],
+      "retainedReleasedVisible": "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1",
+      "terminalMarks": {},
+      "terminalCards": [
+        ["fixture-host", "claude", 0, null]
+      ]
     }
   },
   {
@@ -1056,13 +1143,8 @@
       "launcherCardKeys": {
         "exact": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
       },
-      "cardKeys": [
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
-      ],
-      "legacyCardKeys": [
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111",
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
-      ],
+      "cardKeys": ["fixture-host|claude||11111111-1111-4111-8111-111111111111"],
+      "legacyCardKeys": ["fixture-host|claude||11111111-1111-4111-8111-111111111111", "fixture-host|claude||11111111-1111-4111-8111-111111111111"],
       "retainedCardKeys": [],
       "sharedLauncherKey": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
       "representativeKind": "interactive",
@@ -1073,7 +1155,19 @@
       "runtimePhases": {
         "background": "working",
         "interactive": "idle"
-      }
+      },
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 107,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"]
+      ]
     }
   },
   {
@@ -1170,13 +1264,8 @@
       "launcherCardKeys": {
         "exact": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
       },
-      "cardKeys": [
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
-      ],
-      "legacyCardKeys": [
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111",
-        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
-      ],
+      "cardKeys": ["fixture-host|claude||11111111-1111-4111-8111-111111111111"],
+      "legacyCardKeys": ["fixture-host|claude||11111111-1111-4111-8111-111111111111", "fixture-host|claude||11111111-1111-4111-8111-111111111111"],
       "retainedCardKeys": [],
       "sharedLauncherKey": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
       "representativeKind": "background",
@@ -1187,7 +1276,19 @@
       "runtimePhases": {
         "background": "working",
         "interactive": "idle"
-      }
+      },
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 108,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"]
+      ]
     }
   },
   {
@@ -1294,16 +1395,28 @@
           "listedRow": ["fixture-host", "claude", 2]
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||fixture-worker"
-      ],
+      "cardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude||fixture-worker", "fixture-host|claude||fixture-worker"],
       "retainedCardKeys": [],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||fixture-worker"
       },
-      "launcherCwd": "/fixture/right"
+      "launcherCwd": "/fixture/right",
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 111,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1],
+            ["fixture-host", "claude", 1, 0],
+            ["fixture-host", "claude", 2, 0]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"],
+        ["fixture-host", "claude", 1, "exact"],
+        ["fixture-host", "claude", 2, "exact"]
+      ]
     }
   },
   {
@@ -1410,16 +1523,28 @@
           "listedRow": ["fixture-host", "claude", 0]
         }
       },
-      "cardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||fixture-worker"
-      ],
+      "cardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude||fixture-worker", "fixture-host|claude||fixture-worker"],
       "retainedCardKeys": [],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||fixture-worker"
       },
-      "launcherCwd": "/fixture/right"
+      "launcherCwd": "/fixture/right",
+      "terminalMarks": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 109,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0],
+            ["fixture-host", "claude", 1, 0],
+            ["fixture-host", "claude", 2, 1]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "exact"],
+        ["fixture-host", "claude", 1, "exact"],
+        ["fixture-host", "claude", 2, "exact"]
+      ]
     }
   },
   {
@@ -1505,12 +1630,184 @@
       ],
       "launchers": {},
       "launcherCardKeys": {},
-      "cardKeys": [
-        "fixture-host|claude||fixture-worker",
-        "fixture-host|claude||fixture-current-worker"
-      ],
+      "cardKeys": ["fixture-host|claude||fixture-worker", "fixture-host|claude||fixture-current-worker"],
       "retainedCardKeys": [],
-      "reusedRecoveryTarget": "fixture-host|claude||fixture-current-worker"
+      "reusedRecoveryTarget": "fixture-host|claude||fixture-current-worker",
+      "terminalMarks": {},
+      "terminalCards": [
+        ["fixture-host", "claude", 0, null],
+        ["fixture-host", "claude", 1, null]
+      ]
+    }
+  },
+  {
+    "name": "터미널 열림 표시: 정확한 연결이 식별자만 같은 연결·추정 연결보다 앞서고 실행 위치 연결·닫힌 연결을 구분",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 140,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "worker-a",
+                "sessionId": "33333333-3333-4333-8333-333333333331",
+                "kind": "interactive",
+                "cwd": "/fixture/a",
+                "phase": "idle"
+              }
+            ],
+            "codex": [
+              {
+                "agent": "codex",
+                "id": "codex-1",
+                "home": ".codex-fixture",
+                "cwd": "/fixture/c",
+                "phase": "idle"
+              }
+            ]
+          }
+        }
+      ],
+      "recoverySessions": []
+    },
+    "terminals": [
+      {
+        "id": "11111111111111111111111111111111",
+        "mode": "attach",
+        "alive": true,
+        "nativeSource": {
+          "host": "fixture-host",
+          "agent": "claude",
+          "id": "worker-a",
+          "sessionId": "33333333-3333-4333-8333-333333333339",
+          "cwd": "/fixture/other",
+          "kind": "background"
+        }
+      },
+      {
+        "id": "22222222222222222222222222222222",
+        "mode": "attach",
+        "alive": true,
+        "nativeSource": {
+          "host": "fixture-host",
+          "agent": "claude",
+          "id": "worker-a",
+          "sessionId": "33333333-3333-4333-8333-333333333331",
+          "cwd": "/fixture/a",
+          "kind": "background"
+        }
+      },
+      {
+        "id": "33333333333333333333333333333333",
+        "mode": "new-session",
+        "alive": true,
+        "sourceKey": "{\"host\": \"fixture-host\", \"agent\": \"codex\", \"home\": \".codex-fixture\", \"id\": \"codex-1\"}"
+      },
+      {
+        "id": "44444444444444444444444444444444",
+        "mode": "attach",
+        "alive": true,
+        "closed": true,
+        "nativeSource": {
+          "host": "fixture-host",
+          "agent": "codex",
+          "home": ".codex-fixture",
+          "id": "codex-1",
+          "cwd": "/fixture/c"
+        }
+      },
+      {
+        "id": "55555555555555555555555555555555",
+        "mode": "new-session",
+        "alive": true,
+        "linkConfidence": "estimated",
+        "nativeSource": {
+          "host": "fixture-host",
+          "agent": "claude",
+          "id": "worker-a",
+          "sessionId": "33333333-3333-4333-8333-333333333331",
+          "cwd": "/fixture/a",
+          "kind": "interactive"
+        }
+      }
+    ],
+    "expected": {
+      "terminalMarks": {
+        "11111111111111111111111111111111": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 140,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        },
+        "22222222222222222222222222222222": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 140,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 0]
+          ]
+        },
+        "33333333333333333333333333333333": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 140,
+          "listedRows": [
+            ["fixture-host", "codex", 0, 2]
+          ]
+        },
+        "44444444444444444444444444444444": null,
+        "55555555555555555555555555555555": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 140,
+          "listedRows": [
+            ["fixture-host", "claude", 0, 1]
+          ]
+        }
+      },
+      "terminalCards": [
+        ["fixture-host", "claude", 0, "22222222222222222222222222222222"],
+        ["fixture-host", "codex", 0, "33333333333333333333333333333333"]
+      ],
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "id": "worker-a",
+              "home": ".claude",
+              "sessionId": "33333333-3333-4333-8333-333333333331"
+            },
+            "boardDuplicateOf": null
+          }
+        ]
+      ],
+      "recoveries": [],
+      "launchers": {
+        "11111111111111111111111111111111": null,
+        "22222222222222222222222222222222": null,
+        "33333333333333333333333333333333": null,
+        "44444444444444444444444444444444": null,
+        "55555555555555555555555555555555": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 140,
+          "listedRow": null
+        }
+      },
+      "cardKeys": ["fixture-host|claude||worker-a", "fixture-host|codex|.codex-fixture|codex-1"],
+      "retainedCardKeys": [],
+      "launcherCardKeys": {
+        "11111111111111111111111111111111": null,
+        "22222222222222222222222222222222": null,
+        "33333333333333333333333333333333": null,
+        "44444444444444444444444444444444": null,
+        "55555555555555555555555555555555": null
+      }
     }
   }
 ]

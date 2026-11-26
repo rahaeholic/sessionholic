@@ -159,7 +159,9 @@ class RecoveryHttpTest(unittest.TestCase):
                                       for row, original in zip(result['recoverySessions'], recoveries)], recoveries)
                     self.assertEqual({row['id']: row.get('boardLauncher') for row in terminals['terminals']},
                                      expected['launchers'])
-                    self.assertEqual([{key: val for key, val in row.items() if key != 'boardLauncher'}
+                    self.assertEqual({row['id']: row.get('boardTerminalMark') for row in terminals['terminals']},
+                                     expected['terminalMarks'])
+                    self.assertEqual([{key: val for key, val in row.items() if key not in ('boardLauncher', 'boardTerminalMark')}
                                       for row in terminals['terminals']], case['terminals'])
                     self.assertEqual(self.terms.records, case['terminals'])
                     self.assert_no_execution()

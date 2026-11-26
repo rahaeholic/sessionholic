@@ -2086,6 +2086,27 @@ for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) 
       assert.deepEqual(launcherCards(annotatedTerminals), expected.launcherCardKeys);
       assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys, 'a terminal response without hints keeps legacy matching');
 
+      // "터미널 열림": the server's per-card decision equals the web rule it replaced, which
+      // stays the fallback for a server without it or for another snapshot version.
+      const { terminalForSession, decidedTerminalForSession } = vm.runInContext('({ terminalForSession, decidedTerminalForSession })', c.context);
+      const terminalCards = () => JSON.parse(JSON.stringify(c.allSessions().filter((row) => Number.isInteger(row.listedIndex))
+        .map((row) => [row.host, row.agent, row.listedIndex, terminalForSession(row)?.id ?? null])));
+      const live = (records) => records.filter((terminal) => terminal.alive !== false && !terminal.closed);
+      c.state.terminals = terminals;
+      assert.deepEqual(terminalCards(), expected.terminalCards, 'legacy web rule');
+      c.state.terminals = terminals.map((terminal) => expected.terminalMarks[terminal.id]
+        ? { ...terminal, boardTerminalMark: expected.terminalMarks[terminal.id] } : terminal);
+      assert.deepEqual(terminalCards(), expected.terminalCards, 'server decision');
+      for (const row of c.allSessions().filter((row) => Number.isInteger(row.listedIndex)))
+        assert.notEqual(decidedTerminalForSession(row, live(c.state.terminals)), undefined, 'the decision is used');
+      c.state.terminals = c.state.terminals.map((terminal) => terminal.boardTerminalMark
+        ? { ...terminal, boardTerminalMark: { ...terminal.boardTerminalMark, snapshotVersion: -1 } } : terminal);
+      for (const row of c.allSessions().filter((row) => Number.isInteger(row.listedIndex)))
+        assert.equal(decidedTerminalForSession(row, live(c.state.terminals)), live(c.state.terminals).length ? undefined : null,
+          'another snapshot version falls back');
+      assert.deepEqual(terminalCards(), expected.terminalCards, 'fallback for another version');
+      c.state.terminals = [];
+
       const alias = expected.notificationAlias;
       if (alias) {
         c.state.authenticated = true;
