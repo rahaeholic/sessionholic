@@ -11029,7 +11029,8 @@ test('같은 작업자 ID를 쓰는 서로 다른 Claude 대화 두 카드는 �
   c.context.toast = (message) => warnings.push(message);
   const cards = Array.from(c.allSessions());
   assert.deepEqual(cards.map((s) => s.kind), ['interactive', 'background']);
-  assert.equal(new Set(cards.map((s) => s.key)).size, 2, 'two conversations, two keys');
+  // Card keys stay as they were (notification links and an open selection keep working).
+  assert.deepEqual(cards.map((s) => s.key), ['workstation|claude||fixture-worker', 'workstation|claude||fixture-worker']);
   c.renderTerminals();
   c.get('running-terminals').events.click();
   const list = c.get('running-list');
@@ -11038,13 +11039,28 @@ test('같은 작업자 ID를 쓰는 서로 다른 Claude 대화 두 카드는 �
   await settle();
   assert.equal(c.state.terminal?.id, terminal.id);
   assert.equal(c.context.selectedSession().sessionId, background.sessionId);
-  assert.equal(c.state.selected, cards[1].key);
+  assert.ok(c.state.selected.startsWith('claude-detail:'), 'opened by its own conversation key');
+  assert.equal(c.context.workspaceHooks().sessionKeyForTerminal(terminal), c.state.selected);
   assert.deepEqual(warnings, []);
-  // A single card with that worker id keeps its plain key.
-  c.state.snapshot = { version: 6, bootId: 'fixture-boot', hosts: [
-    { name: shared.host, label: 'Fixture', ok: true, data: { claude: [{ ...interactive }], codex: [] } },
-  ] };
-  assert.equal(Array.from(c.allSessions())[0].key, 'workstation|claude||fixture-worker');
+});
+
+test('열어 둔 Claude 카드는 같은 작업자 ID의 다른 대화가 목록에 나타나도 선택이 그대로다', () => {
+  // 11/27 사후 검토: a key that changed when a sibling appeared dropped the open selection.
+  const c = client(undefined, noChatTimers);
+  const shared = { host: 'workstation', agent: 'claude', id: 'fixture-worker', cwd: '/fixture/work', boardDuplicateOf: null };
+  const first = { ...shared, sessionId: '11111111-1111-4111-8111-111111111112', kind: 'interactive', phase: 'idle' };
+  const sibling = { ...shared, sessionId: '22222222-2222-4222-8222-222222222223', kind: 'background', phase: 'working' };
+  const listing = (rows, version) => ({ version, bootId: 'fixture-boot', hosts: [
+    { name: shared.host, label: 'Fixture', ok: true, data: { claude: rows, codex: [] } }] });
+  c.state.authenticated = true;
+  c.state.snapshot = listing([first], 5);
+  const [card] = c.allSessions();
+  c.state.selected = card.key;
+  c.state.snapshot = listing([first, sibling], 6);
+  const selected = c.context.selectedSession();
+  assert.equal(selected.key, card.key);
+  assert.equal(selected.sessionId, first.sessionId);
+  assert.notEqual(selected.recoverySource, true);
 });
 
 test('원이 알림 경로를 원이 화면으로 전달한다', () => {
