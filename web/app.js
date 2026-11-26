@@ -8044,12 +8044,16 @@ function chatPollDelay(count) {
 function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
   if (!currentChat(entry, selected)) return;
   clearTimeout(state.chatPollTimer);
+  const connecting = entry.data?.capability?.connecting === true;
+  if (connecting && !entry.connectingPoll) state.chatPollCount = 0;
+  entry.connectingPoll = connecting;
   const reconnecting = chatRecovery(entry, selected)?.action === "refresh_host";
   // A bubble still waiting for its message keeps the conversation followed, so it
   // goes when the message (or an answer after it) shows, or when it times out.
   if (networkOffline() || !chatVisible() || state.chatPollCount >= CHAT_POLL_MAX ||
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
        !chatReadUnavailable(entry) && !reconnecting &&
+       !connecting &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
@@ -8057,7 +8061,7 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
     if (run !== state.chatPollRun || !currentChat(entry) || !chatVisible()) return;
     state.chatPollCount++;
     loadChatState(s, false);
-  }, reconnecting ? Math.min(5000, chatPollDelay(state.chatPollCount)) : chatPollDelay(state.chatPollCount));
+  }, connecting ? 1000 : reconnecting ? Math.min(5000, chatPollDelay(state.chatPollCount)) : chatPollDelay(state.chatPollCount));
 }
 function applyChatReceipt(entry, receipt, selected) {
   if (!receipt) return;

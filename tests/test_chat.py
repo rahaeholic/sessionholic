@@ -1252,6 +1252,7 @@ class ChatClaudeTest(unittest.TestCase):
             state = self.state(source=ref)
         self.assertFalse(state['capability']['supported'])
         self.assertEqual(state['capability']['reason'], chat.CLAUDE_CONNECTING)
+        self.assertTrue(state['capability']['connecting'])
         self.assertEqual(self.rejected(source=ref), chat.CLAUDE_EXTERNAL)
         self.assertEqual(self.terms.pastes, [])
 

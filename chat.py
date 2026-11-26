@@ -721,6 +721,8 @@ class Chat:
             supported, reason = bool(caps.get('canSend')), caps.get('reason') or result.get('reason')
         capability = {'supported': supported, 'attachments': bool(source.get('cwd')),
                       'reason': None if supported else reason}
+        if claude and not supported and reason == CLAUDE_CONNECTING:
+            capability['connecting'] = True
         if action:
             # What the user can do to make sending possible ("open_terminal": the board's terminal button).
             capability['action'] = action
