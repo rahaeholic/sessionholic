@@ -3617,6 +3617,10 @@ def web_terminal_card_rank(info, card):
     return None
 
 
+TERMINAL_MARK_FIELDS = ("alive", "closed", "mode", "linkConfidence", "nativeSource", "sourceKey")
+TERMINAL_MARK_CACHE = {}
+
+
 def annotate_board_terminal_marks(board, records, boot_id):
     """Which listed cards show each live terminal as "터미널 열림" (web terminalForSession
     moved here, as the launcher decision was): a client of this snapshot version uses it."""
@@ -3624,21 +3628,28 @@ def annotate_board_terminal_marks(board, records, boot_id):
              if isinstance(record, dict) and record.get("alive") is not False and not record.get("closed")]
     if not alive:
         return records
-    snapshot = board.snapshot()
-    cards = [(position, {**row, "host": position[0], "agent": position[1]})
-             for position, row, _, duplicate_of in board_listed_rows(snapshot, ("claude", "codex"))
-             if not (position[1] == "claude" and duplicate_of is not None)]
+    infos = [{**(records[index].get("metadata") or {}), **records[index]} for index in alive]
+    # Each page asks every second: while the board state and these terminals' fields are the same,
+    # the last decision stands (no copy of the whole listing under the board lock).
+    key = (id(board), getattr(board, "version", None), boot_id, json.dumps(
+        [{field: info.get(field) for field in TERMINAL_MARK_FIELDS} for info in infos], sort_keys=True, default=str))
+    cached = TERMINAL_MARK_CACHE.get("value")
+    if cached and cached[0] == key:
+        version, marks = cached[1]
+    else:
+        snapshot = board.snapshot()
+        cards = [(position, {**row, "host": position[0], "agent": position[1]})
+                 for position, row, _, duplicate_of in board_listed_rows(snapshot, ("claude", "codex"))
+                 if not (position[1] == "claude" and duplicate_of is not None)]
+        version = snapshot["version"]
+        marks = [[[*position, rank] for position, card in cards
+                  for rank in (web_terminal_card_rank(info, card),) if rank is not None] for info in infos]
+        if key[1] is not None:
+            TERMINAL_MARK_CACHE["value"] = (key, (version, marks))
     result = list(records)
-    for index in alive:
-        record = records[index]
-        info = {**(record.get("metadata") or {}), **record}
-        rows = []
-        for position, card in cards:
-            rank = web_terminal_card_rank(info, card)
-            if rank is not None:
-                rows.append([*position, rank])
-        result[index] = {**record, "boardTerminalMark": {
-            "bootId": boot_id, "snapshotVersion": snapshot["version"], "listedRows": rows}}
+    for index, rows in zip(alive, marks):
+        result[index] = {**records[index], "boardTerminalMark": {
+            "bootId": boot_id, "snapshotVersion": version, "listedRows": copy.deepcopy(rows)}}
     return result
 
 
