@@ -477,8 +477,13 @@ class Chat:
     @classmethod
     def watch_identity(cls, source):
         identity = cls.identity(source)
-        if source.get('agent') == 'claude' and source.get('sessionId'):
-            identity['sessionId'] = source['sessionId']
+        if source.get('agent') == 'claude':
+            if source.get('sessionId'):
+                identity['sessionId'] = source['sessionId']
+            if source.get('listedKind'):
+                identity['kind'] = source['listedKind']
+                if source.get('cwd'):
+                    identity['cwd'] = source['cwd']
         return identity
 
     @classmethod
@@ -499,15 +504,21 @@ class Chat:
             source.setdefault('agent', ref.get('agent'))
             return source
         except ValueError:
+            kind = ref.get('kind') if ref.get('agent') == 'claude' else None
             for terminal in self.workflow.terminals.list():
                 native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
                 if (isinstance(native, dict) and self.identity(native) == self.identity(ref or {})
+                        and (not kind or native.get('kind') == kind)
+                        and (not kind or not ref.get('cwd') or native.get('cwd') == ref['cwd'])
                         and (not ref.get('sessionId') or native.get('sessionId') == ref['sessionId'])):
-                    return {**native, 'title': terminal.get('title', '이어가는 작업')}
+                    return {**native, 'title': terminal.get('title', '이어가는 작업'),
+                            **({'listedKind': kind} if kind else {})}
                 selected = terminal.get('chatSource') or terminal.get('metadata', {}).get('chatSource')
                 if (allow_chat_source and isinstance(selected, dict) and self.identity(selected) == self.identity(ref)
+                        and (not kind or selected.get('kind') == kind)
+                        and (not kind or not ref.get('cwd') or selected.get('cwd') == ref['cwd'])
                         and (not ref.get('sessionId') or selected.get('sessionId') == ref['sessionId'])):
-                    return {**selected, 'readOnly': True}
+                    return {**selected, 'readOnly': True, **({'listedKind': kind} if kind else {})}
             raise
 
     def source(self, ref, sending=True):
@@ -558,9 +569,15 @@ class Chat:
         """The conversation view. A watcher read (watching=True) also carries the receipts
         clients recently asked for, so their next read is answered from the cache; a read
         still in progress is shared by readers asking for a subset of its receipts."""
-        source, host = self.source(data.get('source'), sending=False)
+        ref = data.get('source')
+        source, host = self.source(ref, sending=False)
         identity = self.identity(source)
         key = self.state_key(source)
+        def client_view(view):
+            # Legacy clients still receive their original route shape even when
+            # the representative was resolved with an exact execution kind.
+            return {**view, 'route': identity} if source.get('listedKind') and not ref.get('kind') else view
+
         request_id = data.get('requestId')
         if request_id is not None and (not isinstance(request_id, str) or not STATE_REQUEST.fullmatch(request_id)):
             raise ValueError('메시지 요청 식별자가 올바르지 않습니다.')
@@ -600,9 +617,9 @@ class Chat:
                     sequence, epoch = self.read_sequence, self.cache_epoch
                     read = self.reads[key] = StateRead(carried, epoch, source.get('cwd'), source.get('sessionId'))
         if cached:
-            return self._cached_view(cached[1], request_ids, recheck_pane=True)
+            return client_view(self._cached_view(cached[1], request_ids, recheck_pane=True))
         if shared is not None:
-            return self._shared_view(shared, request_ids)
+            return client_view(self._shared_view(shared, request_ids))
         if watching:
             kwargs = {'requestIds': carried} if carried else {}
         else:
@@ -622,7 +639,7 @@ class Chat:
                 if self.reads.get(key) is read:
                     del self.reads[key]
             read.done.set()
-        return self._cached_view(response, request_ids)
+        return client_view(self._cached_view(response, request_ids))
 
     def _shared_view(self, shared, request_ids):
         """The asked receipts from another reader's read; its failure is this reader's too."""
@@ -745,7 +762,8 @@ class Chat:
                 capability['reason'] = '연결이 끝난 세션입니다. 같은 대화를 다시 열어 이어갈 수 있습니다.'
             elif recovery.get('reason'):
                 capability['reason'] = recovery['reason']
-        response = {'route': identity, 'phase': phase,
+        route = self.watch_identity(source) if source.get('listedKind') else identity
+        response = {'route': route, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
                     # Rows before these were left out (collector.recent_window, the read's range).
@@ -929,7 +947,18 @@ class Chat:
                 pass
         with self.lock:
             self.cache_epoch += 1
-            self.cache.pop(self.state_key(source), None)
+            if source.get('agent') == 'claude':
+                identity = self.watch_identity(source)
+                identity.pop('kind', None)
+                identity.pop('cwd', None)
+                self.cache.pop(json.dumps(identity, sort_keys=True), None)
+                for kind in ('interactive', 'background', 'bg'):
+                    route = {**identity, 'kind': kind}
+                    self.cache.pop(json.dumps(route, sort_keys=True), None)
+                    if source.get('cwd'):
+                        self.cache.pop(json.dumps({**route, 'cwd': source['cwd']}, sort_keys=True), None)
+            else:
+                self.cache.pop(self.state_key(source), None)
 
     # ---------- the board terminal attached to a session ----------
     @staticmethod
@@ -946,18 +975,28 @@ class Chat:
         return False
 
     def _board_terminal(self, source):
+        fallback = None
+        interactive = source.get('agent') == 'claude' and source.get('kind') == 'interactive'
+        kind = source.get('listedKind') or ('interactive' if interactive else None)
         for terminal in self.workflow.terminals.list():
             # A 새 세션 link guessed from start times may name another terminal's session:
             # it is shown as estimated and never receives a paste or a menu answer.
-            if terminal.get('linkConfidence') == 'estimated':
+            info = {**(terminal.get('metadata') or {}), **terminal}
+            if info.get('linkConfidence') == 'estimated':
                 continue
-            native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
+            native = info.get('nativeSource')
             if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
-                if (launcher_claude(terminal)
-                        and not self.workflow.terminals.claude_pane_available(terminal['id'])):
+                if kind and native.get('kind') and native['kind'] != kind:
                     continue
-                return terminal
-        return None
+                if launcher_claude(info):
+                    if not self.workflow.terminals.claude_pane_available(terminal['id']):
+                        continue
+                    return info
+                if not interactive:
+                    return info
+                if fallback is None:
+                    fallback = info
+        return fallback
 
     def _capture_terminal(self, terminal, **kwargs):
         if launcher_claude(terminal):
@@ -1678,7 +1717,10 @@ class Chat:
                 args['source'] = self.identity(source)
             attachment = self.workflow.transfers.rpc(host, 'attachment', args, timeout=60)
             from server import private_json
-            record = {'source': self.watch_identity(source), 'cwd': cwd, 'attachment': attachment}
+            attachment_source = self.watch_identity(source)
+            attachment_source.pop('kind', None)
+            attachment_source.pop('cwd', None)
+            record = {'source': attachment_source, 'cwd': cwd, 'attachment': attachment}
             private_json(self.root / 'attachments' / (attachment['id'] + '.json'), record)
             return {'attachment': {**attachment, 'type': attachment.get('mime', 'application/octet-stream')}}
         finally:

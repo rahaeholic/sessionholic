@@ -968,9 +968,10 @@ class SnapshotResponseTest(unittest.TestCase):
         handler = object.__new__(server.Handler)
         handler.server = self.httpd
         retained, cursor = handler.recovery_sessions()
-        kept = handler.retained_user_sessions(snapshot, retained)
+        retained.extend(handler.retained_user_sessions(snapshot, retained))
+        server.annotate_board_snapshot(snapshot, retained)
         snapshot = {**snapshot, 'bootId': self.httpd.boot_id, 'quickReplyPreferences': self.httpd.preferences.snapshot(),
-                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': retained + kept,
+                    'savedPrompts': self.httpd.prompts.summary(), 'recoverySessions': retained,
                     'retainedNextCursor': cursor, 'retainedUserCatalog': {'ok': True},
                     'retainedDisplayVersion': handler.retained_display_version(),
                     'retainedCatalog': {'ok': True}}
@@ -1036,6 +1037,8 @@ class SnapshotResponseTest(unittest.TestCase):
         self.assertNotIn('sk-proj', rows['codex'][1]['originalTitle'])
         self.assertNotIn('displayTitle', rows['codex'][2])
         self.assertEqual(rows['claude'][0]['displayTitle'], 'Claude')
+        self.assertEqual(rows['claude'][0]['boardSource']['id'], claude['sessionId'])
+        self.assertIsNone(rows['claude'][0]['boardDuplicateOf'])
 
     def test_every_input_of_a_kept_answer_changes_the_next_one(self):
         from session_labels import BoardPreferences, SavedPrompts, SessionOpened, SessionPinned, SessionRemoved

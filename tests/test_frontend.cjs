@@ -2046,6 +2046,226 @@ test('a linked Claude launcher opens only its listed conversation and uses the l
   }
 });
 
+for (const file of fs.readdirSync(path.join(__dirname, 'parity')).filter((file) => file.endsWith('.json'))) {
+  const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'parity', file), 'utf8'));
+  for (const { name, snapshot, terminals, expected } of cases) {
+    test(`Claude board parity: ${name}`, async () => {
+      const reads = [];
+      let sequence = 0;
+      const observe = (phase) => ({ version: 1, known: true, phase, bootId: snapshot.bootId,
+        requestSeq: ++sequence, acceptedSeq: sequence, observedAt: snapshot.serverTime, expiresAt: snapshot.serverTime + 120,
+        reasonCode: 'claude_registry_process', evidence: 'claude_registry_process' });
+      const c = client(async (url, options) => {
+        const body = options?.body && JSON.parse(options.body);
+        if (url !== '/api/chat/state') return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        reads.push(body.source);
+        const phase = expected.runtimePhases?.[body.source.kind] || 'idle';
+        const runtimeObservation = expected.runtimePhases ? observe(phase) : undefined;
+        return { ok: true, status: 200, json: async () => ({ route: body.source, capability: { supported: true },
+          phase, messages: [], ...(runtimeObservation ? { runtimeObservation } : {}) }) };
+      }, noChatTimers);
+      const { isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo, openRecovery, renderRecoveries,
+        selectedSession, launcherConversation } = vm.runInContext(
+        '({ isInteractiveClaudeLauncher, listedLauncherClaude, terminalInfo, openRecovery, renderRecoveries, selectedSession, launcherConversation })', c.context);
+      const launcherCards = (records) => Object.fromEntries(records.map((terminal) =>
+        [terminal.id, isInteractiveClaudeLauncher(terminalInfo(terminal)) ? listedLauncherClaude(terminal)?.key || null : null]));
+      const cardKeys = () => Array.from(c.allSessions(), (row) => row.key);
+      const annotatedTerminals = terminals.map((terminal) => expected.launchers[terminal.id]
+        ? { ...terminal, boardLauncher: expected.launchers[terminal.id] } : terminal);
+      c.state.snapshot = snapshot;
+      assert.deepEqual(cardKeys(), expected.legacyCardKeys || expected.cardKeys);
+      assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys);
+
+      c.state.snapshot = { ...snapshot,
+        hosts: snapshot.hosts.map((host, h) => ({ ...host, data: { ...host.data,
+          claude: host.data.claude.map((row, i) => ({ ...row, ...expected.claude[h][i],
+            ...(expected.runtimePhases ? { runtimeObservation: observe(row.phase) } : {}) })) } })),
+        recoverySessions: snapshot.recoverySessions.map((row, i) => ({ ...row, boardRecovery: expected.recoveries[i] })) };
+      assert.deepEqual(cardKeys(), expected.cardKeys);
+      assert.deepEqual(Array.from(c.allSessions().filter((row) => row.retained), (row) => row.key), expected.retainedCardKeys);
+      assert.deepEqual(launcherCards(annotatedTerminals), expected.launcherCardKeys);
+      assert.deepEqual(launcherCards(terminals), expected.launcherCardKeys, 'a terminal response without hints keeps legacy matching');
+
+      const alias = expected.notificationAlias;
+      if (alias) {
+        c.state.authenticated = true;
+        const annotated = c.state.snapshot;
+        c.state.snapshot = { ...annotated, hosts: [] };
+        assert.equal(c.requestSessionOpen('/?session=' + encodeURIComponent(alias.key)), true);
+        assert.equal(c.state.openRequest?.key, alias.key, 'a cold link waits until the host is listed');
+        c.state.snapshot = annotated;
+        c.openRequestedSession();
+        assert.equal(c.state.openRequest, null);
+        assert.equal(c.state.selected, alias.target, 'the original link opens the representative');
+        for (const ref of annotated.recoverySessions) {
+          renderRecoveries();
+          assert.equal(c.get('session-recoveries').hidden, true, 'the recovery section omits a represented conversation');
+          await openRecovery(ref);
+          assert.equal(c.state.selected, alias.target, 'an existing recovery click also opens the representative');
+          assert.equal(c.state.nativeSessions.size, 0);
+          // A previously resolved alias must also disappear when its representative arrives.
+          c.state.nativeSessions.set(alias.key, { ...ref, key: alias.key, recoverySource: true });
+          assert.deepEqual(cardKeys(), expected.cardKeys);
+          c.state.nativeSessions.clear();
+
+          const api = vm.runInContext('api', c.context);
+          let finishRecovery;
+          c.context.api = (url, options) => url.startsWith('/api/session/recover?') ?
+            new Promise((resolve) => { finishRecovery = resolve; }) : api(url, options);
+          c.state.snapshot = { ...annotated, hosts: [], recoverySessions: [{ ...ref, boardRecovery: undefined }] };
+          const pending = openRecovery(ref);
+          assert.equal(typeof finishRecovery, 'function', 'a recovery starts before the representative arrives');
+          c.state.snapshot = annotated;
+          finishRecovery({ session: ref });
+          await pending;
+          c.context.api = api;
+          assert.equal(c.state.selected, alias.target, 'a representative arriving during recovery wins');
+          assert.equal(c.state.nativeSessions.size, 0);
+        }
+        const launcher = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow &&
+          expected.launcherCardKeys[terminal.id] === alias.key);
+        if (launcher && !expected.sharedLauncherKey) {
+          assert.equal(launcherConversation(launcher).kind, 'interactive');
+          c.openNativeChat(launcher);
+          assert.equal(c.state.selected, alias.key, 'the detail opens the unique interactive selector');
+          assert.equal(selectedSession().kind, 'interactive');
+          assert.equal(c.state.nativeSessions.size, 0);
+          assert.deepEqual(cardKeys(), expected.cardKeys, 'opening the hidden selector leaves one card');
+        }
+      }
+
+      if (expected.retainedReleasedVisible) {
+        const annotated = c.state.snapshot;
+        for (const input of [annotated, { ...annotated, recoverySessions: snapshot.recoverySessions }, snapshot]) {
+          c.state.snapshot = input;
+          const card = c.allSessions().find((row) => row.key === expected.retainedReleasedVisible);
+          assert.equal(card.retained, true);
+          assert.equal(card.closedReason, 'released');
+          assert.ok(c.matches(card, input.serverTime), 'the old released card remains in the default list');
+        }
+        c.state.snapshot = annotated;
+      }
+
+      if (expected.sharedLauncherKey) {
+        const rawKey = expected.sharedLauncherKey;
+        const url = '/?session=' + encodeURIComponent(rawKey);
+        assert.equal(selectedSession().kind, expected.representativeKind);
+        assert.equal(selectedSession().phase, expected.runtimePhases[expected.representativeKind]);
+        const draft = c.chatEntry(selectedSession());
+        draft.text = '공유하는 초안';
+        await settle();
+        const older = { ...annotatedTerminals[0], boardLauncher: { ...annotatedTerminals[0].boardLauncher, snapshotVersion: -1 } };
+        for (const terminal of [annotatedTerminals[0], terminals[0], older]) {
+          if (expected.representativeKind === 'interactive') {
+            const open = c.context.openTerminal;
+            const prepare = c.context.preparePlan;
+            const calls = [];
+            c.context.openTerminal = (opened, options) => calls.push([opened.id, options.inline.key]);
+            c.context.preparePlan = () => assert.fail('the existing launcher must be reused');
+            c.state.terminals = [terminal];
+            c.goToSessionTerminal(rawKey);
+            vm.runInContext('openChatTerminal', c.context)(selectedSession());
+            assert.deepEqual(calls, [[terminal.id, rawKey], [terminal.id, rawKey]]);
+            c.context.openTerminal = open;
+            c.context.preparePlan = prepare;
+          }
+          reads.length = 0;
+          c.openNativeChat(terminal);
+          assert.equal(selectedSession().kind, 'interactive');
+          assert.equal(c.sourceOf(selectedSession()).kind, 'interactive');
+          assert.deepEqual(cardKeys(), [rawKey], 'the list keeps the original representative key');
+          assert.equal(c.chatEntry(selectedSession()), draft, 'choosing the execution kind preserves the draft');
+          await settle();
+          assert.ok(reads.some((source) => source.kind === 'interactive'), 'the detail API requests the interactive kind');
+          assert.equal(selectedSession().phase, expected.runtimePhases.interactive);
+          assert.equal(selectedSession().runtimeObservation.phase, expected.runtimePhases.interactive);
+          const annotated = c.state.snapshot;
+          const reduced = { ...annotated, version: annotated.version + 1,
+            hosts: annotated.hosts.map((host) => ({ ...host, data: { ...host.data,
+              claude: host.data.claude.filter((row) => row.kind === 'interactive').map((row) => ({ ...row, boardDuplicateOf: null })) } })) };
+          c.state.snapshot = reduced;
+          c.state.terminals = [terminal];
+          assert.equal(vm.runInContext('terminalForOpenDetail', c.context)(selectedSession()).id, terminal.id,
+            'the same runtime remains attached after its sibling leaves the snapshot');
+          c.state.snapshot = annotated;
+          c.requestSessionOpen(url);
+          assert.equal(c.state.selected, rawKey, 'the original notification still opens the representative');
+          assert.equal(selectedSession().kind, expected.representativeKind);
+          await settle();
+          assert.equal(selectedSession().phase, expected.runtimePhases[expected.representativeKind]);
+        }
+
+        const terminal = annotatedTerminals[0];
+        const attach = { ...terminal, id: 'background-attach', mode: 'attach', boardLauncher: undefined,
+          nativeSource: { ...terminal.nativeSource, kind: 'background' } };
+        for (const order of [[attach, terminal], [terminal, attach]]) {
+          c.state.terminalVisible = false;
+          c.requestSessionOpen(url);
+          c.state.terminals = order;
+          c.state.terminal = terminal;
+          c.state.terminalAlive = c.state.terminalVisible = true;
+          c.get('terminal-draft').value = '터미널 초안';
+          let actions, inline;
+          c.context.openActionSheet = (sheet) => { actions = sheet.actions; };
+          c.context.openTerminal = (opened, options) => {
+            inline = { opened, ...options.inline };
+            c.state.terminalVisible = true;
+          };
+          const useComposer = vm.runInContext('useSessionComposer', c.context);
+          useComposer();
+          await actions.find((action) => action.label === '메시지 초안 보기').run();
+          assert.equal(selectedSession().kind, 'interactive');
+          assert.equal(inline.opened.id, terminal.id);
+          assert.equal(inline.key, selectedSession().key);
+          assert.equal(c.get('terminal-draft').value, '터미널 초안');
+          assert.equal(draft.text, '공유하는 초안');
+          const terminalForOpenDetail = vm.runInContext('terminalForOpenDetail', c.context);
+          assert.equal(terminalForOpenDetail(selectedSession()).id, terminal.id);
+          useComposer();
+          await actions.find((action) => action.label === '초안 합쳐서 이동').run();
+          assert.equal(selectedSession().kind, 'interactive');
+          assert.equal(inline.key, selectedSession().key);
+          assert.equal(draft.text, '공유하는 초안\n\n터미널 초안');
+          assert.equal(c.get('terminal-draft').value, '');
+          draft.text = '공유하는 초안';
+        }
+      }
+
+      if (expected.launcherCwd) {
+        c.state.authenticated = true;
+        const older = { ...annotatedTerminals[0], boardLauncher: { ...annotatedTerminals[0].boardLauncher, snapshotVersion: -1 } };
+        for (const terminal of [annotatedTerminals[0], terminals[0], older]) {
+          c.state.selected = null;
+          reads.length = 0;
+          c.openNativeChat(terminal);
+          assert.equal(selectedSession().cwd, expected.launcherCwd);
+          assert.equal(selectedSession().kind, 'interactive');
+          await settle();
+          assert.ok(reads.some((source) => source.cwd === expected.launcherCwd && source.kind === 'interactive'));
+        }
+      }
+      if (expected.reusedRecoveryTarget) {
+        c.state.authenticated = true;
+        renderRecoveries();
+        assert.equal(c.get('session-recoveries').hidden, true);
+        await openRecovery(c.state.snapshot.recoverySessions[0]);
+        assert.equal(c.state.selected, expected.reusedRecoveryTarget);
+        assert.equal(c.state.nativeSessions.size, 0);
+        assert.deepEqual(cardKeys(), expected.cardKeys);
+      }
+
+      const confirmed = annotatedTerminals.find((terminal) => terminal.boardLauncher?.listedRow);
+      if (confirmed) {
+        const unlinked = { ...confirmed, boardLauncher: { ...confirmed.boardLauncher, listedRow: null } };
+        assert.equal(listedLauncherClaude(unlinked), null, 'a current no-match decision is authoritative');
+        c.state.snapshot.version++;
+        assert.equal(listedLauncherClaude(unlinked)?.key, expected.launcherCardKeys[confirmed.id],
+          'a hint from an older snapshot falls back to the current listed rows');
+      }
+    });
+  }
+}
+
 test('environment changes live in a native disclosure that starts closed and retains the existing controls', () => {
   const c = client(undefined, noChatTimers);
   const details = c.buildContinuePanel({ host: 'workstation', agent: 'codex', home: '.codex-example', id: 'session', key: 'source-key' });

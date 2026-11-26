@@ -7,12 +7,17 @@ import sqlite3
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 from unittest.mock import patch
 
+import collector
 import launch
+import native_chat
 import server
+from events import chat_ref, watch_key
+from push import PushService
 from session_recovery import RetainedSessions, RecoverySessions
 
 
@@ -124,6 +129,235 @@ class RecoveryHttpTest(unittest.TestCase):
         self.assertEqual(self.terms.creates, 0)
         self.assertEqual(self.terms.inputs, 0)
         self.assertTrue(all(call[1] == 'recover_session' for call in self.calls))
+
+    def test_claude_board_display_contract_matches_shared_fixtures(self):
+        for path in sorted(Path(__file__).with_name('parity').glob('*.json')):
+            for case in json.loads(path.read_text(encoding='utf-8')):
+                with self.subTest(case=case['name']):
+                    snapshot = case['snapshot']
+                    recoveries = snapshot['recoverySessions']
+                    expected = case['expected']
+                    self.terms.records = copy.deepcopy(case['terminals'])
+                    with patch.object(self.board, 'snapshot', side_effect=lambda: copy.deepcopy(snapshot)), \
+                            patch.object(self.board, 'version', snapshot['version']), \
+                            patch.object(self.httpd, 'boot_id', snapshot['bootId']), \
+                            patch.object(server.Handler, 'recovery_sessions',
+                                         side_effect=lambda: (copy.deepcopy(recoveries), None)):
+                        result = self.snapshot()
+                        status, terminals = self.request('GET', '/api/terminals')
+                    self.assertEqual(status, 200)
+                    self.assertEqual(len(result['hosts']), len(snapshot['hosts']))
+                    for actual_host, input_host, fields in zip(result['hosts'], snapshot['hosts'], expected['claude']):
+                        rows = actual_host['data']['claude']
+                        self.assertEqual([{key: row[key] for key in ('boardSource', 'boardDuplicateOf')}
+                                          for row in rows], fields)
+                        self.assertEqual([{key: row[key] for key in original}
+                                          for row, original in zip(rows, input_host['data']['claude'])],
+                                         input_host['data']['claude'])
+                    self.assertEqual([row['boardRecovery'] for row in result['recoverySessions']], expected['recoveries'])
+                    self.assertEqual([{key: row[key] for key in original}
+                                      for row, original in zip(result['recoverySessions'], recoveries)], recoveries)
+                    self.assertEqual({row['id']: row.get('boardLauncher') for row in terminals['terminals']},
+                                     expected['launchers'])
+                    self.assertEqual([{key: val for key, val in row.items() if key != 'boardLauncher'}
+                                      for row in terminals['terminals']], case['terminals'])
+                    self.assertEqual(self.terms.records, case['terminals'])
+                    self.assert_no_execution()
+                    alias = expected.get('notificationAlias')
+                    if alias:
+                        host = snapshot['hosts'][0]
+                        row = host['data']['claude'][1]
+                        key = PushService.row_key(host, 'claude', row)
+                        notice = PushService.notice(SimpleNamespace(clock=lambda: 100),
+                            {'row': row, 'host': host, 'key': key, 'kind': 'needs_input'})
+                        self.assertEqual(parse_qs(urlsplit(notice['url']).query), {'session': [alias['key']]})
+
+    def test_mixed_claude_rows_preserve_recovery_and_exact_launcher_in_both_orders(self):
+        position = [HOST['name'], 'claude', 0]
+        for interactive_index in (0, 1):
+            with self.subTest(interactive_index=interactive_index):
+                sid = '11111111-1111-4111-8111-%012d' % interactive_index
+                active = {'agent': 'claude', 'id': '', 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work'}
+                background = {**active, 'id': 'background-worker-%d' % interactive_index, 'kind': 'background'}
+                rows = [active, background] if interactive_index == 0 else [background, active]
+                hidden = {**rows[1], 'host': HOST['name'], 'id': rows[1]['id'] or sid}
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
+                    self.assertTrue(self.board.poll(HOST))
+                self.flow.recoveries.remember(hidden, closed_reason='released')
+                self.terms.records = [{'id': 'b' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact',
+                                       'nativeSource': {**active, 'host': HOST['name'], 'id': sid}}]
+                snapshot = self.snapshot()
+                self.assertEqual(snapshot['hosts'][0]['data']['claude'][1]['boardDuplicateOf'], position)
+                recovery = next(row for row in snapshot['recoverySessions']
+                                if row.get('sessionId') == sid and row['id'] == hidden['id'])
+                self.assertEqual(recovery['boardRecovery'], {'listedRow': position, 'retainedAction': 'merge'})
+                status, result = self.recover(hidden)
+                self.assertEqual((status, result['session']['id']), (200, hidden['id']))
+                status, result = self.request('GET', '/api/terminals')
+                self.assertEqual(status, 200)
+                # Listing a terminal can record its recovery, publishing a newer snapshot.
+                current = self.snapshot()
+                self.assertEqual(result['terminals'][0]['boardLauncher'], {
+                    'bootId': current['bootId'], 'snapshotVersion': current['version'],
+                    'listedRow': [HOST['name'], 'claude', interactive_index],
+                })
+                self.assertEqual(self.calls, [])
+                self.assert_no_execution()
+
+    def test_shared_claude_key_keeps_both_execution_kinds_exact(self):
+        for interactive_index in (0, 1):
+            with self.subTest(interactive_index=interactive_index):
+                sid = '22222222-2222-4222-8222-%012d' % interactive_index
+                active = {'agent': 'claude', 'id': sid, 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work',
+                          'state': 'idle'}
+                background = {**active, 'kind': 'background', 'state': 'working'}
+                rows = [active, background] if interactive_index == 0 else [background, active]
+                collected = collector.claude_session_rows(rows, [], {}, transcripts={})
+                for row in collected:
+                    row['runtimeReadToken'] = 'a' * 16 + ':%d' % (interactive_index + 1)
+                stream = SimpleNamespace(name=HOST['name'], stopping=False, delivered=False)
+                with patch.dict(self.board.streams, {HOST['name']: stream}):
+                    self.assertTrue(self.board.apply_live(stream, {'claude': collected, 'codex': []}))
+                snapshot = self.snapshot()
+                phases = {'background': 'working', 'interactive': 'idle'}
+                self.assertEqual({row['kind']: row['phase'] for row in snapshot['hosts'][0]['data']['claude']}, phases)
+                self.assertEqual({row['kind']: row['runtimeObservation']['phase']
+                                  for row in snapshot['hosts'][0]['data']['claude']}, phases)
+                ref = {'host': HOST['name'], 'agent': 'claude', 'id': sid, 'sessionId': sid}
+                representative = rows[0]['kind']
+                self.assertEqual(self.board.source(ref)['kind'], representative)
+                kinds = ('background', 'interactive')
+                resolved = [self.board.source({**ref, 'kind': kind}) for kind in kinds]
+                self.assertEqual(tuple(row['kind'] for row in resolved), kinds)
+                keys = [self.httpd.chat.state_key(row) for row in resolved]
+                self.assertNotEqual(*keys)
+                self.assertEqual(keys, [watch_key(chat_ref(self.httpd.chat.watch_identity(row))) for row in resolved])
+                with patch.object(native_chat.native, '_claude_binary', return_value='fixture-claude'), \
+                        patch.object(native_chat.native, '_claude_run', return_value=json.dumps(rows)):
+                    self.assertEqual(native_chat._agents_row(ref, self.home, 0, resolved[1]), active)
+                    self.assertEqual(native_chat._agents_row(ref, self.home, 0, resolved[0]), background)
+                launcher = {'id': 'b' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact',
+                            'nativeSource': {**active, 'host': HOST['name']}}
+                attach = {'id': 'c' * 32, 'alive': True, 'mode': 'attach', 'linkConfidence': 'exact',
+                          'nativeSource': {**background, 'host': HOST['name']}}
+                self.terms.records = [launcher]
+                status, body = self.request('GET', '/api/terminals')
+                self.assertEqual(status, 200)
+                self.assertEqual(body['terminals'][0]['boardLauncher']['listedRow'],
+                                 [HOST['name'], 'claude', interactive_index])
+                rpc_kinds = []
+
+                def read_state(host, operation, args, timeout):
+                    self.assertEqual((operation, args['action']), ('chat', 'read'))
+                    kind = args['source']['kind']
+                    rpc_kinds.append(kind)
+                    return {'phase': phases[kind], 'runtimeKnown': True, 'messages': [], 'capabilities': {}}
+
+                self.terms.records = []
+                legacy_ref = {key: value for key, value in ref.items() if key != 'sessionId'}
+                for recovery_present in (True, False):
+                    with self.subTest(recovery_present=recovery_present), \
+                            patch.object(self.flow.recoveries, 'get', wraps=self.flow.recoveries.get) as recover, \
+                            patch.object(self.flow.transfers, 'rpc', side_effect=read_state):
+                        if not recovery_present:
+                            recover.return_value = None
+                        for source in (legacy_ref, ref):
+                            code, state = self.request('POST', '/api/chat/state', {'source': source})
+                            self.assertEqual(code, 200)
+                            self.assertEqual(state['phase'], phases[representative])
+                            self.assertEqual(state['route'], {**legacy_ref, 'home': None})
+                        recover.assert_not_called()
+                        self.assertEqual(rpc_kinds.pop(), representative)
+                        self.httpd.chat._forget_state(resolved[1])
+
+                for terminals in ([attach, launcher], [launcher, attach]):
+                    self.terms.records = terminals
+                    with patch.object(self.flow.transfers, 'rpc', side_effect=read_state), \
+                            patch.object(self.terms, 'claude_pane_available', create=True, return_value=True), \
+                            patch.object(self.terms, 'capture', create=True, return_value='') as capture:
+                        for terminal in (attach, launcher):
+                            kind = terminal['nativeSource']['kind']
+                            capture.reset_mock()
+                            code, state = self.request('POST', '/api/chat/state', {'source': {**ref, 'kind': kind}})
+                            self.assertEqual(code, 200)
+                            self.assertEqual(state['phase'], phases[kind])
+                            self.assertEqual(state['route']['kind'], kind)
+                            self.assertEqual(state['route']['sessionId'], sid)
+                            self.assertEqual(state['runtimeObservation']['phase'], phases[kind])
+                            self.assertEqual(state['terminalConnection']['id'], terminal['id'])
+                            self.assertTrue(capture.call_args_list)
+                            self.assertTrue(all(call.args[0] == terminal['id'] for call in capture.call_args_list))
+                    self.assertTrue(all(key in self.httpd.chat.cache for key in keys))
+                    self.httpd.chat._forget_state(resolved[1])
+                    self.assertTrue(all(key not in self.httpd.chat.cache for key in keys))
+                self.assertEqual(tuple(rpc_kinds), kinds * 2)
+                self.assert_no_execution()
+
+    def test_recovery_tracks_claude_uuid_when_an_old_worker_id_is_reused(self):
+        sid = '11111111-1111-4111-8111-111111111112'
+        row = {'agent': 'claude', 'id': 'fixture-current-worker', 'sessionId': sid,
+               'kind': 'interactive', 'cwd': '/fixture/right'}
+        saved = {**row, 'host': HOST['name'], 'id': 'fixture-worker'}
+        reused = {**row, 'id': saved['id'], 'sessionId': '11111111-1111-4111-8111-111111111113'}
+        self.flow.recoveries.remember(saved, closed_reason='released')
+        for index, rows in ((0, [row]), (1, [reused, row]), (0, [row, reused])):
+            with self.subTest(index=index, count=len(rows)):
+                collected = collector.claude_session_rows(rows, [], {}, transcripts={})
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': collected}):
+                    self.assertTrue(self.board.poll(HOST))
+                result = self.snapshot()
+                recovery = next(item for item in result['recoverySessions']
+                                if item['id'] == saved['id'] and item.get('sessionId') == sid)
+                self.assertEqual(recovery['closedReason'], 'released')
+                self.assertEqual(recovery['boardRecovery'], {'listedRow': [HOST['name'], 'claude', index],
+                                                            'retainedAction': 'hide'})
+        self.assert_no_execution()
+
+    def test_launcher_preserves_folder_when_non_uuid_worker_is_reused(self):
+        row = {'agent': 'claude', 'id': 'fixture-worker', 'sessionId': 'fixture-transcript',
+               'kind': 'interactive', 'cwd': '/fixture/right'}
+        wrong = {**row, 'cwd': '/fixture/wrong'}
+        background = {**row, 'kind': 'background'}
+        ref = {**row, 'host': HOST['name']}
+        self.terms.records = [{'id': 'd' * 32, 'alive': True, 'mode': 'new-session', 'linkConfidence': 'exact', 'nativeSource': ref}]
+        for index, rows in ((2, [wrong, background, row]), (0, [row, background, wrong])):
+            with self.subTest(index=index):
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
+                    self.assertTrue(self.board.poll(HOST))
+                for lookup in (self.board.source, self.httpd.chat.resolve):
+                    self.assertEqual(lookup(ref)['cwd'], '/fixture/right')
+                    self.assertEqual(lookup({**ref, 'cwd': wrong['cwd']})['cwd'], '/fixture/wrong')
+                right = self.board.source(ref)
+                wrong_row = self.board.source({**ref, 'cwd': wrong['cwd']})
+                self.assertNotEqual(self.httpd.chat.state_key(right), self.httpd.chat.state_key(wrong_row))
+                with patch.object(native_chat.native, '_claude_binary', return_value='fixture-claude'), \
+                        patch.object(native_chat.native, '_claude_run', return_value=json.dumps(rows)):
+                    self.assertEqual(native_chat._agents_row(ref, self.home, 0, right), row)
+                status, body = self.request('GET', '/api/terminals')
+                self.assertEqual(status, 200)
+                self.assertEqual(body['terminals'][0]['boardLauncher']['listedRow'], [HOST['name'], 'claude', index])
+        self.assert_no_execution()
+
+    def test_duplicate_interactive_pids_share_retained_mark(self):
+        sid = '33333333-3333-4333-8333-333333333333'
+        raw = {'id': '', 'sessionId': sid, 'kind': 'interactive', 'cwd': '/fixture/work'}
+        saved = {**raw, 'host': HOST['name'], 'agent': 'claude', 'id': sid}
+        self.flow.recoveries.remember(saved, closed_reason='released')
+        for pids in ((9, 10), (10, 9)):
+            with self.subTest(pids=pids):
+                rows = collector.claude_session_rows([{**raw, 'pid': pid} for pid in pids], [], {}, transcripts={})
+                with patch.object(self.board, 'runner', return_value={'codex': [], 'claude': rows}):
+                    self.assertTrue(self.board.poll(HOST))
+                snapshot = self.snapshot()
+                actual = snapshot['hosts'][0]['data']['claude']
+                self.assertEqual([(row['id'], row['pid']) for row in actual], [('', pid) for pid in pids])
+                representative = [HOST['name'], 'claude', 0]
+                self.assertEqual(actual[1]['boardDuplicateOf'], representative)
+                recovery = next(row for row in snapshot['recoverySessions'] if row['id'] == sid)
+                self.assertEqual(recovery['closedReason'], 'released')
+                self.assertEqual(recovery['boardRecovery'], {'listedRow': representative, 'retainedAction': 'merge'})
+                self.assertEqual(self.board.source(saved)['pid'], pids[0])
+                self.assert_no_execution()
 
     def test_recover_authentication_and_untrusted_browser_references_never_reach_native(self):
         self.assertEqual(self.recover(authorized=False)[0], 401)

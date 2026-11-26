@@ -51,6 +51,7 @@ class RuntimeObservations:
         if identity['agent'] == 'claude':
             identity['home'] = identity['home'] or '.claude'
             identity['sessionId'] = source.get('sessionId')
+            identity['kind'] = source.get('kind')
         return json.dumps(identity, sort_keys=True)
 
     def begin(self):
