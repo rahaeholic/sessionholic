@@ -1000,9 +1000,16 @@ class Chat:
             native = row.get('nativeSource') or metadata.get('nativeSource')
             created = row.get('createdAt')
             program = row.get('program', metadata.get('program'))
+            program_at = row.get('programAt', metadata.get('programAt'))
+            program_menu = row.get('programMenu', metadata.get('programMenu'))
+            typed = row.get('typed', metadata.get('typed'))
             waiting_for_program = (program is None
-                                   and row.get('programMenu', metadata.get('programMenu')) is True
-                                   and row.get('typed', metadata.get('typed')) is True)
+                                   and typed is True
+                                   and (program_menu is True
+                                        or program_at is None
+                                        or (isinstance(program_at, (int, float))
+                                            and not isinstance(program_at, bool)
+                                            and program_at < started)))
             if (row.get('mode', metadata.get('mode')) == 'new-session'
                     and row.get('alive') and not row.get('closed') and not native
                     and (program == 'claude' or waiting_for_program)

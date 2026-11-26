@@ -1344,6 +1344,35 @@ class ChatClaudeTest(unittest.TestCase):
             state = self.state(source=ref)
         self.assertTrue(state['capability']['supported'])
 
+    def test_interactive_new_session_unread_launcher_shows_connecting_only_if_typed(self):
+        self.row.update(id='', kind='interactive', status='idle', startedAt=1015,
+                        runtimeReadToken='a' * 16 + ':1')
+        stream = SimpleNamespace(name=HOST['name'], stopping=False)
+        self.board.streams[stream.name] = stream
+        self.board.apply_live(stream, {'claude': [self.row], 'codex': []})
+        ref = {'host': HOST['name'], 'agent': 'claude', 'id': CLAUDE_SID, 'sessionId': CLAUDE_SID}
+        launcher = {'id': TERMINAL_ID, 'host': HOST['name'], 'mode': 'new-session',
+                    'createdAt': 1000, 'alive': True, 'closed': False, 'typed': True}
+        self.terms.rows = [launcher]
+
+        with patch.object(chat.time, 'time', return_value=1020):
+            state = self.state(source=ref)
+        self.assertTrue(state['capability']['connecting'])
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_CONNECTING)
+
+        # A launcher read after Claude started with no menu did not launch this Claude session.
+        self.terms.rows = [{**launcher, 'programAt': 1016, 'programMenu': False}]
+        with patch.object(chat.time, 'time', return_value=1020):
+            state = self.state(source=ref)
+        self.assertFalse(state['capability'].get('connecting', False))
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+
+        self.terms.rows = [{key: value for key, value in launcher.items() if key != 'typed'}]
+        with patch.object(chat.time, 'time', return_value=1020):
+            state = self.state(source=ref)
+        self.assertFalse(state['capability'].get('connecting', False))
+        self.assertEqual(state['capability']['reason'], chat.CLAUDE_EXTERNAL)
+
     def test_new_launcher_proves_its_pane_before_claude_chat_can_paste(self):
         import launcher_programs as lp
 
