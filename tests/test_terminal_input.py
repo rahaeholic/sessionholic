@@ -7,6 +7,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from terminal import ClaudeSubmitNotStarted
 from terminal_input import InputUncertain, TerminalInputs
 
 TID = 'a' * 32
@@ -65,6 +66,30 @@ class TerminalInputTest(unittest.TestCase):
         self.assertEqual(len(accepted), 1024)
         self.assertEqual(self.writes, [])
         self.assertEqual(self.count(), 1)
+
+    def test_submit_refusal_preserves_legacy_receipts_and_prunes_with_its_reservation(self):
+        self.ledger.submit(TID, RID, 'legacy', self.write)
+        with sqlite3.connect(self.ledger.path) as connection:
+            connection.execute('DROP TRIGGER receipts_delete_blocked')
+            connection.execute('DROP TABLE blocked_submissions')
+        restarted = TerminalInputs(self.root)
+        self.assertTrue(restarted.submit(TID, RID, 'legacy', self.write)['deduplicated'])
+
+        def pasted(tid, text):
+            self.write(tid, text)
+            raise ClaudeSubmitNotStarted()
+
+        with self.assertRaises(ClaudeSubmitNotStarted):
+            restarted.submit(OTHER, RID, 'draft', pasted)
+        again = TerminalInputs(self.root)
+        with self.assertRaises(ClaudeSubmitNotStarted):
+            again.submit(OTHER, RID, 'draft', self.write)
+        with self.assertRaises(ValueError):
+            again.submit(OTHER, RID, 'other', self.write)
+        self.assertEqual(self.writes, [(TID, 'legacy'), (OTHER, 'draft')])
+        self.assertEqual(again.prune_closed(OTHER, [{'id': OTHER, 'closed': True}]), {'pruned': 1})
+        with sqlite3.connect(again.path) as connection:
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM blocked_submissions').fetchone(), (0,))
 
     def test_committed_unknown_reservation_exists_before_writer_is_called(self):
         def inspect(tid, value):

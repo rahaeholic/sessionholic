@@ -9045,6 +9045,32 @@ test('a disconnected Claude chat connects on send, stays in chat, and sends its 
   assert.equal(c.get('chat-send').disabled, true, 'unsupported external sessions keep their policy');
 });
 
+test('a Claude submit refusal keeps the pasted draft reserved and blocks a second paste', async () => {
+  let sends = 0;
+  const reason = '본문은 붙여넣었지만 제출 Enter는 보내지 않았습니다.';
+  const c = client(async (url, options) => {
+    if (url === '/api/chat/send') {
+      sends++;
+      return { ok: false, status: 409, json: async () => ({ error: reason, dispatchState: 'not_started',
+        code: 'claude_submit_not_started', phase: 'submit', draftPasted: true }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ route: JSON.parse(options.body || '{}').source,
+      phase: 'idle', messages: [], capability: { supported: true } }) };
+  }, noChatTimers);
+  const { s, entry } = selectChat(c, { agent: 'claude', home: '' });
+  c.drawDetail(s);
+  await settle();
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: true } };
+  entry.text = '보낼 내용';
+  await c.sendChat(entry);
+  await c.sendChat(entry);
+  assert.equal(sends, 1);
+  assert.equal(entry.text, '보낼 내용');
+  assert.ok(entry.pending);
+  assert.equal(entry.receipt.submitBlocked, true);
+  assert.equal(c.chatReceiptCopy(entry.receipt), reason);
+});
+
 test('a send refused because the terminal closed keeps the draft and makes the next send reconnect', async () => {
   let reads = 0;
   let c;

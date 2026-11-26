@@ -7677,6 +7677,7 @@ function renderKeyboardHint() {
   if (hint) hint.hidden = !keyboardPresent();
 }
 function chatReceiptCopy(receipt) {
+  if (receipt?.submitBlocked) return receipt.reason;
   if (receipt?.dispatchState === "not_started")
     return `${receipt.reason || "메시지 전송 조건을 확인해 주세요."} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
   if (receipt?.status === "failed" && receipt.confirmed === true)
@@ -9307,7 +9308,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
   } catch (err) {
     if (authEpoch === state.authEpoch && !err.unauthorized && !err.staleAuth) {
       haptic("error");
-      if (!recovering && (!dispatched || err.dispatchState === "not_started")) {
+      const submitBlocked = err.code === "claude_submit_not_started";
+      if (!submitBlocked && !recovering && (!dispatched || err.dispatchState === "not_started")) {
         applyChatReceipt(entry, { requestId: pending.requestId, status: "failed", confirmed: false,
           dispatchState: "not_started", reason: err.message });
         entry.error = `${err.message} 메시지는 전송되지 않았습니다. 초안과 첨부는 유지됩니다.`;
@@ -9333,7 +9335,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
       } else {
         // HTTP status alone cannot establish whether the native runtime started.
         sent = true;
-        const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails };
+        const receipt = { requestId: pending.requestId, status: "unknown", attachments: pending.attachmentDetails,
+          ...(submitBlocked ? { submitBlocked: true, reason: err.message } : {}) };
         // A status read may already have settled this same send before its
         // HTTP response was lost. Keep that evidence and the next draft.
         if (unconfirmedChatRequests(entry).some((request) => request.requestId === pending.requestId)) {
@@ -14880,7 +14883,7 @@ async function pasteDraft(submit = false) {
   } catch (err) {
     if (state.terminal?.id === pending.id) {
       $("draft-note").textContent =
-        err.code === "claude_pane_unavailable" ? err.message
+        ["claude_pane_unavailable", "claude_submit_not_started"].includes(err.code) ? err.message
           : "전달 여부를 확인하지 못해 초안을 남겼습니다. 터미널을 확인한 뒤 다시 시도하세요.";
       haptic("error");
     }

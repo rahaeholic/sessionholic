@@ -138,6 +138,12 @@ class ClaudePaneUnavailable(InputNotSent):
         super().__init__(message)
 
 
+class ClaudeSubmitNotStarted(RuntimeError):
+    """The body was pasted, and the guarded submit Enter was refused."""
+    def __init__(self):
+        super().__init__("Claude 창에 본문은 붙여넣었지만 제출 Enter는 보내지 않았습니다. 다시 붙여넣기 전에 터미널을 확인해 주세요.")
+
+
 def launcher_claude(metadata):
     return (metadata.get("mode") == "new-session"
             and (metadata.get("nativeSource") or {}).get("agent") == "claude")
@@ -939,7 +945,7 @@ class TerminalManager:
         return {"ok": True, "mode": "app", "position": None}
 
     def _claude_pane(self, terminal):
-        from launcher_programs import PANE_ID, PS, pane_program, session_pane, table
+        from launcher_programs import PANE_ID, pane_program, session_pane, table
 
         metadata = terminal.record["metadata"]
         identifier, pid = metadata.get("claudePaneId"), metadata.get("claudePanePid")
@@ -952,15 +958,10 @@ class TerminalManager:
             pane = session_pane(self._command(), terminal.record["name"], identifier)
             program = pane_program(pane[1], table()) if pane else None
             if program and program["program"] == "claude" and program["pid"] == pid:
-                # A suspended/backgrounded Claude can still be in the pane's process tree
-                # while its shell owns the foreground and would receive the input.
-                group = subprocess.run([PS, "-p", str(pid), "-o", "pgid=,tpgid=,stat="],
-                                       capture_output=True, text=True, timeout=3)
-                fields = group.stdout.split()
-                if (group.returncode == 0 and len(fields) == 3 and fields[0] == fields[1]
-                        and fields[0].isdigit() and int(fields[0]) > 0
-                        and not fields[2].startswith(("T", "Z"))):
-                    return pane
+                check = subprocess.run(["/bin/sh", "-c", CLAUDE_FOREGROUND, "sh", str(pid), pane[2]],
+                                       stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
+                if check.returncode == 0:
+                    return pane[:2]
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             pass
         raise ClaudePaneUnavailable()
@@ -1102,8 +1103,7 @@ class TerminalManager:
                         pane = self._claude_pane(terminal)
                         self._run_for_claude_pane(terminal, pane, ("send-keys", "-t", pane[0], "Enter"))
                     except ClaudePaneUnavailable as exc:
-                        # The paste already happened. Keep the receipt as unconfirmed.
-                        raise RuntimeError("붙여넣은 뒤 연결된 Claude 창을 확인하지 못했습니다.") from exc
+                        raise ClaudeSubmitNotStarted() from exc
                 else:
                     done = self._run("send-keys", "-t", target, "Enter")
                     if done.returncode != 0:
@@ -1339,7 +1339,8 @@ class TerminalManager:
                     or terminal.record["metadata"].get("mode") != "new-session"):
                 return None
             name = terminal.record["name"]
-        return session_pane(self._command(), name)
+        pane = session_pane(self._command(), name)
+        return pane[:2] if pane else None
 
     def set_program(self, terminal_id, info):
         """Record what a 새 세션 terminal runs (read from its host); never its identity or command."""

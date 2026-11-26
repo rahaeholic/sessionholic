@@ -1300,9 +1300,9 @@ class ChatClaudeTest(unittest.TestCase):
                     def transfer(host, op, args, timeout):
                         return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
                     def tmux_run(command, **kwargs):
-                        if command[0] == lp.PS:
-                            return subprocess.CompletedProcess(command, 0, '32 32 S+')
-                        output = ''.join(f"{hold or record['name']} %{i} {pid} 0\n"
+                        if command[0] == '/bin/sh':
+                            return subprocess.CompletedProcess(command, 0, '')
+                        output = ''.join(f"{hold or record['name']} %{i} {pid} 0 /dev/ttys001\n"
                                          for i, pid in enumerate(panes.splitlines()))
                         return subprocess.CompletedProcess(command, 0, output)
 
@@ -1473,7 +1473,7 @@ class ChatClaudeTest(unittest.TestCase):
                 return run_tmux(*args, **kwargs)
 
             with patch.object(manager, '_run', side_effect=replace_before_enter), \
-                    self.assertRaisesRegex(RuntimeError, '붙여넣은 뒤 연결된 Claude 창'):
+                    self.assertRaises(terminal.ClaudeSubmitNotStarted):
                 manager.paste(TERMINAL_ID, 'paste with no submit')
             wait_for(replacement_log.exists)
             # A warm conversation cache must also report the missing pane.
@@ -1525,20 +1525,27 @@ class ChatClaudeTest(unittest.TestCase):
 
             launcher = folder / 'launcher-fixture.py'
             launcher.write_text(
-                "import os, signal, subprocess, sys\n"
+                "import os, pty, signal, subprocess, sys\n"
                 "from pathlib import Path\n"
                 "os.setpgid(0, 0)\n"
                 "signal.signal(signal.SIGTTOU, signal.SIG_IGN)\n"
                 "os.tcsetpgrp(0, os.getpgrp())\n"
                 "prefix = sys.argv[1]\n"
-                "child = subprocess.Popen([sys.executable, '-u', " + repr(str(fixture)) + ", prefix + '.child'])\n"
-                "Path(prefix + '.pid').write_text(str(child.pid))\n"
-                "child.wait()\n"
+                "argv = [sys.executable, '-u', " + repr(str(fixture)) + ", prefix + '.child']\n"
+                "if prefix.endswith('/separate-tty'):\n"
+                "    pid, master = pty.fork()\n"
+                "    if not pid:\n"
+                "        os.execv(sys.executable, argv)\n"
+                "    Path(prefix + '.pid').write_text(str(pid))\n"
+                "else:\n"
+                "    child = subprocess.Popen(argv)\n"
+                "    Path(prefix + '.pid').write_text(str(child.pid))\n"
+                "    child.wait()\n"
                 "with open(prefix + '.launcher', 'wb', buffering=0) as log:\n"
                 "    while True:\n"
                 "        log.write(os.read(0, 4096))\n"
             )
-            for phase in ('paste', 'menu', 'submit'):
+            for phase in ('paste', 'menu', 'submit', 'chat-submit', 'separate-tty'):
                 with self.subTest(phase=phase):
                     identifier = secrets.token_hex(16)
                     name = 'sb-' + identifier
@@ -1554,6 +1561,19 @@ class ChatClaudeTest(unittest.TestCase):
                     manager.terminals[identifier] = terminal._Terminal(
                         {'id': identifier, 'name': name, 'key': phase, 'socket': socket, 'metadata': meta}, 1024)
                     manager.link_native(identifier, saved['nativeSource'], claude_pane=(pane, pid))
+                    if phase == 'separate-tty':
+                        fields = subprocess.check_output(['/bin/ps', '-p', str(pid), '-o', 'tty=,pgid=,tpgid='],
+                                                         text=True).split()
+                        self.assertEqual(fields[1], fields[2])
+                        self.assertNotEqual('/dev/' + fields[0], tmux('display-message', '-p', '-t', pane, '#{pane_tty}').strip())
+                        self.chat._forget_state(self.row | {'host': HOST['name']})
+                        for _ in range(2):
+                            status, state = post_json('/api/chat/state', {'source': CLAUDE_REF})
+                            self.assertEqual((status, state['capability']['supported']), (200, False))
+                        status, refused = post_draft(identifier, 'other-tty-input', 'no bytes', True)
+                        self.assertEqual((status, refused['dispatchState']), (409, 'not_started'))
+                        self.assertEqual((child_log.read_bytes(), parent_log.read_bytes()), (b'', b''))
+                        continue
                     self.assertTrue(manager.claude_pane_available(identifier))
                     if phase == 'paste':
                         self.assertEqual(post_draft(identifier, 'launcher-ready', 'ready', True)[0], 200)
@@ -1575,6 +1595,12 @@ class ChatClaudeTest(unittest.TestCase):
                                              [pane, root_pid, '0'])
                         return run_tmux(*args, **kwargs)
 
+                    def send_draft():
+                        if phase == 'chat-submit':
+                            return post_json('/api/chat/send', {'source': CLAUDE_REF,
+                                                                 'requestId': 'launcher-chat-race', 'text': 'draft'})
+                        return post_draft(identifier, 'launcher-race', 'draft', phase == 'submit')
+
                     with patch.object(manager, '_run', side_effect=exit_child_before_dispatch):
                         if phase == 'menu':
                             status, failed = post_json('/api/chat/prompt', {'action': 'answer', 'source': CLAUDE_REF,
@@ -1583,14 +1609,25 @@ class ChatClaudeTest(unittest.TestCase):
                                              (409, 'claude_pane_unavailable', 'not_started'))
                             self.assertEqual(child_log.read_bytes(), b'!')
                         else:
-                            status, failed = post_draft(identifier, 'launcher-race', 'draft', phase == 'submit')
+                            status, failed = send_draft()
                             self.assertEqual(status, 409)
                             if phase == 'paste':
                                 self.assertEqual((failed['code'], failed['dispatchState']),
                                                  ('claude_pane_unavailable', 'not_started'))
                             else:
-                                self.assertNotIn('dispatchState', failed)
+                                self.assertEqual((failed['code'], failed['dispatchState'], failed['phase'], failed['draftPasted']),
+                                                 ('claude_submit_not_started', 'not_started', 'submit', True))
                                 self.assertEqual(child_log.read_bytes(), b'\x1b[200~draft\x1b[201~')
+                                if phase == 'submit':
+                                    from terminal_input import TerminalInputs
+                                    httpd.terminal_inputs = TerminalInputs(self.root)
+                                self.assertEqual(send_draft(), (409, failed))
+                                self.assertEqual(child_log.read_bytes(), b'\x1b[200~draft\x1b[201~')
+                                if phase == 'chat-submit':
+                                    status, snapshot = post_json('/api/chat/state', {
+                                        'source': CLAUDE_REF, 'requestId': 'launcher-chat-race'})
+                                    self.assertEqual(status, 200)
+                                    self.assertIs(snapshot['receipts'][0]['submitBlocked'], True)
                     self.assertEqual(fired, [True])
                     self.assertFalse(manager.claude_pane_available(identifier))
                     self.assertEqual(parent_log.read_bytes(), b'')

@@ -14,7 +14,7 @@ import uuid
 
 import instance
 from attachments import MAX_ATTACHMENTS
-from terminal import ClaudePaneUnavailable, launcher_claude
+from terminal import ClaudePaneUnavailable, ClaudeSubmitNotStarted, launcher_claude
 
 MAX_FILE = 20 * 1024 * 1024
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -543,6 +543,7 @@ class Chat:
                 'acknowledged': result.get('acknowledged', False),
                 'turnId': result.get('turnId'),
                 'reason': result.get('reason'),
+                **({'submitBlocked': True} if result.get('submitBlocked') is True else {}),
                 **({'deliveryVerified': result['deliveryVerified']} if 'deliveryVerified' in result else {}),
                 **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
                    and result.get('failureCode') == 'server_overloaded' else {}),
@@ -1383,6 +1384,8 @@ class Chat:
             return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
         receipt = dict(record.get('receipt') or {})
         evidence = self._claude_evidence(record, messages, queued)
+        if evidence:
+            receipt.pop('submitBlocked', None)
         if evidence == 'message':
             receipt.update(delivery='accepted', confirmed=True, readbackConfirmed=True,
                            currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
@@ -1491,6 +1494,8 @@ class Chat:
         try:
             previous = self._claude_read_record(source, request_id)
             if previous:
+                if (previous.get('receipt') or {}).get('submitBlocked') is True:
+                    raise ClaudeSubmitNotStarted()
                 return {**(previous.get('receipt') or {}), 'attachments': manifest}
             try:
                 current = self.rpc(host, 'capabilities', source)
@@ -1565,6 +1570,8 @@ class Chat:
                 fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except FileExistsError:
                 saved = self._claude_read_record(source, request_id) or {}
+                if (saved.get('receipt') or {}).get('submitBlocked') is True:
+                    raise ClaudeSubmitNotStarted()
                 return {**(saved.get('receipt') or unknown), 'attachments': manifest}
             words = claude_words(body)[:CLAUDE_PROBE]
             record = {'requestId': request_id, 'sentAt': time.time(), 'probe': digest,
@@ -1588,6 +1595,8 @@ class Chat:
             except InputNotSent as exc:
                 path.unlink(missing_ok=True)
                 raise SendRejected(str(exc), 409) from None
+            except ClaudeSubmitNotStarted as exc:
+                receipt = {**unknown, 'submitBlocked': True, 'reason': str(exc)}
             except (RuntimeError, ValueError, OSError):
                 receipt = unknown
             from server import private_json
@@ -1596,6 +1605,9 @@ class Chat:
             except (OSError, ValueError):
                 receipt = {**receipt, 'ledgerPending': True}
             timing.mark('save')
+            if receipt.get('submitBlocked'):
+                self._forget_state(source)
+                raise ClaudeSubmitNotStarted()
             return {**receipt, 'attachments': manifest}
         finally:
             turn.release()

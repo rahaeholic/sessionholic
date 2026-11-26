@@ -4434,6 +4434,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def route_post(self):
         from chat import PromptRejected, SendRejected
+        from terminal import ClaudeSubmitNotStarted
         path = urlparse(self.path).path
         not_started = {"dispatchState": "not_started"} if path in ("/api/chat/send", "/api/session/action") else {}
         if not host_allowed(self.headers.get("Host")):
@@ -4729,6 +4730,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"ok": True})
         except GoalError as exc:
             return self.send_json(exc.status, exc.payload)
+        except ClaudeSubmitNotStarted as exc:
+            # Only the submit phase was stopped. The pasted body stays reserved.
+            return self.send_json(409, {"error": str(exc), "code": "claude_submit_not_started",
+                                        "dispatchState": "not_started", "phase": "submit", "draftPasted": True})
         except SendRejected as exc:
             # A refusal with a code (e.g. "terminal_required") lets the composer act on it at once.
             payload = {"error": str(exc), "dispatchState": "not_started"}

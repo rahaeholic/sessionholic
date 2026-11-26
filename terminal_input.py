@@ -12,7 +12,7 @@ import sqlite3
 from contextlib import contextmanager
 
 import settings
-from terminal import InputNotSent
+from terminal import ClaudeSubmitNotStarted, InputNotSent
 
 ID = re.compile(r'[a-f0-9]{32}\Z')
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -62,6 +62,11 @@ class TerminalInputs:
                 'BEGIN UPDATE totals SET count=count+1 WHERE id=1; END')
             connection.execute('CREATE TRIGGER IF NOT EXISTS receipts_delete AFTER DELETE ON receipts '
                 'BEGIN UPDATE totals SET count=count-1 WHERE id=1; END')
+            # Preserve the version 1 receipt layout. Older readers still see a
+            # partial request as unknown, and never replay its pasted body.
+            connection.execute('CREATE TABLE IF NOT EXISTS blocked_submissions (request_hash TEXT PRIMARY KEY) WITHOUT ROWID')
+            connection.execute('CREATE TRIGGER IF NOT EXISTS receipts_delete_blocked AFTER DELETE ON receipts '
+                'BEGIN DELETE FROM blocked_submissions WHERE request_hash=old.request_hash; END')
             connection.execute('PRAGMA user_version=1')
             connection.execute('COMMIT')
 
@@ -111,13 +116,17 @@ class TerminalInputs:
         request_hash = hashlib.sha256((terminal_id + ':' + request_id).encode()).hexdigest()
         with self._connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
-            prior = connection.execute('SELECT digest, status FROM receipts WHERE request_hash=?', (request_hash,)).fetchone()
+            prior = connection.execute(
+                'SELECT digest, status, EXISTS(SELECT 1 FROM blocked_submissions AS b WHERE b.request_hash=r.request_hash) '
+                'FROM receipts AS r WHERE request_hash=?', (request_hash,)).fetchone()
             if prior:
                 if not isinstance(prior[0], str) or not SHA.fullmatch(prior[0]) or prior[1] not in ('unknown', 'accepted'):
                     raise RuntimeError('터미널 입력 기록 형식이 올바르지 않습니다.')
                 if prior[0] != digest:
                     raise ValueError('같은 요청으로 다른 입력을 보낼 수 없습니다.')
                 connection.execute('COMMIT')
+                if prior[2]:
+                    raise ClaudeSubmitNotStarted()
                 if prior[1] == 'unknown':
                     raise InputUncertain(UNCERTAIN)
                 return {'ok': True, 'delivery': 'accepted', 'deduplicated': True}
@@ -131,6 +140,14 @@ class TerminalInputs:
         try:
             try:
                 writer(terminal_id, text)
+            except ClaudeSubmitNotStarted:
+                try:
+                    with self._connection() as connection:
+                        connection.execute('INSERT INTO blocked_submissions SELECT request_hash FROM receipts '
+                                           "WHERE request_hash=? AND digest=? AND status='unknown'", (request_hash, digest))
+                except (OSError, RuntimeError, ValueError):
+                    pass  # The unknown reservation still prevents another paste.
+                raise
             except InputNotSent:
                 # A definitive refusal permits another attempt. A partial write never does.
                 with self._connection() as connection:
@@ -143,7 +160,7 @@ class TerminalInputs:
                 if result.rowcount != 1:
                     raise InputUncertain(UNCERTAIN)
                 connection.execute('COMMIT')
-        except InputNotSent:
+        except (ClaudeSubmitNotStarted, InputNotSent):
             raise
         except (OSError, RuntimeError, ValueError, KeyError):
             raise InputUncertain(UNCERTAIN) from None

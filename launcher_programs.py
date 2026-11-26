@@ -264,22 +264,22 @@ def launcher_programs(args):
 
 
 def session_pane(command, name, pane_id=None):
-    """Read a live pane's (ID, PID) in this exact session. Initial proof requires one pane."""
+    """Read a live pane's (ID, PID, tty) in this exact session. Initial proof requires one pane."""
     try:
         done = subprocess.run(command + ["list-panes", "-s", "-t", "=" + name + ":",
-                                         "-F", "#{session_name} #{pane_id} #{pane_pid} #{pane_dead}"],
+                                         "-F", "#{session_name} #{pane_id} #{pane_pid} #{pane_dead} #{pane_tty}"],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, text=True)
         panes = done.stdout.splitlines()
         if done.returncode or (pane_id is None and len(panes) != 1):
             return None
         for line in panes:
             fields = line.split()
-            if len(fields) != 4:
+            if len(fields) != 5:
                 continue
-            owner, identifier, pid, dead = fields
-            if (owner == name and PANE_ID.fullmatch(identifier) and dead == "0"
+            owner, identifier, pid, dead, tty = fields
+            if (owner == name and PANE_ID.fullmatch(identifier) and dead == "0" and tty.startswith("/dev/")
                     and (pane_id is None or identifier == pane_id) and re.fullmatch(r"[1-9][0-9]{0,9}", pid)):
-                return identifier, int(pid)
+                return identifier, int(pid), tty
     except (OSError, ValueError, subprocess.TimeoutExpired):
         pass
     return None
