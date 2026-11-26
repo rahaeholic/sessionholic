@@ -1526,7 +1526,8 @@ function listedSessionKey(host, s) {
 }
 function claudeDetailKey(key, row) {
   const transcript = row.sessionId || row.id;
-  return "claude-detail:" + JSON.stringify([key, transcript, conversationUUID(transcript) ? null : row.cwd || null]);
+  return "claude-detail:" + JSON.stringify([key, transcript, conversationUUID(transcript) ? null : row.cwd || null,
+    ...(row.kind === "background" ? ["background"] : [])]);
 }
 function listedSession(host, s, key, following) {
   const row = { ...s, host: host.name, stale: !host.ok };
@@ -1551,7 +1552,7 @@ function listedAliasSession(key) {
   if (!key) return;
   if (key.startsWith("claude-detail:")) {
     for (const host of state.snapshot?.hosts || []) {
-      const row = host.data?.claude?.find((row) => row.kind === "interactive" &&
+      const row = host.data?.claude?.find((row) => (row.kind === "interactive" || row.kind === "background") &&
         claudeDetailKey(listedSessionKey(host, row), row) === key);
       if (row) return listedSession(host, row, key, chatVisible() ? state.selected : null);
     }
@@ -13268,6 +13269,18 @@ function terminalMatchesDetail(terminal, s) {
   return !!source && sameRecoverySource(source, s) &&
     (s.agent !== "claude" || !s.sessionId || source.sessionId === s.sessionId);
 }
+function sessionForTerminalDetail(terminal) {
+  const source = terminalInfo(terminal).nativeSource;
+  const background = source?.agent === "claude" && source.kind === "background";
+  const exact = allSessions().find((s) => (!background || s.kind === "background") && terminalMatchesDetail(terminal, s));
+  if (exact || !background) return exact;
+  // A merged background row can share the visible interactive card's key.
+  for (const { host, row } of listedClaudeAliases()) {
+    if (row.kind !== "background" || !terminalMatchesDetail(terminal, { ...row, host: host.name })) continue;
+    const key = claudeDetailKey(listedSessionKey(host, row), row);
+    return listedSession(host, row, key, state.selected);
+  }
+}
 function sessionRecordOnly(s) {
   return !s || sessionOneShot(s) || !!botRequestForNative(sourceOf(s));
 }
@@ -14016,7 +14029,7 @@ async function openTerminal(terminal, { recordHistory = true, inline = null, pas
   if (window.SessionholicWorkspace?.claimTerminal(terminal, { passive }) === false) return;
   if (!inline && terminalInfo(terminal).mode === "new-session") return openNewSessionTerminal(terminal, { recordHistory });
   if (!inline) {
-    const exact = allSessions().find((s) => terminalMatchesDetail(terminal, s));
+    const exact = sessionForTerminalDetail(terminal);
     if (exact) {
       select(exact.key);
       if (state.selected !== exact.key) return;
@@ -16974,7 +16987,7 @@ function workspaceHooks() {
     prepareSplit: () => {
       if (!state.terminalVisible || state.inlineTerminal) return true;
       if (workspaceComposing()) { toast("입력창 밖을 누른 뒤 다시 분할해 주세요."); return false; }
-      const s = allSessions().find((s) => terminalMatchesDetail(state.terminal, s));
+      const s = sessionForTerminalDetail(state.terminal);
       if (!s) { toast("채팅 화면으로 돌아간 뒤 분할해 주세요."); return false; }
       if (state.selected !== s.key) select(s.key);
       const host = $("detail-terminal-host");
@@ -16982,7 +16995,7 @@ function workspaceHooks() {
       state.inlineTerminal = inlineTerminalRef(s); host.append($("terminal-screen"));
       applyDock(); return true;
     },
-    sessionKeyForTerminal: (terminal) => allSessions().find((s) => terminalMatchesDetail(terminal, s))?.key || null,
+    sessionKeyForTerminal: (terminal) => sessionForTerminalDetail(terminal)?.key || null,
     listChanged: () => { if (state.snapshot) renderSessionList(allSessions(), state.snapshot.serverTime || Date.now() / 1000); },
     sessionExists: (key) => !!selectableSession(key),
     // A PC or a Mac takes the pane's focus in its editor. On a phone or an iPad the on-screen

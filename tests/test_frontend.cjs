@@ -10957,6 +10957,38 @@ test('the folded session connections row keeps the keyboard focus as it opens', 
   c.context.document.activeElement = null;
 });
 
+test('열린 터미널 목록에서 대화형 대표에 합쳐진 기존 Claude 백그라운드 연결을 다시 연다', async () => {
+  const c = client(undefined, noChatTimers);
+  c.context.navigator = { onLine: false };
+  c.windowEvents.DOMContentLoaded();
+  const source = { host: 'workstation', agent: 'claude', id: 'fixture-worker',
+    sessionId: '11111111-1111-4111-8111-111111111112', cwd: '/fixture/work' };
+  const interactive = { ...source, kind: 'interactive', phase: 'idle', boardDuplicateOf: null };
+  const background = { ...source, kind: 'background', phase: 'working', boardDuplicateOf: [source.host, 'claude', 0] };
+  const terminal = { id: 'a'.repeat(32), host: source.host, agent: 'claude', title: '기존 연결',
+    alive: true, mode: 'attach', nativeSource: { ...source, kind: 'background' } };
+  c.state.authenticated = true;
+  c.state.snapshot = { version: 5, bootId: 'fixture-boot', hosts: [
+    { name: source.host, label: 'Fixture', ok: true, data: { claude: [interactive, background], codex: [] } },
+  ] };
+  c.state.terminals = [terminal];
+  const warnings = [];
+  c.context.toast = (message) => warnings.push(message);
+  assert.deepEqual(Array.from(c.allSessions(), (s) => s.kind), ['interactive']);
+  c.renderTerminals();
+  c.get('running-terminals').events.click();
+  const list = c.get('running-list');
+  byClass(list, 'running-connections')[0].events.click();
+  byClass(list, 'running-terminal')[0].events.click();
+  await settle();
+  assert.equal(c.state.terminal?.id, terminal.id);
+  assert.equal(c.state.terminalVisible, true);
+  assert.equal(c.get('terminal-screen').hidden, false);
+  assert.equal(c.context.selectedSession().listedKind, 'background');
+  assert.equal(c.context.workspaceHooks().sessionKeyForTerminal(terminal), c.state.selected);
+  assert.deepEqual(warnings, []);
+});
+
 test('원이 알림 경로를 원이 화면으로 전달한다', () => {
   const c = client();
   const opened = [];

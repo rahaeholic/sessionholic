@@ -765,6 +765,8 @@ def _agents_row(identity, home, deadline, source):
     row = matches[0]
     if source.get("cwd") is not None and source["cwd"] != row.get("cwd"):
         raise ValueError("실제 Claude 세션의 작업 폴더가 변경되었습니다. 목록을 다시 읽어 주세요.")
+    if source.get("sessionId") and row.get("sessionId") != source["sessionId"]:
+        raise ValueError("정확한 원본 Claude 세션을 확인하지 못했습니다.")
     return row
 
 
