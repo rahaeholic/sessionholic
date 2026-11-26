@@ -1658,7 +1658,9 @@ class Chat:
             raise RuntimeError('다른 파일을 전송 중입니다. 완료 뒤 다시 선택해 주세요.')
         try:
             # Fresh native read supplies actual cwd; snapshot cwd cannot drift unnoticed.
-            current = self.rpc(host, 'read', source)
+            kwargs = ({'allowMissingTranscript': True}
+                      if source.get('agent') == 'claude' and source.get('kind') == 'interactive' else {})
+            current = self.rpc(host, 'read', source, **kwargs)
             cwd = current.get('cwd')
             if not cwd or cwd != source.get('cwd') and source.get('agent') != 'claude':
                 raise ValueError('실제 세션의 작업 폴더를 확인하지 못했습니다. 목록을 새로 읽어 주세요.')
