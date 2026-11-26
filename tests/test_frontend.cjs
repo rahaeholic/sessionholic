@@ -16634,8 +16634,8 @@ test('터미널 파일 paste는 올린 뒤 미리보기만 표시하고 보내�
   assert.equal(c.terminalAttachmentEntry().attachments.length, 0);
 });
 
-test('Claude 새 세션의 터미널 첨부는 서버에 붙여넣기와 Enter를 함께 요청한다', async () => {
-  for (const submit of [true, false]) {
+test('Claude 새 세션의 터미널 초안은 첨부 유무와 관계없이 서버에서 검증한 창으로만 보낸다', async () => {
+  for (const [submit, attach, bracketed] of [[true, true, false], [false, true, true], [true, false, true], [false, false, false]]) {
     const inputs = [];
     let refused = true;
     const c = terminalFilesClient(async (url, options) => {
@@ -16647,14 +16647,15 @@ test('Claude 새 세션의 터미널 첨부는 서버에 붙여넣기와 Enter�
     });
     Object.assign(c.state.terminal, { mode: 'new-session', linkConfidence: 'exact',
       nativeSource: { host: 'fixture', agent: 'claude', id: 'native-fixture', kind: 'interactive' } });
+    c.state.term.modes.bracketedPasteMode = bracketed;
     c.get('terminal-draft').value = '검토해 줘';
-    await c.uploadTerminalFiles([{ name: 'shot.png', size: 9, type: 'image/png' }]);
+    if (attach) await c.uploadTerminalFiles([{ name: 'shot.png', size: 9, type: 'image/png' }]);
     await c.pasteDraft(submit);
     assert.equal(inputs.length, 1);
     assert.equal(inputs[0].claudePasteSubmit, submit);
-    assert.equal(inputs[0].text, '검토해 줘\n첨부 파일: "/fixture/work/file-1.png"');
+    assert.equal(inputs[0].text, attach ? '검토해 줘 첨부 파일: "/fixture/work/file-1.png"' : '검토해 줘');
     assert.match(c.get('draft-note').textContent, /Claude 창을 확인하지 못했습니다/);
-    assert.equal(c.terminalAttachmentEntry().attachments.length, 1);
+    assert.equal(c.terminalAttachmentEntry().attachments.length, Number(attach));
     assert.equal(c.get('terminal-draft').value, '검토해 줘');
     assert.equal(c.state.connected, true);
     refused = false;

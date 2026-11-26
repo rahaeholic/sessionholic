@@ -1,4 +1,5 @@
 import base64
+from contextlib import closing
 import hashlib
 import http.client
 import json
@@ -1106,16 +1107,18 @@ class ChatHttpTest(ChatTest):
         body = {'requestId': 'attachment-paste-01', 'text': '첨부 파일: "/fixture/file.txt"',
                 'claudePasteSubmit': True}
         terms = self.httpd.terminals
-        with patch.object(terms, 'claude_pane_available', create=True, return_value=False) as owned, \
-                patch.object(terms, 'paste', create=True, return_value={'ok': True}) as paste, \
+        with patch.object(terms, 'paste', create=True, side_effect=terminal.ClaudePaneUnavailable()) as paste, \
                 patch.object(terms, 'write', create=True) as raw:
             status, data = self.post(path, body)
             self.assertEqual((status, data['code'], data['dispatchState']),
                              (409, 'claude_pane_unavailable', 'not_started'))
-            paste.assert_not_called()
-            owned.return_value = True
+            paste.assert_called_once()
+            # The definite refusal released its reservation. The same request can now send once.
+            paste.reset_mock(side_effect=True)
             self.assertEqual(self.post(path, body)[0], 200)
-            self.assertEqual(self.post(path, body)[0], 200)
+            paste.side_effect = terminal.ClaudePaneUnavailable()
+            status, data = self.post(path, body)
+            self.assertEqual((status, data['delivery'], data['deduplicated']), (200, 'accepted', True))
             self.assertEqual(self.post(path, {**body, 'claudePasteSubmit': False})[0], 400)
             paste.assert_called_once_with(TERMINAL_ID, body['text'], submit=True, require_claude_pane=True)
             raw.assert_not_called()
@@ -1353,10 +1356,13 @@ class ChatClaudeTest(unittest.TestCase):
         fixture.write_text(
             "import os, sys, tty\n"
             "tty.setraw(0)\n"
+            "os.write(1, b'\\x1b[?2004h')\n"
             "with open(sys.argv[1], 'wb', buffering=0) as log:\n"
             "    while True:\n"
             "        data = os.read(0, 4096)\n"
             "        log.write(data)\n"
+            "        if b'~off' in data:\n"
+            "            os.write(1, b'\\x1b[?2004l')\n"
             "        if b'!' in data:\n"
             "            print(" + repr(CLAUDE_PERMISSION.replace('\n', '\r\n')) + ", end='', flush=True)\n"
         )
@@ -1374,7 +1380,21 @@ class ChatClaudeTest(unittest.TestCase):
         manager.link_native(TERMINAL_ID, self.flow._native_of(HOST['name'], 'claude', self.row))
         self.assertFalse(self.state()['capability']['supported'])
         self.assertEqual(self.rejected(rid='pane-unverified-01'), chat.CLAUDE_EXTERNAL)
+        httpd = server.make_server('127.0.0.1', 0, self.board, 'synthetic', terminals=manager,
+                                   workflow=self.flow, state_dir=self.root)
+        self.addCleanup(httpd.server_close)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
         rpc, program_of = self.flow.transfers.rpc, lp.program_of
+
+        def post_draft(identifier, request, draft, submit):
+            with closing(http.client.HTTPConnection('127.0.0.1', httpd.server_port, timeout=5)) as client:
+                client.request('POST', '/api/terminal/' + identifier + '/input',
+                               json.dumps({'requestId': request, 'text': draft, 'claudePasteSubmit': submit}),
+                               {'Content-Type': 'application/json', 'Authorization': 'Bearer synthetic',
+                                'X-CSRF-Token': httpd.csrf})
+                response = client.getresponse()
+                return response.status, json.loads(response.read())
 
         def transfer(host, op, args, timeout):
             return lp.launcher_programs(args) if op == 'launcher_programs' else rpc(host, op, args, timeout)
@@ -1404,10 +1424,24 @@ class ChatClaudeTest(unittest.TestCase):
             self.messages = [{'role': 'user', 'text': 'pane fixture', 'ts': time.time()}]
             attachment = self.chat.upload(CLAUDE_REF, 'memo.txt', b'fixture')['attachment']
             self.assertTrue(self.send(text='pane fixture', attachments=[attachment['id']])['receipt']['deliveryVerified'])
-            sent = ('pane fixture\r첨부 파일: ' + attachment['path'] + '\r').encode()
+            sent = ('\x1b[200~pane fixture\n첨부 파일: ' + attachment['path'] + '\x1b[201~\r').encode()
             wait_for(lambda: own_log.read_bytes().endswith(sent))
             self.assertEqual(decoy_log.read_bytes(), b'')
             self.assertEqual(own_log.read_bytes(), sent)
+            # The active decoy is still bracketed. Only the original pane's mode is relevant.
+            tmux('send-keys', '-t', own, '-l', '~off')
+            wait_for(lambda: tmux('display-message', '-p', '-t', own, '#{bracket_paste_flag}').strip() == '0')
+            self.assertEqual(tmux('display-message', '-p', '-t', decoy, '#{bracket_paste_flag}').strip(), '1')
+            before = own_log.read_bytes()
+            status, refused = post_draft(TERMINAL_ID, 'draft-multiline', 'draft\nAttachment: "/fixture/note.txt"', False)
+            self.assertEqual((status, refused['dispatchState']), (409, 'not_started'))
+            self.assertIn('여러 줄 붙여넣기', refused['error'])
+            self.assertEqual(own_log.read_bytes(), before)
+            for submit, draft in ((False, 'draft Attachment: "/fixture/note.txt"'), (True, 'plain draft')):
+                self.assertEqual(post_draft(TERMINAL_ID, f'draft-{submit}', draft, submit)[0], 200)
+                before += draft.encode() + (b'\r' if submit else b'')
+                wait_for(lambda: own_log.read_bytes() == before)
+                self.assertEqual(decoy_log.read_bytes(), b'')
             tmux('send-keys', '-t', own, '-l', '!')
             wait_for(lambda: 'Do you want to proceed?' in tmux('capture-pane', '-p', '-t', own))
             fingerprint = chat.parse_menu(tmux('capture-pane', '-p', '-t', own))['fingerprint']
@@ -1420,11 +1454,10 @@ class ChatClaudeTest(unittest.TestCase):
             run_tmux = manager._run
 
             def replace_before_enter(*args, **kwargs):
-                result = run_tmux(*args, **kwargs)
-                if args[0] == 'load-buffer':
+                if args[0] == 'if-shell' and 'send-keys' in args[5]:
                     wait_for(lambda: own_log.read_bytes().endswith(b'paste with no submit'))
                     tmux('respawn-pane', '-k', '-t', own, sys.executable, '-u', str(fixture), str(replacement_log))
-                return result
+                return run_tmux(*args, **kwargs)
 
             with patch.object(manager, '_run', side_effect=replace_before_enter), \
                     self.assertRaisesRegex(RuntimeError, '붙여넣은 뒤 연결된 Claude 창'):
@@ -1438,6 +1471,41 @@ class ChatClaudeTest(unittest.TestCase):
                 self.answer(2, fingerprint, rid='pane-replaced-02')
             self.assertEqual(decoy_log.read_bytes(), b'')
             self.assertEqual(replacement_log.read_bytes(), b'')
+            status, receipt = post_draft(TERMINAL_ID, 'draft-True', 'plain draft', True)
+            self.assertEqual((status, receipt['delivery'], receipt['deduplicated']), (200, 'accepted', True))
+            self.assertEqual(replacement_log.read_bytes(), b'')
+
+            # Replace the process after the last Python check, at each guarded tmux dispatch.
+            for action in ('paste-buffer', 'send-keys'):
+                with self.subTest(action=action):
+                    identifier = secrets.token_hex(16)
+                    name = 'sb-' + identifier
+                    original, replacement = (folder / (action + suffix) for suffix in ('-own', '-replacement'))
+                    pane, pane_pid = tmux('new-session', '-dP', '-F', '#{pane_id} #{pane_pid}', '-s', name,
+                                         sys.executable, '-u', str(fixture), str(original)).split()
+                    meta = {'host': HOST['name'], 'mode': 'new-session'}
+                    manager.terminals[identifier] = terminal._Terminal(
+                        {'id': identifier, 'name': name, 'key': action, 'socket': socket, 'metadata': meta}, 1024)
+                    manager.link_native(identifier, saved['nativeSource'], claude_pane=(pane, int(pane_pid)))
+                    wait_for(original.exists)
+
+                    def replace_before_dispatch(*args, **kwargs):
+                        if args[0] == 'if-shell' and action in args[5]:
+                            tmux('respawn-pane', '-k', '-t', pane, sys.executable, '-u', str(fixture), str(replacement))
+                        return run_tmux(*args, **kwargs)
+
+                    with patch.object(manager, '_run', side_effect=replace_before_dispatch):
+                        if action == 'paste-buffer':
+                            status, refused = post_draft(identifier, 'draft-race', 'race payload', False)
+                            self.assertEqual((status, refused['code'], refused['dispatchState']),
+                                             (409, 'claude_pane_unavailable', 'not_started'))
+                        else:
+                            with self.assertRaises(terminal.ClaudePaneUnavailable):
+                                manager.send_keys(identifier, ['Down', 'Enter'])
+                    wait_for(replacement.exists)
+                    self.assertEqual(original.read_bytes(), b'')
+                    self.assertEqual(replacement.read_bytes(), b'')
+            self.assertEqual(tmux('list-buffers', '-F', '#{buffer_name}').strip(), '')
 
     @unittest.skipUnless(shutil.which('tmux'), 'tmux is required')
     def test_hold_window_name_collision_cannot_authorize_foreign_claude_input(self):

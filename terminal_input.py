@@ -12,6 +12,7 @@ import sqlite3
 from contextlib import contextmanager
 
 import settings
+from terminal import InputNotSent
 
 ID = re.compile(r'[a-f0-9]{32}\Z')
 REQUEST = re.compile(r'[A-Za-z0-9_-]{8,100}\Z')
@@ -128,13 +129,22 @@ class TerminalInputs:
             connection.execute('INSERT INTO receipts VALUES (?, ?, ?, ?)', (request_hash, terminal_hash, digest, 'unknown'))
             connection.execute('COMMIT')
         try:
-            writer(terminal_id, text)
+            try:
+                writer(terminal_id, text)
+            except InputNotSent:
+                # A definitive refusal permits another attempt. A partial write never does.
+                with self._connection() as connection:
+                    connection.execute("DELETE FROM receipts WHERE request_hash=? AND digest=? AND status='unknown'",
+                                       (request_hash, digest))
+                raise
             with self._connection() as connection:
                 connection.execute('BEGIN IMMEDIATE')
                 result = connection.execute("UPDATE receipts SET status='accepted' WHERE request_hash=? AND digest=? AND status='unknown'", (request_hash, digest))
                 if result.rowcount != 1:
                     raise InputUncertain(UNCERTAIN)
                 connection.execute('COMMIT')
+        except InputNotSent:
+            raise
         except (OSError, RuntimeError, ValueError, KeyError):
             raise InputUncertain(UNCERTAIN) from None
         return {'ok': True, 'delivery': 'accepted', 'deduplicated': False}

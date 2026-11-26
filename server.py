@@ -4677,17 +4677,19 @@ class Handler(BaseHTTPRequestHandler):
                     terminals = self.server.terminals
                     if "claudePasteSubmit" in data:
                         from chat import CONTROL
-                        from terminal import ClaudePaneUnavailable
+                        from terminal import InputNotSent
                         submit = data["claudePasteSubmit"]
                         if type(submit) is not bool or not text or CONTROL.search(text):
                             raise ValueError("Claude 붙여넣기에는 일반 텍스트만 보낼 수 있습니다.")
-                        if not terminals.claude_pane_available(tid):
-                            raise SendRejected(str(ClaudePaneUnavailable()), 409, code="claude_pane_unavailable")
-                        self.server.terminal_inputs.submit(
-                            tid, request_id, text,
-                            lambda identifier, body: terminals.paste(identifier, body, submit=submit,
-                                                                     require_claude_pane=True),
-                            operation="claude-submit" if submit else "claude-paste")
+                        try:
+                            receipt = self.server.terminal_inputs.submit(
+                                tid, request_id, text,
+                                lambda identifier, body: terminals.paste(identifier, body, submit=submit,
+                                                                         require_claude_pane=True),
+                                operation="claude-submit" if submit else "claude-paste")
+                        except InputNotSent as exc:
+                            raise SendRejected(str(exc), 409, code="claude_pane_unavailable") from None
+                        return self.send_json(200, receipt)
                     else:
                         self.server.terminal_inputs.submit(tid, request_id, text, terminals.write)
                 elif action == "resize":

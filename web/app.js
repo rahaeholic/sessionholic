@@ -14829,14 +14829,14 @@ async function pasteDraft(submit = false) {
         "초안에 제어 문자가 포함되어 있습니다. 일반 텍스트만 붙여넣을 수 있습니다.";
       return;
     }
-    const pinnedAttachment = attached.length && isInteractiveClaudeLauncher(terminalInfo(state.terminal));
-    const bracketed = pinnedAttachment || !!state.term?.modes?.bracketedPasteMode;
-    if (/[\r\n]/.test(text) && !bracketed) {
+    const pinned = isInteractiveClaudeLauncher(terminalInfo(state.terminal));
+    const bracketed = !!state.term?.modes?.bracketedPasteMode;
+    if (/[\r\n]/.test(text) && !pinned && !bracketed) {
       $("draft-note").textContent =
         "터미널의 붙여넣기 모드를 확인하지 못했습니다. 다시 연결한 뒤 보내 주세요. 여러 줄 초안은 유지됩니다.";
       return;
     }
-    const separator = bracketed ? "\n" : " ";
+    const separator = bracketed && !pinned ? "\n" : " ";
     const payload = [text, ...attached.map((file) => `첨부 파일: ${JSON.stringify(file.path)}`)].filter(Boolean).join(separator);
     if (new TextEncoder().encode(payload).length > 32750) {
       $("draft-note").textContent =
@@ -14847,10 +14847,10 @@ async function pasteDraft(submit = false) {
     pending.dispatched = true;
     if (attachmentEntry) attachmentEntry.sending = true;
     saveDraft();
-    if (pinnedAttachment) await sendInput(normalized, submit);
+    if (pinned) await sendInput(normalized, submit);
     else await sendInput(bracketed ? `\x1b[200~${normalized}\x1b[201~` : normalized);
     if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
-    if (submit && !pinnedAttachment) {
+    if (submit && !pinned) {
       // A separate Enter after the TUI has handled the paste, as a person would type it.
       await new Promise((resolve) => setTimeout(resolve, 120));
       if (pending.cancelled || state.terminal?.id !== pending.id || state.inputEpoch !== pending.epoch) return;
