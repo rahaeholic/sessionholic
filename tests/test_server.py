@@ -161,6 +161,28 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(handler.close_connection)
         self.assertIn("/api/chat/state disconnected response", trace.getvalue())
 
+    def test_chat_state_refusal_logs_its_type_code_and_reason(self):
+        # 11/26: a run of /api/chat/state 409s left only the status code.
+        handler = object.__new__(server.Handler)
+        handler.path = "/api/chat/state?x=1"
+        handler.command = "POST"
+        handler.log_date_time_string = lambda: "test"
+        handler.send_body = lambda *args, **kwargs: None
+        with patch("server.sys.stderr", new_callable=io.StringIO) as trace:
+            try:
+                raise RuntimeError("대화 상태를 확인하지 못했습니다.")
+            except RuntimeError as exc:
+                handler.send_json(409, {"error": str(exc)})
+            handler.send_json(409, {"error": "다른 화면", "code": "prompt_changed"})
+            handler.path = "/api/terminals"
+            handler.send_json(409, {"error": "x"})
+            handler.path = "/api/chat/state"
+            handler.send_json(200, {"ok": True})
+        lines = trace.getvalue().splitlines()
+        self.assertEqual(lines, [
+            "test POST /api/chat/state refused 409 code=- type=RuntimeError reason=대화 상태를 확인하지 못했습니다.",
+            "test POST /api/chat/state refused 409 code=prompt_changed type=- reason=다른 화면"])
+
     def login_cookie(self):
         res, _ = self.request("POST", "/login", json.dumps({"token": TOKEN}), {"Content-Type": "application/json"})
         self.assertEqual(res.status, 200)
