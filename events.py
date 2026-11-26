@@ -74,8 +74,10 @@ def chat_ref(query):
     ref = {key: query.get(key) for key in ("host", "agent", "id")}
     if query.get("home"):
         ref["home"] = query["home"]
-    if query.get('agent') == 'claude' and query.get('sessionId'):
-        ref['sessionId'] = query['sessionId']
+    if query.get('agent') == 'claude':
+        for field in ('sessionId', 'kind'):
+            if query.get(field):
+                ref[field] = query[field]
     return ref
 
 
@@ -84,8 +86,10 @@ def watch_key(ref):
     source): the same string as the conversation state cache key, so one watcher serves
     one conversation however the client spelled it."""
     identity = {key: ref.get(key) for key in CHAT_KEYS}
-    if ref.get('agent') == 'claude' and ref.get('sessionId'):
-        identity['sessionId'] = ref['sessionId']
+    if ref.get('agent') == 'claude':
+        for field in ('sessionId', 'kind'):
+            if ref.get(field):
+                identity[field] = ref[field]
     return json.dumps(identity, sort_keys=True)
 
 

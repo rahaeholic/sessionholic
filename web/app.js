@@ -1038,8 +1038,9 @@ function openRequestedSession() {
   if (Date.now() > request.until) { state.openRequest = null; return; }
   if (!state.authenticated || state.launchBusy) return;
   const sessions = allSessions();
+  const alias = listedAliasSession(request.key);
   const target = sessions.find((session) => session.key === request.key) ||
-    sessionAtListedPosition(sessions, listedAliasSession(request.key)?.boardDuplicateOf);
+    (request.key.startsWith("claude-detail:") ? alias : sessionAtListedPosition(sessions, alias?.boardDuplicateOf));
   if (!target) {
     if (request.after && state.snapshot?.retainedDisplayVersion && !state.retainedLoading) {
       const after = request.after;
@@ -1059,7 +1060,7 @@ function openRequestedSession() {
   select(target.key);
 }
 function openSessionWindow(s) {
-  if (!state.authenticated || !allSessions().some((row) => row.key === s?.key)) return;
+  if (!state.authenticated || !selectableSession(s?.key)) return;
   const url = new URL("/", window.location.origin);
   url.searchParams.set("window", "1"); url.searchParams.set("session", s.key);
   const page = state.retainedPage;
@@ -1518,8 +1519,17 @@ function listedSessionKey(host, s) {
   return [host.name, s.agent, s.home || "", s.id || (s.agent === "claude"
     ? `~${s.pid ?? ""}:${s.sessionId || ""}:${s.cwd || ""}:${s.startedAt ?? ""}` : "")].join("|");
 }
+function claudeDetailKey(key, row) {
+  return "claude-detail:" + JSON.stringify([key, row.sessionId || row.id]);
+}
 function listedSession(host, s, key, following) {
   const row = { ...s, host: host.name, stale: !host.ok };
+  if (s.agent === "claude" && s.kind) {
+    const identifier = sourceOf(s).id;
+    if (key.startsWith("claude-detail:") || identifier && host.data?.claude?.some((other) =>
+      other.kind !== s.kind && (other.home || ".claude") === (s.home || ".claude") && sourceOf(other).id === identifier))
+      row.listedKind = s.kind;
+  }
   // The list's own phase stands again once it changed since the conversation was read,
   // or, for a conversation no longer open, once the host was read again after it.
   return labeledSession({ ...row, ...sessionRuntime(row, key, host.fetchedAt, following),
@@ -1532,9 +1542,20 @@ function* listedClaudeAliases() {
 }
 function listedAliasSession(key) {
   if (!key) return;
+  if (key.startsWith("claude-detail:")) {
+    for (const host of state.snapshot?.hosts || []) {
+      const row = host.data?.claude?.find((row) => row.kind === "interactive" &&
+        claudeDetailKey(listedSessionKey(host, row), row) === key);
+      if (row) return listedSession(host, row, key, chatVisible() ? state.selected : null);
+    }
+    return;
+  }
   for (const { host, row } of listedClaudeAliases())
     if (listedSessionKey(host, row) === key)
       return listedSession(host, row, key, chatVisible() ? state.selected : null);
+}
+function selectableSession(key, sessions = allSessions()) {
+  return sessions.find((s) => s.key === key) || listedAliasSession(key);
 }
 function sessionAtListedPosition(sessions, position) {
   if (!position) return;
@@ -1567,6 +1588,14 @@ function allSessions() {
     matches.push(session);
     listedByRecovery.set(identity, matches);
   }
+  for (const { host, row } of listedClaudeAliases()) {
+    const alias = { ...row, host: host.name };
+    const identity = recoveryIdentity(alias);
+    if (!identity) continue;
+    const matches = listedByRecovery.get(identity) || [];
+    matches.push(alias);
+    listedByRecovery.set(identity, matches);
+  }
   const older = state.retainedPage?.version === state.snapshot?.retainedDisplayVersion ? state.retainedPage?.rows : null;
   const retained = [...(state.snapshot?.recoverySessions || []), ...(older || [])].filter((row) => row.retained === true);
   const retainedByKey = new Map();
@@ -1596,10 +1625,17 @@ function allSessions() {
     } else {
       const listed = listedByRecovery.get(identity);
       if (listed) {
-        if (listed.length === 1 && sameRecoverySource(row, listed[0]) && sameRecoverySource(listed[0], row) &&
-            (row.cwd === listed[0].cwd || sameClaudeConversation(row, listed[0]))) {
-          listed[0].retained = true;
-          listed[0].closedReason = row.closedReason;
+        const representatives = row.agent === "claude" ? new Set(listed.filter((s) =>
+          sameRecoverySource(row, s) && (!row.cwd || row.cwd === s.cwd || sameClaudeConversation(row, s))
+        ).map((s) => sessionAtListedPosition(out, s.boardDuplicateOf) ||
+          out.find((representative) => sameClaudeConversation(s, representative)) || s)) : new Set(listed);
+        if (representatives.size === 1) {
+          const [card] = representatives;
+          if ((row.sessionId || null) === (card.sessionId || null) &&
+              (row.cwd === card.cwd || sameClaudeConversation(row, card))) {
+            card.retained = true;
+            card.closedReason = row.closedReason;
+          }
         }
         continue;
       }
@@ -1691,6 +1727,7 @@ function sourceOf(s) {
     id: s.id,
   };
   if (s.home) source.home = s.home;
+  if (s.agent === "claude" && s.listedKind) source.kind = s.listedKind;
   if (s.agent === "claude" && s.sessionId) {
     source.sessionId = s.sessionId;
     if (!source.id && s.kind === "interactive" && /^[0-9A-Za-z-]{8,64}$/.test(s.sessionId))
@@ -1722,7 +1759,7 @@ function selectedSession() {
     const row = host.data?.claude?.find((row) => !row.boardDuplicateOf && matches(row)) || host.data?.codex?.find(matches);
     if (row) return listedSession(host, row, key, chatVisible() ? key : null);
   }
-  return allSessions().find((s) => s.key === key) || listedAliasSession(key) || heldSelectedSession();
+  return selectableSession(key) || heldSelectedSession();
 }
 // Recovery references are navigation hints from the server, never launch instructions.
 // Claude's sole default account historically omitted home; Codex always names its account.
@@ -2002,8 +2039,7 @@ function render() {
   syncLauncherWorkspace();
   const now = state.snapshot.serverTime || Date.now() / 1000;
   const sessions = allSessions();
-  const selected = sessions.find((session) => session.key === state.selected) ||
-    listedAliasSession(state.selected) || heldSelectedSession();
+  const selected = selectableSession(state.selected, sessions) || heldSelectedSession();
   const reading = state.detailShown && selected;
   if (reading && !sharedSessionSidebar() && !botFilter() && sessionCategoryOf(reading) !== state.sessionCategory) setSessionCategory(sessionCategoryOf(reading), { renderView: false, clearSelection: false });
   const embedded = window.SessionholicWorkspace?.embedded;
@@ -4270,7 +4306,7 @@ function select(key) {
           conversationIdentity(selectedSession()) !== identity) return;
       state.selectionPending = null;
       if (!committed) { toast("입력 확정을 기다리고 있습니다. 입력창을 확인한 뒤 다시 이동해 주세요."); return; }
-      if (allSessions().some((session) => session.key === key) || listedAliasSession(key)) return select(key);
+      if (selectableSession(key)) return select(key);
     });
   }
   state.selectionPending = null;
@@ -4292,7 +4328,7 @@ function select(key) {
   if (state.docked && key !== state.dockBeside) undock();
   if (state.selected !== key) rememberConversationView();
   if (state.selected !== key) closeQuickReplies();
-  const target = allSessions().find((session) => session.key === key) || listedAliasSession(key) ||
+  const target = selectableSession(key) ||
     (state.selected === key ? heldSelectedSession() : null);
   // The window can advance while this conversation is open. Keep its exact
   // selector for the active pane without adding another row to the list.
@@ -4346,7 +4382,7 @@ function select(key) {
 function detailReadRevision(s) {
   return JSON.stringify([s.stale, s.phase, s.title, s.project, s.account, s.hostLabel, s.stale ? s.fetchedAt : null,
     s.cwd || null, s.sessionId || null, s.runtimeKnown, s.readOnly, s.initiator, s.initiatorName, s.initiatorEvidence,
-    s.executionMode, s.transcriptAvailability, s.historyNotice]);
+    s.executionMode, s.transcriptAvailability, s.historyNotice, s.listedKind]);
 }
 function detailRevision(s) {
   return JSON.stringify([detailReadRevision(s), normalizedRuntimeReason(s.runtimeReason), normalizedRuntimeReason(s.runtimeReadReason),
@@ -5319,7 +5355,7 @@ function conversationIdentity(s) {
   if (!s) return null;
   const transcript = s.agent === "claude" ? s.sessionId || s.id : s.id;
   const folder = s.agent === "claude" && conversationUUID(transcript) ? null : s.cwd || null;
-  return JSON.stringify([chatKey(sourceOf(s)), folder, transcript]);
+  return JSON.stringify([chatKey(sourceOf(s)), folder, transcript, ...(s.listedKind ? [s.listedKind] : [])]);
 }
 function conversationUUID(value) {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
@@ -5441,6 +5477,7 @@ function chatEntry(s) {
   // The transcript already has its own slot in the existing draft format. Adding it to a
   // recovered transport selector must not give the same conversation a different draft.
   const draftSource = { ...source }; delete draftSource.sessionId;
+  delete draftSource.kind; // Both listed execution kinds share the transcript's draft.
   const draftIdentity = JSON.stringify([draftSource, s.agent === "claude" ? s.sessionId || s.id : s.id]);
   const previous = state.chats.get(key);
   if (previous && previous.draftIdentity !== draftIdentity) {
@@ -5470,7 +5507,11 @@ function chatEntry(s) {
     restoreChatDraft(entry);
   }
   const entry = state.chats.get(key);
-  if (source.sessionId && entry.source.sessionId !== source.sessionId)
+  if (source.kind !== entry.source.kind) {
+    entry.data = null;
+    entry.stateEpoch++;
+  }
+  if (source.kind !== entry.source.kind || source.sessionId && entry.source.sessionId !== source.sessionId)
     entry.source = Object.freeze({ ...source });
   return entry;
 }
@@ -8248,8 +8289,12 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     // A read asked for while this one ran (a return to the screen, a live update) still
     // happens: at once, or shortly after this one failed, so the old screen never stays.
     if (recheck && currentChat(entry) && chatVisible() && !networkOffline()) {
-      if (!readFailed) queueMicrotask(() => loadChatState(s, false));
-      else setTimeout(() => { if (currentChat(entry) && chatVisible()) loadChatState(s, false); }, CHAT_RECHECK_RETRY_MS);
+      const refresh = () => {
+        const current = selectedSession();
+        if (currentChat(entry, current) && chatVisible()) loadChatState(current, false);
+      };
+      if (!readFailed) queueMicrotask(refresh);
+      else setTimeout(refresh, CHAT_RECHECK_RETRY_MS);
     }
   }
   return outcome;
@@ -10544,7 +10589,8 @@ function openNativeChat(terminal) {
   const isClaudeLauncher = isInteractiveClaudeLauncher(info);
   const listed = isClaudeLauncher && listedLauncherClaude(terminal);
   if (isClaudeLauncher && !listed) return;
-  const key = listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
+  const key = listed?.listedKind === "interactive" ? claudeDetailKey(listed.key, listed) :
+    listed?.key || [source.host, source.agent, source.home || "", source.id].join("|");
   // This identity comes only from the server-owned launched terminal metadata.
   // The user explicitly selects it; the original source never changes underneath a draft.
   if (!isClaudeLauncher && !allSessions().some((s) => s.key === key)) {
@@ -15752,7 +15798,7 @@ function syncEvents() {
   if (state.events?.key === key && state.events?.identity === identity) return;
   closeEvents();
   const params = new URLSearchParams();
-  for (const name of ["host", "agent", "home", "id", "sessionId"]) if (chat?.[name]) params.set(name, chat[name]);
+  for (const name of ["host", "agent", "home", "id", "sessionId", "kind"]) if (chat?.[name]) params.set(name, chat[name]);
   const query = params.toString();
   let source;
   try {
@@ -16793,7 +16839,7 @@ function showHistoryEntry(event, swiped = false) {
   state.reopenOnReturn = null;
   // An ended terminal's 이 세션 다시 열기 (reopenEndedTerminal), once the board is shown.
   const reopenSession = () => {
-    const target = reopen && allSessions().find((item) => item.key === reopen);
+    const target = reopen && selectableSession(reopen);
     if (target) openSessionTerminal(target);
   };
   // Forward again to a notification's conversation shows it, not the terminal's launch.
@@ -16899,7 +16945,7 @@ function workspaceHooks() {
     },
     sessionKeyForTerminal: (terminal) => allSessions().find((s) => terminalMatchesDetail(terminal, s))?.key || null,
     listChanged: () => { if (state.snapshot) renderSessionList(allSessions(), state.snapshot.serverTime || Date.now() / 1000); },
-    sessionExists: (key) => allSessions().some((s) => s.key === key) || !!listedAliasSession(key),
+    sessionExists: (key) => !!selectableSession(key),
     // A PC or a Mac takes the pane's focus in its editor. On a phone or an iPad the on-screen
     // keyboard would cover the screen: a tap (a list selection, a pane's title) gives the
     // conversation the focus, only a hardware keyboard's move (→/Enter, Option+number) the editor.
@@ -16920,7 +16966,7 @@ function workspaceHooks() {
     resize: () => updateViewport(),
     restore: (ref) => {
       if (!state.authenticated || !state.snapshot) return false;
-      const s = ref.key && allSessions().find((s) => s.key === ref.key);
+      const s = ref.key && selectableSession(ref.key);
       if (ref.key && !s) return false;
       if (s) state.detailModes.set(conversationIdentity(s), ref.mode === "terminal" ? "terminal" : "chat");
       if (s && state.selected !== s.key) select(s.key);

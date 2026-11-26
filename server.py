@@ -1557,11 +1557,33 @@ class Board:
         if agent not in ("claude", "codex"):
             raise ValueError("지원하지 않는 에이전트입니다.")
         with self.lock:
-            for row in (host.get("data") or {}).get(agent, []):
-                identifier = self._listed_id(row, agent)
-                if identifier and identifier == ref.get("id") and (agent != "codex" or row.get("home") == ref.get("home")):
-                    return {**copy.deepcopy(row), "id": identifier, "host": host["name"], "hostLabel": host["label"],
-                            "online": host["ok"], "fetchedAt": host["fetchedAt"]}
+            identifier = ref.get("id")
+            rows = (host.get("data") or {}).get(agent, [])
+            matches = [row for row in rows if identifier and self._listed_id(row, agent) == identifier
+                       and (agent != "codex" or row.get("home") == ref.get("home"))]
+            kind = ref.get("kind") if agent == "claude" else None
+            if agent == "claude" and len(matches) > 1:
+                home = ref.get("home") or ".claude"
+                matches = [row for row in matches if (row.get("home") or ".claude") == home
+                           and (not ref.get("sessionId") or row.get("sessionId") == ref["sessionId"])]
+            if kind:
+                matches = [row for row in matches if row.get("kind") == kind]
+            if agent == "claude" and len(matches) > 1:
+                # Multiple processes may publish the same route for one conversation.
+                # Different execution kinds or folders need an exact selector.
+                first = matches[0]
+                transcript = first.get("sessionId") or identifier
+                if (not isinstance(transcript, str) or not CLAUDE_TRANSCRIPT_UUID.fullmatch(transcript)
+                        or any((row.get("sessionId") or identifier) != transcript
+                               or row.get("kind") != first.get("kind") or row.get("cwd") != first.get("cwd")
+                               for row in matches[1:])):
+                    raise ValueError("같은 식별자의 작업이 여러 개입니다. 목록에서 다시 선택해 주세요.")
+            if matches:
+                result = {**copy.deepcopy(matches[0]), "id": identifier, "host": host["name"],
+                          "hostLabel": host["label"], "online": host["ok"], "fetchedAt": host["fetchedAt"]}
+                if kind:
+                    result["listedKind"] = kind
+                return result
         raise ValueError("목록에서 작업을 다시 선택해 주세요.")
 
     def read(self, host_name, agent, session_id, home, fresh=False):
@@ -1845,6 +1867,10 @@ class Workflow:
             if record is None:
                 raise original
         source = dict(record["source"])
+        if ref.get("agent") == "claude" and ref.get("kind"):
+            if source.get("kind") != ref["kind"]:
+                raise ValueError("원래 대화의 실행 방식이 변경되었습니다.")
+            source["listedKind"] = ref["kind"]
         if record.get("provenance", {}).get("closure") in ("explicit_termination", "legacy_user_close"):
             raise ValueError("이 작업의 종료 의도를 확인하지 못했습니다. 원래 기록에서 명시적으로 선택해 주세요.")
         host = next((h for h in self.board.hosts if h["name"] == source["host"]), None)
@@ -3408,8 +3434,10 @@ def board_listed_rows(snapshot, agents):
 
 def annotate_board_snapshot(snapshot, recoveries):
     """Add display decisions to the HTTP snapshot's own copy."""
-    listed_by_identity, listed_by_conversation = {}, {}
+    listed_by_identity, listed_by_conversation, representatives = {}, {}, {}
     for position, row, source, duplicate_of in board_listed_rows(snapshot, ("claude", "codex")):
+        if duplicate_of is None:
+            representatives[position] = row, source
         if source["agent"] == "claude":
             row["boardSource"] = source
             row["boardDuplicateOf"] = duplicate_of
@@ -3421,6 +3449,11 @@ def annotate_board_snapshot(snapshot, recoveries):
             listed_by_identity.setdefault(identity, []).append((position, row, source, duplicate_of))
 
     missing = object()
+
+    def same_place(row, listed, conversation, listed_source):
+        return (row.get("cwd", missing) == listed.get("cwd", missing)
+                or conversation and conversation == claude_display_conversation(listed_source))
+
     for row in recoveries:
         source = board_display_source(row)
         identity = board_recovery_identity(source)
@@ -3429,17 +3462,19 @@ def annotate_board_snapshot(snapshot, recoveries):
         position, action = None, "add"
         if matches:
             action = "hide"
-            compatible = []
+            compatible = set()
             for listed_position, listed, listed_source, duplicate_of in matches:
                 same_transcript = source.get("sessionId") == listed_source.get("sessionId")
-                same_place = (row.get("cwd", missing) == listed.get("cwd", missing)
-                              or conversation and conversation == claude_display_conversation(listed_source))
-                if (same_transcript or not source.get("sessionId")) and (same_place or not row.get("cwd")):
-                    compatible.append(duplicate_of or listed_position)
-                if len(matches) == 1 and duplicate_of is None and same_transcript and same_place:
+                if ((same_transcript or not source.get("sessionId"))
+                        and (not row.get("cwd") or same_place(row, listed, conversation, listed_source))):
+                    compatible.add(duplicate_of or listed_position)
+            if len(compatible) == 1:
+                position = next(iter(compatible))
+                representative, listed_source = representatives[position]
+                if ((source["agent"] == "claude" or len(matches) == 1)
+                        and source.get("sessionId") == listed_source.get("sessionId")
+                        and same_place(row, representative, conversation, listed_source)):
                     action = "merge"
-            if len(set(compatible)) == 1:
-                position = compatible[0]
         elif identity and conversation in listed_by_conversation:
             position, action = listed_by_conversation[conversation], "hide"
         row["boardRecovery"] = {"listedRow": position, "retainedAction": action}

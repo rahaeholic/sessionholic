@@ -477,8 +477,11 @@ class Chat:
     @classmethod
     def watch_identity(cls, source):
         identity = cls.identity(source)
-        if source.get('agent') == 'claude' and source.get('sessionId'):
-            identity['sessionId'] = source['sessionId']
+        if source.get('agent') == 'claude':
+            if source.get('sessionId'):
+                identity['sessionId'] = source['sessionId']
+            if source.get('listedKind'):
+                identity['kind'] = source['listedKind']
         return identity
 
     @classmethod
@@ -499,15 +502,19 @@ class Chat:
             source.setdefault('agent', ref.get('agent'))
             return source
         except ValueError:
+            kind = ref.get('kind') if ref.get('agent') == 'claude' else None
             for terminal in self.workflow.terminals.list():
                 native = terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource')
                 if (isinstance(native, dict) and self.identity(native) == self.identity(ref or {})
+                        and (not kind or native.get('kind') == kind)
                         and (not ref.get('sessionId') or native.get('sessionId') == ref['sessionId'])):
-                    return {**native, 'title': terminal.get('title', '이어가는 작업')}
+                    return {**native, 'title': terminal.get('title', '이어가는 작업'),
+                            **({'listedKind': kind} if kind else {})}
                 selected = terminal.get('chatSource') or terminal.get('metadata', {}).get('chatSource')
                 if (allow_chat_source and isinstance(selected, dict) and self.identity(selected) == self.identity(ref)
+                        and (not kind or selected.get('kind') == kind)
                         and (not ref.get('sessionId') or selected.get('sessionId') == ref['sessionId'])):
-                    return {**selected, 'readOnly': True}
+                    return {**selected, 'readOnly': True, **({'listedKind': kind} if kind else {})}
             raise
 
     def source(self, ref, sending=True):
@@ -929,7 +936,14 @@ class Chat:
                 pass
         with self.lock:
             self.cache_epoch += 1
-            self.cache.pop(self.state_key(source), None)
+            if source.get('agent') == 'claude':
+                identity = self.watch_identity(source)
+                identity.pop('kind', None)
+                self.cache.pop(json.dumps(identity, sort_keys=True), None)
+                for kind in ('interactive', 'background', 'bg'):
+                    self.cache.pop(json.dumps({**identity, 'kind': kind}, sort_keys=True), None)
+            else:
+                self.cache.pop(self.state_key(source), None)
 
     # ---------- the board terminal attached to a session ----------
     @staticmethod
@@ -1678,7 +1692,9 @@ class Chat:
                 args['source'] = self.identity(source)
             attachment = self.workflow.transfers.rpc(host, 'attachment', args, timeout=60)
             from server import private_json
-            record = {'source': self.watch_identity(source), 'cwd': cwd, 'attachment': attachment}
+            attachment_source = self.watch_identity(source)
+            attachment_source.pop('kind', None)
+            record = {'source': attachment_source, 'cwd': cwd, 'attachment': attachment}
             private_json(self.root / 'attachments' / (attachment['id'] + '.json'), record)
             return {'attachment': {**attachment, 'type': attachment.get('mime', 'application/octet-stream')}}
         finally:

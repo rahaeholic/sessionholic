@@ -671,7 +671,7 @@
       "recoveries": [
         {
           "listedRow": ["fixture-host", "claude", 0],
-          "retainedAction": "hide"
+          "retainedAction": "merge"
         }
       ],
       "launchers": {
@@ -693,7 +693,9 @@
         "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "fixture-host|claude|.claude|background-worker"
       ],
-      "retainedCardKeys": [],
+      "retainedCardKeys": [
+        "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
+      ],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "estimated-mixed": null
@@ -818,7 +820,7 @@
       "recoveries": [
         {
           "listedRow": ["fixture-host", "claude", 0],
-          "retainedAction": "hide"
+          "retainedAction": "merge"
         }
       ],
       "launchers": {
@@ -840,7 +842,9 @@
         "fixture-host|claude|.claude|background-worker",
         "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100"
       ],
-      "retainedCardKeys": [],
+      "retainedCardKeys": [
+        "fixture-host|claude|.claude|background-worker"
+      ],
       "launcherCardKeys": {
         "exact": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "estimated-mixed": null
@@ -848,6 +852,333 @@
       "notificationAlias": {
         "key": "fixture-host|claude||~17:11111111-1111-4111-8111-111111111111:/fixture/work:100",
         "target": "fixture-host|claude|.claude|background-worker"
+      }
+    }
+  },
+  {
+    "name": "빈 ID와 PID가 다른 대화형 두 행의 보관 상태를 대표로 합침",
+    "snapshot": {
+      "serverTime": 691200,
+      "bootId": "fixture-boot",
+      "version": 106,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "interactive",
+                "cwd": "/fixture/work",
+                "pid": 9,
+                "startedAt": 1,
+                "phase": "closed",
+                "updatedAt": 1,
+                "initiator": "human"
+              },
+              {
+                "agent": "claude",
+                "id": "",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "interactive",
+                "cwd": "/fixture/work",
+                "pid": 10,
+                "startedAt": 1,
+                "phase": "closed",
+                "updatedAt": 1,
+                "initiator": "human"
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": [
+        {
+          "agent": "claude",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "sessionId": "11111111-1111-4111-8111-111111111111",
+          "kind": "interactive",
+          "cwd": "/fixture/work",
+          "pid": 9,
+          "startedAt": 1,
+          "phase": "closed",
+          "updatedAt": 1,
+          "host": "fixture-host",
+          "retained": true,
+          "closedReason": "released",
+          "initiator": "human"
+        }
+      ]
+    },
+    "terminals": [],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": ["fixture-host", "claude", 0]
+          }
+        ]
+      ],
+      "recoveries": [
+        {
+          "listedRow": ["fixture-host", "claude", 0],
+          "retainedAction": "merge"
+        }
+      ],
+      "launchers": {},
+      "launcherCardKeys": {},
+      "cardKeys": [
+        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
+      ],
+      "legacyCardKeys": [
+        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1",
+        "fixture-host|claude||~10:11111111-1111-4111-8111-111111111111:/fixture/work:1"
+      ],
+      "retainedCardKeys": [
+        "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
+      ],
+      "retainedReleasedVisible": "fixture-host|claude||~9:11111111-1111-4111-8111-111111111111:/fixture/work:1"
+    }
+  },
+  {
+    "name": "키를 공유하는 대표와 대화형 런처 상세를 구분 (후보 0)",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 107,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "11111111-1111-4111-8111-111111111111",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "interactive",
+                "cwd": "/fixture/work",
+                "pid": 9,
+                "startedAt": 1,
+                "phase": "working",
+                "updatedAt": 1
+              },
+              {
+                "agent": "claude",
+                "id": "11111111-1111-4111-8111-111111111111",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "background",
+                "cwd": "/fixture/work",
+                "pid": 9,
+                "startedAt": 1,
+                "phase": "idle",
+                "updatedAt": 1
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": []
+    },
+    "terminals": [
+      {
+        "id": "exact",
+        "mode": "new-session",
+        "alive": true,
+        "linkConfidence": "exact",
+        "nativeSource": {
+          "agent": "claude",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "sessionId": "11111111-1111-4111-8111-111111111111",
+          "kind": "interactive",
+          "cwd": "/fixture/original",
+          "host": "fixture-host"
+        }
+      }
+    ],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": ["fixture-host", "claude", 0]
+          }
+        ]
+      ],
+      "recoveries": [],
+      "launchers": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 107,
+          "listedRow": ["fixture-host", "claude", 0]
+        }
+      },
+      "launcherCardKeys": {
+        "exact": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      },
+      "cardKeys": [
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      ],
+      "legacyCardKeys": [
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      ],
+      "retainedCardKeys": [],
+      "sharedLauncherKey": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+      "representativeKind": "interactive",
+      "notificationAlias": {
+        "key": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+        "target": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      }
+    }
+  },
+  {
+    "name": "키를 공유하는 대표와 대화형 런처 상세를 구분 (후보 1)",
+    "snapshot": {
+      "serverTime": 1000,
+      "bootId": "fixture-boot",
+      "version": 108,
+      "hosts": [
+        {
+          "name": "fixture-host",
+          "label": "fixture-host",
+          "ok": true,
+          "data": {
+            "claude": [
+              {
+                "agent": "claude",
+                "id": "11111111-1111-4111-8111-111111111111",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "background",
+                "cwd": "/fixture/work",
+                "pid": 9,
+                "startedAt": 1,
+                "phase": "idle",
+                "updatedAt": 1
+              },
+              {
+                "agent": "claude",
+                "id": "11111111-1111-4111-8111-111111111111",
+                "sessionId": "11111111-1111-4111-8111-111111111111",
+                "kind": "interactive",
+                "cwd": "/fixture/work",
+                "pid": 9,
+                "startedAt": 1,
+                "phase": "working",
+                "updatedAt": 1
+              }
+            ],
+            "codex": []
+          }
+        }
+      ],
+      "recoverySessions": []
+    },
+    "terminals": [
+      {
+        "id": "exact",
+        "mode": "new-session",
+        "alive": true,
+        "linkConfidence": "exact",
+        "nativeSource": {
+          "agent": "claude",
+          "id": "11111111-1111-4111-8111-111111111111",
+          "sessionId": "11111111-1111-4111-8111-111111111111",
+          "kind": "interactive",
+          "cwd": "/fixture/original",
+          "host": "fixture-host"
+        }
+      }
+    ],
+    "expected": {
+      "claude": [
+        [
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": null
+          },
+          {
+            "boardSource": {
+              "host": "fixture-host",
+              "agent": "claude",
+              "home": ".claude",
+              "id": "11111111-1111-4111-8111-111111111111",
+              "sessionId": "11111111-1111-4111-8111-111111111111"
+            },
+            "boardDuplicateOf": ["fixture-host", "claude", 0]
+          }
+        ]
+      ],
+      "recoveries": [],
+      "launchers": {
+        "exact": {
+          "bootId": "fixture-boot",
+          "snapshotVersion": 108,
+          "listedRow": ["fixture-host", "claude", 1]
+        }
+      },
+      "launcherCardKeys": {
+        "exact": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      },
+      "cardKeys": [
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      ],
+      "legacyCardKeys": [
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+        "fixture-host|claude||11111111-1111-4111-8111-111111111111"
+      ],
+      "retainedCardKeys": [],
+      "sharedLauncherKey": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+      "representativeKind": "background",
+      "notificationAlias": {
+        "key": "fixture-host|claude||11111111-1111-4111-8111-111111111111",
+        "target": "fixture-host|claude||11111111-1111-4111-8111-111111111111"
       }
     }
   }
