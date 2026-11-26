@@ -12,10 +12,7 @@
   }
   function sourceOf(session) {
     const source = { ...(options.sourceOf?.(session) || session) };
-    if (source.agent === 'claude') {
-      source.home ||= '.claude';
-      if (!source.id && session.kind === 'interactive') source.id = session.sessionId;
-    }
+    if (source.agent === 'claude') source.home ||= '.claude';
     return { host: source.host, agent: source.agent, id: source.id, ...(source.home ? { home: source.home } : {}),
       ...(source.agent === 'claude' && session.sessionId ? { sessionId: session.sessionId } : {}) };
   }

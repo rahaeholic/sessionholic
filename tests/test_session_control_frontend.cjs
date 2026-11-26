@@ -63,6 +63,14 @@ test('관리 미리보기는 정확한 기기·계정·세션을 보내고 지�
   assert.equal(c.calls.length, 1);
 });
 
+test('worker ID 없는 Claude 대화형 세션의 관리 미리보기는 대화 ID를 보낸다', async () => {
+  const c = client(async () => response(preview()));
+  const sid = '019a0000-0000-7000-8000-000000000001';
+  await c.manageSession(source({ agent: 'claude', id: '', home: undefined, kind: 'interactive', sessionId: sid }));
+  assert.equal(c.calls[0].url, '/api/session/preview');
+  assert.deepEqual(c.calls[0].body.source, { host: 'workstation', agent: 'claude', id: sid, sessionId: sid });
+});
+
 test('실행 확인 전에는 제어하지 않고 중복 클릭·완료 후 재클릭도 원본에 한 번만 보낸다', async () => {
   const pending = deferred();
   const c = client(async ({ url }) => url.endsWith('/preview') ? response(preview()) : pending.promise);

@@ -240,7 +240,11 @@ def launcher_programs(args):
         identifier = terminal.get("id")
         if identifier not in result:
             continue
-        exact = held_codex(terminal.get("holdName"), rows)
+        # A time-derived Claude PID describes the program but cannot authorize terminal input.
+        hold = terminal.get("holdName")
+        exact = held_program(hold, rows) if hold else pane_program(terminal.get("panePid"), rows)
+        if exact and exact.get("program") != "claude" and not exact.get("nativeSource"):
+            exact = None
         resumed = result[identifier].get("sessionId") if result[identifier].get("program") == "codex" else None
         source = None if exact or not resumed else resumed_codex_source(resumed, terminal.get("createdAt"))
         if exact:
@@ -256,8 +260,48 @@ def launcher_programs(args):
     return {"terminals": result}
 
 
-def held_codex(hold, rows):
-    """Read the exact hold pane's CLI and its writable original rollout, never a time guess."""
+def single_pane_pid(command, name):
+    """Read the PID only when this named tmux session has one pane."""
+    try:
+        done = subprocess.run(command + ["list-panes", "-s", "-t", "=" + name + ":",
+                                         "-F", "#{session_name} #{pane_pid}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, text=True)
+        panes = done.stdout.splitlines()
+        if not done.returncode and len(panes) == 1:
+            owner, _, pid = panes[0].partition(" ")
+            if owner == name and re.fullmatch(r"[1-9][0-9]{0,9}", pid):
+                return int(pid)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def pane_program(pane_pid, rows):
+    """A unique first CLI in the pane's process tree. Stop before its helpers and tools."""
+    if type(pane_pid) is not int or pane_pid <= 0:
+        return None
+    by_pid = {pid: command for pid, _, _, command in rows}
+    children = {}
+    for pid, parent, _, _ in rows:
+        children.setdefault(parent, []).append(pid)
+    queue, seen, found = [pane_pid], set(), None
+    while queue and len(seen) < 128:
+        pid = queue.pop(0)
+        if pid in seen or pid not in by_pid:
+            continue
+        seen.add(pid)
+        program = program_of(by_pid[pid])
+        if program:
+            if found is not None:
+                return None
+            found = {**program, "pid": pid, "paneVerified": True}
+        else:
+            queue.extend(children.get(pid, []))
+    return None if queue else found
+
+
+def held_program(hold, rows):
+    """Find the first CLI of the exact hold and preserve Codex's rollout check."""
     if not isinstance(hold, str) or not re.fullmatch(r"sh-[0-9a-f]{16}", hold):
         return None
     from transfer_worker import HOLD_SOCKET
@@ -265,33 +309,17 @@ def held_codex(hold, rows):
     tmux = which("tmux")
     if not tmux:
         return None
+    program = pane_program(single_pane_pid([tmux, "-L", HOLD_SOCKET, "-f", "/dev/null"], hold), rows)
+    if not program or program["program"] != "codex":
+        return program
     try:
-        done = subprocess.run([tmux, "-L", HOLD_SOCKET, "-f", "/dev/null", "list-panes", "-t", "=" + hold,
-                               "-F", "#{pane_pid}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=3, text=True)
-        panes = done.stdout.splitlines()
-        if done.returncode or len(panes) != 1 or not panes[0].isdigit():
-            return None
         by_pid = {pid: command for pid, _, _, command in rows}
         children = {}
         for pid, parent, _, _ in rows:
             children.setdefault(parent, []).append(pid)
-        queue, seen, agents = [int(panes[0])], set(), []
-        while queue and len(seen) < 128:
-            pid = queue.pop(0)
-            if pid in seen or pid not in by_pid:
-                continue
-            seen.add(pid)
-            program = program_of(by_pid[pid])
-            if program:
-                agents.append((pid, program["program"]))
-            else:
-                queue.extend(children.get(pid, []))
-        if queue or len(agents) != 1 or agents[0][1] != "codex":
-            return None
         # The Node wrapper, native TUI and its embedded app-server can own the writer.
         # Do not descend through command tools, MCP servers or independently launched agents.
-        first = agents[0][0]
+        first = program["pid"]
         queue, pids = [first], set()
         while queue and len(pids) < 8:
             pid = queue.pop(0)

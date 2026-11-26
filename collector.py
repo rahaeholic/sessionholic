@@ -857,14 +857,15 @@ def claude_row(row, transcripts, projects):
         "kind": row.get("kind"), "entrypoint": entrypoint, "state": row.get("state"), "status": row.get("status"),
         "waitingFor": row.get("waitingFor"), "phase": claude_phase(row.get("state"), row.get("status")),
         "startedAt": to_epoch(row.get("startedAt")), "updatedAt": updated,
-        "snippet": snippet, "resume": "claude attach " + str(row.get("id") or ""),
+        "snippet": snippet,
         **session_origin(row),
     }
     out.update(titles)
+    if out["kind"] == "background" and out["id"]:
+        out["resume"] = "claude attach " + out["id"]
     pid = row.get("pid")
-    if not out["id"] and isinstance(pid, int) and not isinstance(pid, bool):
-        # A row `claude agents` lists without an id (seen for a working interactive
-        # session) cannot be read or sent to; its process id still tells two apart on the board.
+    if (out["kind"] == "interactive" or not out["id"]) and type(pid) is int and pid > 0:
+        # Interactive rows may have no worker id. The pid ties them to a launcher on this host.
         out["pid"] = pid
     if out['phase'] == 'unknown':
         out.update(runtimeKnown=False, runtimeReason='이 Claude CLI의 실행 상태를 해석하지 못했습니다.')

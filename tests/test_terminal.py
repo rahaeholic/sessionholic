@@ -361,7 +361,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_paste_uses_one_private_buffer_then_a_separate_enter(self):
         stream = self.fake_terminal()
-        name = stream.record["name"]
+        name = "=" + stream.record["name"] + ":"
         ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
         with patch.object(self.manager, "_attach"), patch.object(terminal.time, "sleep") as sleep, \
                 patch.object(self.manager, "_run", return_value=ok) as run:
@@ -417,7 +417,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_scroll_drives_tmux_history_never_the_cli(self):
         stream = self.fake_terminal()
-        tid, name = stream.record["id"], stream.record["name"]
+        tid, name = stream.record["id"], "=" + stream.record["name"] + ":"
         ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
         history = {"ok": True, "mode": "history"}
         with patch.object(self.manager, "_run", return_value=ok) as run, \
@@ -470,7 +470,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_full_screen_mouse_app_receives_wheel_events_instead_of_history(self):
         stream = self.fake_terminal()
-        tid, name = stream.record["id"], stream.record["name"]
+        tid, name = stream.record["id"], "=" + stream.record["name"] + ":"
         ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
         app = {"ok": True, "mode": "app", "position": None}
         cases = [  # lines, pane, expected one -l argument
@@ -519,7 +519,7 @@ class ValidationTest(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess([], 0, stdout=b"1|1|0|100|30|0||0\n")
             self.assertEqual(self.manager._pane(stream), {"alternate": 1, "mouse": 1, "sgr": 0, "width": 100,
                                                           "height": 30, "inMode": 0, "position": 0, "history": 0})
-            self.assertEqual(run.call_args.args[0][5:], ["display-message", "-p", "-t", stream.record["name"],
+            self.assertEqual(run.call_args.args[0][5:], ["display-message", "-p", "-t", "=" + stream.record["name"] + ":",
                                                          terminal.PANE_FORMAT])
             self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
             for done in (subprocess.CompletedProcess([], 1, stdout=b"1|1|0|100|30|0||0"),
@@ -534,7 +534,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_send_keys_presses_only_named_navigation_keys_in_one_call(self):
         stream = self.fake_terminal()
-        tid, name = stream.record["id"], stream.record["name"]
+        tid, name = stream.record["id"], "=" + stream.record["name"] + ":"
         ok, failed = subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 1)
         with patch.object(self.manager, "_run", return_value=ok) as run:
             for keys in ([], ["Left"], ["enter"], ["Down", "C-c"], ["Enter "], "Enter", ("Up", 1),
@@ -570,7 +570,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_new_attach_client_and_its_first_input_leave_stale_copy_mode(self):
         stream = self.fake_terminal()
-        tid, name = stream.record["id"], stream.record["name"]
+        tid, name = stream.record["id"], "=" + stream.record["name"] + ":"
         cancel = ("send-keys", "-t", name, "-X", "cancel")
         process = Mock(pid=0)
         process.poll.return_value = None
@@ -1586,7 +1586,7 @@ class TmuxFixtureTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=5)
 
     def mode(self, terminal_id):
-        done = self.tmux("display-message", "-p", "-t", "sb-" + terminal_id, "#{pane_in_mode} #{scroll_position}")
+        done = self.tmux("display-message", "-p", "-t", "=sb-" + terminal_id + ":", "#{pane_in_mode} #{scroll_position}")
         self.assertEqual(done.returncode, 0)
         return done.stdout.strip()
 
@@ -1604,11 +1604,19 @@ class TmuxFixtureTest(unittest.TestCase):
                                       {"agent": "fixture", "host": "local"})
         tid = created["id"]
         cursor = self.wait_for(self.manager, tid, b"FIXTURE_READY")
+        # Another session's window has the board session's name and is now current.
+        decoy = self.tmux("new-session", "-d", "-s", "decoy", "-n", "sb-" + tid, "/bin/cat")
+        self.assertEqual(decoy.returncode, 0, decoy.stderr)
+        self.assertIn("FIXTURE_READY", self.manager.capture(tid))
+        self.assertEqual(self.tmux("set-option", "-t", "=decoy:", "status", "2").returncode, 0)
+        self.manager._configure(self.manager.terminals[tid])
+        self.assertEqual(self.tmux("show-options", "-v", "-t", "=decoy:", "status").stdout.strip(), "2")
         self.assertEqual(self.tmux("show-options", "-g", "-v", "history-limit").stdout.strip(), "20000")
-        self.assertEqual(self.tmux("display-message", "-p", "-t", "sb-" + tid, "#{history_limit}").stdout.strip(), "20000")
+        self.assertEqual(self.tmux("display-message", "-p", "-t", "=sb-" + tid + ":", "#{history_limit}").stdout.strip(), "20000")
 
         self.assertEqual(self.manager.paste(tid, "pasted-fixture"), {"ok": True})
         cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:pasted-fixture", cursor)
+        self.assertNotIn("pasted-fixture", self.tmux("capture-pane", "-p", "-t", "=decoy:").stdout)
         before = cursor
         self.manager.paste(tid, "line-one\nline-two")
         cursor = self.wait_for(self.manager, tid, b"FIXTURE_REPLY:line-two", cursor)

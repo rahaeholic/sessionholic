@@ -39,6 +39,26 @@ not a process line
 
 
 class TableTest(unittest.TestCase):
+    def test_single_pane_requires_an_exact_session_name_and_valid_pid(self):
+        name = "sh-0123456789abcdef"
+        command = ["/fixture/tmux"]
+        for code, output, expected in (
+            (0, name + " 52\n", 52),
+            (0, "sh-1123456789abcdef 32\n", None),
+            (0, name + " 52\nsh-1123456789abcdef 32\n", None),
+            (0, name + " 52\n" + name + " 53\n", None),
+            (0, name + " x\n", None),
+            (0, "52\n", None),
+            (0, "", None),
+            (1, name + " 52\n", None),
+        ):
+            with self.subTest(code=code, output=output), patch.object(lp.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], code, output)) as run:
+                self.assertEqual(lp.single_pane_pid(command, name), expected)
+                self.assertEqual(run.call_args.args[0],
+                                 command + ["list-panes", "-s", "-t", "=" + name + ":",
+                                            "-F", "#{session_name} #{pane_pid}"])
+
     def test_ps_rows_are_parsed_in_the_c_locale_and_bad_lines_are_skipped(self):
         commands = []
         rows = lp.table(lambda command: commands.append(command) or PS, uid=501)
@@ -84,7 +104,7 @@ class ExactCodexTest(unittest.TestCase):
         terminal = {"id": FIRST, "createdAt": opened}
         seen = {FIRST: {"program": "codex", "cwd": None, "sessionId": identifier, "pid": 31}}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
-                patch.object(lp, "describe", return_value=seen), patch.object(lp, "held_codex", return_value=None), \
+                patch.object(lp, "describe", return_value=seen), patch.object(lp, "held_program", return_value=None), \
                 patch.object(lp, "resumed_codex_source", wraps=lambda sid, at: lp.rollout_source(
                     self.home / ".codex-work/sessions/2026/10/21" / ("rollout-now-" + sid + ".jsonl"), self.home)):
             reply = lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST]
@@ -121,18 +141,18 @@ class ExactCodexTest(unittest.TestCase):
                 (21, 20, 2, "/vendor/codex"), (22, 21, 2, "/vendor/codex app-server"),
                 (23, 21, 2, "/vendor/codex app-server daemon"), (30, 21, 3, "bash -c tool"),
                 (31, 30, 3, "/vendor/codex"), (40, 1, 2, "/vendor/codex")]
-        done = subprocess.CompletedProcess([], 0, "10\n")
+        done = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\n")
         with patch("collector.which", return_value="/fixture/tmux"), patch.object(lp.subprocess, "run", return_value=done) as run, \
                 patch.object(lp, "writable_codex_source", return_value=self.native) as read:
-            self.assertEqual(lp.held_codex("sh-0123456789abcdef", rows),
+            self.assertEqual(lp.held_program("sh-0123456789abcdef", rows),
                              {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native})
             read.assert_called_once_with({20, 21, 22})
             self.assertIn("list-panes", run.call_args.args[0])
-            run.return_value = subprocess.CompletedProcess([], 0, "10\n40\n")
-            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
+            run.return_value = subprocess.CompletedProcess([], 0, "sh-0123456789abcdef 10\nsh-0123456789abcdef 40\n")
+            self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
             run.side_effect = subprocess.TimeoutExpired("tmux", 3)
-            self.assertIsNone(lp.held_codex("sh-0123456789abcdef", rows))
-            self.assertIsNone(lp.held_codex("../other", rows))
+            self.assertIsNone(lp.held_program("sh-0123456789abcdef", rows))
+            self.assertIsNone(lp.held_program("../other", rows))
 
     def test_an_ssh_destination_is_named_by_the_board_host_its_alias_reaches_here(self):
         machines = {"bk": "pc.example.ts.net", "beaulink": "pc.example.ts.net", "air15": "air15", "elsewhere": "elsewhere"}
@@ -154,7 +174,7 @@ class ExactCodexTest(unittest.TestCase):
         seen = {FIRST: {"program": "ssh", "cwd": None, "sshHost": "bk", "pid": 12}}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
                 patch.object(lp, "describe", side_effect=lambda *a: {k: dict(v) for k, v in seen.items()}), \
-                patch.object(lp, "held_codex", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get), \
+                patch.object(lp, "held_program", return_value=None), patch.object(lp, "ssh_hostname", side_effect=machines.get), \
                 patch("subprocess.run", side_effect=AssertionError("this host's real ssh settings were read")):
             reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"beaulink": "beaulink"}})
             self.assertEqual(reply["terminals"][FIRST]["sshHost"], "beaulink")
@@ -165,7 +185,7 @@ class ExactCodexTest(unittest.TestCase):
         terminal = {"id": FIRST, "createdAt": 1, "holdName": "sh-0123456789abcdef"}
         evidence = {"program": "codex", "pid": 20, "cwd": "/work/project", "nativeSource": self.native}
         with patch("launch.new_session", return_value={"argv": LAUNCHER}), \
-                patch.object(lp, "table", return_value=[]), patch.object(lp, "held_codex", return_value=evidence):
+                patch.object(lp, "table", return_value=[]), patch.object(lp, "held_program", return_value=evidence):
             self.assertEqual(lp.launcher_programs({"terminals": [terminal]})["terminals"][FIRST], evidence)
 
 
@@ -297,6 +317,51 @@ class ProgramTest(unittest.TestCase):
 
 
 class WorkflowTest(unittest.TestCase):
+    def test_claude_link_uses_the_unique_interactive_pid_on_the_launcher_host(self):
+        import collector
+        import server
+        from unittest.mock import Mock
+
+        sid = "019a0000-0000-7000-8000-000000000001"
+        raw = {"kind": "interactive", "sessionId": sid, "pid": 42, "cwd": "/work/project"}
+        host = {"name": "remote-mac", "local": False}
+        other = {"name": "laptop", "local": True}
+        rows = [{"id": FIRST, "createdAt": 100, "holdName": "sh-0123456789abcdef"}]
+        board = Mock(hosts=[other, host])
+        terminals = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            flow = server.Workflow(board, terminals, directory)
+            for name, listed, info, fresh, linked in (
+                ("match", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
+                ("worker id", [{**raw, "id": "worker-42"}], {"program": "claude", "pid": 42, "paneVerified": True}, True, True),
+                ("different pid", [{**raw, "pid": 41}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("duplicate", [raw, {**raw, "sessionId": sid[:-1] + "2"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("background", [{**raw, "kind": "background"}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("invalid sessionId", [{**raw, "sessionId": ""}], {"program": "claude", "paneVerified": True, "pid": 42}, True, False),
+                ("missing pid", [raw], {"program": "claude", "paneVerified": True}, True, False),
+                ("unverified pid", [raw], {"program": "claude", "pid": 42}, True, False),
+                ("no pane target", [raw], {"program": "claude", "pid": 42, "paneVerified": True}, True, False),
+                ("failed collection", [raw], {"program": "claude", "paneVerified": True, "pid": 42}, False, False),
+            ):
+                with self.subTest(name=name):
+                    board.state = {
+                        host["name"]: {"ok": True, "data": {
+                            "claude": [collector.claude_row(item, {}, []) for item in listed],
+                            "sourceStatus": {"claude": {"ok": fresh}}}},
+                        other["name"]: {"ok": True, "data": {"claude": [collector.claude_row(raw, {}, [])]}},
+                    }
+                    terminals.reset_mock()
+                    with patch.object(flow.transfers, "rpc", return_value={"terminals": {FIRST: info}}):
+                        flow._describe_host(host, [{"id": FIRST, "createdAt": 100}] if name == "no pane target" else rows)
+                    terminals.set_program.assert_called_once_with(FIRST, info)
+                    if linked:
+                        terminals.link_native.assert_called_once_with(FIRST, {
+                            "host": host["name"], "agent": "claude", "id": sid, "home": None,
+                            "cwd": raw["cwd"], "kind": "interactive", "sessionId": sid,
+                        }, confidence="exact")
+                    else:
+                        terminals.link_native.assert_not_called()
+
     def test_host_owned_exact_evidence_is_recorded_and_unconfirmed_holds_are_read_after_a_minute(self):
         import server
         from unittest.mock import Mock

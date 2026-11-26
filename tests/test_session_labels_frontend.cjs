@@ -1,12 +1,14 @@
 "use strict";
 
-// Only the standalone label module is loaded. All sessions and responses are synthetic.
+// Load the label module and the app's shared source selector with synthetic sessions.
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const moduleSource = fs.readFileSync(path.join(__dirname, "../web/session_labels.js"), "utf8");
+const app = fs.readFileSync(path.join(__dirname, "../web/app.js"), "utf8");
+const appSourceOf = vm.runInNewContext(app.slice(app.indexOf("function sourceOf("), app.indexOf("function accountOf(")) + "\nsourceOf");
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const settle = () => new Promise(setImmediate);
 function deferred() {
@@ -72,7 +74,7 @@ function client(transport = async () => { throw new Error("Unexpected fixture re
   labels.init({
     api: async (url, request) => { calls.push({ url, ...plain(request) }); return transport(url, request); },
     canEdit: options.canEdit || (() => true),
-    sourceOf: (s) => ({ host: s.host, agent: s.agent, id: s.id, ...(s.home ? { home: s.home } : {}) }),
+    sourceOf: appSourceOf,
     getAuthEpoch: () => authEpoch,
     onChanged: (record) => changed.push(plain(record)),
     openDialog: (dialog) => dialog.showModal(), toast: (message) => toasts.push(message),
