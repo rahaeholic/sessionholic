@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import stat
 import time
 import uuid
@@ -209,6 +210,9 @@ class ChatAppServer(native._DeadlineAppServer):
     def __init__(self, path, deadline):
         self.native_requests = []
         super().__init__(path, deadline)
+
+    def _io_timeout(self):
+        return native._remaining(self.deadline)
 
     def call(self, method, params):
         if method == "initialize":
@@ -562,7 +566,7 @@ class _Ledger:
         os.replace(str(temporary), str(self.path))
 
 
-def _send(client, identity, args, thread, home):
+def _send(client, identity, args, thread, home, deadline):
     request_id = _request(args.get("requestId"))
     if type(args.get("requireIdle", False)) is not bool:
         raise ValueError("작업 상태 조건을 확인해 주세요.")
@@ -623,6 +627,7 @@ def _send(client, identity, args, thread, home):
             chosen = next((row for row in _models(client) if row['model'] == options['model']), None)
             if chosen is None or options['effort'] not in chosen['efforts']:
                 return {**before, 'delivery': 'rejected', 'reason': '선택한 모델·에포트를 다시 확인해 주세요.'}
+        native._remaining(deadline)
         ledger.save({"digest": digest, "receipt": before, "attachments": manifest, "attachmentEvidence": evidence})
         acknowledged, turn_id = False, None
         try:
@@ -779,6 +784,16 @@ def handle(args, *, home=None, timeout=10):
     deadline = time.monotonic() + min(max(float(timeout), 0.05), 30)
     if identity["agent"] == "claude":
         return _claude(identity, action, home, deadline, args)
+    try:
+        return _codex(identity, action, home, deadline, args, request_ids)
+    except (TimeoutError, socket.timeout):
+        # Once a send is attempted, _send keeps the result in its receipt even on timeout.
+        reason = ("Codex 응답이 늦어 메시지를 보내지 않았습니다. 잠시 뒤 다시 보내 주세요."
+                  if action == "send" else native.DEADLINE_EXCEEDED)
+        raise TimeoutError(reason) from None
+
+
+def _codex(identity, action, home, deadline, args, request_ids):
     with _client(identity, home, deadline) as client:
         thread = _thread(client, identity)
         if action == 'command':
@@ -798,5 +813,5 @@ def handle(args, *, home=None, timeout=10):
             request_id = _request(args.get("requestId"))
             result.update(_read_receipt(identity, request_id, thread, home))
         elif action == "send":
-            result.update(_send(client, identity, args, thread, home))
+            result.update(_send(client, identity, args, thread, home, deadline))
         return result
