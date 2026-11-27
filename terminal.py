@@ -962,7 +962,9 @@ class TerminalManager:
             if pane and pane[3] != "0":
                 raise ClaudePaneUnavailable(CLAUDE_SYNC_UNAVAILABLE)
             program = pane_program(pane[1], table()) if pane else None
-            if program and program["program"] == "claude" and program["pid"] == pid:
+            # A PC Claude zz started over SSH: its pane runs that SSH connection, which ends with it.
+            expected = "ssh" if metadata.get("claudePaneProgram") == "ssh" else "claude"
+            if program and program["program"] == expected and program["pid"] == pid:
                 check = subprocess.run(["/bin/sh", "-c", CLAUDE_FOREGROUND, "sh", str(pid), pane[2]],
                                        stdin=subprocess.DEVNULL, capture_output=True, timeout=3)
                 if check.returncode == 0:
@@ -1165,7 +1167,7 @@ class TerminalManager:
         self._changed()
         return result
 
-    def link_native(self, terminal_id, native, confidence="exact", claude_pane=None):
+    def link_native(self, terminal_id, native, confidence="exact", claude_pane=None, claude_pane_program="claude"):
         """Exact host-owned evidence can correct a new launcher's estimate, never an exact binding."""
         with self.lock:
             if confidence not in ("exact", "estimated"):
@@ -1174,14 +1176,17 @@ class TerminalManager:
             previous = terminal.record["metadata"]
             correction = (confidence == "exact" and previous.get("linkConfidence") == "estimated"
                           and (previous.get("nativeSource") == native or previous.get("mode") == "new-session"
-                               and isinstance(native, dict) and native.get("host") == previous.get("host")))
+                               and isinstance(native, dict) and native.get("host") in (
+                                   previous.get("host"), previous.get("programHost") if claude_pane_program == "ssh" else None)))
             if claude_pane is not None:
                 from launcher_programs import PANE_ID
                 from session_recovery import same_claude_conversation
                 pane_id, pid = claude_pane
                 if (confidence != "exact" or previous.get("mode") != "new-session" or native.get("agent") != "claude"
                         or not isinstance(pane_id, str) or not PANE_ID.fullmatch(pane_id)
-                        or type(pid) is not int or pid <= 0):
+                        or type(pid) is not int or pid <= 0 or claude_pane_program not in ("claude", "ssh")
+                        or claude_pane_program == "ssh" and (previous.get("program") != "ssh"
+                                                             or native.get("host") != previous.get("programHost"))):
                     raise ValueError("Claude 창 연결 근거를 확인해 주세요.")
                 backfill = (previous.get("linkConfidence") == "exact" and not previous.get("claudePaneId")
                             and same_claude_conversation(previous.get("nativeSource"), native))
@@ -1193,7 +1198,8 @@ class TerminalManager:
                 return False
             metadata = {**previous, "nativeSource": native, "linkConfidence": confidence}
             if claude_pane is not None:
-                metadata.update(claudePaneId=pane_id, claudePanePid=pid)
+                metadata.update(claudePaneId=pane_id, claudePanePid=pid,
+                                claudePaneProgram="ssh" if claude_pane_program == "ssh" else None)
             metadata = _metadata(metadata)
             terminal.record["metadata"] = metadata
             try:
@@ -1365,6 +1371,8 @@ class TerminalManager:
         # The host an SSH run went to (its destination as typed), so its session is looked for there.
         ssh_host = info.get("sshHost") if program == "ssh" else None
         ssh_host = ssh_host if isinstance(ssh_host, str) and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}", ssh_host) else None
+        ssh_session = info.get("claudeSessionId") if ssh_host else None
+        ssh_session = ssh_session if isinstance(ssh_session, str) and re.fullmatch(r"[0-9a-f-]{36}", ssh_session) else None
         # Its host named its launcher and nothing runs below it: the launcher's menu still waits.
         menu = program is None and info.get("launcher") is True
         with self.lock:
@@ -1373,7 +1381,7 @@ class TerminalManager:
                 return False
             previous = terminal.record["metadata"]
             terminal.record["metadata"] = _metadata({**previous, "program": program, "programCwd": cwd,
-                                                     "programHost": ssh_host,
+                                                     "programHost": ssh_host, "programSessionId": ssh_session,
                                                      "programMenu": menu, "programAt": int(time.time())})
             try:
                 self._save()

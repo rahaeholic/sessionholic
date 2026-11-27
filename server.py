@@ -2025,6 +2025,7 @@ class Workflow:
             seen = terminal.get("programAt")
             program = terminal.get("program")
             confirming = (program == "claude" and not terminal.get("claudePaneId")
+                          or program == "ssh" and terminal.get("programSessionId") and not terminal.get("claudePaneId")
                           or program == "codex" and terminal.get("linkConfidence") != "exact"
                           and terminal.get("holdName"))
             if type(seen) is int and now - seen < (self.PROGRAM_STALE if terminal.get("program") and not confirming else self.PROGRAM_REFRESH):
@@ -2088,6 +2089,19 @@ class Workflow:
                                 if native is not None:
                                     self.terminals.link_native(identifier, native, confidence="exact",
                                                                claude_pane=(pane_id, pid))
+                        elif (info.get("program") == "ssh" and info.get("paneVerified") is True
+                              and identifier in pane_targets and isinstance(info.get("sshHost"), str)):
+                            # zz started this PC Claude with a conversation ID of its own: the PC's
+                            # listed row with that ID is the run this pane's SSH connection carries.
+                            from launcher_programs import PANE_ID
+                            pane_id, pid = info.get("paneId"), info.get("pid")
+                            target = pane_targets[identifier]
+                            if (isinstance(pane_id, str) and PANE_ID.fullmatch(pane_id) and not target.get("holdName")
+                                    and target.get("paneId") == pane_id):
+                                native = self._launcher_claude_session(info["sshHost"], info.get("claudeSessionId"))
+                                if native is not None:
+                                    self.terminals.link_native(identifier, native, confidence="exact",
+                                                               claude_pane=(pane_id, pid), claude_pane_program="ssh")
                     except (RuntimeError, OSError, ValueError, KeyError):
                         continue
         except (RuntimeError, OSError, ValueError, KeyError, AttributeError):
@@ -2095,6 +2109,20 @@ class Workflow:
         finally:
             with self.program_lock:
                 self.program_busy.discard(host["name"])
+
+    def _launcher_claude_session(self, host, session_id):
+        if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
+            return None
+        status = self.board.state.get(host) or {}
+        data = status.get("data") or {}
+        if not status.get("ok") or ((data.get("sourceStatus") or {}).get("claude") or {}).get("ok") is False:
+            return None
+        matches = [row for row in data.get("claude") or [] if row.get("kind") == "interactive"
+                   and row.get("sessionId") == session_id]
+        if len(matches) == 1:
+            row = matches[0]
+            return self._native_of(host, "claude", {**row, "id": row["sessionId"]})
+        return None
 
     def _launcher_claude_source(self, host, pid):
         if type(pid) is not int or pid <= 0:

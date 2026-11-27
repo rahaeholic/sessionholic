@@ -297,6 +297,33 @@ class ProgramTest(unittest.TestCase):
         # No launcher named: no claim either way.
         self.assertEqual(lp.describe([terminal], LAUNCHER, []), {FIRST: {"program": None}})
 
+    def test_zz_pc_claude_launch_names_its_conversation(self):
+        import base64
+        sid = "019a0000-0000-4000-8000-0000000000aa"
+        def command(data):
+            payload = base64.b64encode(json.dumps(data).encode()).decode()
+            return ("ssh -t -o BatchMode=yes -o ConnectTimeout=10 beaulink python.exe "
+                    "C:/Users/example/Projects/agent-config/scripts/windows/start-project.py --payload "
+                    + payload + "; exit $LASTEXITCODE")
+        claude = {"project": "example-project", "agent": "CLAUDE", "args": ["--dangerously-skip-permissions", "--session-id", sid]}
+        self.assertEqual(lp.program_of(command(claude))["claudeSessionId"], sid)
+        for other in ({**claude, "agent": "CODEX"}, {**claude, "args": ["--dangerously-skip-permissions"]},
+                      {**claude, "args": ["--session-id", sid.upper()]}, {**claude, "args": ["--session-id"]},
+                      {**claude, "args": ["--session-id", sid, "--session-id", sid]}):
+            self.assertNotIn("claudeSessionId", lp.program_of(command(other)))
+        self.assertNotIn("claudeSessionId", lp.program_of("ssh -t beaulink cmd --payload !!notbase64!!"))
+        # The pane's own SSH run keeps its conversation, named by the board host it reaches.
+        terminal = {"id": FIRST, "createdAt": 1, "paneId": "%3", "panePid": 10}
+        seen = {"program": "ssh", "cwd": None, "sshHost": "bk", "claudeSessionId": sid, "pid": 12, "paneVerified": True}
+        with patch("launch.new_session", return_value={"argv": LAUNCHER}), patch.object(lp, "table", return_value=[]), \
+                patch.object(lp, "describe", return_value={FIRST: {"program": "ssh", "cwd": None, "sshHost": "bk", "pid": 12}}), \
+                patch.object(lp, "pane_program", return_value=dict(seen)), \
+                patch.object(lp, "ssh_hostname", side_effect={"bk": "pc.example", "beaulink": "pc.example"}.get):
+            reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"beaulink": "beaulink"}})["terminals"][FIRST]
+            self.assertEqual((reply["sshHost"], reply["claudeSessionId"], reply["paneId"], reply["pid"]), ("beaulink", sid, "%3", 12))
+            reply = lp.launcher_programs({"terminals": [terminal], "sshHosts": {"air15": "air15"}})["terminals"][FIRST]
+            self.assertNotIn("claudeSessionId", reply)
+
     def test_ssh_destination_requires_allowlisted_options_before_it(self):
         for key, value in (("BatchMode", "yes"), ("ConnectTimeout", "10"),
                            ("ServerAliveInterval", "30"), ("ServerAliveCountMax", "3"),
@@ -365,6 +392,47 @@ class WorkflowTest(unittest.TestCase):
                             "host": host["name"], "agent": "claude", "id": sid, "home": None,
                             "cwd": raw["cwd"], "kind": "interactive", "sessionId": sid,
                         }, confidence="exact", claude_pane=("%7", 42))
+                    else:
+                        terminals.link_native.assert_not_called()
+
+    def test_pc_claude_over_ssh_links_by_the_conversation_zz_named(self):
+        import collector
+        import server
+        from unittest.mock import Mock
+
+        sid = "019a0000-0000-4000-8000-0000000000aa"
+        raw = {"kind": "interactive", "sessionId": sid, "pid": 7000, "cwd": "C:\\Users\\example\\Projects\\project"}
+        local = {"name": "air15", "local": True}
+        rows = [{"id": FIRST, "createdAt": 100, "paneId": "%4", "panePid": 10}]
+        board = Mock(hosts=[local, {"name": "beaulink", "platform": "windows"}])
+        terminals = Mock()
+        terminals.launcher_pane.return_value = ("%4", 10)
+        info = {"program": "ssh", "cwd": None, "sshHost": "beaulink", "claudeSessionId": sid, "pid": 12,
+                "paneVerified": True, "paneId": "%4"}
+        with tempfile.TemporaryDirectory() as directory:
+            flow = server.Workflow(board, terminals, directory)
+            for name, listed, reply, fresh, linked in (
+                ("match", [raw], info, True, True),
+                ("other conversation", [{**raw, "sessionId": sid[:-1] + "b"}], info, True, False),
+                ("two rows", [raw, {**raw, "pid": 7001}], info, True, False),
+                ("background", [{**raw, "kind": "background"}], info, True, False),
+                ("no conversation named", [raw], {k: v for k, v in info.items() if k != "claudeSessionId"}, True, False),
+                ("other pane", [raw], {**info, "paneId": "%5"}, True, False),
+                ("unverified", [raw], {**info, "paneVerified": False}, True, False),
+                ("failed collection", [raw], info, False, False),
+            ):
+                with self.subTest(name=name):
+                    board.state = {"beaulink": {"ok": True, "data": {
+                        "claude": [collector.claude_row(item, {}, []) for item in listed],
+                        "sourceStatus": {"claude": {"ok": fresh}}}}, "air15": {"ok": True, "data": {}}}
+                    terminals.reset_mock()
+                    with patch.object(flow.transfers, "rpc", return_value={"terminals": {FIRST: reply}}):
+                        flow._describe_host(local, [{"id": FIRST, "createdAt": 100}])
+                    if linked:
+                        terminals.link_native.assert_called_once_with(FIRST, {
+                            "host": "beaulink", "agent": "claude", "id": sid, "home": None, "cwd": raw["cwd"],
+                            "kind": "interactive", "sessionId": sid}, confidence="exact", claude_pane=("%4", 12),
+                            claude_pane_program="ssh")
                     else:
                         terminals.link_native.assert_not_called()
 
