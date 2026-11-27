@@ -13420,6 +13420,12 @@ function isInteractiveClaudeLauncher(info) {
   const source = info.nativeSource;
   return info.mode === "new-session" && source?.agent === "claude" && source.kind === "interactive";
 }
+// The input bar pastes into the verified Claude pane only when the board confirmed the link
+// (the server requires exact). A link guessed from start times (estimated), e.g. a PC Claude
+// started over SSH before its exact link, takes the bar like typed keys into the open terminal.
+function pinnedClaudeTerminal(info) {
+  return isInteractiveClaudeLauncher(info) && info.linkConfidence === "exact";
+}
 function listedLauncherClaude(terminal) {
   // The terminal carries the transcript ID. Requests must use the collector's listed selector.
   const candidate = (row) => row.kind === "interactive" && !row.recoverySource && !row.nativeSource &&
@@ -14873,7 +14879,7 @@ async function sendTerminalCommand(text) {
   state.terminalScrollLines = 0;
   renderTerminalScroll();
   try {
-    if (isInteractiveClaudeLauncher(terminalInfo(state.terminal))) {
+    if (pinnedClaudeTerminal(terminalInfo(state.terminal))) {
       await sendInput(text, { claudePasteSubmit: true });
       return;
     }
@@ -15049,7 +15055,7 @@ async function pasteDraft(submit = false) {
         "초안에 제어 문자가 포함되어 있습니다. 일반 텍스트만 붙여넣을 수 있습니다.";
       return;
     }
-    const pinned = isInteractiveClaudeLauncher(terminalInfo(state.terminal));
+    const pinned = pinnedClaudeTerminal(terminalInfo(state.terminal));
     const bracketed = !!state.term?.modes?.bracketedPasteMode;
     if (/[\r\n]/.test(text) && !pinned && !bracketed) {
       $("draft-note").textContent =
