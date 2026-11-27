@@ -2817,6 +2817,112 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(self.calls.count(('chat', 'read')), reads + 1)
         self.assertEqual(missing['status'], 'unknown')
 
+    def test_windows_restart_receipt_preserves_same_second_transcript_order(self):
+        from windows_collector import _claude_rows
+
+        self.chat.boot = ('a' * 16, 1700000000.125)
+        source = {**CLAUDE_REF, 'sessionId': CLAUDE_SID}
+        old = {'type': 'assistant', 'uuid': 'old', 'timestamp': '2023-11-14T22:13:19.750Z',
+               'message': {'content': '이전 응답'}}
+        origin = self.chat._restart_origin(source, _claude_rows([old]), '익명 입력')
+        self.assertIsNotNone(origin)
+        same_second_after_boot = {**old, 'timestamp': '2023-11-14T22:13:20.250Z'}
+        self.assertIsNone(self.chat._restart_origin(source, _claude_rows([same_second_after_boot]), '익명 입력'))
+        self.kind('interactive')
+        self.terminal(kind='interactive')
+        pairs = (
+            (1700000001.25, 1700000002000, 1700000003000),
+            (1700000004.25, 1700000004500, 1700000004750),
+        )
+        fixture_rpc = self.flow.transfers.rpc
+
+        def rpc(host, op, args, timeout):
+            result = fixture_rpc(host, op, args, timeout)
+            if args['action'] == 'capabilities':
+                return {**result, 'messages': _claude_rows([old])}
+            if expect_reply:
+                now[0] = 1700000006.0
+                return {**result, 'messages': _claude_rows(entries)}
+            return result
+
+        with patch.dict(self.board.hosts[0], platform='windows'), patch.object(self.flow.transfers, 'rpc', rpc):
+            for index, (sent, user_at, reply_at) in enumerate(pairs):
+                request_id = f'request-00{index:02}'
+                path = self.chat._claude_record_path(source, request_id, windows=True)
+                now = [sent]
+                entries = [old, {'type': 'user', 'uuid': 'user', 'timestamp': user_at,
+                                 'message': {'content': '익명 입력'}},
+                           {'type': 'assistant', 'uuid': 'reply', 'timestamp': reply_at,
+                            'message': {'content': '익명 답변'}}]
+                expect_reply = index == 0
+                with patch.object(chat.time, 'time', side_effect=lambda: now[0]):
+                    sent_receipt = self.send(rid=request_id, text='익명 입력')['receipt']
+                    self.assertIs(sent_receipt['responseObserved'], expect_reply)
+                    if expect_reply:
+                        receipt = sent_receipt
+                    else:
+                        expect_reply = True
+                        state = self.state(requestId=request_id)
+                        receipt = state['receipts'][0]
+                        messages = state['messages'][-2:]
+                        self.assertEqual([row['ts'] for row in messages], [user_at // 1000, reply_at // 1000])
+                        self.assertTrue(all('transcriptAt' not in row for row in messages))
+                self.assertTrue(receipt['readbackConfirmed'])
+                self.assertTrue(receipt['responseObserved'])
+                record = json.loads(path.read_text())
+                proof = record['boardRestart']
+                self.assertEqual((proof['userAt'], proof['replyAt']), (user_at / 1000, reply_at / 1000))
+        self.assertEqual(len(self.terms.pastes), 2)
+        record['boardRestart'] = origin
+
+        queue = {'type': 'attachment', 'uuid': 'queued', 'timestamp': 1700000004500,
+                 'attachment': {'type': 'queued_command', 'origin': {'kind': 'human'}, 'prompt': '익명 입력'}}
+        early_user = {**entries[1], 'timestamp': 1700000004125}
+        same_time_reply = {**entries[2], 'timestamp': entries[1]['timestamp']}
+        cases = ([early_user, entries[2]], [entries[1], same_time_reply, entries[2]], [queue, entries[2]],
+                 [entries[1], {**queue, 'attachment': {**queue['attachment'], 'prompt': '다른 입력'}}, entries[2]])
+        for transcript in cases:
+            with patch.object(chat.time, 'time', return_value=1700000006.0):
+                self.assertFalse(self.chat._record_restart_reply(record, source, _claude_rows(transcript)))
+
+    def test_windows_restart_receipt_uses_full_collector_fingerprint(self):
+        from windows_collector import _claude_messages
+
+        self.chat.boot = ('a' * 16, 1700000000.125)
+        self.kind('interactive')
+        self.terminal(kind='interactive')
+        source = {**CLAUDE_REF, 'sessionId': CLAUDE_SID}
+        text = '가' * 3997 + '나  다'
+        old = {'type': 'assistant', 'uuid': 'old', 'timestamp': 1700000000000,
+               'message': {'content': '이전 응답'}}
+        user = {'type': 'user', 'uuid': 'user', 'timestamp': 1700000001500,
+                'message': {'content': f'<pasted_content>{text}</pasted_content>'}}
+        other = {**user, 'uuid': 'other', 'message': {'content': text[:-1] + '라'}}
+        reply = {'type': 'assistant', 'uuid': 'reply', 'timestamp': 1700000001750,
+                 'message': {'content': '익명 답변'}}
+        fixture_rpc = self.flow.transfers.rpc
+
+        def rpc(host, op, args, timeout):
+            result = fixture_rpc(host, op, args, timeout)
+            if args['action'] == 'capabilities':
+                return {**result, 'messages': _claude_messages([old])}
+            now[0] = 1700000002.0
+            return {**result, 'messages': _claude_messages(entries)}
+
+        cases = (([old, user, reply], True), ([old, other, reply], False), ([old, user, other, reply], False))
+        with patch.dict(self.board.hosts[0], platform='windows'), patch.object(self.flow.transfers, 'rpc', rpc):
+            for index, (entries, proven) in enumerate(cases):
+                with self.subTest(proven=proven, transcript=index):
+                    request_id = f'request-long-{index}'
+                    now = [1700000001.25]
+                    with patch.object(chat.time, 'time', side_effect=lambda: now[0]):
+                        self.send(rid=request_id, text=text)
+                    path = self.chat._claude_record_path(source, request_id, windows=True)
+                    proof = json.loads(path.read_text())['boardRestart']
+                    self.assertEqual('observedAt' in proof, proven)
+                    if proven:
+                        self.assertEqual(proof['inputHash'], _claude_messages(entries)[1]['bodyHash'])
+
     def test_receipt_readback_matches_collapsed_opening_text_of_new_user_message(self):
         self.terminal()
         long_tail = '가' * 300

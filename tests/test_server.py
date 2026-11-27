@@ -1089,6 +1089,8 @@ class HelperTest(unittest.TestCase):
     def test_open_flag_prints_one_time_login_link(self):
         class FakeServer:
             server_address = ("127.0.0.1", 8799)
+            boot_id = "boot-fixture"
+            boot_at = 1_700_000_000.0
             def __init__(self):
                 self.once, self.once_lock = ("", 0), threading.Lock()
                 self.workflow = SimpleNamespace(start_hold_sweep=lambda: None)

@@ -442,6 +442,7 @@ class Chat:
     def __init__(self, board, workflow, state_dir):
         self.board, self.workflow = board, workflow
         self.root = Path(state_dir) / 'chat'
+        self.boot = None
         self.lock = threading.RLock()
         self.cache = {}
         # state key -> (epoch seconds, the last view read from its host), shown read-only while
@@ -717,7 +718,12 @@ class Chat:
                                {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'})
             receipts.append(self.receipt(receipt, request_id))
         for message in messages:
-            if isinstance(message, dict) and isinstance(message.get('attachments'), list):
+            if not isinstance(message, dict):
+                continue
+            if windows and claude:
+                message.pop('transcriptAt', None)
+                message.pop('queuedPrompt', None)
+            if isinstance(message.get('attachments'), list):
                 from launch import scrub_text
                 message['attachments'] = [{**item, 'name': scrub_text(item['name'])}
                                           if isinstance(item, dict) and isinstance(item.get('name'), str) else item
@@ -1504,6 +1510,66 @@ class Chat:
         return hashlib.sha256(json.dumps([message.get('messageId'), message.get('ts')]).encode()).hexdigest()
 
     @staticmethod
+    def _conversation_uuid(source):
+        value = source.get('sessionId') or source.get('id')
+        try:
+            return value if isinstance(value, str) and str(uuid.UUID(value)) == value else None
+        except ValueError:
+            return None
+
+    def _restart_origin(self, source, messages, body):
+        if not self.boot or not (conversation := self._conversation_uuid(source)):
+            return None
+        boot_id, started = self.boot
+        previous = [row['transcriptAt'] for row in messages if isinstance(row, dict)
+                    and not row.get('queuedPrompt') and row.get('role') in ('user', 'assistant') and row.get('messageId')
+                    and type(row.get('transcriptAt')) in (int, float) and 0 < row['transcriptAt'] < started]
+        if previous:
+            return {'bootId': boot_id, 'platform': 'windows', 'conversationId': conversation,
+                    'previousAt': max(previous),
+                    'inputHash': hashlib.sha256(body.encode()).hexdigest()}
+        return None
+
+    def _record_restart_reply(self, record, source, messages):
+        proof = record.get('boardRestart')
+        if (not self.boot or not isinstance(proof, dict) or proof.get('bootId') != self.boot[0]
+                or proof.get('conversationId') != self._conversation_uuid(source)
+                or 'observedAt' in proof or not isinstance(record.get('priorMessages'), list)):
+            return False
+        observed = time.time()
+        now_input = None
+        pairs = []
+        matching_users = 0
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            at, role = message.get('transcriptAt'), message.get('role')
+            stamped = bool(message.get('messageId')) and type(at) in (float, int) and at <= observed
+            if role == 'user':
+                now_input = None
+                if not message.get('queuedPrompt') and stamped and record['sentAt'] <= at:
+                    # The collector hashes the full transcript body before clipping the display text.
+                    text = message.get('text')
+                    digest = message.get('bodyHash') if message.get('truncated') else (
+                        hashlib.sha256(text.encode()).hexdigest() if isinstance(text, str) else None)
+                    stamp = self._claude_message_stamp(message)
+                    if digest and digest == proof.get('inputHash') and stamp not in record['priorMessages']:
+                        now_input = at, stamp
+                        matching_users += 1
+            elif role == 'assistant' and now_input:
+                if stamped and now_input[0] < at:
+                    stamp = self._claude_message_stamp(message)
+                    if stamp != now_input[1]:
+                        pairs.append((*now_input, at, stamp))
+                now_input = None
+        if matching_users != 1 or len(pairs) != 1:
+            return False
+        user_at, user_stamp, reply_at, reply_stamp = pairs[0]
+        record['boardRestart'] = {**proof, 'userAt': user_at, 'userStamp': user_stamp,
+                                  'replyAt': reply_at, 'replyStamp': reply_stamp, 'observedAt': observed}
+        return True
+
+    @staticmethod
     def _pc_claude_receipt(receipt):
         receipt.setdefault('responseObserved', False)
         if not receipt.get('readbackConfirmed') and receipt.get('deliveryVerified') is not True:
@@ -1523,6 +1589,25 @@ class Chat:
         if evidence:
             receipt.pop('submitBlocked', None)
             self._apply_claude_evidence(receipt, evidence)
+        proof = record.get('boardRestart')
+        if (windows and evidence == 'reply' and self.boot and isinstance(proof, dict)
+                and proof.get('bootId') == self.boot[0] and 'observedAt' not in proof):
+            # Re-read under the send lock. A late read must never overwrite a concurrent send.
+            lock = self._claude_lock_for(source)
+            if lock.acquire(blocking=False):
+                try:
+                    latest = self._claude_read_record(source, request_id, windows)
+                    if latest and self._record_restart_reply(latest, source, messages):
+                        from server import private_json
+                        proof_receipt = dict(latest['receipt'])
+                        proof_receipt.pop('submitBlocked', None)
+                        self._apply_claude_evidence(proof_receipt, 'reply')
+                        private_json(self._claude_record_path(source, request_id, windows),
+                                     {**latest, 'receipt': proof_receipt})
+                except (OSError, ValueError):
+                    pass  # Runtime response is still useful. A later read can save the proof.
+                finally:
+                    lock.release()
         return receipt
 
     @staticmethod
@@ -1552,6 +1637,8 @@ class Chat:
                     return None
                 evidence = self._claude_evidence(record, result['messages'], result.get('queuedPrompts'))
                 if evidence:
+                    if evidence == 'reply':
+                        self._record_restart_reply(record, source, result['messages'])
                     return evidence
                 if not isinstance(result.get('queuedPrompts'), list):
                     return None
@@ -1727,6 +1814,9 @@ class Chat:
                       'probeLength': len(probe), 'wordsProbe': hashlib.sha256(words.encode()).hexdigest(),
                       'wordsLength': len(words), 'receipt': unknown}
             if windows:
+                if origin := self._restart_origin(source, current.get('messages') or [], body):
+                    base['source']['sessionId'] = origin['conversationId']
+                    record['boardRestart'] = origin
                 # Keep the stamps of matching entries already visible before this send.
                 record['priorMessages'] = [
                     self._claude_message_stamp(message)

@@ -5340,6 +5340,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     # Names this server process (and so its CSRF token): a client that sees another
     # bootId reads /api/capabilities again instead of sending a token from before a restart.
     server.boot_id = secrets.token_urlsafe(12)
+    server.boot_at = round(time.time(), 6)
     with board.runtime_observations.lock:
         board.runtime_observations.boot_id = server.boot_id
         board.runtime_observations.records.clear()
@@ -5381,6 +5382,7 @@ def make_server(bind, port, board, token, terminals=None, workflow=None, state_d
     server.woni_upload_gate = threading.BoundedSemaphore(2)
     from chat import Chat
     server.chat = Chat(board, server.workflow, state_dir)
+    server.chat.boot = (server.boot_id, server.boot_at)
     from batch_jobs import BatchJobs
     server.batch_jobs = BatchJobs(state_dir, server.chat)
     server.termination_jobs = TerminationJobs(state_dir, lambda job, initial: run_termination_job(server, job, initial))
@@ -5484,7 +5486,8 @@ def main(argv=None):
                         automatic_work=args.auto_work and not args.no_auto_work, push=not args.no_push,
                         work_list=args.auto_work and not args.no_auto_work, suggested_replies=config["suggestedReplies"])
     collecting = "화면을 열 때와 알림을 받는 기기가 있을 때 수집합니다." if not args.no_push else "화면을 열 때만 수집합니다."
-    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}", file=sys.stderr)
+    print(f"{LOG_PREFIX}: http://127.0.0.1:{args.port}/ · {collecting}"
+          f" · board-start {httpd.boot_id} {httpd.boot_at:.6f}", file=sys.stderr, flush=True)
     if args.open:
         print(issue_login_link(httpd), flush=True)
         print(f"표준 출력의 일회용 로그인 링크를 {ONCE_TTL // 60}분 안에 개인 브라우저에서 여세요. 한 번만 사용할 수 있습니다.",

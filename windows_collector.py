@@ -79,15 +79,17 @@ def _metadata(value, limit=160):
     return value if isinstance(value, str) and 0 < len(value) <= limit and not any(ord(c) < 32 for c in value) else None
 
 
-def _epoch(value):
+def _epoch(value, *, precise=False):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return int(value / 1000 if value > 100000000000 else value)
-    if isinstance(value, str):
+        seconds = value / 1000 if value > 100000000000 else value
+    elif isinstance(value, str):
         try:
-            return int(datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp())
+            seconds = datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
         except (ValueError, OverflowError):
-            pass
-    return None
+            return None
+    else:
+        return None
+    return seconds if precise else int(seconds)
 
 
 def _windows_path(path):
@@ -1842,7 +1844,8 @@ def _claude_rows(entries):
         message = entry.get('message')
         role = entry.get('type')
         content = _queued_prompt(entry) if role == 'attachment' else None
-        if content is not None:
+        from_queue = content is not None
+        if from_queue:
             role = 'user'
         elif role not in ('user', 'assistant') or not isinstance(message, dict):
             continue
@@ -1855,6 +1858,10 @@ def _claude_rows(entries):
             continue
         if content is None:
             content = message.get('content')
+        # Keep the existing display timestamp and receipt stamps stable.
+        evidence = {'transcriptAt': _epoch(ts, precise=True)}
+        if from_queue:
+            evidence['queuedPrompt'] = True
         blocks = [{'type': 'text', 'text': content}] if isinstance(content, str) else content
         attached = _native_attachments(blocks) if role == 'user' else []
         texts = [content] if isinstance(content, str) else [block['text'] for block in content if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)] if isinstance(content, list) else []
@@ -1866,11 +1873,12 @@ def _claude_rows(entries):
                     settings = _model_settings({'model': message.get('model'),
                                                 'reasoningEffort': entry.get('effort') or entry.get('perTurnEffort')})
                     extra.update({key: value for key, value in settings.items() if value})
-                result.append(_message(shown[0], shown[1], ts, messageId=uid, **extra))
+                result.append({**_message(shown[0], shown[1], ts, messageId=uid, **extra), **evidence})
         user_row = next((row for row in result[start:] if row['role'] == 'user'), None)
         if attached:
             if user_row is None:
-                user_row = _message('user', '[이미지 첨부]' if all(item['kind'] == 'image' for item in attached) else '[파일 첨부]', ts, messageId=uid)
+                label = '[이미지 첨부]' if all(item['kind'] == 'image' for item in attached) else '[파일 첨부]'
+                user_row = {**_message('user', label, ts, messageId=uid), **evidence}
                 result.append(user_row)
             user_row['attachments'] = attached
         if role == 'assistant':
