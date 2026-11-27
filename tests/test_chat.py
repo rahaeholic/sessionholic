@@ -9,6 +9,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1109,6 +1110,7 @@ class ChatHttpTest(ChatTest):
         import collector
         import launch
         import native_chat
+        import transfer
         from test_collector import FakeDaemon
         from test_native_chat import FakeClient
 
@@ -1158,6 +1160,33 @@ class ChatHttpTest(ChatTest):
                     receipt_key = native_chat._ledger_key(identity, 'slow-send-02')
                     receipt_dir = native_chat.ledger_root(folder) / 'chat-receipts'
                     self.assertEqual(list(receipt_dir.glob(receipt_key + '.*')), [])
+
+                    # Only the worker's first fsync is delayed, after bootstrap has installed it.
+                    marker = 'sys.argv=[str(path)];'
+                    delayed_fsync = (
+                        'original_fsync = os.fsync\n'
+                        'def delay_first_fsync(fd):\n'
+                        ' os.fsync = original_fsync\n'
+                        ' time.sleep(1.5)\n'
+                        ' original_fsync(fd)\n'
+                        'os.fsync = delay_first_fsync\n'
+                    )
+                    self.assertIn(marker, transfer.BOOTSTRAP)
+                    bootstrap = transfer.BOOTSTRAP.replace(marker, delayed_fsync + marker, 1)
+                    send = {'source': REF, 'requestId': 'slow-save-01', 'text': 'fixture'}
+                    daemon.delay = 9
+                    with patch.object(transfer, 'BOOTSTRAP', bootstrap):
+                        status, refused = self.post('/api/chat/send', send, timeout=25)
+                    self.assertEqual((status, refused.get('dispatchState')), (409, 'not_started'), refused)
+                    self.assertEqual(refused['error'], native_chat.SEND_DEADLINE_EXCEEDED)
+                    key = native_chat._ledger_key(identity, send['requestId'])
+                    record = json.loads((receipt_dir / (key + '.json')).read_text())
+                    self.assertTrue(record['notStarted'])
+                    self.assertEqual(record['receipt']['delivery'], 'rejected')
+
+                    # With a fresh budget, replay must still refuse without a second write.
+                    daemon.delay = 0
+                    self.assertEqual(self.post('/api/chat/send', send), (409, refused))
             finally:
                 release.set()
                 daemon.close()
@@ -3231,6 +3260,37 @@ class MenuDemoTmuxTest(unittest.TestCase):
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def test_managed_codex_launch_modes_keep_the_three_second_initialize_timeout(self):
+        import launch
+        from test_collector import FakeDaemon
+
+        methods = []
+
+        class SlowInitialize(FakeDaemon):
+            def answer(self, conn, message):
+                methods.append(message['method'])
+                if message['method'] == 'initialize':
+                    time.sleep(4)
+                super().answer(conn, message)
+
+        profile = {'agent': 'codex', 'home': '.codex'}
+        with tempfile.TemporaryDirectory(dir=Path('/tmp').resolve()) as folder:
+            home = Path(folder)
+            path = home / profile['home'] / launch.SOCKET_REL
+            path.parent.mkdir(parents=True)
+            with closing(SlowInitialize(path)):
+                for mode in ('profile', 'transfer', 'handoff'):
+                    with self.subTest(mode=mode):
+                        spec = {'mode': mode, 'argv': ['codex', 'fixture'], 'cwd': folder,
+                                'model': 'fixture-model', 'effort': 'high'}
+                        receipt = home / (mode + '.json')
+                        started = time.monotonic()
+                        with self.assertRaises(socket.timeout):
+                            managed_launch.bind(spec, profile, 'fixture', home=home, receipt_path=receipt)
+                        self.assertGreaterEqual(time.monotonic() - started, 2.8)
+                        self.assertFalse(receipt.exists())
+        self.assertEqual(methods, ['initialize'] * 3)
+
     def test_profile_permissions_are_confirmed_before_first_prompt_and_resume(self):
         class Client:
             def __init__(self, response): self.response, self.calls = response, []

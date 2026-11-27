@@ -64,6 +64,10 @@ def _remaining(deadline):
     return remaining
 
 
+class RequestNotSent(TimeoutError):
+    """The deadline check stopped a request before its socket write."""
+
+
 class _DeadlineAppServer(collector.AppServer):
     """Bound all socket IO and frame processing by one wall-clock deadline."""
     def __init__(self, path, deadline):
@@ -90,7 +94,13 @@ class _DeadlineAppServer(collector.AppServer):
         return super()._frame()
 
     def _send(self, opcode, data):
-        self._check()
+        try:
+            self._check()
+        except TimeoutError as error:
+            # A pong can be sent while a request is already awaiting its reply.
+            if opcode == 0x1:
+                raise RequestNotSent(str(error)) from None
+            raise
         return super()._send(opcode, data)
 
 

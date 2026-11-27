@@ -728,6 +728,22 @@ class NativeChatTests(unittest.TestCase):
         self.assertNotIn('fixture message', records[0].read_text())
         self.assertNotIn(str(self.cwd), records[0].read_text())
 
+    def test_deadline_before_readback_keeps_the_acknowledged_turn(self):
+        thread = self.thread()
+
+        def read(params):
+            if thread['turns']:
+                raise chat.native.RequestNotSent('readback request blocked by deadline')
+            return {'thread': thread}
+
+        client = FakeClient(thread, outcomes={'thread/read': read})
+        result = self.handle(client)
+        self.assertEqual((result['delivery'], result['acknowledged'], result['readbackConfirmed']),
+                         ('accepted', True, False))
+        clean = FakeClient(self.thread())
+        self.assertEqual(self.handle(clean)['delivery'], 'accepted')
+        self.assertEqual(self.writes(clean), [])
+
     def test_explicit_native_attachment_rejection_is_preserved_without_retry(self):
         error = chat.NativeRejected({'code': -32600, 'message': 'failed to prepare attachment: fixture private path'})
         client = FakeClient(self.thread(), outcomes={'turn/start': error})

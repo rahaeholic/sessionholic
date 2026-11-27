@@ -26,6 +26,7 @@ import transfer_native as native
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}\Z")
 KNOWN_TURN_STATUS = ("inProgress", "completed", "interrupted", "failed")
 NOT_STEERABLE = "현재 실행 중인 작업(/review·/compact 등)은 새 입력을 받을 수 없습니다. 끝난 뒤 다시 보내 주세요."
+SEND_DEADLINE_EXCEEDED = "Codex 응답이 늦어 메시지를 보내지 않았습니다. 잠시 뒤 다시 보내 주세요."
 FALLBACK = "승인·질문 응답과 지원되지 않는 입력은 원본 native 터미널에서 처리하세요."
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}\Z")
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
@@ -207,12 +208,15 @@ class NativeRejected(collector.RpcError):
 
 class ChatAppServer(native._DeadlineAppServer):
     """Experimental thread fields, retain only safe notification/request metadata."""
-    def __init__(self, path, deadline):
+    def __init__(self, path, deadline, *, wait_until_deadline=False):
         self.native_requests = []
+        self.wait_until_deadline = wait_until_deadline
         super().__init__(path, deadline)
 
     def _io_timeout(self):
-        return native._remaining(self.deadline)
+        if self.wait_until_deadline:
+            return native._remaining(self.deadline)
+        return super()._io_timeout()
 
     def call(self, method, params):
         if method == "initialize":
@@ -238,8 +242,8 @@ class ChatAppServer(native._DeadlineAppServer):
                 # Never answer permission/elicitation prompts from this observer.
 
 
-def _client(identity, home, deadline):
-    return ChatAppServer(native._socket_path(identity, home), deadline)
+def _client(identity, home, deadline, *, wait_until_deadline=False):
+    return ChatAppServer(native._socket_path(identity, home), deadline, wait_until_deadline=wait_until_deadline)
 
 
 def _thread(client, identity):
@@ -612,6 +616,8 @@ def _send(client, identity, args, thread, home, deadline):
         if before["confirmed"]:
             return before
         if prior:
+            if prior.get("notStarted") is True:
+                raise TimeoutError(SEND_DEADLINE_EXCEEDED)
             # An unknown result remains read-only even when native history lags.
             saved = prior.get("receipt") or {}
             return saved if saved.get("confirmed") or saved.get("delivery") == "rejected" else before
@@ -629,7 +635,7 @@ def _send(client, identity, args, thread, home, deadline):
                 return {**before, 'delivery': 'rejected', 'reason': '선택한 모델·에포트를 다시 확인해 주세요.'}
         native._remaining(deadline)
         ledger.save({"digest": digest, "receipt": before, "attachments": manifest, "attachmentEvidence": evidence})
-        acknowledged, turn_id = False, None
+        acknowledged, turn_id, not_started = False, None, False
         try:
             # turn/start begins a turn when idle and joins the active turn otherwise;
             # the native CLI decides when the model reads it. No board-side queue.
@@ -641,7 +647,10 @@ def _send(client, identity, args, thread, home, deadline):
             receipt.update(_state(after))
         except (OSError, ValueError, TimeoutError, collector.RpcError) as error:
             receipt = dict(before)
-            if isinstance(error, NativeRejected):
+            if isinstance(error, native.RequestNotSent) and not acknowledged:
+                not_started = True
+                receipt.update({"delivery": "rejected", "reason": SEND_DEADLINE_EXCEEDED})
+            elif isinstance(error, NativeRejected):
                 receipt.update({"nativeErrorCode": error.code, "nativeErrorCategory": error.category})
                 if not acknowledged and error.category == "notSteerable":
                     receipt.update({"delivery": "rejected", "reason": NOT_STEERABLE})
@@ -654,11 +663,16 @@ def _send(client, identity, args, thread, home, deadline):
         receipt["fallback"] = FALLBACK
         if manifest:
             receipt["attachments"] = manifest
+        record = {"digest": digest, "receipt": receipt, "attachments": manifest, "attachmentEvidence": evidence}
+        if not_started:
+            record["notStarted"] = True
         try:
-            ledger.save({"digest": digest, "receipt": receipt, "attachments": manifest, "attachmentEvidence": evidence})
+            ledger.save(record)
         except (OSError, ValueError):
-            # Input already crossed the native boundary; never report it as a pre-send failure.
+            # Preserve the result of the send attempt even if writing it fails.
             receipt["ledgerPending"] = True
+        if not_started:
+            raise TimeoutError(SEND_DEADLINE_EXCEEDED)
         return receipt
 
 
@@ -787,14 +801,13 @@ def handle(args, *, home=None, timeout=10):
     try:
         return _codex(identity, action, home, deadline, args, request_ids)
     except (TimeoutError, socket.timeout):
-        # Once a send is attempted, _send keeps the result in its receipt even on timeout.
-        reason = ("Codex 응답이 늦어 메시지를 보내지 않았습니다. 잠시 뒤 다시 보내 주세요."
-                  if action == "send" else native.DEADLINE_EXCEEDED)
+        # _send handles timeouts after a possible socket write within its receipt.
+        reason = SEND_DEADLINE_EXCEEDED if action == "send" else native.DEADLINE_EXCEEDED
         raise TimeoutError(reason) from None
 
 
 def _codex(identity, action, home, deadline, args, request_ids):
-    with _client(identity, home, deadline) as client:
+    with _client(identity, home, deadline, wait_until_deadline=action in ("send", "read", "capabilities")) as client:
         thread = _thread(client, identity)
         if action == 'command':
             return _codex_command(client, identity, args, thread, home)
