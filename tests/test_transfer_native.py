@@ -150,6 +150,21 @@ class TransferNativeTest(unittest.TestCase):
                          ("initialize", {"clientInfo": {"name": "fixture"}, "capabilities": {"experimentalApi": True}}))
         self.assertEqual(call.call_args_list[1].args, ("thread/read", {"threadId": self.source["id"]}))
 
+    def test_deadline_marks_only_a_request_stopped_before_the_socket_write(self):
+        client = object.__new__(native._DeadlineAppServer)
+        with patch.object(client, "_check", side_effect=TimeoutError()), \
+             patch.object(collector.AppServer, "_send") as write:
+            with self.assertRaises(native.RequestNotSent):
+                client._send(0x1, b"request")
+            with self.assertRaises(TimeoutError) as pong:
+                client._send(0xA, b"pong")
+            self.assertNotIsInstance(pong.exception, native.RequestNotSent)
+            write.assert_not_called()
+        with patch.object(client, "_check"), patch.object(collector.AppServer, "_send", side_effect=socket.timeout()):
+            with self.assertRaises(socket.timeout) as during_write:
+                client._send(0x1, b"request")
+            self.assertNotIsInstance(during_write.exception, native.RequestNotSent)
+
     def test_interrupt_exact_active_turn_then_confirm_native_completion(self):
         active = [{"id": "exact-turn", "status": "inProgress"}]
         ended = [{"id": "exact-turn", "status": "interrupted"}]

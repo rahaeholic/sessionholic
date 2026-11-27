@@ -1128,7 +1128,7 @@ class RemoteHandoffHome(unittest.TestCase):
                         # The native client and daemon are fixtures here. The real
                         # listening/refused socket distinction is tested in test_offline_codex.
                         patch('collector.daemon_socket_state', return_value='ready'),
-                        patch('native_chat._client', side_effect=lambda *a: Native())):
+                        patch('native_chat._client', side_effect=lambda *a, **kw: Native())):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.handoffs = self.home / '.local/state/sessionholic-transfers/handoffs'

@@ -137,7 +137,7 @@ def bind(spec, profile, host, *, home=None, receipt_path=None):
                 raise ValueError('미확인 실행 대상이 다릅니다. 원래 실행 기록을 확인해 주세요.')
             return _resume(spec, native, socket, receipt_path)
     request_id = 'handoff-' + uuid.uuid4().hex
-    with _client(selector, home, time.monotonic() + 15) as client:
+    with _client(selector, home, time.monotonic() + 15, wait_until_deadline=False) as client:
         # legacy is supported by both installed versions and the existing reader.
         params = {'cwd': spec['cwd'], 'historyMode': 'legacy'}
         if spec.get('mode') == 'profile':

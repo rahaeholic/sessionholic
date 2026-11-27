@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -706,8 +707,15 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(self.handle(again, {**self.args, 'mode': 'queue'})['delivery'], 'accepted')
         self.assertEqual(self.writes(again), [])
 
+    def test_codex_read_and_capabilities_report_the_helper_deadline(self):
+        for action in ('read', 'capabilities'):
+            with self.subTest(action=action), patch.object(chat, '_client', side_effect=socket.timeout('timed out')):
+                with self.assertRaises(TimeoutError) as caught:
+                    chat.handle({'action': action, 'source': self.source}, home=self.home)
+                self.assertEqual(str(caught.exception), chat.native.DEADLINE_EXCEEDED)
+
     def test_unknown_delivery_stays_read_only_on_repeated_request(self):
-        client = FakeClient(self.thread(), outcomes={'turn/start': TimeoutError()})
+        client = FakeClient(self.thread(), outcomes={'turn/start': socket.timeout('timed out')})
         first = self.handle(client)
         self.assertEqual(first['delivery'], 'unknown')
         self.assertFalse(first['canRetry'])
@@ -719,6 +727,22 @@ class NativeChatTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertNotIn('fixture message', records[0].read_text())
         self.assertNotIn(str(self.cwd), records[0].read_text())
+
+    def test_deadline_before_readback_keeps_the_acknowledged_turn(self):
+        thread = self.thread()
+
+        def read(params):
+            if thread['turns']:
+                raise chat.native.RequestNotSent('readback request blocked by deadline')
+            return {'thread': thread}
+
+        client = FakeClient(thread, outcomes={'thread/read': read})
+        result = self.handle(client)
+        self.assertEqual((result['delivery'], result['acknowledged'], result['readbackConfirmed']),
+                         ('accepted', True, False))
+        clean = FakeClient(self.thread())
+        self.assertEqual(self.handle(clean)['delivery'], 'accepted')
+        self.assertEqual(self.writes(clean), [])
 
     def test_explicit_native_attachment_rejection_is_preserved_without_retry(self):
         error = chat.NativeRejected({'code': -32600, 'message': 'failed to prepare attachment: fixture private path'})

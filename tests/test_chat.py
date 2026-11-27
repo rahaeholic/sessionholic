@@ -9,6 +9,7 @@ import secrets
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1099,11 +1100,98 @@ class ChatHttpTest(ChatTest):
         self.assertEqual(code, 400)
         self.assertIn('작업 폴더', json.loads(body)['error'])
         self.assertNotIn('20MiB', json.loads(body)['error'])
-    def post(self, path, body):
-        c=http.client.HTTPConnection('127.0.0.1',self.port,timeout=5)
-        c.request('POST',path,json.dumps(body),{'Content-Type':'application/json','Authorization':'Bearer synthetic',
-                                                 'X-CSRF-Token':self.httpd.csrf})
-        r=c.getresponse(); data=json.loads(r.read()); c.close(); return r.status,data
+    def post(self, path, body, timeout=5):
+        with closing(http.client.HTTPConnection('127.0.0.1', self.port, timeout=timeout)) as conn:
+            conn.request('POST', path, json.dumps(body), {'Content-Type': 'application/json',
+                         'Authorization': 'Bearer synthetic', 'X-CSRF-Token': self.httpd.csrf})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+    def test_codex_chat_waits_for_a_slow_daemon_and_reports_expiry_before_dispatch(self):
+        import collector
+        import launch
+        import native_chat
+        import transfer
+        from test_collector import FakeDaemon
+        from test_native_chat import FakeClient
+
+        client = FakeClient({'id': SID, 'cwd': str(self.project), 'turns': [], 'status': {'type': 'idle'},
+                             'canAcceptDirectInput': True, 'source': 'cli'})
+        release = threading.Event()
+
+        class SlowDaemon(FakeDaemon):
+            delay = 4
+
+            def answer(self, conn, message):
+                method, params = message['method'], message['params']
+                if method == 'initialize':
+                    return super().answer(conn, message)
+                if method == 'thread/read' and not client.thread['turns']:
+                    release.wait(self.delay)
+                self.send(conn, {'id': message['id'], 'result': client.call(method, params)})
+
+        fixture_parent = Path('/tmp').resolve()
+        with tempfile.TemporaryDirectory(dir=fixture_parent) as folder:
+            socket_path = Path(folder) / REF['home'] / launch.SOCKET_REL
+            socket_path.parent.mkdir(parents=True)
+            daemon = SlowDaemon(socket_path)
+            transfers = self.flow.transfers
+            try:
+                env = {**collector.tool_env(), 'HOME': folder}
+                with patch.object(collector, 'tool_env', return_value=env), \
+                     patch.object(transfers, 'rpc', type(transfers).rpc.__get__(transfers)):
+                    status, state = self.post('/api/chat/state', {'source': REF}, timeout=25)
+                    self.assertEqual((status, state.get('phase')), (200, 'idle'), state)
+                    status, sent = self.post('/api/chat/send', {'source': REF, 'requestId': 'slow-send-01',
+                                                               'text': 'fixture'}, timeout=25)
+                    self.assertEqual((status, sent.get('status')), (200, 'accepted'), sent)
+                    self.assertTrue(sent['receipt']['readbackConfirmed'])
+
+                    client.thread['turns'].clear()
+                    client.thread['status'] = {'type': 'idle'}
+                    daemon.delay = 15
+                    started = time.monotonic()
+                    status, refused = self.post('/api/chat/send', {'source': REF, 'requestId': 'slow-send-02',
+                                                                  'text': 'fixture'}, timeout=25)
+                    self.assertGreaterEqual(time.monotonic() - started, 9.5)
+                    self.assertEqual((status, refused.get('dispatchState')), (409, 'not_started'), refused)
+                    self.assertIn('Codex 응답이 늦어 메시지를 보내지 않았습니다', refused['error'])
+                    self.assertNotIn('timed out', refused['error'])
+                    identity = native_chat.native._identity(REF)
+                    receipt_key = native_chat._ledger_key(identity, 'slow-send-02')
+                    receipt_dir = native_chat.ledger_root(folder) / 'chat-receipts'
+                    self.assertEqual(list(receipt_dir.glob(receipt_key + '.*')), [])
+
+                    # Only the worker's first fsync is delayed, after bootstrap has installed it.
+                    marker = 'sys.argv=[str(path)];'
+                    delayed_fsync = (
+                        'original_fsync = os.fsync\n'
+                        'def delay_first_fsync(fd):\n'
+                        ' os.fsync = original_fsync\n'
+                        ' time.sleep(1.5)\n'
+                        ' original_fsync(fd)\n'
+                        'os.fsync = delay_first_fsync\n'
+                    )
+                    self.assertIn(marker, transfer.BOOTSTRAP)
+                    bootstrap = transfer.BOOTSTRAP.replace(marker, delayed_fsync + marker, 1)
+                    send = {'source': REF, 'requestId': 'slow-save-01', 'text': 'fixture'}
+                    daemon.delay = 9
+                    with patch.object(transfer, 'BOOTSTRAP', bootstrap):
+                        status, refused = self.post('/api/chat/send', send, timeout=25)
+                    self.assertEqual((status, refused.get('dispatchState')), (409, 'not_started'), refused)
+                    self.assertEqual(refused['error'], native_chat.SEND_DEADLINE_EXCEEDED)
+                    key = native_chat._ledger_key(identity, send['requestId'])
+                    record = json.loads((receipt_dir / (key + '.json')).read_text())
+                    self.assertTrue(record['notStarted'])
+                    self.assertEqual(record['receipt']['delivery'], 'rejected')
+
+                    # With a fresh budget, replay must still refuse without a second write.
+                    daemon.delay = 0
+                    self.assertEqual(self.post('/api/chat/send', send), (409, refused))
+            finally:
+                release.set()
+                daemon.close()
+        self.assertEqual(sum(method == 'turn/start' for method, _ in client.calls), 1)
+
     def test_terminal_attachment_input_requires_a_verified_claude_pane_and_deduplicates_submit(self):
         path = '/api/terminal/' + TERMINAL_ID + '/input'
         body = {'requestId': 'attachment-paste-01', 'text': '첨부 파일: "/fixture/file.txt"',
@@ -3217,6 +3305,37 @@ class MenuDemoTmuxTest(unittest.TestCase):
 
 
 class ManagedLaunchTest(unittest.TestCase):
+    def test_managed_codex_launch_modes_keep_the_three_second_initialize_timeout(self):
+        import launch
+        from test_collector import FakeDaemon
+
+        methods = []
+
+        class SlowInitialize(FakeDaemon):
+            def answer(self, conn, message):
+                methods.append(message['method'])
+                if message['method'] == 'initialize':
+                    time.sleep(4)
+                super().answer(conn, message)
+
+        profile = {'agent': 'codex', 'home': '.codex'}
+        with tempfile.TemporaryDirectory(dir=Path('/tmp').resolve()) as folder:
+            home = Path(folder)
+            path = home / profile['home'] / launch.SOCKET_REL
+            path.parent.mkdir(parents=True)
+            with closing(SlowInitialize(path)):
+                for mode in ('profile', 'transfer', 'handoff'):
+                    with self.subTest(mode=mode):
+                        spec = {'mode': mode, 'argv': ['codex', 'fixture'], 'cwd': folder,
+                                'model': 'fixture-model', 'effort': 'high'}
+                        receipt = home / (mode + '.json')
+                        started = time.monotonic()
+                        with self.assertRaises(socket.timeout):
+                            managed_launch.bind(spec, profile, 'fixture', home=home, receipt_path=receipt)
+                        self.assertGreaterEqual(time.monotonic() - started, 2.8)
+                        self.assertFalse(receipt.exists())
+        self.assertEqual(methods, ['initialize'] * 3)
+
     def test_profile_permissions_are_confirmed_before_first_prompt_and_resume(self):
         class Client:
             def __init__(self, response): self.response, self.calls = response, []
