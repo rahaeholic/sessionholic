@@ -17073,6 +17073,27 @@ test('Claude 새 세션의 터미널 초안은 첨부 유무와 관계없이 서
   }
 });
 
+test('추정 연결된 Claude 터미널(PC ssh 등)의 초안은 Claude 창 고정 없이 입력처럼 터미널에 보낸다', async () => {
+  for (const submit of [true, false]) {
+    const inputs = [];
+    const c = terminalFilesClient(async (url, options) => {
+      inputs.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    });
+    Object.assign(c.state.terminal, { mode: 'new-session', linkConfidence: 'estimated', program: 'ssh',
+      nativeSource: { host: 'beaulink', agent: 'claude', id: 'native-fixture', kind: 'interactive' } });
+    c.state.term.modes.bracketedPasteMode = true;
+    c.get('terminal-draft').value = 'pdf도 만들어 줘';
+    await c.pasteDraft(submit);
+    assert.equal(inputs[0].claudePasteSubmit, undefined);
+    assert.equal(inputs[0].directKeys, undefined);
+    assert.equal(inputs[0].text, '\x1b[200~pdf도 만들어 줘\x1b[201~');
+    assert.equal(inputs.length, submit ? 2 : 1);
+    if (submit) assert.equal(inputs[1].text, '\r');
+    assert.equal(c.get('terminal-draft').value, '');
+  }
+});
+
 test('연결 갱신 전 Claude 초안 거절 뒤에도 직접 터미널 키는 구분해서 보낸다', async () => {
   const inputs = [];
   const c = terminalFilesClient(async (url, options) => {
