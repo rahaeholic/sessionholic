@@ -7,6 +7,7 @@ when another program is recognized below it.
 Only `ps` is read; nothing is signalled. A terminal whose launcher cannot
 be named exactly (none, or two within the window) reports no program rather than a guess.
 """
+import base64
 import itertools
 import json
 import os
@@ -106,6 +107,10 @@ def program_of(command):
                 # starts the remote command, whose remaining arguments do not matter.
                 if SSH_NAME.fullmatch(host) and not next(words, "").startswith("-"):
                     found["sshHost"] = host
+                    # zz's PC launch names the Claude conversation it starts (--session-id in its payload).
+                    session = remote_claude_session(command)
+                    if session:
+                        found["claudeSessionId"] = session
                 break
             if word.startswith("-o"):
                 option = word[2:] or next(words, "")
@@ -116,6 +121,29 @@ def program_of(command):
                 return found
         return found
     return None
+
+
+REMOTE_PAYLOAD = re.compile(r"\s--payload\s+([A-Za-z0-9+/]{8,8192}={0,2})(?=[\s;]|$)")
+
+
+def remote_claude_session(command):
+    """The conversation ID zz gave the Claude it starts on a PC (`start-project.py --payload`), or None."""
+    found = REMOTE_PAYLOAD.findall(command)
+    if len(found) != 1:
+        return None
+    try:
+        data = json.loads(base64.b64decode(found[0], validate=True).decode())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    args = data.get("args") if isinstance(data, dict) else None
+    if data.get("agent") != "CLAUDE" or not isinstance(args, list) or args.count("--session-id") != 1:
+        return None
+    index = args.index("--session-id")
+    value = args[index + 1] if index + 1 < len(args) else None
+    try:
+        return value if isinstance(value, str) and str(uuid.UUID(value)) == value else None
+    except ValueError:
+        return None
 
 
 def ssh_hostname(alias):
@@ -244,10 +272,14 @@ def launcher_programs(args):
         # A time-derived Claude PID describes the program but cannot authorize terminal input.
         hold = terminal.get("holdName")
         exact = held_program(hold, rows) if hold else pane_program(terminal.get("panePid"), rows)
-        if not hold and exact and exact["program"] == "claude":
+        if not hold and exact and (exact["program"] == "claude" or exact.get("claudeSessionId")):
             exact["paneId"] = terminal.get("paneId")
-        if exact and exact.get("program") != "claude" and not exact.get("nativeSource"):
+        if exact and exact.get("program") != "claude" and not exact.get("nativeSource") and not exact.get("claudeSessionId"):
             exact = None
+        if exact and exact.get("sshHost"):
+            board = ssh_board_host(exact["sshHost"], args.get("sshHosts"))
+            exact = {**exact, "sshHost": board} if board else {key: value for key, value in exact.items()
+                                                               if key not in ("sshHost", "claudeSessionId")}
         resumed = result[identifier].get("sessionId") if result[identifier].get("program") == "codex" else None
         source = None if exact or not resumed else resumed_codex_source(resumed, terminal.get("createdAt"))
         if exact:

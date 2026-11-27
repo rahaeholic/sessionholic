@@ -1752,3 +1752,61 @@ class TmuxFixtureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux가 필요합니다")
+class SshClaudePaneTest(unittest.TestCase):
+    """A PC Claude zz started over SSH: input goes to the pane while its recorded SSH run is in front."""
+
+    def test_paste_reaches_the_pane_whose_recorded_ssh_run_is_in_front(self):
+        import launcher_programs as lp
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            socket_name = "sb-test-" + secrets.token_hex(5)
+            manager = terminal.TerminalManager(state_dir=folder / "records", socket_name=socket_name)
+            self.addCleanup(manager.close)
+            command = [shutil.which("tmux"), "-L", socket_name, "-f", "/dev/null"]
+
+            def tmux(*args):
+                return subprocess.run(command + list(args), capture_output=True, text=True, timeout=5, check=True).stdout
+
+            fixture, log = folder / "fake-ssh.py", folder / "typed"
+            fixture.write_text("import os, sys, tty\ntty.setraw(0)\nos.write(1, b'\\x1b[?2004h')\n"
+                               "with open(sys.argv[1], 'wb', buffering=0) as out:\n"
+                               "    while True:\n        out.write(os.read(0, 4096))\n")
+            identifier = "c" * 32
+            pane, pid = tmux("new-session", "-dP", "-x", "120", "-y", "30", "-F", "#{pane_id} #{pane_pid}",
+                             "-s", "sb-" + identifier, sys.executable, "-u", str(fixture), str(log)).split()
+            self.addCleanup(tmux, "kill-server")
+            record = {"id": identifier, "name": "sb-" + identifier, "key": "fixture", "socket": socket_name,
+                      "metadata": {"host": "air15", "mode": "new-session", "program": "ssh", "programHost": "beaulink"}}
+            manager.terminals[identifier] = terminal._Terminal(record, 1024)
+            sid = "019a0000-0000-4000-8000-0000000000aa"
+            native = {"host": "beaulink", "agent": "claude", "id": sid, "home": None,
+                      "cwd": "C:\\Users\\example\\Projects\\project", "kind": "interactive", "sessionId": sid}
+            # The start-time estimate is corrected by the conversation zz named, on the SSH host.
+            manager.link_native(identifier, {**native, "id": "other-guess", "sessionId": "019a0000-0000-4000-8000-0000000000bb"}, confidence="estimated")
+            with self.assertRaises(ValueError):  # an SSH pane is only for the host it reaches
+                manager.link_native(identifier, {**native, "host": "mini"}, claude_pane=(pane, int(pid)), claude_pane_program="ssh")
+            self.assertTrue(manager.link_native(identifier, native, claude_pane=(pane, int(pid)), claude_pane_program="ssh"))
+            metadata = manager.terminals[identifier].record["metadata"]
+            self.assertEqual((metadata["linkConfidence"], metadata["claudePaneProgram"]), ("exact", "ssh"))
+            original = lp.program_of
+            as_ssh = lambda argv: {"program": "ssh", "cwd": None} if str(fixture) in argv else original(argv)
+            with patch.object(lp, "program_of", side_effect=as_ssh):
+                for _ in range(100):
+                    if manager.claude_pane_available(identifier):
+                        break
+                    time.sleep(.02)
+                self.assertTrue(manager.claude_pane_available(identifier))
+                manager.paste(identifier, "안녕", submit=False, require_claude_pane=True)
+                for _ in range(100):
+                    if "안녕".encode() in (log.read_bytes() if log.exists() else b""):
+                        break
+                    time.sleep(.02)
+                self.assertIn("안녕".encode(), log.read_bytes())
+            # The same pane read as a local Claude does not match an SSH-recorded run.
+            as_claude = lambda argv: {"program": "claude", "cwd": None} if str(fixture) in argv else original(argv)
+            with patch.object(lp, "program_of", side_effect=as_claude):
+                self.assertFalse(manager.claude_pane_available(identifier))
