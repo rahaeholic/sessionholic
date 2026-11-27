@@ -2016,7 +2016,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(state['capability']['supported'])
         self.assertEqual(self.chat._board_terminal(self.row | {'host': 'local'})['id'], terminal['id'])
         result = self.send(text='previous file', attachments=[file['id']])
-        self.assertEqual(result['status'], 'accepted')
+        self.assertEqual(result['status'], 'unknown')
         self.assertIn(file['path'], self.terms.pastes[-1][1])
         fresh = self.chat.upload(CLAUDE_REF, 'after.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
         self.assertTrue(fresh['path'].startswith(str(moved.resolve())))
@@ -2327,7 +2327,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertTrue(state['capability']['supported'])
         self.assertEqual(state['terminalConnection'], {'connected': True, 'id': TERMINAL_ID})
         self.assertIsNone(state['prompt'])
-        self.assertEqual(self.send(text='첫 줄\n둘째 줄')['status'], 'accepted')
+        self.assertEqual(self.send(text='첫 줄\n둘째 줄')['status'], 'unknown')
         self.assertEqual(self.terms.pastes, [(TERMINAL_ID, '첫 줄\n둘째 줄', True)])
         for change in ({'alive': False}, {'closed': True}, {'linkConfidence': 'estimated'},
                        {'nativeSource': {**row['nativeSource'], 'sessionId': 'different-session'}}):
@@ -2376,11 +2376,50 @@ class ChatClaudeTest(unittest.TestCase):
         self.assertEqual(json.loads(saved)['receipt']['delivery'], 'accepted')
         # Same request: the saved receipt answers; nothing reaches the CLI again, even after a restart.
         self.assertEqual(self.send(text='  첫 줄\n둘째 줄  ')['status'], 'accepted')
-        self.send(text='다른 내용')
         restarted = chat.Chat(self.board, self.flow, self.root)
-        restarted.send({'source': CLAUDE_REF, 'requestId': 'request-0001', 'text': '첫 줄\n둘째 줄'})
+        self.assertEqual(restarted.send({'source': CLAUDE_REF, 'requestId': 'request-0001', 'text': '첫 줄\n둘째 줄'}), result)
         self.assertEqual(len(self.terms.pastes), 1)
         self.assertEqual(self.calls, [('chat', 'capabilities'), ('chat', 'read')])
+
+    def test_reused_claude_request_rejects_a_changed_body_or_attachment_list(self):
+        self.terminal()
+        files = [self.chat.upload(CLAUDE_REF, 'fixture.txt', content)['attachment']['id']
+                 for content in (b'one', b'two', b'three')]
+        text = 'x' * chat.CLAUDE_PROBE + ' 원래 끝'
+        original = self.send(text=text, attachments=files[:2])
+        for body, ids in ((text + ' 변경', files[:2]), (text, files[1:]), (text, files[:2][::-1]), (text, [])):
+            with self.subTest(attachments=len(ids)):
+                with self.assertRaises(chat.SendRejected) as rejected:
+                    self.send(text=body, attachments=ids)
+                self.assertEqual(rejected.exception.status, 409)
+        self.assertEqual(self.send(text=text, attachments=files[:2]), original)
+        self.assertEqual(len(self.terms.pastes), 1)
+
+    def test_legacy_claude_request_without_full_fingerprint_cannot_replay_a_receipt(self):
+        self.terminal()
+        self.send(text='기존 입력')
+        path, = self.records()
+        record = json.loads(path.read_text())
+        record.pop('digest', None)
+        path.write_text(json.dumps(record))
+        with self.assertRaises(chat.SendRejected) as rejected:
+            self.send(text='기존 입력')
+        self.assertEqual(rejected.exception.status, 409)
+        self.assertEqual(len(self.terms.pastes), 1)
+        self.assertEqual(json.loads(path.read_text()), record)
+
+    def test_claude_reservation_race_checks_the_saved_fingerprint_before_replay(self):
+        self.terminal()
+        original = self.send(text='기존 입력')
+        path, = self.records()
+        saved = json.loads(path.read_text())
+        with patch.object(self.chat, '_claude_read_record', side_effect=[None, saved]):
+            with self.assertRaises(chat.SendRejected) as rejected:
+                self.send(text='다른 입력')
+            self.assertEqual(rejected.exception.status, 409)
+        with patch.object(self.chat, '_claude_read_record', side_effect=[None, saved]):
+            self.assertEqual(self.send(text='기존 입력'), original)
+        self.assertEqual(len(self.terms.pastes), 1)
 
     def test_a_slow_send_leaves_one_line_of_its_step_times_and_nothing_of_the_message(self):
         import contextlib, io, instance
@@ -2479,7 +2518,9 @@ class ChatClaudeTest(unittest.TestCase):
         self.terms.chunks = [{'after': 0, 'alive': False}]
         for plan, error, reason in cases:
             with self.subTest(reason=reason):
-                launch = {'side_effect': error} if error else {'return_value': {'terminal': {'id': TERMINAL_ID}}}
+                native = self.flow.native_of(self.chat.resolve(CLAUDE_REF))
+                launch = {'side_effect': error} if error else {
+                    'return_value': {'terminal': {'id': TERMINAL_ID, 'nativeSource': native}}}
                 with patch.object(self.flow, 'plan', return_value=plan), patch.object(self.flow, 'launch', **launch):
                     with self.assertRaises(chat.PromptRejected) as caught:
                         self.chat.prompt({'source': CLAUDE_REF, 'action': 'open', 'requestId': 'prompt-0003'})
@@ -2529,8 +2570,8 @@ class ChatClaudeTest(unittest.TestCase):
                 opened.append((ref['id'], source['kind'], request_id))
                 return self.terminal()
             with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
-                self.assertEqual(self.send(rid='request-0004', text='PC 확인')['status'], 'accepted')
-                self.assertEqual(self.send(rid='request-0005', text='두 번째')['status'], 'accepted')
+                self.assertEqual(self.send(rid='request-0004', text='PC 확인')['status'], 'unknown')
+                self.assertEqual(self.send(rid='request-0005', text='두 번째')['status'], 'unknown')
             self.assertEqual(opened, [(CLAUDE_REF['id'], 'background', 'request-0004')])
             self.assertEqual(self.terms.pastes, [(TERMINAL_ID, 'PC 확인', True), (TERMINAL_ID, '두 번째', True)])
             # Waiting for the user with that terminal open: it still takes a reply.
@@ -2550,7 +2591,7 @@ class ChatClaudeTest(unittest.TestCase):
             self.kind('interactive')
             self.terms.screen = ''
             with patch.object(self.chat, '_open_claude_terminal', side_effect=attach):
-                self.assertEqual(self.send(rid='request-0006', text='대화형')['status'], 'accepted')
+                self.assertEqual(self.send(rid='request-0006', text='대화형')['status'], 'unknown')
             self.assertEqual(opened[-1], (CLAUDE_REF['id'], 'interactive', 'request-0006'))
             self.assertEqual(len(self.terms.pastes), 3)
         finally:
@@ -2565,9 +2606,10 @@ class ChatClaudeTest(unittest.TestCase):
             self.assertEqual(state['capability'], {'supported': False, 'attachments': True,
                                                    'reason': chat.CLAUDE_WINDOWS_OPEN, 'action': 'open_terminal'})
             self.assertFalse(state['promptOpenable'])
-            with patch.object(self.flow, 'plan', return_value={'allowed': False, 'reason': '원본 PC에서 실행 중입니다.'}):
+            with patch.object(self.flow, 'plan', return_value={'allowed': False, 'reason': '원본 PC에서 실행 중입니다.'}) as plan:
                 with self.assertRaises(chat.SendRejected) as caught:
                     self.send()
+            self.assertEqual(plan.call_args.args[0]['source']['sessionId'], CLAUDE_SID)
             self.assertEqual((str(caught.exception), caught.exception.code), ('원본 PC에서 실행 중입니다.', 'terminal_unavailable'))
             self.assertEqual((self.terms.pastes, self.records()), ([], []))
             # Resumed in a board terminal: the text is pasted there, like a Mac session.
@@ -2575,7 +2617,10 @@ class ChatClaudeTest(unittest.TestCase):
             state = self.state()
             self.assertTrue(state['capability']['supported'])
             self.assertTrue(state['capability']['attachments'], 'a PC session takes files as well')
-            self.assertEqual(self.send()['status'], 'accepted')
+            result = self.send()
+            self.assertEqual(result['status'], 'unknown')
+            self.assertTrue(result['receipt']['acknowledged'])
+            self.assertFalse(result['receipt']['readbackConfirmed'])
             self.assertEqual(len(self.terms.pastes), 1)
             self.assertNotIn(('chat', 'send'), self.calls)
             # A menu on that screen is still answered only from what it shows.
@@ -2788,10 +2833,11 @@ class ChatClaudeTest(unittest.TestCase):
             self.terminal()
             self.assertTrue(self.state()['capability']['attachments'])
             uploaded = self.chat.upload(CLAUDE_REF, 'shot.png', b'\x89PNG\r\n\x1a\nfixture')['attachment']
-            self.assertEqual(uploads[0]['source'], {'host': 'local', 'agent': 'claude', 'home': None, 'id': CLAUDE_REF['id']})
+            self.assertEqual(uploads[0]['source'], {'host': 'local', 'agent': 'claude', 'home': None,
+                                                   'id': CLAUDE_REF['id'], 'sessionId': CLAUDE_SID})
             self.assertEqual(uploads[0]['cwd'], str(self.project))
             result = self.send(text='PC 화면 확인', attachments=[uploaded['id']])
-            self.assertEqual(result['status'], 'accepted')
+            self.assertEqual(result['status'], 'unknown')
             self.assertEqual(self.terms.pastes, [(TERMINAL_ID, 'PC 화면 확인\n첨부 파일: ' + uploaded['path'], True)])
             self.assertTrue(uploaded['path'].startswith('C:\\Users\\example\\project\\.'))
             self.assertEqual(result['receipt']['attachments'][0]['name'], 'shot.png')
@@ -2858,8 +2904,7 @@ class ChatClaudeTest(unittest.TestCase):
         self.terms.screen = CLAUDE_QUESTION
         def launch(plan_id, request_id):
             self.terms.log.append('launch')
-            self.terminal()
-            return {'terminal': {'id': TERMINAL_ID}}
+            return {'terminal': self.terminal()}
         with patch.object(self.flow, 'plan', return_value={'allowed': True, 'id': 'plan-1'}) as plan, \
                 patch.object(self.flow, 'launch', side_effect=launch) as launched:
             self.assertTrue(self.state()['promptOpenable'])

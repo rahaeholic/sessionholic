@@ -5386,7 +5386,8 @@ function renderJump() {
 // Drafts and attachment handles stay in memory and are keyed by the actual
 // runtime identity, independently of the continuation/transfer route selectors.
 function chatKey(source) {
-  return JSON.stringify([source.host, source.agent, source.home || "", source.id]);
+  return JSON.stringify([source.host, source.agent, source.home || "", source.id,
+    ...(source.agent === "claude" && source.sessionId && source.sessionId !== source.id ? [source.sessionId] : [])]);
 }
 function conversationIdentity(s) {
   if (!s) return null;
@@ -5486,7 +5487,8 @@ function updateChatDeliveryEvidence(entry) {
   }
   const labels = { accepted: "전송 접수", queued: "전송 접수", completed: "응답 종료",
     interrupted: "접수 후 중단", unknown: "전송 결과 미확인", failed: "접수 후 오류" };
-  const label = pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
+  const queued = matchingReceipt && receipt?.status === "queued" && receipt.responseObserved === false;
+  const label = queued ? "입력 대기열 확인" : pending ? entry.sending ? "전송 중" : "전송 결과 미확인" : labels[receipt?.status];
   const record = receipt?.readbackConfirmed === true && !pending ? " · 세션 기록 확인" : "";
   const caption = `${label}${record} · 전송에 포함한 첨부 ${files.length}개`;
   const revision = JSON.stringify([pending?.requestId || receipt?.requestId, caption, files]);
@@ -5517,13 +5519,18 @@ function chatEntry(s) {
   delete draftSource.kind; // Both listed execution kinds share the transcript's draft.
   delete draftSource.cwd;
   const draftIdentity = JSON.stringify([draftSource, s.agent === "claude" ? s.sessionId || s.id : s.id]);
-  const previous = state.chats.get(key);
+  const legacyKey = chatKey(draftSource);
+  const previous = state.chats.get(key) || (source.sessionId ? state.chats.get(legacyKey) : null);
   if (previous && previous.draftIdentity !== draftIdentity) {
     if (s.agent === "claude" && s.sessionId && !previous.draftTranscript) {
       // A first transcript UUID enriches the same worker, including its in-flight sends.
       const oldKey = draftStorageKey("chat", previous.draftIdentity), oldShape = state.draftSavedShapes.get(oldKey);
       const oldRow = readSavedDraft(oldKey);
       previous.draftIdentity = draftIdentity; previous.draftTranscript = s.sessionId;
+      if (key !== legacyKey) {
+        state.chats.delete(legacyKey);
+        state.chats.set(key, previous);
+      }
       if (persistChatDraft(previous) && oldRow && oldShape === savedDraftShape(oldRow)) {
         try { localStorage.removeItem(oldKey); } catch { /* keep the older recovery record */ }
       }
@@ -5802,8 +5809,12 @@ function restoreTerminalDraft(terminal) {
   if (row && !row.pending) {
     state.drafts.set(draftKey(terminal), row.text);
     const entry = terminalAttachmentEntry(terminal);
-    if (entry && !entry.attachments.length) entry.attachments = row.attachments.filter((file) =>
-      validTerminalAttachment(file) && entry.source && file.terminalSourceKey === chatKey(entry.source));
+    if (entry?.source && !entry.attachments.length) {
+      const key = chatKey(entry.source);
+      const legacy = chatKey({ ...entry.source, sessionId: undefined });
+      entry.attachments = row.attachments.filter((file) => validTerminalAttachment(file) &&
+        [key, legacy].includes(file.terminalSourceKey)).map((file) => ({ ...file, terminalSourceKey: key }));
+    }
   }
   else if (row?.pending) draftStorageNotice("전송 중이던 터미널 입력은 자동 복원하지 않습니다. 터미널에서 반영 여부를 확인해 주세요.");
 }
@@ -7818,6 +7829,13 @@ function chatReceiptCopy(receipt) {
     return receipt.failureCode === "server_overloaded"
       ? "응답 서버가 혼잡해 응답이 중단됐습니다. 메시지는 전달됐습니다. 잠시 후 이어서 요청해 주세요."
       : "요청 처리 중 오류가 발생했습니다. 대화를 확인해 주세요.";
+  if (receipt?.responseObserved === true) return "원래 대화에 메시지와 후속 응답이 기록됐습니다.";
+  if (receipt?.responseObserved === false) {
+    if (receipt.readbackConfirmed === true) return "원래 대화에 메시지가 기록됐습니다.";
+    if (receipt.status === "queued" && receipt.deliveryVerified === true) return "Claude 입력 대기열에서 확인했습니다.";
+    if (receipt.status === "unknown" && receipt.acknowledged === true)
+      return "터미널에 입력했습니다. 원래 대화 수신은 아직 확인되지 않았습니다.";
+  }
   const labels = {
     accepted: "메시지를 접수했습니다. 작업 완료는 대화에서 확인해 주세요.",
     queued: "메시지를 접수했습니다. 답변은 대화에서 확인해 주세요.",
@@ -7855,7 +7873,8 @@ function receiptNotice(entry) {
   // A refusal keeps saying the draft was not sent; anything else waits while
   // the agent asks something (the phase says so).
   if (phase === "needs_input" && entry.receipt?.dispatchState !== "not_started" && status !== "failed") return "";
-  if (receiptSettled(entry) && ["accepted", "queued"].includes(status)) return "";
+  if (receiptSettled(entry) && ["accepted", "queued"].includes(status) &&
+      entry.receipt?.responseObserved !== true) return "";
   // Its request ended and the agent now works on a newer one (typed in the
   // terminal, say): the phase says what is going on.
   if (["completed", "interrupted"].includes(status) && phase === "working") return "";
@@ -8189,6 +8208,7 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
       (!entry.pending && !(entry.error && entry.error !== entry.inputError) && !entry.data?.prompt &&
        !chatReadUnavailable(entry) && !reconnecting &&
        !connecting &&
+       !(entry.receipt?.readbackConfirmed === true && entry.receipt.responseObserved === false) &&
        !["working", "needs_input"].includes(entry.data?.phase) &&
        !(entry.outbox || []).some(outboxAwaitsAgent))) return;
   const run = state.chatPollRun;
@@ -8200,7 +8220,8 @@ function scheduleChatPoll(s, entry, selected = selectedSession() || null) {
 }
 function applyChatReceipt(entry, receipt, selected) {
   if (!receipt) return;
-  const settled = ["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status);
+  const settled = ["accepted", "queued", "completed", "interrupted", "failed"].includes(receipt.status) &&
+    !(receipt.status === "queued" && receipt.responseObserved === false);
   const earlier = entry.outbox?.find((item) => item.pending?.requestId === receipt.requestId);
   if (earlier) {
     markOutbox(entry, receipt.requestId, receipt);
@@ -8208,6 +8229,10 @@ function applyChatReceipt(entry, receipt, selected) {
     return;
   }
   if (entry.pending && receipt.requestId !== entry.pending.requestId) return;
+  if (entry.receipt?.requestId === receipt.requestId && entry.receipt.responseObserved === true &&
+      receipt.readbackConfirmed === true) receipt = { ...receipt, responseObserved: true };
+  if (entry.receipt?.requestId === receipt.requestId && entry.receipt.readbackConfirmed === true &&
+      receipt.responseObserved === false && receipt.readbackConfirmed !== true) return;
   if (receipt.status === "unknown" && entry.receipt?.requestId === receipt.requestId &&
       (entry.receipt.confirmed === true || entry.receipt.readbackConfirmed === true)) return;
   const fallback = entry.pending?.attachmentDetails ||
@@ -8240,14 +8265,16 @@ function applyChatReceipt(entry, receipt, selected) {
 }
 const CHAT_RECHECK_RETRY_MS = 3000;
 async function loadChatState(s, manual = false, { join = false } = {}) {
-  const entry = chatEntry(s);
   const authEpoch = state.authEpoch;
+  const identity = conversationIdentity(s);
   // Found once before the read and once after it (the selection may change meanwhile).
   let selected = selectedSession() || null;
+  if (conversationIdentity(selected) !== identity) return;
+  const entry = chatEntry(s);
   if (!currentChat(entry, selected) || !chatVisible() || networkOffline()) return;
   // Without an id the session has no chat state; its transcript (if named) is read directly.
   if (claudeWithoutId(s)) return { status: "skipped" };
-  const identity = conversationIdentity(s);
+  const source = entry.source;
   if (entry.checking) {
     if (join) {
       if (entry.stateReadIdentity === identity && entry.stateReadAuthEpoch === state.authEpoch)
@@ -8276,13 +8303,23 @@ async function loadChatState(s, manual = false, { join = false } = {}) {
     const lastRequestId = entry.pending?.requestId ||
       (entry.receipt?.dispatchState === "not_started" || ["completed", "interrupted", "failed"].includes(entry.receipt?.status) ? null : entry.receipt?.requestId);
     const requestIds = submissionRequestIds(entry, lastRequestId);
-    const data = await api("/api/chat/state", { method: "POST", body: {
-      source: entry.source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
+    let data = await api("/api/chat/state", { method: "POST", body: {
+      source, ...(lastRequestId ? { requestId: lastRequestId } : {}),
       ...(requestIds.length ? { requestIds } : {}),
     } });
     selected = selectedSession() || null;
     if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry) return;
-    if (epoch !== entry.stateEpoch || currentChat(entry, selected) && conversationIdentity(selected) !== identity) return;
+    const current = currentChat(entry, selected);
+    if (epoch !== entry.stateEpoch || entry.source !== source || current && conversationIdentity(selected) !== identity) return;
+    if (source.agent === "claude") {
+      const route = data.route;
+      if (!route) return;
+      if (source.sessionId && route.sessionId == null) {
+        // A legacy response can inherit only the scope of its own still-selected request.
+        if (!current || chatKey(route) !== chatKey({ ...source, sessionId: undefined })) return;
+        data = { ...data, route: { ...route, sessionId: source.sessionId } };
+      } else if (chatKey(route) !== chatKey(source) || source.sessionId && route.sessionId !== source.sessionId) return;
+    }
     entry.data = data;
     if (chatRecovery(entry, selected)?.action !== "refresh_host") clearConnectionNotice(entry);
     outcome = { status: "success", data };
@@ -9424,7 +9461,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
         source: pending.source, requestId: pending.requestId,
       }, authEpoch });
       assertAuthEpoch(authEpoch);
-      if (!state.authenticated || state.chats.get(chatKey(pending.source)) !== entry || connection.connected !== true)
+      if (!state.authenticated || state.chats.get(chatKey(entry.source)) !== entry || connection.connected !== true ||
+          connection.source && pending.source.agent === "claude" && chatKey(connection.source) !== chatKey(entry.source))
         throw new Error("대화 연결을 확인하지 못했습니다.");
       if (networkOffline()) throw new Error("기기 연결이 끊겼습니다.");
       entry.connecting = false;
@@ -9444,7 +9482,8 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
     const status = recovering && result.status === "failed" && result.receipt?.confirmed !== true ? "unknown" : result.status;
     applyChatReceipt(entry, { ...result.receipt, requestId: pending.requestId, status: status || "unknown" });
     sent = result.status !== "failed";
-    if (["accepted", "queued", "completed"].includes(result.status)) haptic("success");
+    if (["accepted", "queued", "completed"].includes(result.status) &&
+        (result.receipt?.responseObserved == null || result.receipt.readbackConfirmed === true)) haptic("success");
     // A Claude send may have attached the session's board terminal: its marks show it now.
     if (pending.source?.agent === "claude" && result.receipt?.terminalId) refreshTerminals();
   } catch (err) {
@@ -9509,7 +9548,7 @@ async function dispatchChat(entry, pending, authEpoch, recovering = false) {
 // "sent" (accepted or queued), "uncertain" (no answer: that message cannot be
 // duplicated) or "failed" (never started: the draft or retry bubble retains it).
 const OUTBOX_LABELS = { connecting: "연결 중…", sending: "전송 중…", uncertain: "전송 확인 중", sent: "서버 접수 · 대화 반영 대기", recorded: "대화 반영 확인",
-  queued: "대기 중 · 지금 작업이 끝나면 전달됩니다", failed: "보내지 못함" };
+  terminal: "터미널 입력 · 대화 수신 미확인", queued: "대기 중 · Claude 입력 대기열", failed: "보내지 못함" };
 const OUTBOX_SETTLED_MS = 3 * 60 * 1000;
 const OUTBOX_MAX_MS = 15 * 60 * 1000;
 // A transcript may record a message a little before the browser's clock says
@@ -9634,8 +9673,11 @@ function outboxState(receipt) {
 function markOutbox(entry, requestId, receipt) {
   const item = entry.outbox?.find((value) => value.requestId === requestId);
   if (!item) return;
+  if (item.nativeReadback && (item.recorded || item.status === "queued") && receipt?.status === "unknown") return;
   item.state = outboxState(receipt);
   item.status = receipt?.status || "unknown";
+  item.nativeReadback ||= typeof receipt?.responseObserved === "boolean";
+  item.terminalAcknowledged ||= receipt?.acknowledged === true;
   item.reason = item.state === "failed" ? String(receipt?.reason || "") : "";
   if (item.state === "failed" || ["completed", "interrupted"].includes(receipt?.status)) item.settledAt ||= Date.now();
   // The server found the message in the conversation it read. Found only in Claude's input
@@ -9680,6 +9722,10 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
     if (item.state === "failed") continue;
     const view = { codex, cut: outboxCut(item, list), known: Array.isArray(item.known) ? new Set(item.known) : null };
     views.set(item, view);
+    if (item.nativeReadback || !codex && capsHost(entry.source?.host)?.platform === "windows") {
+      if (item.recorded) settled.add(item);
+      continue;
+    }
     const row = rows.find((value) => outboxMatches(item, value, view));
     if (row) {
       // Exact native client identity proves delivery even if its HTTP receipt
@@ -9695,6 +9741,7 @@ function settleOutbox(entry, messages, { working = false, claimed = null } = {})
   }
   for (const item of entry.outbox) {
     if (settled.has(item) || item.state === "failed") continue;
+    if (item.nativeReadback || !codex && capsHost(entry.source?.host)?.platform === "windows") continue;
     const view = { ...views.get(item), loose: true };
     if (!codex && outboxDelivered(item)) {
       const row = rows.find((value) => outboxMatches(item, value, view));
@@ -9769,7 +9816,8 @@ function outboxRows(list, entry) {
     }
     const name = entry.connecting && entry.pending?.requestId === item.requestId ? "connecting"
       : item.state === "sent" && item.status === "queued" ? "queued"
-      : item.state === "sent" && item.recorded ? "recorded" : item.state;
+      : item.state === "sent" && item.recorded ? "recorded"
+      : item.state === "uncertain" && item.terminalAcknowledged ? "terminal" : item.state;
     const className = `msg user is-outbox is-${item.state}`;
     if (row.className !== className) row.className = className;
     const revision = `${name}|${item.reason}`;

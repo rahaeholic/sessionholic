@@ -65,11 +65,16 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
 
 
-def _identity(source):
+def _identity(source, *, listed=False):
     if not isinstance(source, dict) or source.get('agent') not in ('codex', 'claude'):
         raise ValueError('PC 세션 정보가 올바르지 않습니다.')
     agent = source['agent']
     sid = source.get('id') or source.get('sessionId')
+    if agent == 'claude':
+        if source.get('home') not in (None, '', '.claude'):
+            raise ValueError('원본 PC Claude 계정 경로를 확인해 주세요.')
+        if not listed and source.get('sessionId'):
+            sid = source['sessionId']
     if not isinstance(sid, str) or not wc.SID.fullmatch(sid):
         raise ValueError('PC 세션 ID가 올바르지 않습니다.')
     if agent == 'codex' and (str(uuid.UUID(sid)) != sid or source.get('home') != '.codex'):
@@ -473,7 +478,7 @@ class WindowsRuntime:
 
     def recover_session(self, source):
         """Read exact saved metadata only; no endpoint, process launch or native write."""
-        identity = _identity(source)
+        identity = _identity(source, listed=True)
         if identity['agent'] == 'codex':
             rows = self.reader.database_rows(identity['id'])
             if not rows:
@@ -487,8 +492,6 @@ class WindowsRuntime:
             row = self.reader._row(rows[0])
             row = {**row, **identity, 'cwd': rows[0]['cwd']}
         else:
-            if source.get('home') not in (None, '', '.claude'):
-                raise ValueError('원본 PC Claude 계정 경로를 확인해 주세요.')
             sid = source.get('sessionId') or identity['id']
             if not isinstance(sid, str) or not wc.SID.fullmatch(sid):
                 raise ValueError('PC Claude 대화 식별자가 올바르지 않습니다.')
@@ -852,7 +855,11 @@ class WindowsRuntime:
         path = self.reader._transcripts().get(identity['id'])
         if path is None:
             raise ValueError('PC Claude 기록을 확인하지 못했습니다.')
-        cwd = next((entry['cwd'] for entry in wc._head(path) if isinstance(entry.get('cwd'), str)), '')
+        header = wc._head(path)
+        if any(entry.get('sessionId') and entry['sessionId'] != identity['id']
+               for entry in header if not entry.get('isSidechain')):
+            raise ValueError('PC Claude 기록의 대화 식별자가 일치하지 않습니다.')
+        cwd = next((entry['cwd'] for entry in header if isinstance(entry.get('cwd'), str)), '')
         if source.get('cwd') and wc._norm(source['cwd']) != wc._norm(cwd):
             raise ValueError('PC Claude 기록의 작업 폴더가 바뀌었습니다.')
         binary = self.reader.home / '.local/bin/claude.exe'

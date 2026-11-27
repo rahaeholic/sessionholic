@@ -322,9 +322,12 @@ class ClaudeProcessOriginTest(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text('\n'.join(json.dumps(row) for row in [
             {'type': 'assistant', 'uuid': 'message', 'message': {'content': 'saved example'}},
-            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 123, 'content': '<pasted_content>queued</pasted_content>'}]))
+            {'type': 'queue-operation', 'operation': 'enqueue', 'timestamp': 123, 'content': '<pasted_content>queued</pasted_content>'},
+            {'type': 'user', 'sessionId': 'different-session', 'message': {'content': '다른 대화 입력'}},
+            {'type': 'queue-operation', 'sessionId': 'different-session', 'operation': 'enqueue',
+             'timestamp': 124, 'content': '다른 대화 대기'}]))
         result = self.reader.read('claude', self.sid)
-        self.assertEqual(result['messages'][0]['text'], 'saved example')
+        self.assertEqual([row['text'] for row in result['messages']], ['saved example'])
         self.assertEqual(result['queuedPrompts'], [{'ts': 123, 'text': 'queued'}])
         self.assertNotIn('historyNotice', result)
 

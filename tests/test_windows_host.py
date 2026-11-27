@@ -510,11 +510,17 @@ class WindowsRoutingTest(unittest.TestCase):
             # It now runs in that terminal, so the PC would refuse a second resume.
             key = hashlib.sha256(json.dumps([self.flow.route_identity(self.board.source(CLAUDE_REF)), target],
                                             sort_keys=True).encode()).hexdigest()
-            self.terms.list = lambda: [{'alive': True, 'key': key + ':fixture'}]
+            native = self.flow.native_of(self.board.source(CLAUDE_REF))
+            terminals = [{'alive': True, 'key': key + ':fixture', 'nativeSource': native}]
+            self.terms.list = lambda: terminals
             rpc.side_effect = ValueError('이 Claude 세션은 PC 터미널에서 실행 중입니다.')
             again = self.flow.plan({'source': CLAUDE_REF, 'target': target})
+            terminals[0] = {**terminals[0], 'nativeSource': {**native, 'sessionId': 'different-transcript'}}
+            wrong = self.flow.plan({'source': CLAUDE_REF, 'target': target})
+            self.assertFalse(wrong['allowed'])
+            self.assertIs(rpc.call_args.args[2]['takeover'], False)
         self.assertEqual((again['mode'], again['allowed']), ('reconnect', True))
-        self.assertEqual(rpc.call_count, 1)
+        self.assertEqual(rpc.call_count, 2)
 
     def test_cross_host_or_account_plan_remains_unsupported(self):
         with self.assertRaisesRegex(ValueError, REASON):

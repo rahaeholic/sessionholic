@@ -558,6 +558,7 @@ class Chat:
                 'reason': result.get('reason'),
                 **({'submitBlocked': True} if result.get('submitBlocked') is True else {}),
                 **({'deliveryVerified': result['deliveryVerified']} if 'deliveryVerified' in result else {}),
+                **({'responseObserved': result['responseObserved']} if 'responseObserved' in result else {}),
                 **({'failureCode': 'server_overloaded'} if status == 'failed' and result.get('confirmed') is True
                    and result.get('failureCode') == 'server_overloaded' else {}),
                 'attachments': Chat.attachment_history(result.get('attachments', [])),
@@ -703,10 +704,13 @@ class Chat:
         from server import scrub_payload
         messages = scrub_payload(result.get('messages', []))
         claude = source.get('agent') == 'claude'
+        windows = host.get('platform') == 'windows'
         receipts = []
         for request_id in request_ids:
             if claude:
-                receipt = self._claude_receipt(source, request_id, messages, result.get('queuedPrompts'))
+                receipt = self._claude_receipt(source, request_id,
+                                               (result.get('messages') or []) if windows else messages,
+                                               result.get('queuedPrompts'), windows)
             else:
                 receipt = next((receipt for receipt in result.get('receipts', [])
                                 if isinstance(receipt, dict) and receipt.get('requestId') == request_id),
@@ -762,7 +766,7 @@ class Chat:
                 capability['reason'] = '연결이 끝난 세션입니다. 같은 대화를 다시 열어 이어갈 수 있습니다.'
             elif recovery.get('reason'):
                 capability['reason'] = recovery['reason']
-        route = self.watch_identity(source) if source.get('listedKind') else identity
+        route = self.watch_identity(source) if claude else identity
         response = {'route': route, 'phase': phase,
                     'capability': capability,
                     'messages': messages,
@@ -884,6 +888,8 @@ class Chat:
         receipts = [known.get(request_id) or self.receipt(
             {'delivery': 'unknown', 'reason': '기기에 연결되지 않아 전송 결과를 확인하지 못했습니다.'}, request_id)
             for request_id in request_ids]
+        receipts = [{**receipt, 'currentSnapshotConfirmed': False} if 'responseObserved' in receipt else receipt
+                    for receipt in receipts]
         capability = {name: value for name, value in last.get('capability', {}).items() if name != 'action'}
         # slow: the host is reachable but did not answer in time (not "not connected").
         capability.update(supported=False, attachments=False,
@@ -978,6 +984,8 @@ class Chat:
         fallback = None
         interactive = source.get('agent') == 'claude' and source.get('kind') == 'interactive'
         kind = source.get('listedKind') or ('interactive' if interactive else None)
+        windows_claude = source.get('agent') == 'claude' and any(
+            host['name'] == source.get('host') and host.get('platform') == 'windows' for host in self.board.hosts)
         for terminal in self.workflow.terminals.list():
             # A 새 세션 link guessed from start times may name another terminal's session:
             # it is shown as estimated and never receives a paste or a menu answer.
@@ -986,7 +994,7 @@ class Chat:
                 continue
             native = info.get('nativeSource')
             if terminal.get('alive') and not terminal.get('closed') and self._same_native(native, source):
-                if kind and native.get('kind') and native['kind'] != kind:
+                if not windows_claude and kind and native.get('kind') and native['kind'] != kind:
                     continue
                 if launcher_claude(info):
                     if not self.workflow.terminals.claude_pane_available(terminal['id']):
@@ -1238,12 +1246,18 @@ class Chat:
     def _open_claude_terminal(self, ref, source, request_id):
         """Attach the exact background session in a board terminal, never a new session.
         Used by the question card's "질문 불러오기" and by sending to a session with no board terminal."""
+        if source.get('sessionId'):
+            ref = {**ref, 'sessionId': source['sessionId']}
         plan = self.workflow.plan({'source': ref, 'target': {
             'host': source['host'], 'agent': 'claude', 'account': 'claude:default'}})
         if not plan.get('allowed'):
             raise SendRejected(plan.get('reason') or CLAUDE_EXTERNAL, 409)
         launch_id = 'chat_' + hashlib.sha256(request_id.encode()).hexdigest()[:40]
         terminal = self.workflow.launch(plan['id'], launch_id)['terminal']
+        info = {**(terminal.get('metadata') or {}), **terminal}
+        if (info.get('linkConfidence') == 'estimated' or not self._same_native(info.get('nativeSource'), source)
+                or launcher_claude(info) and not self.workflow.terminals.claude_pane_available(terminal['id'])):
+            raise SendRejected('같은 Claude 대화의 터미널인지 확인하지 못했습니다.', 409)
         if not self._settled(terminal['id']):
             # A retry finds this terminal; it waits for the attach screen again before a paste.
             self.unsettled.add(terminal['id'])
@@ -1333,7 +1347,7 @@ class Chat:
             if not self._same_native(terminal.get('nativeSource') or terminal.get('metadata', {}).get('nativeSource'), source):
                 raise ValueError('같은 대화의 터미널인지 확인하지 못했습니다.')
             self._forget_state(source)
-            return {'connected': True, 'source': self.identity(source), 'terminalId': terminal['id']}
+            return {'connected': True, 'source': self.watch_identity(source), 'terminalId': terminal['id']}
         finally:
             turn.release()
 
@@ -1392,13 +1406,16 @@ class Chat:
     def _warm_key(source):
         return json.dumps([source.get('host'), source.get('sessionId') or source.get('id')])
 
-    def _claude_record_path(self, source, request_id):
+    def _claude_record_path(self, source, request_id, windows=False):
         folder = self.root / 'claude-sends'
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = folder.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise ValueError('메시지 전송 기록 경로가 안전하지 않습니다.')
-        key = hashlib.sha256(json.dumps([self.identity(source), request_id], sort_keys=True).encode()).hexdigest()
+        identity = self.identity(source)
+        if windows:
+            identity.update(id=source.get('sessionId') or source['id'], home=source.get('home') or '.claude')
+        key = hashlib.sha256(json.dumps([identity, request_id], sort_keys=True).encode()).hexdigest()
         return folder / (key + '.json')
 
     @staticmethod
@@ -1407,10 +1424,18 @@ class Chat:
         collapsed = ' '.join(str(text or '').split())[:CLAUDE_PROBE]
         return collapsed, hashlib.sha256(collapsed.encode()).hexdigest()
 
-    def _claude_read_record(self, source, request_id):
+    def _claude_read_record(self, source, request_id, windows=False):
         try:
-            path = self._claude_record_path(source, request_id)
+            path = self._claude_record_path(source, request_id, windows)
             fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            legacy = self._claude_read_record(source, request_id) if windows else None
+            if legacy and self._claude_record_path(source, request_id) != path:
+                # A legacy worker-id key cannot prove which Claude conversation it addressed.
+                if (source.get('sessionId') or source['id']) != source['id']:
+                    return {'receipt': {'delivery': 'unknown'}}
+                return legacy
+            return None
         except (OSError, ValueError):
             return None
         with os.fdopen(fd, 'rb') as file:
@@ -1446,36 +1471,73 @@ class Chat:
 
     @classmethod
     def _claude_evidence(cls, record, messages, queued):
-        """'message' when the conversation shows the send, 'queue' when it is only in Claude Code's
-        input queue (Claude still works; the conversation records it when Claude takes it, seconds
-        to minutes later), None when neither has it."""
+        """Find the user message or its enqueue. On PC, report a following reply separately."""
         since = record.get('sentAt', 0) - 5
-        def found(items):
-            return any(isinstance(item, dict) and isinstance(item.get('ts'), (int, float)) and item['ts'] >= since
-                       and cls._recorded(record, item) for item in items)
-        if found(message for message in messages if isinstance(message, dict) and message.get('role') == 'user'):
+        prior = record.get('priorMessages')
+
+        def matches(item):
+            return (isinstance(item, dict) and isinstance(item.get('ts'), (int, float)) and item['ts'] >= since
+                    and cls._recorded(record, item)
+                    and (prior is None or cls._claude_message_stamp(item) not in prior))
+
+        if prior is not None:
+            matched = observed = False
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                if message.get('role') == 'user':
+                    matched = matches(message)
+                    observed = observed or matched
+                elif matched and message.get('role') == 'assistant':
+                    return 'reply'
+            if observed:
+                return 'message'
+        elif any(matches(message) for message in messages
+                 if isinstance(message, dict) and message.get('role') == 'user'):
             return 'message'
-        if isinstance(queued, list) and found(queued):
+        if isinstance(queued, list) and any(matches(item) for item in queued):
             return 'queue'
         return None
 
-    def _claude_receipt(self, source, request_id, messages, queued=None):
-        record = self._claude_read_record(source, request_id)
+    @staticmethod
+    def _claude_message_stamp(message):
+        return hashlib.sha256(json.dumps([message.get('messageId'), message.get('ts')]).encode()).hexdigest()
+
+    @staticmethod
+    def _pc_claude_receipt(receipt):
+        receipt.setdefault('responseObserved', False)
+        if not receipt.get('readbackConfirmed') and receipt.get('deliveryVerified') is not True:
+            receipt.update(delivery='unknown', confirmed=False, deliveryVerified=None)
+        return receipt
+
+    def _claude_receipt(self, source, request_id, messages, queued=None, windows=False):
+        record = self._claude_read_record(source, request_id, windows)
         if not record:
-            return {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+            receipt = {'delivery': 'unknown', 'reason': '전송 결과를 확인하지 못했습니다. 상태를 다시 확인해 주세요.'}
+            return self._pc_claude_receipt(receipt) if windows else receipt
         receipt = dict(record.get('receipt') or {})
-        evidence = self._claude_evidence(record, messages, queued)
+        if windows:
+            self._pc_claude_receipt(receipt)
+            receipt['currentSnapshotConfirmed'] = False
+        evidence = self._claude_evidence(record, messages, queued) if record.get('probe') else None
         if evidence:
             receipt.pop('submitBlocked', None)
-        if evidence == 'message':
+            self._apply_claude_evidence(receipt, evidence)
+        return receipt
+
+    @staticmethod
+    def _apply_claude_evidence(receipt, evidence):
+        if evidence in ('message', 'reply'):
             receipt.update(delivery='accepted', confirmed=True, readbackConfirmed=True,
                            currentSnapshotConfirmed=True, deliveryVerified=True, reason=None)
+            if evidence == 'reply':
+                receipt['responseObserved'] = True
         elif evidence == 'queue':
             # Delivered, but the conversation does not show it yet: the page keeps its bubble
             # ("대기 중") until the message itself shows (readbackConfirmed only for that).
-            receipt.update(delivery='queued', confirmed=True, readbackConfirmed=False,
-                           deliveryVerified=True, reason=None)
-        return receipt
+            if not receipt.get('readbackConfirmed'):
+                receipt.update(delivery='queued', confirmed=True, readbackConfirmed=False,
+                               deliveryVerified=True, reason=None)
 
     def _claude_readback(self, host, source, record, seconds):
         deadline = self.verify_clock() + seconds
@@ -1507,7 +1569,7 @@ class Chat:
         resubmitted = bool(receipt.get('resubmitted'))
         try:
             found = self._claude_readback(host, source, record, CLAUDE_READ_SECONDS)
-            if found is False:
+            if found is False and 'priorMessages' not in record:
                 outcome = 'missing'
                 screen = self._capture_terminal(terminal)
                 if parse_menu(screen):
@@ -1530,14 +1592,10 @@ class Chat:
                         outcome += '→repaste'
                 else:
                     found = None
-            if found in ('message', 'queue'):
-                if found == 'message':
-                    receipt.update(readbackConfirmed=True, currentSnapshotConfirmed=True)
-                else:
-                    receipt.update(delivery='queued')
-                receipt.update(deliveryVerified=True, reason=None)
-                outcome = ('ok' if outcome == 'unknown' else outcome + '→ok') + ('' if found == 'message' else '(대기열)')
-            elif found is False:
+            if found in ('message', 'reply', 'queue'):
+                self._apply_claude_evidence(receipt, found)
+                outcome = ('ok' if outcome == 'unknown' else outcome + '→ok') + ('(대기열)' if found == 'queue' else '')
+            elif found is False and 'priorMessages' not in record:
                 receipt.update(delivery='not_delivered', confirmed=False, deliveryVerified=False, reason=CLAUDE_NOT_DELIVERED)
                 outcome += '→missing'
         except (RuntimeError, ValueError, KeyError, OSError):
@@ -1564,6 +1622,21 @@ class Chat:
     def _send_claude(self, ref, source, host, request_id, text, ids, manifest, timing=None, require_idle=False):
         windows = host.get('platform') == 'windows'
         timing = timing or SendTiming('claude', self.clock)
+        text = text.strip()
+        digest = hashlib.sha256(json.dumps([text, ids]).encode()).hexdigest()
+
+        def replay(saved):
+            receipt = saved.get('receipt') if saved else None
+            # The old transcript probes can match only an opening or normalized words.
+            if not isinstance(receipt, dict) or not receipt or not saved.get('digest'):
+                raise SendRejected('기존 요청의 메시지와 첨부가 일치하는지 확인할 수 없습니다.', 409)
+            if saved['digest'] != digest:
+                raise SendRejected('이미 사용한 요청 ID에 다른 메시지나 첨부를 보낼 수 없습니다.', 409)
+            if receipt.get('submitBlocked') is True:
+                raise ClaudeSubmitNotStarted()
+            receipt = {**receipt, 'attachments': manifest}
+            return self._pc_claude_receipt(receipt) if windows else receipt
+
         turn = self._claude_lock_for(source)
         acquired = turn.acquire(timeout=30)
         timing.mark('lock')
@@ -1573,11 +1646,9 @@ class Chat:
             raise SendRejected('이 세션의 연결을 여는 중입니다. 잠시 뒤 다시 보내 주세요.' if warming else
                                '다른 메시지를 전달하고 있습니다. 잠시 뒤 다시 보내 주세요.', 409)
         try:
-            previous = self._claude_read_record(source, request_id)
-            if previous:
-                if (previous.get('receipt') or {}).get('submitBlocked') is True:
-                    raise ClaudeSubmitNotStarted()
-                return {**(previous.get('receipt') or {}), 'attachments': manifest}
+            previous = self._claude_read_record(source, request_id, windows)
+            if previous is not None:
+                return replay(previous)
             try:
                 current = self.rpc(host, 'capabilities', source)
             except (RuntimeError, OSError):
@@ -1613,14 +1684,17 @@ class Chat:
                 timing.mark('settle')
             self.unsettled.discard(terminal['id'])
             try:
-                screen = self._capture_terminal(terminal)
+                screen = self._capture_terminal(terminal, **({'styled': True} if windows else {}))
             except ClaudePaneUnavailable:
                 raise SendRejected(CLAUDE_EXTERNAL, 409) from None
             except (RuntimeError, ValueError, KeyError, OSError):
                 raise SendRejected('Claude 터미널 화면을 확인하지 못해 보내지 않았습니다. 다시 시도해 주세요.', 409) from None
             # Enter would confirm the highlighted choice of an open menu.
-            if parse_menu(screen):
+            plain = SGR.sub('', screen) if windows else screen
+            if parse_menu(plain):
                 raise SendRejected(CLAUDE_BLOCKED, 409)
+            if windows and input_text(plain) and not empty_claude_input(screen):
+                raise SendRejected('원래 터미널 입력칸에 입력이 남아 있습니다. 터미널에서 먼저 확인해 주세요.', 409)
             if require_idle:
                 try:
                     if self.rpc(host, 'capabilities', source).get('phase') != 'idle':
@@ -1631,7 +1705,7 @@ class Chat:
             hold = terminal.get('holdName')
             if hold and (Path(self.workflow.transfers.hold_waiting) / hold).exists():
                 raise SendRejected('실행 기기에 다시 연결하는 중이라 보내지 않았습니다. 연결된 뒤 다시 보내 주세요.', 409)
-            lines = [text.strip()] if text.strip() else []
+            lines = [text] if text else []
             for aid in ids:
                 record = json.loads((self.root / 'attachments' / (aid + '.json')).read_text())
                 lines.append('첨부 파일: ' + record['attachment']['path'])
@@ -1639,25 +1713,32 @@ class Chat:
             # ESC and other controls would end the bracketed paste and act as keys.
             if CONTROL.search(body):
                 raise SendRejected('메시지에 터미널 제어 문자가 있어 보내지 않았습니다. 일반 텍스트만 보낼 수 있습니다.', 400)
-            probe, digest = self._probe(body)
-            path = self._claude_record_path(source, request_id)
+            probe, probe_digest = self._probe(body)
+            path = self._claude_record_path(source, request_id, windows)
             base = {'source': self.identity(source), 'requestId': request_id, 'turnId': None,
                     'canRetry': False, 'terminalId': terminal['id']}
             unknown = {**base, 'delivery': 'unknown', 'confirmed': False, 'readbackConfirmed': False,
                        'acknowledged': False,
                        'reason': '전달 결과를 확인하지 못했습니다. 같은 입력을 자동으로 다시 보내지 않습니다.'}
+            if windows:
+                self._pc_claude_receipt(unknown)
+            words = claude_words(body)[:CLAUDE_PROBE]
+            record = {'requestId': request_id, 'sentAt': time.time(), 'digest': digest, 'probe': probe_digest,
+                      'probeLength': len(probe), 'wordsProbe': hashlib.sha256(words.encode()).hexdigest(),
+                      'wordsLength': len(words), 'receipt': unknown}
+            if windows:
+                # Keep the stamps of matching entries already visible before this send.
+                record['priorMessages'] = [
+                    self._claude_message_stamp(message)
+                    for field in ('messages', 'queuedPrompts')
+                    for message in (current.get(field) or [])
+                    if isinstance(message, dict) and (field != 'messages' or message.get('role') == 'user')
+                    and self._recorded(record, message)]
             # Reserve the request before any byte reaches the CLI (at-most-once).
             try:
                 fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             except FileExistsError:
-                saved = self._claude_read_record(source, request_id) or {}
-                if (saved.get('receipt') or {}).get('submitBlocked') is True:
-                    raise ClaudeSubmitNotStarted()
-                return {**(saved.get('receipt') or unknown), 'attachments': manifest}
-            words = claude_words(body)[:CLAUDE_PROBE]
-            record = {'requestId': request_id, 'sentAt': time.time(), 'probe': digest,
-                      'probeLength': len(probe), 'wordsProbe': hashlib.sha256(words.encode()).hexdigest(),
-                      'wordsLength': len(words), 'receipt': unknown}
+                return replay(self._claude_read_record(source, request_id, windows))
             with os.fdopen(fd, 'w', encoding='utf-8') as file:
                 json.dump(record, file)
             # The screen check, the message and its reservation.
@@ -1669,7 +1750,9 @@ class Chat:
                 receipt = {**base, 'delivery': 'accepted', 'confirmed': True, 'acknowledged': True,
                            'readbackConfirmed': False, 'deliveryVerified': None,
                            'reason': 'Claude 터미널에 입력했습니다. 대화 기록 반영은 아직 확인되지 않았습니다.'}
-                if self._confirm_submit(terminal, body):
+                if windows:
+                    self._pc_claude_receipt(receipt)
+                elif self._confirm_submit(terminal, body):
                     receipt['resubmitted'] = True
                 timing.mark('submit')
                 self._verify_claude_delivery(host, source, terminal, body, record, receipt)
@@ -1714,7 +1797,7 @@ class Chat:
                     'sha256': hashlib.sha256(content).hexdigest()}
             if host.get('platform') == 'windows':
                 # A PC stores it only in the work folder it records for this exact session.
-                args['source'] = self.identity(source)
+                args['source'] = self.watch_identity(source)
             attachment = self.workflow.transfers.rpc(host, 'attachment', args, timeout=60)
             from server import private_json
             attachment_source = self.watch_identity(source)

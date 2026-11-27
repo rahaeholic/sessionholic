@@ -107,6 +107,123 @@ class ExactRecoveryTest(unittest.TestCase):
         self.assertNotIn('reconnectId', plan)
         self.assertEqual(plan['source']['sessionId'], a['sessionId'])
 
+    def test_pc_claude_reconnects_after_five_restarts_and_reads_its_own_input_and_reply(self):
+        from windows_collector import WindowsCollector
+        from windows_runtime import WindowsRuntime
+
+        host = {**HOST, 'name': 'fixture-pc', 'platform': 'windows', 'local': False}
+        root = Path(self.temp.name).resolve()
+        reader = WindowsCollector(root / 'pc-home', hostname=host['name'], process_reader=lambda pid: None)
+        binary = reader.home / '.local/bin/claude.exe'
+        binary.parent.mkdir(parents=True)
+        binary.touch()
+        sid = '019aaaaa-0000-7000-8000-000000000011'
+        other_sid = sid[:-1] + '2'
+        source = {'host': host['name'], 'agent': 'claude', 'id': 'fixture-worker',
+                  'home': '.claude', 'sessionId': sid, 'cwd': str(root), 'kind': 'interactive'}
+        other = {**source, 'sessionId': other_sid}
+        folder = reader.claude_home / 'projects/fixture'
+        folder.mkdir(parents=True)
+        old = int(time.time()) - 60
+
+        def append(sid, role, text, stamp, **fields):
+            entry = {'sessionId': sid, 'cwd': str(root), 'type': role, 'timestamp': stamp,
+                     'uuid': '%s-%s-%s' % (sid, role, stamp), 'message': {'content': text}, **fields}
+            with (folder / (sid + '.jsonl')).open('a') as file:
+                file.write(json.dumps(entry) + '\n')
+
+        append(sid, 'user', '이전 합성 입력', old)
+        append(other_sid, 'user', '다른 대화의 합성 입력', old)
+        self.flow.recoveries.remember(source)
+        prior = None
+        total_pastes = 0
+        for turn in range(5):
+            with self.subTest(restart=turn + 1):
+                board = server.Board([host], 60, runner=lambda *_: {'claude': [], 'codex': []},
+                                     state_dir=root, live=False)
+                board.poll(host)
+                terms = FakeTerminals()
+                terms.records = [{'id': '0' * 32, 'alive': True, 'nativeSource': other}]
+                terms.capture = Mock(return_value='──────────\n❯ \n──────────')
+                terms.paste = Mock()
+                terms.send_keys = Mock()
+                flow = server.Workflow(board, terms, root)
+                runtime = WindowsRuntime(reader=reader, terminate_process=Mock(side_effect=AssertionError('no takeover')))
+
+                def rpc(host, op, args, timeout):
+                    selected = args['source']
+                    self.assertEqual(selected['sessionId'], sid)
+                    if op == 'recover_session':
+                        return runtime.recover_session(selected)
+                    if op == 'terminal_plan':
+                        self.assertIs(args['takeover'], False)
+                        result = runtime.terminal_plan(selected, prepare=args.get('prepare', False))
+                        self.assertEqual(result['argv'][1:3], ['--resume', sid])
+                        return result
+                    self.assertEqual(op, 'chat')
+                    self.assertIn(args['action'], ('read', 'capabilities'))
+                    return runtime.chat(args)
+
+                flow.transfers.rpc = rpc
+                flow.transfers.windows_terminal = Mock(return_value=['/fixture/fake-transport'])
+                service = chat.Chat(board, flow, root)
+                service._settled = Mock(return_value=True)
+                elapsed = [0]
+                service.verify_clock = lambda: elapsed[0]
+                service.sleep = lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds)
+                if prior:
+                    self.assertEqual(service.send(prior)['status'], 'unknown')
+                    terms.paste.assert_not_called()
+                connect = {'source': source, 'requestId': 'fixture-connect-%02d' % turn}
+                with patch('server.shutil.which', return_value='/fixture/tmux'):
+                    connection = service.connect(connect)
+                    self.assertEqual(service.connect(connect), connection)
+                self.assertEqual(connection['source']['sessionId'], sid)
+                self.assertNotEqual(connection['terminalId'], terms.records[0]['id'])
+                flow.transfers.windows_terminal.assert_called_once()
+                self.assertEqual(len(terms.calls), 1)
+
+                rid = 'fixture-send-%02d' % turn
+                body = '합성 입력 %d' % turn
+                stamp = int(time.time())
+                append(sid, 'user', body, stamp)  # Same text in the same second, before sending.
+                send = {'source': source, 'requestId': rid, 'text': body}
+                result = service.send(send)['receipt']
+                self.assertEqual((result['status'], result['acknowledged'], result['readbackConfirmed'],
+                                  result['responseObserved']), ('unknown', True, False, False))
+                self.assertEqual(service.send(send)['receipt'], result)
+
+                def receipt():
+                    service._forget_state(source)
+                    state = service.state({'source': source, 'requestId': rid})
+                    self.assertEqual(state['route']['sessionId'], sid)
+                    return state['receipts'][0]
+
+                append(other_sid, 'user', body, stamp + 1)
+                append(other_sid, 'assistant', '다른 대화 응답', stamp + 1)
+                append(sid, 'assistant', '입력과 무관한 합성 응답', stamp + 1)
+                self.assertEqual(receipt()['status'], 'unknown')
+                append(sid, 'queue-operation', '', stamp + 2, operation='enqueue', content=body)
+                queued = receipt()
+                self.assertEqual((queued['status'], queued['deliveryVerified'], queued['readbackConfirmed'],
+                                  queued['responseObserved']), ('queued', True, False, False))
+                append(sid, 'user', body, stamp + 3)
+                read = receipt()
+                self.assertEqual((read['status'], read['readbackConfirmed'], read['responseObserved']),
+                                 ('accepted', True, False))
+                append(sid, 'assistant', '같은 대화 합성 후속 응답', stamp + 4)
+                self.assertTrue(receipt()['responseObserved'])
+                board.state[host['name']]['ok'] = False
+                stale = receipt()
+                self.assertTrue(stale['readbackConfirmed'])
+                self.assertFalse(stale['currentSnapshotConfirmed'])
+                terms.paste.assert_called_once_with(connection['terminalId'], body, submit=True)
+                terms.send_keys.assert_not_called()
+                runtime.terminate_process.assert_not_called()
+                prior = send
+                total_pastes += terms.paste.call_count
+        self.assertEqual(total_pastes, 5)
+
     def test_unknown_view_close_never_tidies(self):
         handler = object.__new__(server.Handler)
         handler.server = SimpleNamespace(session_tidied=Mock(), board=self.board)

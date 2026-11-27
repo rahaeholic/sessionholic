@@ -1448,7 +1448,7 @@ class WindowsCollector:
                             'activeFlags': [], 'updatedAt': row.get('updatedAt'), 'readOnly': True,
                             'historyNotice': dict(NOT_PERSISTED), 'executionMode': 'one-shot', 'transcriptAvailability': 'disabled'}
                 raise ValueError('정확한 PC Claude 대화 기록을 찾지 못했습니다.')
-            entries, messages, older = _conversation(path, _claude_rows)
+            entries, messages, older = _conversation(path, _claude_rows, session_id=sid)
             # The work folder, as the list row derives it: an upload is checked against it (chat.Chat.upload).
             return {'messages': messages, 'queuedPrompts': _claude_queued_prompts(entries), 'olderOmitted': older, 'modelSettings': _claude_model_settings(entries),
                     'phase': row.get('phase', 'unknown'), 'runtimeKnown': row.get('runtimeKnown', False),
@@ -1575,7 +1575,7 @@ def _tail_read(path, limit):
     return _entries(lines), size <= limit
 
 
-def _conversation(path, rows_of):
+def _conversation(path, rows_of, *, session_id=None):
     """(entries, window, olderOmitted) of a transcript read from its end, as
     collector.claude_conversation (this reader runs on its own).
 
@@ -1585,6 +1585,8 @@ def _conversation(path, rows_of):
     read did not reach the file's start."""
     for limit in READ_TAILS:
         entries, whole = _tail_read(path, limit)
+        if session_id is not None:
+            entries = [entry for entry in entries if entry.get('sessionId') in (None, session_id)]
         rows = rows_of(entries)
         if whole or _conversation_count(rows) >= MESSAGE_LIMIT or len(rows) >= ROW_LIMIT:
             break

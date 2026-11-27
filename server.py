@@ -2926,7 +2926,12 @@ class Workflow:
             allowed, reason = False, "진행 중인 실행이나 승인 요청을 원래 터미널에서 마무리한 뒤 전환해 주세요."
         windows_resumed = False
         route_key = hashlib.sha256(json.dumps([self.route_identity(source), target], sort_keys=True).encode()).hexdigest()
-        existing = next((item for item in self.terminals.list() if item.get("alive") and item.get("key", "").split(":")[0] == route_key), None)
+        existing = next((item for item in self.terminals.list()
+                         if item.get("alive") and not item.get("closed")
+                         and item.get("key", "").split(":")[0] == route_key
+                         and (not same or source["agent"] != "claude"
+                              or (item.get("linkConfidence") != "estimated"
+                                  and self.same_native(item.get("nativeSource"), source)))), None)
         if existing is None and same:
             # The session already runs in another board terminal linked to it exactly (a handoff's
             # or a resume's new run): that one opens again, never a second connection to it. A
@@ -3056,11 +3061,16 @@ class Workflow:
                 raise ValueError("선택이 만료됐어요. 실행 설정을 다시 확인해 주세요.")
             rows = self.terminals.list()
             previous = [item for item in rows if item.get("key", "").split(":")[0] == key_base]
-            live = next((item for item in reversed(previous) if item.get("alive")), None)
+            same_claude = (source["agent"] == "claude" and plan["target"] ==
+                           {"host": source["host"], "agent": "claude", "account": "claude:default"})
+            live = next((item for item in reversed(previous) if item.get("alive") and not item.get("closed")
+                         and (not same_claude or (item.get("linkConfidence") != "estimated"
+                                                 and self.same_native(item.get("nativeSource"), source)))), None)
             if live is None and plan["mode"] == "reconnect" and plan.get("reconnectId"):
                 # The session's own terminal on another route (plan): that one, while it lives.
                 live = next((item for item in rows if item.get("id") == plan["reconnectId"]
                              and item.get("alive") and not item.get("closed")
+                             and item.get("linkConfidence") != "estimated"
                              and self.same_native(item.get('nativeSource'), source)), None)
             if live:
                 # Settled once linked: a waiting repeat never changes it while it is answered.
@@ -3212,9 +3222,9 @@ class Workflow:
                 "connectionMode": "attach" if prepared.get("connectionMode") == "attach" else None}
 
     def windows_takeover(self, source):
-        """Only this board knows whether a PC run still has its terminal: with none open for the
-        session, the PC may replace the board's own earlier resume it kept after the connection
-        was lost (windows_runtime terminal_plan)."""
+        """A PC run can be considered for replacement only if it has no live board terminal."""
+        if source.get("agent") == "claude":
+            return False  # Leave a live Claude run at its original terminal when it cannot be attached.
         return not any(item.get("alive") and not item.get("closed") and self.same_native(item.get("nativeSource"), source)
                        for item in self.terminals.list())
 
@@ -3246,6 +3256,8 @@ class Workflow:
         if host.get("platform") == "windows":
             spec = self.transfers.rpc(host, "terminal_plan", {"source": source, "prepare": True,
                                                                "takeover": self.windows_takeover(source)}, timeout=20)
+            if source["agent"] == "claude" and not self.same_native(spec.get("nativeSource"), source):
+                raise ValueError("같은 PC Claude 대화의 연결인지 확인하지 못했습니다.")
             import collector
             return {"argv": self.transfers.windows_terminal(host, spec), "cwd": str(Path.home()),
                     "env": collector.tool_env(), "connectionMode": spec.get("connectionMode") or "attach",

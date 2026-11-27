@@ -1516,6 +1516,61 @@ function selectChat(c, { home = '.codex-example', id = 'native-session', agent =
 
 const noChatTimers = { setTimeout: () => 1, clearTimeout() {} };
 
+test('이전 Claude 상태 경로는 현재 선택의 대화에서 읽고 전송에는 요청의 대화 ID를 유지한다', async () => {
+  const calls = [];
+  const c = client(async (url, opts) => {
+    const body = JSON.parse(opts.body || '{}'); calls.push({ url, body });
+    const { sessionId, ...route } = body.source || {};
+    const data = url === '/api/chat/state'
+      ? { route, phase: 'idle', capability: { supported: true }, messages: [{ role: 'assistant', text: '확인용 답변' }] }
+      : { status: 'accepted', receipt: { requestId: body.requestId, confirmed: true } };
+    return { ok: true, status: 200, json: async () => data };
+  }, noChatTimers);
+  const { s } = selectChat(c, { agent: 'claude', home: '.claude', id: 'fixture-worker' });
+  s.sessionId = '11111111-1111-4111-8111-111111111112';
+  const entry = c.chatEntry(s);
+  wireTree(c, c.buildChatComposer(s));
+  assert.equal((await c.loadChatState(s)).status, 'success');
+  assert.equal(entry.conversation.messages[0].text, '확인용 답변');
+  const input = c.get('chat-input'); input.value = '확인용 초안'; input.events.input();
+  await c.sendChat(entry);
+  const sends = calls.filter(({ url }) => url === '/api/chat/send');
+  assert.equal(sends.length, 1);
+  assert.deepEqual(sends[0].body.source, JSON.parse(JSON.stringify(c.sourceOf(s))));
+});
+
+test('이전 Claude 상태의 지연 응답과 식별자 불일치는 어떤 초안이나 영수증도 바꾸지 않는다', async () => {
+  let reply;
+  const c = client((url, opts) => new Promise((resolve) => {
+    assert.equal(url, '/api/chat/state');
+    const { sessionId, ...route } = JSON.parse(opts.body).source;
+    reply = (fields = {}) => resolve({ ok: true, status: 200, json: async () => ({
+      route: { ...route, ...fields }, phase: 'idle', capability: { supported: true },
+      receipts: [{ requestId: 'fixture-0001', status: 'accepted', confirmed: true }], messages: [],
+    }) });
+  }), noChatTimers);
+  const { s } = selectChat(c, { agent: 'claude', home: '.claude', id: 'fixture-worker' });
+  s.sessionId = '11111111-1111-4111-8111-111111111112';
+  const original = c.chatEntry(s);
+  original.text = '첫 초안';
+  original.pending = { requestId: 'fixture-0001', text: original.text, attachments: [], revision: original.revision };
+  for (const fields of [{ host: 'other' }, { agent: 'codex' }, { home: '.claude-other' }, { id: 'other' }, { sessionId: 'other' }]) {
+    const read = c.loadChatState(s); reply(fields); await read;
+    assert.equal(original.receipt, null);
+    assert.equal(original.text, '첫 초안');
+  }
+  const late = c.loadChatState(s);
+  const next = { ...s, sessionId: '22222222-2222-4222-8222-222222222223' };
+  c.state.snapshot.hosts[0].data.claude = [next];
+  const current = c.chatEntry(next);
+  current.text = '다음 초안';
+  reply(); await late;
+  assert.equal(original.receipt, null);
+  assert.equal(original.text, '첫 초안');
+  assert.equal(current.data, null);
+  assert.equal(current.text, '다음 초안');
+});
+
 test('assistant labels show recorded model settings, and current settings only on the latest answer', () => {
   const c = client(undefined, noChatTimers);
   const { s, entry } = selectChat(c);
@@ -8387,6 +8442,31 @@ test('Claude readbackConfirmed settles its bubble without waiting for an answer'
   assert.equal(entry.outbox.length, 0);
 });
 
+test('PC Claude only settles an acknowledged or queued message from its own receipt', () => {
+  const { c, entry } = inlineDetailClient({ agent: 'claude', home: '.claude' });
+  const item = { requestId: 'fixture-pc-send', text: '합성 입력', attachments: [], state: 'sending', at: Date.now() };
+  entry.outbox = [item];
+  const observed = { requestId: item.requestId, status: 'unknown', acknowledged: true,
+    readbackConfirmed: false, responseObserved: false };
+  c.markOutbox(entry, item.requestId, observed);
+  assert.equal(item.state, 'uncertain');
+  assert.match(c.chatReceiptCopy(observed), /터미널에 입력.*수신은 아직 확인/);
+  const queued = { ...observed, status: 'queued', confirmed: true, deliveryVerified: true };
+  entry.pending = { requestId: item.requestId, text: item.text, attachments: [], preserveDraft: true };
+  c.applyChatReceipt(entry, queued);
+  assert.equal(entry.pending.requestId, item.requestId);
+  assert.match(c.chatReceiptCopy(queued), /입력 대기열/);
+  c.settleOutbox(entry, [{ role: 'user', text: item.text }, { role: 'assistant', text: '다른 후속 응답' }]);
+  assert.equal(entry.outbox.length, 1);
+  const read = { ...queued, status: 'accepted', readbackConfirmed: true };
+  c.applyChatReceipt(entry, read);
+  assert.equal(entry.pending, null);
+  c.settleOutbox(entry, []);
+  assert.equal(entry.outbox.length, 0);
+  assert.match(c.chatReceiptCopy(read), /메시지가 기록/);
+  assert.match(c.chatReceiptCopy({ ...read, responseObserved: true }), /후속 응답이 기록/);
+});
+
 test('a failed xterm stylesheet fails the terminal load, and opening again retries only that file', async () => {
   const c = client(undefined, noChatTimers);
   const appended = []; const removed = [];
@@ -9305,6 +9385,32 @@ test('a disconnected Claude chat connects on send, stays in chat, and sends its 
   entry.data = { ...entry.data, capability: { supported: false, attachments: true, reason: '보드 밖 터미널' } };
   c.updateChatComposer(entry);
   assert.equal(c.get('chat-send').disabled, true, 'unsupported external sessions keep their policy');
+});
+
+test('PC Claude chats with the same worker keep their drafts apart and reject a different connect route', async () => {
+  const calls = [];
+  const c = client(async (url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push(url);
+    return { ok: true, status: 200, json: async () => ({
+      connected: true, terminalId: 'fixture-terminal', source: { ...body.source, sessionId: 'other-conversation' },
+    }) };
+  }, noChatTimers);
+  vm.runInContext('loadChatState = async () => {};', c.context);
+  const { s } = selectChat(c, { agent: 'claude', home: '.claude' });
+  s.sessionId = 'original-conversation';
+  const entry = c.chatEntry(s);
+  entry.text = '원래 대화 초안';
+  entry.data = { route: c.sourceOf(s), phase: 'idle', capability: { supported: false, action: 'open_terminal' } };
+  const other = c.chatEntry({ ...s, sessionId: 'other-conversation' });
+  other.text = '다른 대화 초안';
+  assert.notEqual(entry, other);
+  assert.equal(c.chatEntry(s), entry);
+  await c.sendChat(entry);
+  assert.deepEqual(calls, ['/api/chat/connect']);
+  assert.equal(entry.text, '원래 대화 초안');
+  assert.equal(other.text, '다른 대화 초안');
+  assert.equal(entry.receipt.dispatchState, 'not_started');
 });
 
 test('a Claude submit refusal keeps the pasted draft reserved and blocks a second paste', async () => {
